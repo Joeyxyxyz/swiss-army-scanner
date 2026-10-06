@@ -178,7 +178,7 @@ Nothing is overwritten. "Delete" moves an entry to `trash\`; emptying it is your
 
 ## Limits & sizing (measured on the bench setup)
 
-**Setup.** FLIR BFS-U3-16S2M, 1440 × 1080 mono, 3.45 µm pixels; lens ≈ 8 mm (*derived*: 0.30 mm/px measured at ≈ 640 mm gives f ≈ 3.45 µm × 640 mm ÷ 0.30 mm ≈ 7.4 mm); DLP4500 projector at 228.6 mm baseline, 762 mm standoff. Field of view at ≈ 640 mm ≈ 430 × 320 mm.
+**Setup.** FLIR BFS-U3-16S2M, 1440 × 1080 mono, 3.45 µm pixels; 2.8–12 mm varifocal lens set to ≈ 8 mm (consistent with the measured 0.30 mm/px at ≈ 640 mm: f ≈ 3.45 µm × 640 mm ÷ 0.30 mm ≈ 7.4 mm). Changing the zoom or focus changes every number below and invalidates the calibration: recalibrate after any lens adjustment, and lock the zoom/focus rings; DLP4500 projector at 228.6 mm baseline, 762 mm standoff. Field of view at ≈ 640 mm ≈ 430 × 320 mm.
 
 **Codes (2D).**
 

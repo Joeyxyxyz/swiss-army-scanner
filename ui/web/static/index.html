@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swiss Army Scanner</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23161b21'/%3E%3Cpath d='M3 4h10M3 8h10M3 12h10' stroke='%234aa3ff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo">SAS</span><span class="name">Swiss Army Scanner</span></div>
+  <span id="modeBadge" class="badge">…</span>
+  <div class="chips">
+    <span class="chip" id="chipPreset" title="Active preset">preset —</span>
+    <span class="chip" id="chipGeo" title="Active geometry id: bases and calibrations are only valid here">geometry —</span>
+    <span class="chip" id="chipCal" title="Calibration for this geometry (rule 6: mm only with a matching calibration)">uncalibrated</span>
+    <span class="chip" id="chipBase" title="Base used for object scans">base —</span>
+  </div>
+  <div class="spacer"></div>
+  <div id="jobInd" class="jobind" role="button" tabindex="0" title="Engine worker: one job at a time. Click for the queue (cancel queued jobs, stop the live view).">idle</div>
+  <div id="jobMenu" class="jobmenu" hidden></div>
+  <button id="benchBtn" class="ghost" hidden title="Simulated bench (mock mode only)">Sim bench</button>
+  <button id="themeBtn" class="ghost" title="Light / dark">&#9680;</button>
+</header>
+<div id="realBanner" class="banner" hidden>
+  <b>REAL HARDWARE.</b> Close the LightCrafter GUI before scanning. It holds the USB link and can knock the DMD off HDMI.
+  Do not move the camera, projector or focus between a base and its object scans.
+</div>
+<div id="connBanner" class="banner warn" hidden>Lost contact with the UI server. Is <code>python -m ui.web.server</code> still running?</div>
+
+<div class="layout">
+<nav id="tabs">
+  <a href="#setup" data-tab="setup"><i>1</i>Setup</a>
+  <a href="#focus" data-tab="focus"><i>2</i>Focus &amp; signal</a>
+  <a href="#bases" data-tab="bases"><i>3</i>Base library</a>
+  <a href="#scan3d" data-tab="scan3d"><i>4</i>3D scan</a>
+  <a href="#measure" data-tab="measure"><i>5</i>Measure</a>
+  <a href="#defects" data-tab="defects"><i>6</i>Defects</a>
+  <a href="#codes" data-tab="codes"><i>7</i>Codes</a>
+  <a href="#spectral" data-tab="spectral"><i>8</i>Spectral</a>
+  <a href="#grid" data-tab="grid"><i>9</i>Grid &amp; zones</a>
+  <a href="#sensors" data-tab="sensors"><i>10</i>Sensors</a>
+  <a href="#cell" data-tab="cell"><i>11</i>Cell &amp; 3D</a>
+  <a href="#outputs" data-tab="outputs"><i>12</i>Output bin</a>
+  <a href="#log" data-tab="log"><i>13</i>Log</a>
+</nav>
+<main>
+
+<!-- ============================================================ 1 SETUP -->
+<section id="tab-setup" class="tab">
+  <div class="tabhead"><h2>Setup</h2>
+    <p>A preset holds every setting for one rig geometry. Edit a copy here, save it as a new preset, then load it to make it active.</p></div>
+  <div class="card">
+    <div class="row">
+      <label class="f inline"><span>Preset</span><select id="presetSel"></select></label>
+      <button id="presetEdit">Open in editor</button>
+      <button id="presetLoad" class="primary">Load (make active)</button>
+      <span class="muted small" id="presetDir"></span>
+    </div>
+    <div id="presetLoadOut"></div>
+  </div>
+  <div class="split">
+    <div class="card">
+      <div class="cardhead"><h3>Editor: <span id="editorName" class="mono">—</span></h3><span id="dirtyBadge" class="tag warn" hidden>unsaved</span></div>
+      <div id="presetWarn"></div>
+      <form id="presetForm" autocomplete="off"></form>
+    </div>
+    <div class="card side">
+      <h3>Rig geometry: derived</h3>
+      <dl id="derived" class="kv"></dl>
+      <p class="note">Left/right projector: depth moves the fringes sideways, so the fringes must be <b>vertical</b> in the camera image. Above/below needs horizontal fringes. Check signal verifies this and tells you when to toggle rotate&nbsp;90&deg;.</p>
+      <div id="geoSuggest"></div>
+      <h3>Save</h3>
+      <label class="f"><span>Preset name</span><input id="saveName" data-path="name" spellcheck="false"></label>
+      <label class="f"><span>geometry_id</span><input id="saveGeo" data-path="geometry_id" spellcheck="false"></label>
+      <label class="chk"><input type="checkbox" id="saveOverwrite"> overwrite an existing preset of this name</label>
+      <div class="row">
+        <button id="saveBtn">Save as new preset</button>
+        <button id="saveLoadBtn" class="primary">Save &amp; load</button>
+        <button id="revertBtn" class="ghost">Revert</button>
+      </div>
+      <div id="saveOut"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ 2 FOCUS -->
+<section id="tab-focus" class="tab">
+  <div class="tabhead"><h2>Focus &amp; signal</h2>
+    <p>Position and focus with the live view, then check the fringe signal before capturing a base.</p></div>
+  <div class="split wide">
+    <div class="card">
+      <div class="cardhead"><h3>Live view</h3><span class="muted small">holds the rig; stops when you leave this tab, when a rig action is queued, or after 30 s with nobody watching</span></div>
+      <div class="row">
+        <button id="liveStart" class="primary">Start live</button>
+        <button id="liveStop">Stop</button>
+        <label class="f inline"><span>Pattern</span><select id="livePattern"><option value="flood">flood (camera focus)</option><option value="stripes">stripes (projector focus)</option><option value="checker">checker</option></select></label>
+        <label class="f inline"><span>Colour</span><select id="liveColour"><option>white</option><option>red</option><option>green</option><option>blue</option></select></label>
+        <label class="f inline"><span>Level</span><input type="range" id="liveLevel" min="0" max="255" value="140"><output id="liveLevelV" class="mono">140</output></label>
+        <label class="f inline"><span>Period</span><input type="number" id="livePeriod" min="2" max="256" value="8" class="w5"><em>DMD px</em></label>
+      </div>
+      <div class="liveview"><img id="liveImg" alt="live camera frame"><div id="liveEmpty" class="empty">Live view is off.</div></div>
+      <p class="muted small">Red pixels are saturated (&ge;250 counts). Saturation flattens the fringes, so lower the exposure or level until the red goes away. The flood pattern focuses the camera on scene texture; stripes or checker focus the projector.</p>
+    </div>
+    <div class="card side">
+      <h3>Focus score</h3>
+      <div class="bigmeter">
+        <div class="val mono" id="focusVal">—</div>
+        <div class="meter"><div id="focusBar"></div></div>
+        <div class="sub"><span>peak <b class="mono" id="focusPeak">—</b></span><button id="focusReset" class="ghost small">reset peak</button></div>
+      </div>
+      <p class="muted small">Variance of the Laplacian over the lit area (higher = sharper). Turn the focus ring until the bar reaches the peak.</p>
+      <dl class="kv" id="liveStats"></dl>
+    </div>
+  </div>
+  <div class="split">
+    <div class="card">
+      <h3>Check signal</h3>
+      <p class="muted">Projects white, black and phase fringes, then reports fringe modulation (gc_conf), valid pixels and focus. It also checks that the fringes run across the baseline.</p>
+      <button id="sigBtn" class="primary">Check signal</button>
+      <div id="sigOut"></div>
+    </div>
+    <div class="card">
+      <h3>Measure gamma</h3>
+      <p class="muted">Projects a gray staircase and fits the projector's response. HDMI video mode applies degamma.</p>
+      <div class="row"><label class="f inline"><span>Levels</span><input type="number" id="gammaN" value="12" min="4" max="64" class="w5"></label><button id="gammaBtn">Measure gamma</button></div>
+      <div id="gammaOut"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Scan assistant</h3>
+    <p class="muted">Sweeps the camera exposure (and optionally the DMD duty) and recommends the setting with the best fringe modulation and no saturation. It never edits a preset. <b>Apply</b> fills the Setup form for you to review and save.</p>
+    <div class="row">
+      <label class="f inline"><span>Exposures</span><input id="tuneExp" placeholder="auto, or e.g. 2000, 4000, 8000" class="w20"><em>µs</em></label>
+      <label class="f inline"><span>Duties</span><input id="tuneDuty" placeholder="preset duty, or e.g. 0.4, 0.55, 0.8" class="w20"></label>
+      <button id="tuneBtn" class="primary">Run scan assistant</button>
+    </div>
+    <div id="tuneOut"></div>
+  </div>
+  <div class="card">
+    <h3>Fast mode: flash pattern pack</h3>
+    <p class="muted small">Builds a DLPC350 pattern pack (BMPs, manifest, procedure) for the hardware-triggered fast path (about 0.14 s per axis instead of about 15 s). Files only: it never touches the rig. A person switches the controller into pattern mode in the TI GUI. See <code>docs/FLASH_PATTERN_MODE.md</code>.</p>
+    <div class="row">
+      <label class="f inline"><span>Axis</span><select id="flashAxis"><option value="x">x (columns)</option><option value="y">y (rows)</option></select></label>
+      <label class="f inline"><input type="checkbox" id="flashVideo"><span>video port</span></label>
+      <button id="flashBtn">Make flash pack</button>
+    </div>
+    <div id="flashOut"></div>
+  </div>
+</section>
+
+<!-- ============================================================ 3 BASES -->
+<section id="tab-bases" class="tab">
+  <div class="tabhead"><h2>Base library</h2>
+    <p>A base is the empty-scene reference, the datum every object scan is measured against. It is only valid at the geometry it was captured at.</p></div>
+  <div class="card">
+    <h3>Capture base</h3>
+    <div class="row">
+      <label class="f inline"><span>Label</span><input id="baseLabel" value="empty" class="w15"></label>
+      <button id="baseCapture" class="primary">Capture base</button>
+      <span class="muted small">Scene EMPTY. Camera, projector and focus exactly as they will be for the objects.</span>
+    </div>
+    <div id="baseOut"></div>
+  </div>
+  <div class="card">
+    <div class="cardhead"><h3>Bases for <span class="mono geoName">—</span></h3>
+      <label class="chk"><input type="checkbox" id="basesAll"> all geometries</label>
+      <button id="basesRefresh" class="ghost">Refresh</button></div>
+    <div id="basesList" class="tiles"></div>
+  </div>
+</section>
+
+<!-- ============================================================ 4 3D SCAN -->
+<section id="tab-scan3d" class="tab">
+  <div class="tabhead"><h2>3D scan</h2>
+    <p>Place the object without touching the camera or projector, then capture. The relief is the height versus the base: projector px until calibrated.</p></div>
+  <div class="split">
+    <div class="card">
+      <h3>Capture object</h3>
+      <div class="formgrid">
+        <label class="f"><span>Label</span><input id="objLabel" value="part"></label>
+        <label class="f"><span>Base</span><select id="objBase" data-bases></select></label>
+        <label class="f"><span>Known H</span><input id="objH" type="number" step="any" min="0" placeholder="optional"><em>mm</em></label>
+        <label class="f"><span>Known W</span><input id="objW" type="number" step="any" min="0" placeholder="optional"><em>mm</em></label>
+        <label class="f"><span>Known L</span><input id="objL" type="number" step="any" min="0" placeholder="optional"><em>mm</em></label>
+        <label class="f"><span>Grid zone</span><input id="objZone" placeholder="optional: C4, C4:D6, B2,E5" spellcheck="false"></label>
+      </div>
+      <p class="muted small">Known dimensions make the scan a calibration candidate (Measure tab). A zone lights only that part of the grid (see Grid &amp; zones).</p>
+      <button id="objCapture" class="primary">Capture object</button>
+      <div id="objOut"></div>
+    </div>
+    <div class="card">
+      <div class="cardhead"><h3>Scans at <span class="mono geoName">—</span></h3><button id="objRefresh" class="ghost">Refresh</button></div>
+      <div id="objList" class="list"></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="cardhead">
+      <h3>3D viewer: <span id="cloudTitle" class="mono">no scan selected</span></h3>
+      <label class="f inline"><span>Points</span><select id="cloudMax"><option>5000</option><option selected>20000</option><option>50000</option><option>100000</option><option>200000</option></select></label>
+      <label class="f inline"><span>Z&times;</span><input type="range" id="cloudZex" min="-2" max="2" step="0.05" value="0"><output id="cloudZexV" class="mono">auto</output></label>
+      <label class="f inline"><span>Size</span><input type="range" id="cloudSize" min="1" max="5" step="1" value="2"></label>
+      <button id="cloudReset" class="ghost">Reset view</button>
+      <button id="cloudPly">Export .ply</button>
+      <button id="cloudXyz" class="ghost">.xyz</button>
+      <span id="cloudLinks"></span>
+    </div>
+    <div class="cloudwrap"><canvas id="cloud"></canvas><div class="legend" id="cloudLegend" hidden></div><div class="cloudhelp">drag: orbit &middot; shift/right-drag: pan &middot; wheel: zoom &middot; double-click: reset</div></div>
+    <div id="cloudInfo" class="muted small"></div>
+  </div>
+  <div class="card">
+    <div class="cardhead"><h3>2D profile</h3>
+      <label class="f inline"><span>Scan</span><select id="profScan" data-objects></select></label>
+      <label class="f inline"><span>Line</span><select id="profMode"><option value="points">two clicked points</option><option value="auto">auto (long axis)</option><option value="x">x through part</option><option value="y">y through part</option></select></label>
+      <label class="f inline"><span>Width</span><input type="number" id="profWidth" value="5" min="1" max="101" class="w5"><em>px</em></label>
+      <button id="profBtn" class="primary">Profile</button></div>
+    <div class="split even">
+      <div><div class="picker" id="profPick"><img alt="relief preview"><canvas></canvas><div class="empty">Pick a scan.</div></div>
+        <p class="muted small" id="profHint">Click two points on the relief to set the line.</p></div>
+      <div><canvas id="profPlot" class="plot"></canvas><div id="profOut"></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ 5 MEASURE -->
+<section id="tab-measure" class="tab">
+  <div class="tabhead"><h2>Measure</h2>
+    <p>Calibrate from scans with known dimensions, then measure. Results are reported in mm only with a calibration for this geometry; otherwise in px with a warning (rule 6).</p></div>
+  <div class="split">
+    <div class="card">
+      <div class="cardhead"><h3>Calibrate</h3><button id="calRefresh" class="ghost">Refresh</button></div>
+      <p class="muted small">Z is fitted from known H (height_mm = mm_per_px &times; relief_px + intercept). XY is fitted from known W and L. Use two or more heights for a real fit and R&sup2;.</p>
+      <div id="calList" class="list"></div>
+      <button id="calBtn" class="primary">Calibrate from selected</button>
+      <div id="calOut"></div>
+      <h4>Calibrations for <span class="mono geoName">—</span></h4>
+      <div id="calLib"></div>
+    </div>
+    <div class="card">
+      <h3>Measure</h3>
+      <div class="row"><label class="f inline"><span>Scan</span><select id="measScan" data-objects></select></label><button id="measBtn" class="primary">Measure</button></div>
+      <div id="measOut"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ 6 DEFECTS -->
+<section id="tab-defects" class="tab">
+  <div class="tabhead"><h2>Defects</h2>
+    <p>Find blobs that deviate from the local surface, compare against a golden scan, or check against a memory bank of known-good parts.</p></div>
+  <div class="card">
+    <div class="cardhead"><h3>Inspect</h3>
+      <label class="f inline"><span>Scan</span><select id="inspScan" data-objects></select></label>
+      <label class="f inline"><span>n&sigma;</span><input type="number" id="inspSigma" value="6" step="0.5" min="1" class="w5"></label>
+      <label class="f inline"><span>Min area</span><input type="number" id="inspArea" value="50" min="1" class="w5"><em>px</em></label>
+      <label class="f inline"><span>Bg window</span><input type="number" id="inspWin" value="121" min="3" step="2" class="w5"><em>px</em></label>
+      <label class="chk"><input type="checkbox" id="inspWhole"> whole field</label>
+      <button id="inspBtn" class="primary">Inspect</button></div>
+    <div id="inspOut"></div>
+  </div>
+  <div class="split">
+    <div class="card">
+      <h3>Compare to golden</h3>
+      <div class="formgrid">
+        <label class="f"><span>Scan</span><select id="cmpScan" data-objects></select></label>
+        <label class="f"><span>Golden</span><select id="cmpGolden" data-objects></select></label>
+        <label class="f"><span>Fail band</span><input type="number" id="cmpMm" step="any" placeholder="preset tolerance"><em>mm</em></label>
+        <label class="f"><span>or</span><input type="number" id="cmpPx" step="any" placeholder="uncalibrated band"><em>px</em></label>
+      </div>
+      <button id="cmpBtn" class="primary">Compare</button>
+      <div id="cmpOut"></div>
+    </div>
+    <div class="card">
+      <div class="cardhead"><h3>Good memory bank</h3><button id="bankRefresh" class="ghost">Refresh</button></div>
+      <p class="muted small">Add known-good scans of one part type, placed the same way. A check flags anything the good parts never showed, including defects nobody wrote a rule for.</p>
+      <div class="formgrid">
+        <label class="f"><span>Bank</span><input id="bankName" value="default" list="bankNames" spellcheck="false"></label>
+        <label class="f"><span>Scan</span><select id="bankScan" data-objects></select></label>
+        <label class="f"><span>k&sigma;</span><input type="number" id="bankK" value="4" step="0.5" min="1"></label>
+        <label class="f"><span>Min area</span><input type="number" id="bankArea" value="25" min="1"><em>px</em></label>
+      </div>
+      <datalist id="bankNames"></datalist>
+      <div class="row"><button id="bankAdd">Add scan to bank</button><button id="bankCheck" class="primary">Check scan against bank</button></div>
+      <div id="bankList"></div>
+      <div id="bankOut"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ 7 CODES -->
+<section id="tab-codes" class="tab">
+  <div class="tabhead"><h2>Codes</h2>
+    <p>Reads QR codes and 1D barcodes with the DMD as the light source. It brackets brightness and tries red, green, blue and white light. No base or calibration needed.</p></div>
+  <div class="card">
+    <div class="row">
+      <label class="f inline"><span>Label</span><input id="codeLabel" value="codes" class="w15"></label>
+      <label class="f inline"><span>Levels</span><input id="codeLevels" placeholder="255, 170, 110" class="w15"></label>
+      <button id="codeBtn" class="primary">Read codes</button>
+    </div>
+    <p class="muted small">Decoders need about 3 camera px per module. At the 2.7 ft bench standoff a dense QR code must be about 70 mm wide.</p>
+    <div id="codeOut"></div>
+  </div>
+  <div class="card">
+    <div class="cardhead"><h3>Code readings</h3><button id="codeRefresh" class="ghost">Refresh</button></div>
+    <div id="codeList"></div>
+  </div>
+</section>
+
+<!-- ============================================================ 8 SPECTRAL -->
+<section id="tab-spectral" class="tab">
+  <div class="tabhead"><h2>Spectral</h2>
+    <p>Captures reflectance under the red, green and blue LEDs (no USB needed). Teach materials from regions you draw, then classify every pixel.</p></div>
+  <div class="split">
+    <div class="card">
+      <h3>Capture</h3>
+      <div class="row"><label class="f inline"><span>Label</span><input id="specLabel" value="spectral" class="w15"></label><button id="specBtn" class="primary">Spectral capture</button></div>
+      <div id="specOut"></div>
+      <h3>Teach a material</h3>
+      <div class="row">
+        <label class="f inline"><span>Reading</span><select id="specReading"></select></label>
+        <button id="specRefresh" class="ghost">Refresh</button>
+        <button id="specDelete" class="ghost small danger" title="Move the selected reading to trash">Delete…</button>
+      </div>
+      <div class="picker" id="specPick"><img alt="spectral reading"><canvas></canvas><div class="empty">No spectral reading yet.</div></div>
+      <p class="muted small" id="specRoiText">Drag a rectangle inside ONE surface.</p>
+      <div class="row"><label class="f inline"><span>Material</span><input id="matName" placeholder="e.g. aluminium" class="w15"></label><button id="matLearn">Learn material from ROI</button></div>
+      <div id="matOut"></div>
+    </div>
+    <div class="card">
+      <div class="cardhead"><h3>Materials</h3><button id="matRefresh" class="ghost">Refresh</button></div>
+      <div id="matList"></div>
+      <h3>Classify</h3>
+      <div class="row"><label class="f inline"><span>Max distance</span><input type="number" id="clsDist" value="3" step="0.5" min="0.5" class="w5"></label>
+        <button id="clsBtn" class="primary">Classify selected reading</button></div>
+      <p class="muted small">Tick materials above to restrict; none ticked = all.</p>
+      <div id="clsOut"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Separate direct / global light</h3>
+    <p class="muted small">Shifted checkerboards split single-bounce light from inter-reflection and scatter. Glossy cans reflect onto each other and bias the fringes.</p>
+    <div class="row">
+      <label class="f inline"><span>Label</span><input id="sepLabel" value="light" class="w10"></label>
+      <label class="f inline"><span>Square</span><input type="number" id="sepSq" value="16" min="2" class="w5"><em>DMD px</em></label>
+      <label class="f inline"><span>Shifts</span><input type="number" id="sepShifts" value="8" min="2" class="w5"></label>
+      <button id="sepBtn" class="primary">Separate light</button>
+    </div>
+    <div id="sepOut"></div>
+  </div>
+</section>
+
+<!-- ============================================================ 9 GRID -->
+<section id="tab-grid" class="tab">
+  <div class="tabhead"><h2>Grid &amp; zones</h2>
+    <p>Projects a lettered grid onto the scene: columns A, B, C… left to right and rows 1, 2, 3… top to bottom, as the camera sees them. Read the photo, then scan only the zone your part is in, for example <code>C4</code> or <code>C4:D6</code>. An AI agent can read the same photo and zone names.</p></div>
+  <div class="split">
+    <div class="card">
+      <h3>1 &middot; Projector map</h3>
+      <p class="muted small">Decodes both projector axes on the <b>current</b> scene, so each grid cell maps to exact camera pixels. It is needed to cut a scan to a zone and to place drawn zones. The scene must be lit only by the projector (steady room light) and the rig must be fixed. Capture a new map after moving the camera, projector or focus. It takes about as long as two scans.</p>
+      <div class="row"><label class="f inline"><span>Label</span><input id="mapLabel" value="map" class="w10"></label><button id="mapBtn" class="primary">Capture projector map</button><button id="mapRefresh" class="ghost">Refresh</button></div>
+      <div id="mapOut"></div>
+      <div id="mapList"></div>
+    </div>
+    <div class="card">
+      <h3>2 &middot; Project grid</h3>
+      <div class="row">
+        <label class="f inline"><span>Spacing</span><input type="number" id="gridSpacing" value="96" min="16" max="570" class="w5"><em>DMD px</em></label>
+        <label class="f inline"><span>Hold</span><input type="number" id="gridHold" value="0" min="0" max="300" step="0.5" class="w5" title="keeps the grid up (and the rig busy) this long; can't be interrupted; max 300 s"><em>s</em></label>
+        <button id="gridBtn" class="primary">Project grid</button>
+      </div>
+      <div id="gridOut"></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="cardhead"><h3>Grid photo</h3>
+      <div class="seg" id="gridView"><button data-v="overlay" class="on">overlay</button><button data-v="camera">camera</button><button data-v="dmd">sent to DMD</button></div>
+      <span class="muted small" id="gridPhotoInfo"></span><button id="gridEnlarge" class="ghost small">enlarge</button></div>
+    <div id="gridNotice"></div>
+    <div class="picker" id="gridPick"><img alt="grid photo"><canvas></canvas><div class="empty">Project the grid to see the scene with cell labels.</div></div>
+    <div id="gridCells" class="cells"></div>
+  </div>
+  <div class="split">
+    <div class="card">
+      <h3>3 &middot; Scan this zone</h3>
+      <div class="formgrid">
+        <label class="f"><span>Zone</span><input id="zoneText" placeholder="C4, C4:D6, B2,E5 or atlas:cell/cell" spellcheck="false"></label>
+        <label class="f"><span>Label</span><input id="zoneLabel" value="zone-part"></label>
+        <label class="f"><span>Base</span><select id="zoneBase" data-bases></select></label>
+        <label class="f"><span>Known H</span><input id="zoneH" type="number" step="any" placeholder="optional"><em>mm</em></label>
+      </div>
+      <p class="muted small" id="zoneCheck">Click cells under the photo to build a zone.</p>
+      <button id="zoneScan" class="primary">Scan this zone</button>
+      <div id="zoneOut"></div>
+    </div>
+    <div class="card">
+      <div class="cardhead"><h3>Brief for an AI agent</h3><button id="agentCopy" class="ghost">Copy</button></div>
+      <p class="muted small">Paste this to Claude, Grok or another agent. It says where the grid photo is and how to ask for a zone scan.</p>
+      <textarea id="agentBrief" readonly rows="11" spellcheck="false"></textarea>
+    </div>
+  </div>
+  <div class="card">
+    <div class="cardhead"><h3>Custom zones (machine-vision marking)</h3>
+      <div class="seg" id="zoneTool"><button data-v="rect" class="on">rectangle</button><button data-v="poly">polygon</button></div>
+      <label class="f inline"><span>Pattern</span><select id="zonePattern"><option>flood</option><option>outline</option><option>grid</option><option>stripes</option><option>checker</option></select></label>
+      <label class="f inline"><span>Level</span><input type="number" id="zoneLevel" value="255" min="0" max="255" class="w5"></label>
+      <button id="zoneClear" class="ghost">Clear zones</button>
+      <button id="zoneProject" class="primary">Project zones</button></div>
+    <p class="muted small">Draw on the camera photo: drag for a rectangle; for a polygon, click the points and double-click to close. Zones are in camera px and are mapped to the DMD with the projector map.</p>
+    <div class="split even">
+      <div class="picker" id="zonePick"><img alt="camera photo for zones"><canvas></canvas><div class="empty">Project the grid first; its camera photo is the canvas.</div></div>
+      <div><div id="zoneList"></div><div id="zonesOut"></div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="cardhead"><h3>Surfer: atlas regions</h3><button id="atlasRefresh" class="ghost">Refresh</button></div>
+    <p class="muted small">An atlas names DMD regions (for example the held cell). After import, a region works anywhere a zone does: <code>atlas:cell/cell</code>, including <b>Scan this zone</b> above.</p>
+    <div class="row">
+      <label class="f inline"><span>Atlas file</span><input id="atlasPath" class="w30" spellcheck="false" value="" placeholder="path to an atlas .json"></label>
+      <label class="f inline"><span>Name</span><input id="atlasName" value="cell" class="w10"></label>
+      <button id="atlasImport" class="primary">Import atlas</button>
+    </div>
+    <div id="atlasOut"></div>
+    <div id="atlasList"></div>
+    <div class="row">
+      <label class="f inline"><span>Region</span><input id="surfRegion" value="atlas:cell/cell" class="w20" spellcheck="false" title="atlas:<name>/<region>, a zone like P17:P22@48, or x0,y0,x1,y1 DMD px"></label>
+      <button id="floodBtn">Flood verify</button>
+    </div>
+    <div id="floodOut"></div>
+    <div class="row">
+      <label class="f inline"><span>Carriers</span><input id="glareCarriers" class="w20" placeholder="default set, or 0,0; 0.3,-0.5" spellcheck="false"><em>fx,fy[,z]; …</em></label>
+      <button id="glareBtn">Anti-glare sweep</button>
+    </div>
+    <div id="glareOut"></div>
+    <div class="row">
+      <label class="f inline"><span>Orientations</span><input id="moOrients" value="v,h,d45,d135" class="w10" spellcheck="false"></label>
+      <label class="f inline"><span>Period</span><input type="number" id="moPeriod" value="24" min="4" class="w5"><em>DMD px</em></label>
+      <button id="moBtn">Multi-orientation scan</button>
+    </div>
+    <div id="moOut"></div>
+  </div>
+</section>
+
+<!-- ============================================================ 10 SENSORS -->
+<section id="tab-sensors" class="tab">
+  <div class="tabhead"><h2>Virtual sensors</h2>
+    <p>The DMD draws a light spot of any size, anywhere, and the camera is the receiver. Size a spot the way you would pick an industrial laser-spot sensor, aim it at a grid cell, then teach part-present or alignment sensors. A sensor is only valid at the geometry it was taught at.</p></div>
+  <div class="split">
+    <div class="card">
+      <h3>1 &middot; Spot size</h3>
+      <div class="formgrid">
+        <label class="f"><span>Diameter</span><input id="spotD" type="number" step="any" min="0" value="6.5"><em>mm at the part</em></label>
+        <label class="f"><span>Measured scale</span><input id="spotK" type="number" step="any" min="0" placeholder="optional"><em>mm / DMD px</em></label>
+      </div>
+      <p class="muted small">Without a measured scale the nominal one is used: the preset's standoff &divide; throw ratio &divide; 912 columns. To measure your beam, project a spot (step 2), measure it on the part with calipers and enter both numbers:</p>
+      <div class="row">
+        <label class="f inline"><span>Measured</span><input id="spotMeasMm" type="number" step="any" min="0" class="w5"><em>mm</em></label>
+        <label class="f inline"><span>drawn</span><input id="spotMeasPx" type="number" step="any" min="0" class="w5"><em>DMD px across (columns)</em></label>
+        <button id="spotMeasUse" class="ghost small">Use as measured scale</button>
+      </div>
+      <button id="spotSizeBtn" class="primary">Size the spot</button>
+      <div id="spotSizeOut"></div>
+    </div>
+    <div class="card">
+      <h3>2 &middot; Project a spot</h3>
+      <div class="formgrid">
+        <label class="f"><span>At</span><input id="spotAt" placeholder="H8, dmd 456,570 or cam 700,500" spellcheck="false"></label>
+        <label class="f"><span>Shape</span><select id="spotShape"><option>disk</option><option>square</option></select></label>
+        <label class="f"><span>Level</span><input id="spotLevel" type="number" value="255" min="1" max="255"><em>/255</em></label>
+        <label class="f"><span>Label</span><input id="spotLabel" value="spot" spellcheck="false"></label>
+      </div>
+      <p class="muted small">A grid cell lights its centre (pinned to the grid photo below). <code>dmd col,row</code> is a DMD mirror; <code>cam x,y</code> is a camera pixel and needs a projector map. Or click the photo below.</p>
+      <button id="spotBtn" class="primary">Project spot</button>
+      <div id="spotOut"></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="cardhead"><h3>Aim: click the grid photo</h3>
+      <div class="seg" id="sensView"><button data-v="camera" class="on">camera photo</button><button data-v="dmd">sent to DMD</button></div>
+      <div class="seg" id="sensClickTo"><button data-v="spotAt" class="on">click sets: spot</button><button data-v="presAt">click sets: sensor</button></div>
+      <div class="seg" id="sensClickAs" title="cell: the grid cell under the click (its centre). exact point: the pixel you clicked (camera view needs a projector map)"><button data-v="cell" class="on">cell</button><button data-v="point">exact point</button></div>
+      <button id="sensEnlarge" class="ghost small">Enlarge</button>
+      <span class="muted small" id="sensPickInfo"></span></div>
+    <div class="picker" id="sensPick"><img alt="grid photo for aiming"><canvas></canvas><div class="empty">Project the grid (Grid &amp; zones tab) to aim by clicking.</div></div>
+  </div>
+  <div class="split">
+    <div class="card">
+      <h3>3 &middot; Part-present sensor</h3>
+      <div class="formgrid">
+        <label class="f"><span>Name</span><input id="presName" value="part_present" spellcheck="false"></label>
+        <label class="f"><span>At</span><input id="presAt" placeholder="H8, zone G7:H9, dmd 456,570" spellcheck="false"></label>
+        <label class="f"><span>Method</span><select id="presMethod"><option value="photoelectric">photoelectric (returned light)</option><option value="bgs">bgs (background suppression)</option></select></label>
+        <label class="f"><span>Threshold</span><input id="presThr" type="number" step="0.05" min="0" max="1" value="0.25"><em>fraction (photoelectric)</em></label>
+        <label class="f"><span>Min height</span><input id="presMinH" type="number" step="any" min="0" value="3"><em>mm (bgs)</em></label>
+      </div>
+      <p class="muted small">Photoelectric compares the returned light with the empty field: blind to a part that reflects like the background. Background suppression triangulates the spot, so dark and bright parts read the same. The spot diameter and measured scale come from step 1. A zone lights whole grid cells (photoelectric only).</p>
+      <button id="presTeach" class="primary">Teach on the EMPTY field&hellip;</button>
+      <div id="presOut"></div>
+    </div>
+    <div class="card">
+      <div class="cardhead"><h3>Sensors at <span class="mono geoName">—</span></h3><button id="sensRefresh" class="ghost">Refresh</button></div>
+      <div id="sensList"></div>
+      <div id="presCheckOut"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>4 &middot; Alignment</h3>
+    <p class="muted small">Teach the part's pose (centroid, angle, extents) from a scan of a well-placed part, then check later scans against it. Positions are in mm only with a lateral calibration for this geometry; otherwise camera px, judged against the px tolerance.</p>
+    <div class="formgrid">
+      <label class="f"><span>Name</span><input id="alName" value="fixture" list="alNames" spellcheck="false"></label>
+      <label class="f"><span>Scan</span><select id="alScan" data-objects></select></label>
+      <label class="f"><span>Position tol</span><input id="alTolMm" type="number" step="any" min="0" value="1"><em>mm</em></label>
+      <label class="f"><span>or</span><input id="alTolPx" type="number" step="any" min="0" placeholder="uncalibrated"><em>camera px</em></label>
+      <label class="f"><span>Angle tol</span><input id="alTolDeg" type="number" step="any" min="0" value="2"><em>&deg;</em></label>
+    </div>
+    <datalist id="alNames"></datalist>
+    <div class="row"><button id="alTeach">Teach from this scan</button><button id="alCheck" class="primary">Check this scan</button></div>
+    <div id="alOut"></div>
+  </div>
+</section>
+
+<!-- ============================================================ 11 CELL & 3D -->
+<section id="tab-cell" class="tab">
+  <div class="tabhead"><h2>Cell &amp; 3D</h2>
+    <p>Work on a stored scan: export a mesh for CAD / printing, unwrap a standing cell (cylinder fit, seen arc, dent map) and bake per-pixel surface maps. Numbers are in mm only with a matching depth calibration; otherwise they are relief px (rule 6). The rig sees an <b>open arc</b> of the can, never the back.</p></div>
+  <div class="card">
+    <div class="row">
+      <label class="f inline"><span>Scan</span><select id="cellScan" data-objects></select></label>
+      <label class="f inline"><span>Radius</span><input type="number" id="cellRadius" value="24.05" step="any" min="0" class="w5"><em>mm</em></label>
+      <span class="muted small">Radius is the known cell radius (used by cylinder mesh, unwrap and dents; clear it to let the fit decide).</span>
+    </div>
+  </div>
+  <div class="split">
+    <div class="card">
+      <h3>Export mesh (STL / OBJ)</h3>
+      <div class="row">
+        <label class="f inline"><span>Kind</span><select id="meshKind"><option value="relief">relief (heightmap)</option><option value="base">base surface</option><option value="cylinder">cylinder (open arc)</option></select></label>
+        <label class="f inline"><span>Format</span><select id="meshFmt"><option>stl</option><option>obj</option></select></label>
+        <label class="f inline"><span>Stride</span><input type="number" id="meshStride" value="2" min="1" max="64" class="w5"><em>px</em></label>
+        <button id="meshBtn" class="primary">Export mesh</button>
+      </div>
+      <div id="meshOut"></div>
+    </div>
+    <div class="card">
+      <h3>Cell unwrap</h3>
+      <p class="muted small">Fits the cylinder and unwraps the seen surface to (angle, height). The heatmap shows deviation from the fitted can.</p>
+      <button id="unwrapBtn" class="primary">Unwrap cell</button>
+      <div id="unwrapOut"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Cell dents</h3>
+    <div class="row">
+      <label class="f inline"><span>Sigma</span><input type="number" id="dentSigma" value="5" step="any" min="1" class="w5"><em>× noise</em></label>
+      <label class="f inline"><span>Min area</span><input type="number" id="dentArea" value="6" min="1" class="w5"><em>bins</em></label>
+      <label class="f inline"><span>Trigger</span><input type="number" id="dentTrigger" step="any" min="0" placeholder="preset" class="w5"><em>mm</em></label>
+      <button id="dentBtn" class="primary">Find dents</button>
+    </div>
+    <div id="dentOut"></div>
+  </div>
+  <div class="card">
+    <h3>Surface maps</h3>
+    <p class="muted small">Height, cavity, normal, validity and density from the scan. Add a spectral reading for albedo, a light separation for subsurface, and a golden reading for dust. Readings must be of the same scene and geometry.</p>
+    <div class="row">
+      <label class="f inline"><span>Spectral</span><select id="mapsSpectral"></select></label>
+      <label class="f inline"><span>Light</span><select id="mapsLight"></select></label>
+      <label class="f inline"><span>Golden</span><select id="mapsGolden"></select></label>
+      <button id="mapsBtn" class="primary">Bake maps</button>
+    </div>
+    <div id="mapsOut"></div>
+  </div>
+  <div class="card">
+    <h3>Checker scan</h3>
+    <p class="muted small">Projects a checkerboard, finds its corners (camera px ↔ DMD mirrors) and the local stretch of each cell. Uses the rig.</p>
+    <div class="row">
+      <label class="f inline"><span>Square</span><input type="number" id="chkSquare" value="32" min="4" max="256" class="w5"><em>DMD px</em></label>
+      <label class="f inline"><span>Shifts</span><input type="number" id="chkShifts" value="1" min="1" max="16" class="w5"></label>
+      <button id="chkBtn" class="primary">Checker scan</button>
+    </div>
+    <div id="chkOut"></div>
+  </div>
+</section>
+
+<!-- ============================================================ 12 OUTPUTS -->
+<section id="tab-outputs" class="tab">
+  <div class="tabhead"><h2>Output bin</h2>
+    <p>Every derived result, by kind. Nothing is overwritten. "Delete" moves library entries to trash/, where they can be recovered.</p></div>
+  <div class="card">
+    <dl class="kv paths" id="outPaths"></dl>
+    <p class="muted small">To open a folder in Explorer, paste its path into the address bar. Each output below shows its absolute path with a copy button.</p>
+  </div>
+  <div class="card">
+    <div class="cardhead"><h3>Outputs</h3>
+      <label class="f inline"><span>Kind</span><select id="outKind"><option value="">all</option></select></label>
+      <button id="outRefresh" class="ghost">Refresh</button><span id="outCount" class="muted small"></span></div>
+    <div id="outTable"></div>
+  </div>
+</section>
+
+<!-- ============================================================ 13 LOG -->
+<section id="tab-log" class="tab">
+  <div class="tabhead"><h2>Session log</h2><p>Every verb call, success or failure, from the current session's <code>log.jsonl</code>.</p></div>
+  <div class="card">
+    <div class="cardhead">
+      <label class="f inline"><span>Last</span><select id="logN"><option>100</option><option selected>200</option><option>500</option><option>2000</option></select></label>
+      <label class="chk"><input type="checkbox" id="logHideList" checked> hide browsing (list_library)</label>
+      <label class="chk"><input type="checkbox" id="logAuto"> auto-refresh</label>
+      <button id="logRefresh" class="ghost">Refresh</button>
+      <span class="muted small mono" id="logPath"></span></div>
+    <div id="logTable"></div>
+  </div>
+</section>
+
+</main>
+</div>
+
+<aside id="bench" class="drawer" hidden>
+  <div class="cardhead"><h3>Simulated bench</h3><button id="benchClose" class="ghost small">&times;</button></div>
+  <p class="muted small">MOCK MODE ONLY. These buttons stand in for the human's physical steps. On the real rig a person places the parts.</p>
+  <button id="benchValidation">Place validation object <span class="muted">(H 106.95, W 56.5, L 21.9 mm)</span></button>
+  <h4>Box</h4>
+  <div class="formgrid tight">
+    <label class="f"><span>H</span><input type="number" id="bxH" value="30" step="any"><em>mm</em></label>
+    <label class="f"><span>W</span><input type="number" id="bxW" value="40" step="any"><em>mm</em></label>
+    <label class="f"><span>L</span><input type="number" id="bxL" value="30" step="any"><em>mm</em></label>
+    <label class="f"><span>x</span><input type="number" id="bxX" value="0" step="any"><em>mm</em></label>
+    <label class="f"><span>y</span><input type="number" id="bxY" value="0" step="any"><em>mm</em></label>
+    <label class="f"><span>angle</span><input type="number" id="bxA" value="0" step="any"><em>&deg;</em></label>
+    <label class="f"><span>albedo</span><input type="number" id="bxAlb" value="0.7" step="0.05" min="0" max="1" title="reflectance 0..1; the bench is 0.6, so 0.2 is a dark part a photoelectric sensor sees"></label>
+  </div>
+  <button id="benchBox">Place box</button>
+  <h4>QR label</h4>
+  <div class="formgrid tight">
+    <label class="f wide"><span>Text</span><input id="qrData" value="SAS-0001 cell can lot 42"></label>
+    <label class="f"><span>x</span><input type="number" id="qrX" value="-60" step="any"><em>mm</em></label>
+    <label class="f"><span>y</span><input type="number" id="qrY" value="0" step="any"><em>mm</em></label>
+    <label class="f"><span>size</span><input type="number" id="qrS" value="45" step="any"><em>mm</em></label>
+  </div>
+  <button id="benchLabel">Place label</button>
+  <div class="row"><button id="benchClear" class="danger">Clear bench</button></div>
+  <h4>On the bench</h4>
+  <div id="benchState" class="small mono"></div>
+</aside>
+
+<div id="modal" class="modal" hidden><div class="modalbox"><button class="ghost close" id="modalClose">&times;</button><div id="modalTitle" class="mono small"></div><img id="modalImg" alt=""></div></div>
+<div id="toasts"></div>
+</body>
+</html>

@@ -1,0 +1,24 @@
+Swiss Army Scanner
+Copyright 2026 Joey Messina
+
+Licensed under the Apache License, Version 2.0 (see LICENSE). This covers
+the scanner engine (engine/), the UI and CLI (ui/), the tools, and the
+swiss_army_sensor package shipped in this repository.
+
+Acknowledgements
+----------------
+- pycrafter4500 (MIT License): the DLPC350 USB-HID wire format in
+  swiss_army_sensor/drivers/dlp_driver.py was cross-checked byte-for-byte
+  against it. No pycrafter4500 code is included.
+- Texas Instruments documents (DLPU010G, DLPU011E, DLPA036/DLPA037,
+  TIDA-00254) and the DLP LightCrafter 4500 SDK are referenced by section
+  and table for command codes, packing order and timing rules. They are
+  not redistributed here; download them from ti.com.
+- FLIR Spinnaker SDK / PySpin is a separate, vendor-distributed download
+  and is not included.
+
+Safety
+------
+The rig safety rules in the docs (LED current limits, HDMI-only scanning,
+human-only physical steps) are guidance. Operating the hardware safely is
+the user's responsibility.

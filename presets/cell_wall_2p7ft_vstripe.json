@@ -1,0 +1,62 @@
+{
+  "name": "cell_wall_2p7ft_vstripe",
+  "geometry_id": "wall_2p7ft_vstripe_v1",
+  "camera": {
+    "exposure_us": 4000,
+    "gain_db": 0,
+    "average": 12,
+    "mono": true
+  },
+  "projection": {
+    "transport": "hdmi",
+    "monitor_offset": [
+      1920,
+      0
+    ],
+    "size": [
+      912,
+      1140
+    ],
+    "settle_s": 0.0,
+    "min_hold_s": 0.35,
+    "scheme": "bw",
+    "gamma": 1.0,
+    "duty": 0.55,
+    "invert": true,
+    "rotate90": false,
+    "push_twice": true
+  },
+  "bases": [
+    {
+      "name": "graycode",
+      "bits": 10,
+      "complementary": false
+    },
+    {
+      "name": "phaseshift",
+      "steps": 4,
+      "period_px": 24
+    }
+  ],
+  "decode": {
+    "conf_min": 4,
+    "contrast_min": 8
+  },
+  "calibration": {
+    "id": null,
+    "mm_per_px": null,
+    "intercept_mm": 0.0,
+    "lateral_px_per_mm": null
+  },
+  "tolerance": {
+    "ch_fail_mm": 0.7,
+    "dent_fail_um": 25,
+    "min_defect_px": 25
+  },
+  "rig": {
+    "projector_side": "right",
+    "baseline_mm": 279.4,
+    "standoff_mm": 823.0,
+    "throw_ratio": 1.4
+  }
+}

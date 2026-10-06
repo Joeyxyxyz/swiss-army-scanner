@@ -1,0 +1,23 @@
+{
+  "_comment": "Example station config for `scan run`. Paths are relative to this file; $ENV_VARS expand. Nothing station-specific lives in code.",
+  "station_id": "example_cell_station",
+  "preset": "cell_wall_2p7ft_vstripe",
+  "library": null,
+  "mock_library": "../library_mock",
+  "runs_dir": "../runs",
+  "operator_confirmed": false,
+  "require_mm": true,
+  "threshold_mm": null,
+  "job": {
+    "type": "inspect",
+    "base": "latest",
+    "zone": null,
+    "average": null,
+    "n_sigma": 6.0,
+    "min_area_px": 50
+  },
+  "part": {
+    "role": "test",
+    "label": "cell"
+  }
+}

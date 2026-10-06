@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+# runtime data - libraries are per-bench, not source (anchored: engine/library/ IS source)
+/library/
+/library_mock/
+/scan_out/
+# TI documents are copyrighted - kept locally, not pushed
+/docs/*.pdf
+# flow-ready job run folders (scan run): runtime data, not source
+/runs/
+.venv/
+venv/
+
+# legacy bench scripts (drive hardware directly) and the local agent briefing stay local
+/scripts/
+/docs/SCANNER_BRIEFING.md

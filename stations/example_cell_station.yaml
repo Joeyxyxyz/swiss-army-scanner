@@ -1,0 +1,20 @@
+# Example station config for `scan run` (YAML form; needs PyYAML, else use the .json).
+# Paths are relative to this file; $ENV_VARS expand. Nothing station-specific lives in code.
+station_id: example_cell_station
+preset: cell_wall_2p7ft_vstripe
+library: null              # null: --library / $SWISS_SCANNER_LIBRARY / <repo>/library
+mock_library: ../library_mock
+runs_dir: ../runs          # $SCANNER_RUNS_DIR overrides
+operator_confirmed: false  # the real rig also accepts --operator-confirmed
+require_mm: true           # px-only results are INVALID
+threshold_mm: null         # null: the preset's FAIL trigger (tolerance.ch_fail_mm)
+job:
+  type: inspect            # inspect | compare (compare needs golden: <scan id or label>)
+  base: latest             # latest | capture (capture: the scene is empty when the job starts)
+  zone: null               # e.g. H8:I11, or atlas:<name>/<region>
+  average: null
+  n_sigma: 6.0
+  min_area_px: 50
+part:
+  role: test               # golden | test
+  label: cell

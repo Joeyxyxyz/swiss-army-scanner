@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swiss-army-scanner"
+version = "0.1.0"
+description = "Pattern-agnostic DMD structured-light scanner engine with a tiny verb API."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "Joey Messina"}]
+requires-python = ">=3.10"
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    # cv2 is used on the mock and core paths too (mock bench, checkerboard,
+    # one-bit packs, projector maps, the library store, the web UI).
+    "opencv-python>=4.8",
+    # The seed package `swiss_army_sensor` ships in this repo (swiss_army_sensor/)
+    # and is installed with it. The engine loads its numpy-only modules
+    # module-by-module (see engine/_seed.py) — never via its __init__.
+]
+
+[project.optional-dependencies]
+hardware = ["hidapi>=0.14"]         # USB-HID diagnostics only; + PySpin (FLIR Spinnaker SDK)
+codes = ["zxing-cpp>=2.2"]          # stronger QR / Data Matrix / 1D decoding
+dev = ["pytest>=7"]
+
+[project.scripts]
+swiss-army-sensor = "swiss_army_sensor.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["engine*", "swiss_army_sensor*", "ui*"]
+
+[tool.setuptools.package-data]
+"ui" = ["*.md"]
+"ui.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

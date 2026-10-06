@@ -1,0 +1,19 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: windows-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # fast mock-only subset; the full suite takes ~35 min
+      - run: python -m pytest -q -p no:cacheprovider tests/test_rules.py tests/test_config.py tests/test_library_store.py tests/test_cli.py tests/test_run_job_mock.py
+      # the seed package's own tests run in a separate process (they load the USB driver module)
+      - run: python -m pytest -q -p no:cacheprovider tests_sensor
+      - run: python -m ui.cli --mock --average 1 --library ci_library run stations/example_cell_station.json; if ($LASTEXITCODE -eq 5) { exit 0 } else { exit 1 }
+        shell: pwsh

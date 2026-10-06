@@ -1,0 +1,23 @@
+# Example metric station config for `scan run` (YAML form; needs PyYAML, else use the .json).
+# mm come from the STEREO calibration (calibrate-stereo); no base is used.
+station_id: example_metric_check
+preset: cell_wall_2p7ft_vstripe
+library: null              # null: --library / $SWISS_SCANNER_LIBRARY / <repo>/library
+mock_library: ../library_mock
+runs_dir: ../runs          # $SCANNER_RUNS_DIR overrides
+operator_confirmed: false  # the real rig also accepts --operator-confirmed
+threshold_mm: 0.5          # REQUIRED for metric jobs (no preset default): FAIL above it
+job:
+  type: metric
+  scan: fast               # fast (scan_fast) | metric (scan_metric, both axes, slower)
+  axis: xy                 # scan_fast axis: xy | x
+  zone: null               # e.g. F10:J12, or atlas:<name>/<region>
+  steps: null              # null: 4 (fast) / the preset's (metric)
+  periods: null            # DMD px, e.g. [8, 80, 1280]
+  average: null            # null: 2 (fast)
+  measure: plane           # plane: flatness in roi | golden: vs a golden metric scan
+  roi: null                # [x0, y0, x1, y1] camera px; null = whole field
+  golden: null             # golden: a metric scan id / label, or latest
+part:
+  role: test
+  label: flat_panel

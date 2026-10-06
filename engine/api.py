@@ -1428,6 +1428,22 @@ def check_face(placement, golden=None, label: Optional[str] = None,
     return face_verbs.check_face(_engine(), placement, golden, label, over or None, detector)
 
 
+# ------------------------------------------------------------------ rig check (HOME)
+@_verb
+def rig_check(preset: Optional[Preset] = None, set_reference: bool = False,
+              tol_px: float = 0.5, mock_shift_px=None, label: str = "rigref") -> dict:
+    """Has the camera or projector been nudged? A fresh flood + a seeded random block
+    pattern (3 frames, the DMD ends black) vs the reference stored for this geometry
+    (calibrations/<geometry>/<ts>_rigref) -> image shift in camera px by phase correlation
+    (sub-pixel), and ~mm at the working distance when a stereo calibration and a metric
+    scan exist. status OK | MOVED (names camera / projector) | UNKNOWN (no texture) |
+    REFERENCE_SET (first check at this geometry, or set_reference=True). mock_shift_px
+    (dx, dy; mock only) shifts the fresh frames to simulate a nudged camera."""
+    from .calibrate import rigref
+    return rigref.rig_check(_engine(), _preset(preset), bool(set_reference), float(tol_px),
+                            mock_shift_px, label)
+
+
 # ------------------------------------------------------------------ HDMI fast zone scan
 @_verb
 def scan_fast(zone=None, preset: Optional[Preset] = None, label: str = "fast", steps: int = 4,

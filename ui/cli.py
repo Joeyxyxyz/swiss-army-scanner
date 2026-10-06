@@ -2539,6 +2539,31 @@ def cmd_sort_flash(ctx):
     return EXIT_OK, r
 
 
+# ------------------------------------------------------------ rig check (HOME)
+
+def cmd_rig_check(ctx):
+    a = ctx.args
+    shift = None
+    if a.mock_shift:
+        if not ctx.mock:
+            raise CLIError("--mock-shift needs --mock (it fakes a nudged camera)")
+        shift = _numbers(a.mock_shift, 2, "--mock-shift dx,dy (camera px)")
+    r = api.rig_check(ctx.preset(), a.set_reference, a.tol, shift)
+    ctx.say(f"Rig check: {r['status']}  {r['message']}")
+    rows = [["reference", r.get("reference_id") or "-"], ["base", r.get("base_id") or "-"],
+            ["stereo calibration", r.get("calibration_id") or "-"]]
+    for k in ("flood", "pattern"):
+        v = r.get(k)
+        if v:
+            rows.append([f"{k} shift", f"dx {v['dx']:+.2f}, dy {v['dy']:+.2f} px "
+                                       f"(|{v['shift_px']:.2f}| px, match {v['peak']:.2f})"])
+    if r.get("shift_mm") is not None:
+        rows.append(["~mm", f"{r['shift_mm']:.3f} mm at {r.get('working_distance_mm')} mm"])
+    ctx.kv(rows)
+    ctx.warn(r.get("warnings"))
+    return (EXIT_OK if r["status"] in ("OK", "REFERENCE_SET") else EXIT_NOT_OK), r
+
+
 # ------------------------------------------------------------ flow-ready job (run)
 
 EXIT_INVALID = 5                # run only: the job ran, but its numbers cannot be trusted
@@ -2603,6 +2628,157 @@ def _run_compare(ctx, cfg, p, base, log, res) -> None:
         res["invalid_reason"] = f"engine verdict {v.result}"
 
 
+CALIBRATE_STEREO_HOWTO = ("calibrate it first: `scan charuco` (print at 100 %, caliper a "
+                          "square), `scan calib-pose` per board pose (12-20, tilted +-30 deg), "
+                          "then `scan calibrate-stereo --square MM` (mock: `scan --mock "
+                          "calibrate-stereo --mock-poses 12`)")
+METRIC_MAX_PCT = 99.9           # 'max' deviation: robust to isolated triangulation outliers
+
+
+def _mock_place_metric(ctx) -> None:
+    """Mock only: the stereo (mm) bench. validation / none = the empty wall (flat),
+    H,W,L = a block standing out of the wall, cylinder[:R,H,dent] = a standing cell."""
+    if not ctx.mock:
+        return
+    from engine.capture.mock_stereo import Block, MetricCylinder
+    bench = api.mock_bench()
+    bench.clear()
+    bench.use_stereo()
+    spec = ctx.args.mock_part
+    if spec in ("none", "validation") or spec.startswith("qr:"):
+        ctx.say("[mock] stereo bench: the empty wall (a flat reference)")
+        return
+    if spec.startswith("cylinder:"):
+        r, hh, dent = (float(v) for v in spec.split(":", 1)[1].split(","))
+        dents = ([{"depth_mm": dent, "size_mm": 8.0, "angle_deg": 0.0, "z_mm": 0.0}]
+                 if dent > 0 else [])
+        bench.place(MetricCylinder(center=(0, 0, 823.0 - r - 1.0), radius=r, height=hh,
+                                   dents=dents))
+        ctx.say(f"[mock] stereo bench: placed a standing cell (R {r:g}, H {hh:g} mm)")
+        return
+    h, w, l = [float(v) for v in spec.split(",")][:3]
+    bench.place(Block(center=(0.0, 0.0, 823.0 - l / 2), half=(w / 2, h / 2, l / 2)))
+    ctx.say(f"[mock] stereo bench: placed a block (H {h:g}, W {w:g}, L {l:g} mm) on the wall")
+
+
+def _roi_mask(shape, roi) -> np.ndarray:
+    m = np.zeros(shape, bool)
+    if roi is None:
+        m[:] = True
+    else:
+        x0, y0, x1, y1 = roi
+        m[y0:y1, x0:x1] = True
+    return m
+
+
+def _deviation_png(run_dir: Path, dev: np.ndarray, scale_mm: float) -> Optional[str]:
+    """Signed deviation map -> run_dir/deviation.png (red above, blue below, +-scale_mm)."""
+    try:
+        import cv2
+    except ImportError:
+        return None
+    ok = np.isfinite(dev)
+    d = np.clip(np.nan_to_num(dev, nan=0.0) / max(scale_mm, 1e-6), -1, 1)
+    pos, neg = np.clip(d, 0, 1), np.clip(-d, 0, 1)
+    img = np.full(dev.shape + (3,), 40, np.uint8)               # BGR, grey = no data
+    img[..., 2] = np.where(ok, 128 + 127 * pos - 100 * neg, 40).astype(np.uint8)
+    img[..., 1] = np.where(ok, 128 - 100 * np.abs(d), 40).astype(np.uint8)
+    img[..., 0] = np.where(ok, 128 + 127 * neg - 100 * pos, 40).astype(np.uint8)
+    h, w = img.shape[:2]
+    if w > 960:
+        img = cv2.resize(img, (960, int(round(h * 960 / w))), interpolation=cv2.INTER_AREA)
+    out = Path(run_dir) / "deviation.png"
+    ok_write, buf = cv2.imencode(".png", img)
+    if not ok_write:
+        return None
+    with open(out, "xb") as f:                  # never overwrite (a run folder is new)
+        f.write(buf.tobytes())
+    return str(out)
+
+
+def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
+    """metric job: scan_fast / scan_metric (stereo calibration, rule 6) -> mm, then a plane
+    fit in the roi or a golden metric compare; PASS / FAIL against threshold_mm only."""
+    from engine import config as cfgmod
+    from engine.calibrate import stereo
+    from engine.measure import metric
+    from engine.reconstruct import metric_scan
+    s = api._engine()
+    if cfg.threshold_mm is None:
+        res["invalid_reason"] = ("metric jobs need threshold_mm (mm) in the station config: "
+                                 "there is no preset default for a metric measurement")
+        log.event("refused", level="warning", reason=res["invalid_reason"])
+        return
+    cal = stereo.latest(s.store, p.geometry_id, cfgmod.geometry_fingerprint(p))
+    if cal is None:
+        res["calibration"]["same_geometry"] = False
+        res["invalid_reason"] = (f"no stereo calibration for geometry {p.geometry_id} (these rig "
+                                 f"settings), so no mm (rule 6): {CALIBRATE_STEREO_HOWTO}")
+        log.event("refused", level="warning", reason=res["invalid_reason"])
+        return
+    res["calibration"].update(calibration_id=cal.id, same_geometry=True)
+    golden = _find_metric(cfg.golden) if cfg.measure == "golden" else None
+    s.check_cancel()
+    _mock_place_metric(ctx)
+    if cfg.scan == "metric":
+        ms = api.scan_metric(p, cfg.part_label, steps=cfg.steps, periods=cfg.periods,
+                             zone=cfg.zone)
+    else:
+        avg = cfg.average if cfg.average is not None else (ctx.args.average or 2)
+        ms = api.scan_fast(cfg.zone, p, cfg.part_label, cfg.steps or 4, cfg.periods, avg,
+                           axis=cfg.axis)
+    m = ms.meta or {}
+    res["part"]["scan_id"] = ms.id
+    res["calibration"]["calibration_id"] = ms.calibration_id
+    pats = f"scan_fast axis {cfg.axis}" if cfg.scan == "fast" else "scan_metric"
+    res["capture"].update(patterns=f"multifreq ({pats})",
+                          average=m.get("average", res["capture"]["average"]))
+    res["warnings"] += [str(w) for w in m.get("warnings") or []]
+    log.event("scan", scan_id=ms.id, kind=cfg.scan, calibration_id=ms.calibration_id,
+              n_points=m.get("n_points"), valid_pct=m.get("valid_pct"))
+    s.check_cancel()
+    cloud = ms.cloud
+    region = cloud.mask & _roi_mask(cloud.mask.shape, cfg.roi)
+    if cfg.measure == "plane":
+        P = cloud.xyz[region]
+        method = "plane_fit"
+        if len(P) < 100:
+            res["invalid_reason"] = (f"only {len(P)} points in the roi: nothing to fit a "
+                                     "plane to (check the roi, zone and exposure)")
+            log.event("measure", level="warning", method=method, n_points=int(len(P)))
+            return
+        fit, _ = metric.ransac_plane(P, 0.5)
+        d = fit.distance(P)
+        dev = np.full(cloud.mask.shape, np.nan)
+        dev[region] = d
+        extra = {"plane_rms_inliers_mm": round(fit.rms, 5)}
+    else:
+        method = "compare_metric_golden"
+        rep_, dev = metric_scan.compare_metric(s, ms, golden)
+        dev = np.where(_roi_mask(dev.shape, cfg.roi), dev, np.nan)
+        d = dev[np.isfinite(dev)]
+        extra = {"golden": golden.id, "icp_rms_mm": rep_["icp"]["rms_mm"],
+                 "icp_converged": rep_["icp"]["converged"], "blobs": len(rep_["blobs"])}
+        if not rep_["icp"]["converged"]:
+            res["warnings"].append("ICP onto the golden did not converge: check the placement")
+        if d.size < 100:
+            res["invalid_reason"] = (f"only {d.size} points overlap the golden {golden.id} "
+                                     "(in the roi): wrong part or placement?")
+            log.event("measure", level="warning", method=method, n_points=int(d.size), **extra)
+            return
+    mx = float(np.percentile(np.abs(d), METRIC_MAX_PCT))
+    res["deviation_units"] = "mm"
+    res["deviation_mm"].update(max=round(mx, 5), mean=round(float(np.mean(d)), 5),
+                               rms=round(float(np.sqrt(np.mean(d * d))), 5), method=method,
+                               n_points=int(d.size))
+    res["outputs"]["deviation_map"] = _deviation_png(run_dir, dev, cfg.threshold_mm)
+    res["result"] = res["engine_verdict"] = "FAIL" if mx > cfg.threshold_mm else "PASS"
+    res["invalid_reason"] = None
+    log.event("measure", method=method, max_deviation_mm=res["deviation_mm"]["max"],
+              rms_mm=res["deviation_mm"]["rms"], n_points=int(d.size),
+              threshold_mm=cfg.threshold_mm, max_percentile=METRIC_MAX_PCT, **extra)
+
+
 def _run_capture(ctx, cfg, p, base, log, res):
     _mock_place(ctx)                        # mock: the simulated human places the part
     scan = api.capture_object(p, base, cfg.part_label, zone=cfg.zone)
@@ -2656,6 +2832,10 @@ def cmd_run(ctx):
                               exposure_us=p.camera.exposure_us, average=p.camera.average)
         log.event("preset", preset=p.name, geometry_id=p.geometry_id,
                   exposure_us=p.camera.exposure_us, average=p.camera.average)
+        if cfg.job_type == "metric":            # stereo calibration: no base involved
+            _run_metric(ctx, cfg, p, log, res, run_dir)
+            code = {"PASS": EXIT_OK, "FAIL": EXIT_NOT_OK}.get(res["result"], EXIT_INVALID)
+            return _run_done(ctx, cfg, run_id, run_dir, res, log, code)
         base = None if cfg.base == "capture" else api.latest_base(p)
         if base is None and cfg.base == "latest" and not ctx.mock:
             raise CLIError(f"no usable base for geometry {p.geometry_id}: clear the scene "
@@ -2671,6 +2851,15 @@ def cmd_run(ctx):
         log.event("base", base_id=base.id, captured=captured)
         (_run_compare if cfg.job_type == "compare" else _run_inspect)(ctx, cfg, p, base, log, res)
         code = {"PASS": EXIT_OK, "FAIL": EXIT_NOT_OK}.get(res["result"], EXIT_INVALID)
+    except rules.Cancelled as e:              # the operator pressed ABORT: rig already closed
+        res["result"], res["invalid_reason"] = "ABORTED", None
+        res["warnings"].append(f"aborted: {e}")
+        log.event("aborted", level="warning", message=str(e))
+        RJ.write_result(run_dir, res)
+        log.event("run_end", result="ABORTED", exit_code=EXIT_NOT_OK, result_json="result.json")
+        log.close()
+        ctx.say(f"Run {run_id}: ABORTED ({e})", f"  run folder: {run_dir}")
+        return EXIT_NOT_OK, {"run_id": run_id, "run_dir": str(run_dir), "result": res}
     except (Exception, KeyboardInterrupt) as e:
         ecode, line = _classify_error(e, ctx.mode)
         res["result"] = "INVALID"
@@ -2678,10 +2867,19 @@ def cmd_run(ctx):
         log.event("error", level="error", type=type(e).__name__, message=line,
                   exit_code=EXIT_REFUSED if ecode == EXIT_REFUSED else EXIT_ERROR)
         RJ.write_result(run_dir, res)
+        try:                                # callers in-process (the web UI) read the run back
+            e.run_result, e.run_dir = res, str(run_dir)
+        except AttributeError:
+            pass
         log.event("run_end", result="INVALID", exit_code=ecode, result_json="result.json")
         log.close()
         ctx.say(f"Run {run_id}: INVALID ({line})", f"  run folder: {run_dir}")
         raise
+    return _run_done(ctx, cfg, run_id, run_dir, res, log, code)
+
+
+def _run_done(ctx, cfg, run_id, run_dir, res, log, code) -> tuple:
+    from ui import run_job as RJ
     res["outputs"]["mesh"] = [o["path"] for o in ctx.new_outputs()
                               if o["path"].lower().endswith((".stl", ".obj", ".ply"))]
     out = RJ.write_result(run_dir, res)
@@ -2822,7 +3020,11 @@ Surfer atlas (regions become zones atlas:<name>/<region>, e.g. scan part --zone 
   scan sort-flash <recording.npz> [--decode]   offline: re-sort a saved recording
                                          (docs/FLASH_SOFTSYNC.md)
 
+rig check (has the camera / projector been nudged? also the operator UI's HOME):
+  scan rig-check [--set-reference] [--tol 0.5]   exit 0 OK / reference set, 1 MOVED or UNKNOWN
+
 flow-ready job (one station config in, one run folder out; see stations/):
+  inspect / compare: base-relief depth calibration;  metric: stereo calibration (calibrate-stereo)
   scan --mock run stations/example_cell_station.json
   scan run stations/<station>.json --operator-confirmed
                                          result.json + run.log.jsonl in <runs_dir>/<run_id>/;
@@ -3371,6 +3573,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fine-prefilter", type=float, metavar="PX",
                    help="with --decode: camera-px low-pass of the fine fringes (default off)")
     p.add_argument("--label")
+    p = cmd("rig-check", cmd_rig_check, "rig check: fresh flood + pattern vs the stored "
+                                        "reference -> camera / projector shift (px, ~mm)",
+            "the rig check")
+    p.add_argument("--set-reference", action="store_true",
+                   help="store a new reference (right after base / calibration)")
+    p.add_argument("--tol", type=float, default=0.5, help="MOVED above this shift, px "
+                                                         "(default 0.5)")
+    p.add_argument("--mock-shift", metavar="DX,DY",
+                   help="mock only: shift the fresh frames (simulates a nudged camera)")
     p = cmd("run", cmd_run, "flow-ready job: run a station config, write result.json + "
                             "run.log.jsonl in a new run folder (exit 0 PASS, 1 FAIL, "
                             "2 refused, 4 crashed, 5 INVALID)", "the station job")

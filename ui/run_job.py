@@ -12,10 +12,17 @@ folder (never an existing one) with
     run.log.jsonl    one JSON event per line, every line carries run_id
 
 so a script, a CI job or an automation flow can act on the run without
-parsing console text. The verdict is only ever PASS / FAIL / INVALID:
-INVALID means the numbers cannot be trusted (no mm calibration at this
-geometry when mm are required, an INDETERMINATE engine verdict, a refused
-or crashed run) and must never be reported as a pass or a fail.
+parsing console text. The verdict is only ever PASS / FAIL / INVALID (or
+ABORTED when an operator stopped the run): INVALID means the numbers cannot
+be trusted (no mm calibration at this geometry when mm are required, an
+INDETERMINATE engine verdict, a refused or crashed run) and must never be
+reported as a pass or a fail.
+
+Job types and the calibration each needs:
+    inspect, compare   base-relief depth calibration (`calibrate <scan>`)
+    metric             stereo calibration (`calibrate-stereo`): mm from
+                       triangulation, measured as a plane fit or against a
+                       golden metric scan
 
 This module only builds the config, the run folder, the log and the result
 document. The measurement itself goes through engine.api verbs (ui/cli.py
@@ -35,8 +42,10 @@ from pathlib import Path
 from typing import Optional
 
 RESULT_SCHEMA_VERSION = "0.1"
-JOB_TYPES = ("inspect", "compare")
-RESULTS = ("PASS", "FAIL", "INVALID")
+JOB_TYPES = ("inspect", "compare", "metric")
+METRIC_SCANS = ("fast", "metric")           # api.scan_fast | api.scan_metric
+METRIC_MEASURES = ("plane", "golden")
+RESULTS = ("PASS", "FAIL", "INVALID", "ABORTED")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,6 +73,13 @@ class StationConfig:
     n_sigma: float = 6.0
     min_area_px: int = 50
     operator_confirmed: bool = False        # a human confirmed the physical setup
+    # metric jobs (stereo calibration): scan + measure settings
+    scan: str = "fast"                      # fast (api.scan_fast) | metric (api.scan_metric)
+    axis: str = "xy"                        # scan_fast axis
+    steps: Optional[int] = None
+    periods: Optional[list] = None
+    measure: str = "plane"                  # plane | golden
+    roi: Optional[list] = None              # [x0, y0, x1, y1] camera px; None = whole field
     source: Optional[Path] = None
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -123,6 +139,7 @@ def load_station_config(path) -> StationConfig:
     label = str(part.get("label", "part"))
     if not _ID.match(label):
         raise StationConfigError(f"part.label {label!r}: letters, digits, _ . - only")
+    metric = _metric_keys(job, jt)
     thr = doc.get("threshold_mm")
     if thr is not None and (not isinstance(thr, (int, float)) or thr <= 0):
         raise StationConfigError("threshold_mm must be a positive number (mm) or null")
@@ -145,7 +162,43 @@ def load_station_config(path) -> StationConfig:
         n_sigma=float(job.get("n_sigma", 6.0)),
         min_area_px=int(job.get("min_area_px", 50)),
         operator_confirmed=bool(doc.get("operator_confirmed", False)),
-        source=path.resolve(), raw=doc)
+        source=path.resolve(), raw=doc, **metric)
+
+
+def _metric_keys(job: dict, jt: str) -> dict:
+    """job.scan / axis / steps / periods / measure / roi / golden for metric jobs."""
+    if jt != "metric":
+        return {}
+    scan = str(job.get("scan", "fast"))
+    if scan not in METRIC_SCANS:
+        raise StationConfigError(f"job.scan {scan!r} must be one of {', '.join(METRIC_SCANS)}")
+    axis = str(job.get("axis", "xy"))
+    if axis not in ("x", "xy"):
+        raise StationConfigError(f"job.axis {axis!r} must be 'x' or 'xy'")
+    measure = str(job.get("measure", "plane"))
+    if measure not in METRIC_MEASURES:
+        raise StationConfigError(f"job.measure {measure!r} must be one of "
+                                 f"{', '.join(METRIC_MEASURES)}")
+    if measure == "golden" and not job.get("golden"):
+        raise StationConfigError("job.measure golden needs job.golden (a golden metric scan "
+                                 "id / label, or 'latest')")
+    steps = job.get("steps")
+    if steps is not None and (not isinstance(steps, int) or steps < 3):
+        raise StationConfigError("job.steps must be an integer >= 3 or null")
+    periods = job.get("periods")
+    if periods is not None and (not isinstance(periods, list) or not periods or not all(
+            isinstance(v, (int, float)) and v > 0 for v in periods)):
+        raise StationConfigError("job.periods must be a list of positive numbers (DMD px) or null")
+    roi = job.get("roi")
+    if roi is not None:
+        if (not isinstance(roi, list) or len(roi) != 4
+                or not all(isinstance(v, int) and v >= 0 for v in roi)
+                or roi[2] <= roi[0] or roi[3] <= roi[1]):
+            raise StationConfigError("job.roi must be [x0, y0, x1, y1] camera px (x1 > x0, "
+                                     "y1 > y0) or null")
+    return {"scan": scan, "axis": axis, "steps": steps,
+            "periods": [float(v) for v in periods] if periods else None,
+            "measure": measure, "roi": list(roi) if roi else None}
 
 
 # ------------------------------------------------------------ run folder + log
@@ -221,7 +274,8 @@ def empty_result(cfg: StationConfig, run_id: str, run_folder: str, mock: bool,
         "capture": {"preset": None, "geometry_id": None, "patterns": None,
                     "exposure_us": None, "average": None, "zone": cfg.zone},
         "part": {"role": cfg.part_role, "label": cfg.part_label, "scan_id": None},
-        "deviation_mm": {"max": None, "mean": None, "rms": None, "method": None},
+        "deviation_mm": {"max": None, "mean": None, "rms": None, "method": None,
+                         "n_points": None},
         "deviation_units": None,
         "threshold_mm": cfg.threshold_mm,
         "result": "INVALID",

@@ -12,6 +12,45 @@ It is one engine with one small verb API (`engine/api.py`). A web UI, a CLI and 
 
 ---
 
+## Quick start (operator UI)
+
+The page follows the DLP workflow reduced to its core, **Lights, Camera, Action**:
+
+- **Lights**: set up the illumination. Projector / LEDs ready, aim the grid (*Project grid*), assign the areas (the work state's zone; *Show zone* is a placeholder for now).
+- **Camera**: aim the camera at the objects and choose what to capture (*Live preview* to aim and focus, *Signal check* for contrast and focus).
+- **Action**: run the cycle, scan, measure, verdict: that is **START**.
+
+Lights and Camera are setup panels the operator opens when needed (only while the station is idle); Action is the production cycle.
+
+1. Start the server: `run_ui.bat` (real rig) or `run_ui_mock.bat` (simulated bench, port 8766).
+2. Open **http://127.0.0.1:8765/quick** (mock: http://127.0.0.1:8766/quick). The full engineering UI stays at `/`; each links to the other.
+3. Pick the **work state**: one entry per station config in `stations/*.json` (shown as `station_id - part label`).
+4. Press **START**. The lamp shows READY / RUNNING / **PASS** (green) / **FAIL** (red) / **INVALID** (amber: the numbers can't be trusted, never a pass or a fail) / ABORTED, with the key number (max deviation in mm), the time, a link to `result.json` and the deviation map when there is one. The *Lights / Camera / Action* strip follows the job (queued, capturing, verdict).
+
+| Button | What it does |
+|---|---|
+| **START** | runs the selected station config exactly like `scan run` (a new run folder with `result.json` + `run.log.jsonl`) |
+| **ABORT** | stops the run before its next capture; the rig is closed (projector idle, rig lock released) and the run is recorded as **ABORTED** |
+| **HOME** | the **rig check**: a fresh flood + a seeded random block pattern compared with the reference stored for this geometry (phase correlation, sub-pixel). OK, or MOVED with the numbers, e.g. "camera moved ~2.3 px (~0.70 mm at 640 mm): re-home / recalibrate". The first HOME at a geometry stores the reference (do it right after base / calibration, station in its usual empty state). mm need a stereo calibration and a metric scan (the working distance); otherwise px only. CLI: `scan rig-check [--set-reference]` |
+
+**Real rig: operator confirmation.** START (and ARM) stay disabled until the operator ticks *"I confirm the setup"* (the `--operator-confirmed` of `scan run`); the tick clears after each run. Mock mode needs none.
+
+**Commands and sources.** Every source sends the same commands through one state machine (`engine/control/commands.py`):
+
+| Command | Button | Key | HTTP (`POST`) | Hardware input (placeholder) |
+|---|---|---|---|---|
+| START | START | Space / Enter | `/api/cmd/start` `{"operator_confirmed": true}` | serial `START`, DI |
+| ABORT | ABORT | Esc | `/api/cmd/abort` | camera GPIO Line2, DI1, serial `STOP` |
+| HOME | HOME | H | `/api/cmd/home` | DI2, serial `HOME` |
+| TRIGGER (part present) | TRIGGER | T | `/api/cmd/trigger` | camera GPIO Line0, DI0, serial `TRIG` |
+| ARM / DISARM | ARM | A | `/api/cmd/arm`, `/api/cmd/disarm` | DI3 |
+| SELECT_WORKSTATE | work-state list | 1-9 | `/api/cmd/workstate` `{"workstate": "<config>.json" or 1..n}` | - |
+| state + signals | lamp | - | `GET /api/cmd/state` | outputs: READY / BUSY / PASS / FAIL / ALARM (stack light) |
+
+States: READY → START → RUNNING → READY; READY → ARM → ARMED → TRIGGER → RUNNING → ARMED (next part). **ABORT always wins** (RUNNING / HOMING → ABORTING → READY). **HOME** only when idle (READY / ARMED / FAULT) or queued behind an ABORT; HOMING → READY, or FAULT when the rig moved (HOME again, or RESET). **TRIGGER** is ignored unless ARMED; the work state can't change while a job runs. A refused HTTP command answers 409 with the reason. Hardware inputs (camera GPIO lines, serial / USB-IO, a 24 V digital I/O module) and outputs are **placeholders** with a config-driven mapping (`stations/io_example.json`): not implemented yet, disabled in the example.
+
+---
+
 ## Install
 
 Windows 10/11, Python 3.12 (a conda env is the tested setup):
@@ -66,6 +105,25 @@ Only one program drives the rig at a time: a machine-wide rig lock refuses a sec
 scan.bat --mock run stations\example_cell_station.json
 scan.bat run stations\my_station.json --operator-confirmed
 ```
+
+Which calibration each job type needs:
+
+| `job.type` | measures | needs |
+|---|---|---|
+| `inspect`, `compare` | relief vs a base (blobs) / vs a golden scan | base-relief depth calibration (`scan calibrate <scan>` with a known object) |
+| `metric` | mm by triangulation: flatness of a plane in a camera-px `roi`, or deviation from a golden metric scan | **stereo calibration** (`calibrate-stereo`) |
+
+**Metric job** (`stations/example_metric_check.json`): `scan_fast` (default `axis: xy`) or `scan: "metric"` (`scan_metric`), then `measure: "plane"` (RANSAC plane in `roi`; max deviation = 99.9th percentile of |distance|, plus RMS) or `measure: "golden"` (`compare_metric` against `golden: "<label>|latest"`: ICP best fit, so a pure offset of the whole part is not seen). `threshold_mm` is required (INVALID without it); no stereo calibration at the preset's geometry is INVALID with the commands to fix it. result.json adds `deviation_mm.method`, `rms`, `n_points`, the metric scan id and the calibration id.
+
+### Calibration (stereo, for metric jobs)
+
+1. `scan.bat charuco --square 25`: print the PDF at 100 %, measure a printed square with calipers.
+2. `scan.bat parity` once per rig (diamond DMD row parity).
+3. `scan.bat calib-pose` per board pose: 12-20 poses, tilted up to ±30°, filling the measuring volume.
+4. `scan.bat calibrate-stereo --square <measured mm>`: camera RMS < 0.3 px, projector RMS < 0.5 px.
+5. `scan.bat rig-check --set-reference` with the station empty, so HOME can detect a later nudge.
+
+Recalibrate after any zoom / focus / mount change. Mock: `scan.bat --mock calibrate-stereo --mock-poses 12`.
 
 ## Modes (UI tabs ↔ verbs)
 

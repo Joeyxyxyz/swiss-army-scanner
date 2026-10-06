@@ -1,0 +1,26 @@
+{
+  "_comment": "Example metric station config for `scan run`: mm from the STEREO calibration (calibrate-stereo), no base. Paths are relative to this file; $ENV_VARS expand.",
+  "station_id": "example_metric_check",
+  "preset": "cell_wall_2p7ft_vstripe",
+  "library": null,
+  "mock_library": "../library_mock",
+  "runs_dir": "../runs",
+  "operator_confirmed": false,
+  "threshold_mm": 0.5,
+  "job": {
+    "type": "metric",
+    "scan": "fast",
+    "axis": "xy",
+    "zone": null,
+    "steps": null,
+    "periods": null,
+    "average": null,
+    "measure": "plane",
+    "roi": null,
+    "golden": null
+  },
+  "part": {
+    "role": "test",
+    "label": "flat_panel"
+  }
+}

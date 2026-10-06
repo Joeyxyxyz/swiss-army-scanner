@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scanner operator</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23161b21'/%3E%3Ccircle cx='8' cy='8' r='4' fill='%233ccf8a'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/quick.css">
+<script src="/static/quick.js" defer></script>
+</head>
+<body class="quick">
+<header class="qtop">
+  <span class="qbrand">Scanner operator</span>
+  <span id="qMode" class="badge">…</span>
+  <span class="spacer"></span>
+  <a class="qlink" href="/" title="The full engineering UI">Advanced UI</a>
+</header>
+<div id="qConn" class="banner warn" hidden>Lost contact with the UI server. Is it still running?</div>
+
+<main class="qmain">
+  <section class="qleft">
+    <label class="qfield"><span>Work state (station config)</span>
+      <select id="qStation"></select></label>
+    <div id="qStationInfo" class="qinfo muted"></div>
+
+    <div class="qpanels">
+      <details class="qpanel" id="qLights">
+        <summary><b>1 Lights</b> set up the illumination</summary>
+        <p class="muted small">Projector / LEDs ready, aim the grid, assign the areas. Active zone:
+          <b id="qZone">-</b> (from the work state's <code>job.zone</code>).</p>
+        <div class="qrow">
+          <button id="qGrid" class="qbtn2">Project grid</button>
+          <button id="qZones" class="qbtn2" title="Placeholder: lights the work state's zone">Show zone</button>
+        </div>
+        <img id="qGridImg" class="qpreview" alt="grid photo" hidden>
+      </details>
+      <details class="qpanel" id="qCamera">
+        <summary><b>2 Camera</b> aim the camera, choose what to capture</summary>
+        <p class="muted small">Live preview to aim and focus; signal check for contrast and focus.</p>
+        <div class="qrow">
+          <button id="qLive" class="qbtn2">Live preview</button>
+          <button id="qSignal" class="qbtn2">Signal check</button>
+        </div>
+        <img id="qLiveImg" class="qpreview" alt="camera" hidden>
+        <div id="qCamMsg" class="qreason"></div>
+      </details>
+      <div class="qpanel qaction"><b>3 Action</b> run the cycle: scan, measure, verdict (START)</div>
+    </div>
+    <div id="qSetupMsg" class="qreason"></div>
+
+    <label id="qConfirmRow" class="qconfirm" hidden>
+      <input type="checkbox" id="qConfirm">
+      <span>I confirm the setup: part placed, rig untouched since base / calibration</span>
+    </label>
+
+    <div class="qbuttons">
+      <button id="qStart" class="qbtn qstart">START</button>
+      <button id="qAbort" class="qbtn qabort">ABORT</button>
+      <button id="qHome" class="qbtn qhome">HOME</button>
+    </div>
+    <div class="qbuttons2">
+      <button id="qArm" class="qbtn2">ARM</button>
+      <button id="qTrigger" class="qbtn2">TRIGGER</button>
+      <span class="qstate">state <b id="qBusState">-</b></span>
+    </div>
+    <div class="qsignals" id="qSignals">
+      <span data-sig="READY">READY</span><span data-sig="BUSY">BUSY</span>
+      <span data-sig="PASS">PASS</span><span data-sig="FAIL">FAIL</span>
+      <span data-sig="ALARM">ALARM</span>
+    </div>
+
+    <ol class="qsteps" id="qSteps">
+      <li id="qStepLights"><b>Lights</b><span>projector ready</span></li>
+      <li id="qStepCamera"><b>Camera</b><span>capture</span></li>
+      <li id="qStepAction"><b>Action</b><span>measure + verdict</span></li>
+    </ol>
+    <div class="qlegend muted small">Keys: <kbd>Space</kbd>/<kbd>Enter</kbd> START,
+      <kbd>Esc</kbd> ABORT, <kbd>H</kbd> HOME, <kbd>T</kbd> TRIGGER, <kbd>A</kbd> ARM / DISARM,
+      <kbd>1</kbd>-<kbd>9</kbd> work state. Also POST /api/cmd/&lt;start|abort|home|trigger|arm|disarm|workstate&gt;.</div>
+  </section>
+
+  <section class="qright">
+    <div id="qLamp" class="qlamp lamp-ready">READY</div>
+    <div class="qresult">
+      <div class="qkey"><span>Verdict</span><b id="qVerdict">-</b></div>
+      <div class="qkey"><span id="qNumLabel">Max deviation</span><b id="qNumber">-</b></div>
+      <div class="qkey"><span>Time</span><b id="qTime">-</b></div>
+      <div class="qkey"><span>Run</span><b id="qRunId" class="mono small">-</b></div>
+      <div id="qReason" class="qreason"></div>
+      <div class="qlinks"><a id="qResultLink" href="#" hidden target="_blank" rel="noopener">result.json</a></div>
+      <img id="qPreview" class="qpreview" alt="deviation map" hidden>
+    </div>
+    <div class="qrig">
+      <div class="qkey"><span>Rig check</span><b id="qRigStatus">not run</b></div>
+      <div id="qRigMsg" class="qreason"></div>
+    </div>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,22 @@
+{
+  "_comment": "Example command I/O mapping for the command bus (engine/control/commands.py). Hardware backends are PLACEHOLDERS (not implemented): keep them disabled. Inputs map an input name to a command; outputs map a signal (READY, BUSY, PASS, FAIL, ALARM) to an output name.",
+  "inputs": [
+    {"kind": "simulated", "enabled": true,
+     "map": {"trigger": "TRIGGER", "abort": "ABORT", "start": "START", "home": "HOME"}},
+    {"kind": "camera_gpio", "enabled": false,
+     "map": {"Line0": "TRIGGER", "Line2": "ABORT"}, "options": {"debounce_us": 1000}},
+    {"kind": "serial_io", "enabled": false,
+     "map": {"START": "START", "TRIG": "TRIGGER", "STOP": "ABORT", "HOME": "HOME"},
+     "options": {"port": "COM5", "baud": 115200}},
+    {"kind": "digital_io", "enabled": false,
+     "map": {"DI0": "TRIGGER", "DI1": "ABORT", "DI2": "HOME", "DI3": "ARM"},
+     "options": {"host": "192.168.0.50", "poll_ms": 10}}
+  ],
+  "outputs": [
+    {"kind": "simulated", "enabled": true, "map": {}},
+    {"kind": "digital_io", "enabled": false,
+     "map": {"READY": "DO0", "BUSY": "DO1", "PASS": "DO2", "FAIL": "DO3", "ALARM": "DO4"},
+     "options": {"host": "192.168.0.50"}},
+    {"kind": "camera_gpio", "enabled": false, "map": {"BUSY": "Line1"}}
+  ]
+}

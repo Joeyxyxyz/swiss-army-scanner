@@ -37,6 +37,9 @@ class ScanSession:
         # who drives the rig, as another process's RigBusy message names it
         # ("web UI", "cli", an agent's name); "" = default_holder()
         self.holder = holder
+        # cooperative abort (threading.Event or None): set by a UI / runner, checked
+        # before every capture in rig(); raises rules.Cancelled
+        self.cancel = None
         self._log_path: Optional[Path] = None
 
     @property
@@ -85,12 +88,26 @@ class ScanSession:
             projector.zone_mask = zone_mask
             sync = FreeRunSync(projector, camera, average=preset.camera.average,
                                flush=0 if self.mock else 4)
+            self.check_cancel()
+            if self.cancel is not None:
+                shoot = sync.shoot
+
+                def checked(pattern, *a, **kw):     # abort between captures, never mid-frame
+                    self.check_cancel()
+                    return shoot(pattern, *a, **kw)
+                sync.shoot = checked
             yield sync
         except BaseException as e:
             primary = e
             raise
         finally:
             _release_rig(camera, projector, lock, primary)
+
+    def check_cancel(self) -> None:
+        """Raise rules.Cancelled when the operator asked to abort."""
+        if self.cancel is not None and self.cancel.is_set():
+            from .rules import Cancelled
+            raise Cancelled("aborted by the operator")
 
     def acquire_field(self, preset, label: str, zone_mask=None, axis=None):
         """Project the preset's bases, capture, decode -> DeformationField.

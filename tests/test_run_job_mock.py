@@ -196,3 +196,125 @@ def test_calibrated_mock_compare_fail(tmp_path, calibrated_lib):
 def test_run_listed_in_help():
     code, out = _cli(["--help"])
     assert code == 0 and "run stations/example_cell_station.json" in out
+
+
+# ------------------------------------------------------------ metric job (stereo calibration)
+
+METRIC = ROOT / "stations" / "example_metric_check.json"
+
+
+def _metric_station(tmp_path, name="metric.json", **over) -> Path:
+    doc = json.loads(METRIC.read_text(encoding="utf-8"))
+    doc.update({"runs_dir": str(tmp_path / "runs"), "mock_library": None})
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(doc.get(k), dict):
+            doc[k] = {**doc[k], **v}
+        else:
+            doc[k] = v
+    p = tmp_path / name
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    return p
+
+
+@pytest.fixture(scope="module")
+def stereo_lib(tmp_path_factory):
+    """A mock library with the bench's TRUE stereo calibration at the example preset's
+    geometry (calibrate-stereo itself is covered in test_metric_api_mock; here it would
+    only cost a minute)."""
+    import numpy as np
+    from engine import config
+    from engine.calibrate.stereo import StereoCalibration
+    lib = tmp_path_factory.mktemp("run_metric") / "library"
+    s = api.configure(lib, mock=True)
+    try:
+        p = api.load_preset(RJ.load_station_config(METRIC).preset)
+        tr = s.bench.stereo_truth()
+        d = s.store.new_dir("calibrations", p.geometry_id, label="stereo")
+        cal = StereoCalibration(id=f"{p.geometry_id}/{d.name}", geometry_id=p.geometry_id,
+                                K_cam=tr["K_cam"], dist_cam=tr["dist_cam"], K_proj=tr["K_proj"],
+                                dist_proj=np.zeros(5), R=tr["R"], t=np.ravel(tr["t"]),
+                                diamond_parity=tr["parity"],
+                                fingerprint=config.geometry_fingerprint(p), path=d,
+                                created="2026-01-01T00:00:00")
+        s.store.write_json(d / "stereo_calibration.json", cal.to_json())
+    finally:
+        api._session = None
+    return lib
+
+
+def test_example_metric_configs_load():
+    cfg = RJ.load_station_config(METRIC)
+    assert cfg.job_type == "metric" and cfg.scan == "fast" and cfg.axis == "xy"
+    assert cfg.measure == "plane" and cfg.threshold_mm == pytest.approx(0.5)
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        return
+    y = RJ.load_station_config(METRIC.with_suffix(".yaml"))
+    assert (y.station_id, y.job_type, y.measure, y.threshold_mm) == \
+        (cfg.station_id, cfg.job_type, cfg.measure, cfg.threshold_mm)
+
+
+@pytest.mark.parametrize("job, msg", [
+    ({"scan": "slow"}, "job.scan"),
+    ({"measure": "vibes"}, "job.measure"),
+    ({"measure": "golden", "golden": None}, "golden"),
+    ({"roi": [10, 10, 5, 50]}, "job.roi"),
+    ({"axis": "y"}, "job.axis"),
+])
+def test_bad_metric_config_refused(tmp_path, job, msg):
+    with pytest.raises(RJ.StationConfigError, match=msg):
+        RJ.load_station_config(_metric_station(tmp_path, job=job))
+
+
+def test_metric_uncalibrated_is_invalid_and_says_how(tmp_path):
+    """No stereo calibration: INVALID (5) before the rig, and the reason names the
+    calibration commands; never a px number reported as mm."""
+    code, out = _cli([*FAST, "--library", str(tmp_path / "lib"), "run",
+                      str(_metric_station(tmp_path))])
+    assert code == cli.EXIT_INVALID, out
+    res = _check_run(_only_run(tmp_path / "runs"), "example_metric_check")
+    assert res["job"]["type"] == "metric" and res["result"] == "INVALID"
+    assert "stereo calibration" in res["invalid_reason"]
+    assert "calibrate-stereo" in res["invalid_reason"] and "calib-pose" in res["invalid_reason"]
+    assert res["deviation_units"] is None and res["deviation_mm"]["max"] is None
+    assert res["part"]["scan_id"] is None                        # nothing was scanned
+
+
+def test_metric_missing_threshold_is_invalid(tmp_path, stereo_lib):
+    code, out = _cli([*FAST, "--library", str(stereo_lib), "run",
+                      str(_metric_station(tmp_path, threshold_mm=None))])
+    assert code == cli.EXIT_INVALID, out
+    res = _check_run(_only_run(tmp_path / "runs"), "example_metric_check")
+    assert "threshold_mm" in res["invalid_reason"] and res["part"]["scan_id"] is None
+
+
+def test_metric_flat_wall_passes(tmp_path, stereo_lib):
+    code, out = _cli([*FAST, "--library", str(stereo_lib), "--mock-part", "none", "--json",
+                      "run", str(_metric_station(tmp_path))])
+    doc = json.loads(out)
+    res = _check_run(_only_run(tmp_path / "runs"), "example_metric_check")
+    assert doc["result"] == res and code == cli.EXIT_OK, res
+    assert res["result"] == "PASS" and res["deviation_units"] == "mm"
+    dm = res["deviation_mm"]
+    assert dm["method"] == "plane_fit" and 0 < dm["max"] < 0.5 and dm["rms"] < dm["max"]
+    assert dm["n_points"] > 10000
+    assert res["calibration"]["calibration_id"] and res["calibration"]["same_geometry"] is True
+    assert res["part"]["scan_id"] and res["threshold_mm"] == pytest.approx(0.5)
+    run_dir = _only_run(tmp_path / "runs")
+    events = [json.loads(x) for x in (run_dir / "run.log.jsonl").read_text().splitlines()]
+    meas = [e for e in events if e["event"] == "measure"]
+    assert meas and meas[0]["max_deviation_mm"] == dm["max"]
+    if res["outputs"]["deviation_map"]:
+        assert Path(res["outputs"]["deviation_map"]).is_file()
+
+
+def test_metric_block_on_the_wall_fails(tmp_path, stereo_lib):
+    """A 10 mm block inside the roi: the plane fit (RANSAC: the wall) sees ~10 mm -> FAIL."""
+    cfg = _metric_station(tmp_path, station_id="metric_b",
+                          job={"roi": [200, 150, 1000, 850]})
+    code, out = _cli([*FAST, "--library", str(stereo_lib), "--mock-part", "80,40,10",
+                      "run", str(cfg)])
+    res = _check_run(_only_run(tmp_path / "runs"), "metric_b")
+    assert res["result"] == "FAIL" and code == cli.EXIT_NOT_OK, (res, out)
+    assert res["deviation_mm"]["max"] == pytest.approx(10.0, abs=0.5)

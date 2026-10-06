@@ -23,6 +23,14 @@ neither post to the rig nor clickjack this page. /files serves only
 whitelisted types from inside the library root. Nothing here talks to
 hardware: the engine enforces §9.
 
+Operator page (/quick): START runs a station config (stations/*.json) through
+the same code path as `scan run` (ui/cli.py cmd_run) as one job; ABORT sets
+the job's cancel event, which the engine checks before every capture (the
+rig is closed on the way out: projector idle, rig lock released) and the run
+is recorded as ABORTED; HOME (when idle, or queued behind an ABORT) runs the
+rig check. Every command (page buttons, keys, POST /api/cmd/*, hardware
+inputs) goes through one state machine: engine/control/commands.py.
+
 Live view: it holds the rig (camera + DMD + the machine-wide rig lock), so
 it stops when a rig job is queued, when the operator presses Stop (even
 while it is still queued), and when no viewer has polled it for
@@ -64,6 +72,9 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_BODY = 5 * 1024 * 1024
 MAX_JOBS_KEPT = 300
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+STATIONS_DIR = Path(__file__).resolve().parents[2] / "stations"
+RUN_FILES = {"result.json": "application/json", "run.log.jsonl": "text/plain; charset=utf-8",
+             "deviation.png": "image/png"}   # what /runs/<run_id>/ serves of a run folder
 LIVE_IDLE_S = 30.0            # live view stops when nobody polled it for this long
 MAX_LIVE_S = 1800.0           # longest live view one start may ask for (it holds the rig)
 MAX_HOLD_S = 300.0            # pumped grid / zone holds can't be interrupted: keep them short
@@ -549,7 +560,21 @@ VERBS: dict = {
                       {"metric_id": "metric scan id", "golden_id": "station golden id (default: "
                        "newest matching)", "flood_metric_id": "metric scan whose flood pair to use",
                        "label": "text"}),
+    "rig_check": ("Rig check (HOME): a fresh flood + a random block pattern vs the stored "
+                  "reference -> camera / projector shift in px (phase correlation) and ~mm at "
+                  "the working distance; OK | MOVED | UNKNOWN | REFERENCE_SET (first check).",
+                  {"set_reference": "bool: store a new reference (after base / calibration)",
+                   "tol_px": "MOVED above this shift (default 0.5)",
+                   "mock_shift_px": "MOCK ONLY: [dx, dy] shift of the fresh frames"}),
     # UI verbs (not engine.api verbs)
+    "run_station": ("Run one station config (stations/<config>.json) exactly like `scan run`: "
+                    "a new run folder with result.json + run.log.jsonl; PASS / FAIL / INVALID / "
+                    "ABORTED (cancel the job to abort between captures). The real rig needs "
+                    "operator_confirmed.",
+                    {"config": "station config file name (GET /api/stations)",
+                     "operator_confirmed": "bool: a human confirmed the physical setup "
+                                           "(required on the real rig)",
+                     "mock_part": "MOCK ONLY: what the simulated human places (as --mock-part)"}),
     "live_view": ("Keep the rig open and stream a flood / focus pattern until stopped "
                   "(POST /api/live/stop), until a rig job is queued, or when nobody polled "
                   f"GET /api/live/state or /api/live.jpg for {LIVE_IDLE_S:g} s.",
@@ -581,6 +606,11 @@ RIG_FREE_VERBS = frozenset({
     "compare_metric", "predict_precision", "export_metric_mesh", "calibrate_dent_null",
     "detect_dents", "locate_face", "face_profile", "face_golden", "check_face",
     "station_measure", "station_golden", "station_check"})
+
+
+# running jobs that may be aborted: the engine checks the job's cancel event before every
+# capture (ScanSession.cancel), so the rig is never left mid-sequence
+CANCELLABLE_VERBS = frozenset({"run_station", "rig_check"})
 
 
 class ArgError(ValueError):
@@ -975,6 +1005,10 @@ class Job:
         return d
 
 
+class _UILink(str):
+    """A ready URL for a job link (not a library path)."""
+
+
 class _Call:
     """A short read the worker runs between jobs (listings)."""
 
@@ -995,8 +1029,18 @@ class App:
     """The engine side: one worker thread owns every engine call."""
 
     def __init__(self, *, mock: bool, library=None, presets_dir=None,
-                 preset_name: Optional[str] = None):
+                 preset_name: Optional[str] = None, stations_dir=None):
         self.mock = bool(mock)
+        self.stations_dir = Path(stations_dir) if stations_dir else STATIONS_DIR
+        self._runs: dict = {}                   # run_id -> run folder (what /runs/ may serve)
+        # the station command bus (START / ABORT / HOME / TRIGGER ...): every source (page
+        # buttons, keys, POST /api/cmd/*, hardware inputs) goes through its state machine
+        from engine.control.commands import CommandBus, Handlers
+        self.bus = CommandBus(Handlers(start=self._bus_start, abort=self._bus_abort,
+                                       home=self._bus_home),
+                              require_confirmation=not self.mock)
+        self._bus_jobs: dict = {}               # job id -> "run" | "home"
+        self._home_args: dict = {}
         self.library = Path(library) if library else None
         self.presets_dir = Path(presets_dir) if presets_dir else None
         self.preset_name = preset_name
@@ -1060,6 +1104,7 @@ class App:
         else:
             self.startup_warnings.append(f"no presets in {self.presets_path}")
         self._refresh_snapshot()
+        self.refresh_workstates()
 
     def _run(self):
         try:
@@ -1190,6 +1235,9 @@ class App:
             elif job.status == "running" and job.verb == "live_view":
                 self.live.stopped_because = "stopped by the operator"
                 job.cancel.set()
+            elif job.status == "running" and job.verb in CANCELLABLE_VERBS:
+                job.cancel.set()                # checked before the next capture
+                job.note = "abort requested: stops before the next capture"
             elif job.status == "running":
                 raise HTTPError(409, "a running capture can't be interrupted mid-sequence")
             return job
@@ -1228,6 +1276,61 @@ class App:
             jobs = list(self._jobs.values())[-n:]
             return [j.public(full=False) for j in reversed(jobs)]
 
+    # ------------------------------------------------------------ command bus
+    def _bus_start(self, workstate: str, confirmed: bool) -> str:
+        job = self.submit("run_station", {"config": workstate,
+                                          "operator_confirmed": bool(confirmed)})
+        self._bus_jobs[job.id] = "run"
+        return job.id
+
+    def _bus_abort(self) -> list:
+        return self.abort_runs("ABORT")
+
+    def _bus_home(self) -> str:
+        args, self._home_args = self._home_args, {}
+        job = self.submit("rig_check", args)
+        self._bus_jobs[job.id] = "home"
+        return job.id
+
+    def _bus_notify(self, job: Job) -> None:
+        kind = self._bus_jobs.pop(job.id, None)
+        if kind is None:
+            return
+        r = job.result if isinstance(job.result, dict) else {}
+        self.bus.job_finished(kind, r.get("result") if kind == "run" else r.get("status"),
+                              job.error if job.status == "error" else None)
+
+    def refresh_workstates(self) -> list:
+        items = self.stations()
+        names = [i["config"] for i in items if not i.get("error")]
+        with self.bus._lock:
+            if self.bus.state in ("READY", "ARMED", "FAULT"):
+                self.bus.workstates = names
+                if self.bus.workstate not in names:
+                    self.bus.workstate = names[0] if names else None
+        return items
+
+    def abort_runs(self, why: str = "aborted by the operator") -> list:
+        """ABORT: drop queued station runs and rig checks, abort the running one.
+        -> ids of the jobs touched."""
+        dropped = []
+        with self._cv:
+            touched = []
+            for j in [j for j in self._queue if j.verb in CANCELLABLE_VERBS]:
+                self._queue.remove(j)
+                self._fail(j, f"cancelled before it started: {why}", "Cancelled")
+                touched.append(j.id)
+                dropped.append(j)
+            cur = self._current
+            if cur is not None and cur.verb in CANCELLABLE_VERBS and cur.status == "running":
+                cur.cancel.set()
+                cur.note = "abort requested: stops before the next capture"
+                touched.append(cur.id)
+            self._stop_live_locked(why)
+        for j in dropped:                       # never ran: the bus still hears it ended
+            self._bus_notify(j)
+        return touched
+
     def _execute(self, job: Job):
         # The final status is published only AFTER the status snapshot is
         # refreshed: a client that polls the job and then reads /api/status
@@ -1236,7 +1339,10 @@ class App:
         t0 = time.perf_counter()
         final = "error"
         try:
-            out = getattr(self, "_v_" + job.verb)(dict(job.args))
+            if job.verb in CANCELLABLE_VERBS:
+                out = self._cancellable(job)
+            else:
+                out = getattr(self, "_v_" + job.verb)(dict(job.args))
             result, links = out if isinstance(out, tuple) else (out, {})
             job.result = jsonable(result, self.root)
             job.links = {k: jsonable(v, self.root) for k, v in (links or {}).items()
@@ -1256,6 +1362,7 @@ class App:
                 self.startup_warnings.append(f"status refresh failed: {e}")
             job.status = final
             job.done.set()
+            self._bus_notify(job)
 
     # ------------------------------------------------------------ helpers
     def _preset(self):
@@ -2482,6 +2589,109 @@ class App:
         return api.sort_flash_recording(str(f), str(Path(pack).expanduser()) if pack else None,
                                         variant, _bool(a, "decode"), label, _fine_prefilter(a))
 
+    # ------------------------------------------------ operator page (/quick)
+    def _cancellable(self, job: Job):
+        """Run a job with its cancel event wired into the engine (checked before every
+        capture): an abort ends the capture sequence and closes the rig cleanly."""
+        self.session.cancel = job.cancel
+        try:
+            return getattr(self, "_v_" + job.verb)(dict(job.args))
+        finally:
+            self.session.cancel = None
+
+    def stations(self) -> list:
+        """Station configs (the operator page's work states): stations/*.json."""
+        from ui import run_job as RJ
+        out = []
+        d = self.stations_dir
+        for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+            if f.name.startswith("io_"):        # I/O mappings live here too, not stations
+                continue
+            item = {"config": f.name}
+            try:
+                c = RJ.load_station_config(f)
+                item.update(station_id=c.station_id, part_label=c.part_label,
+                            job_type=c.job_type, preset=c.preset, threshold_mm=c.threshold_mm,
+                            zone=c.zone,
+                            measure=c.measure if c.job_type == "metric" else None)
+            except Exception as e:      # noqa: BLE001 - shown as an unusable entry
+                item["error"] = f"{type(e).__name__}: {e}"
+            out.append(item)
+        return out
+
+    def _station_file(self, name) -> Path:
+        if not isinstance(name, str) or not _NAME_RE.match(name) or not name.endswith(".json"):
+            raise ArgError("config must be a station config file name from GET /api/stations")
+        f = (self.stations_dir / name).resolve()
+        if not inside(self.stations_dir.resolve(), f) or not f.is_file():
+            raise ArgError(f"no station config {name!r} in the stations folder")
+        return f
+
+    def _v_run_station(self, a):
+        """`scan run <config>` in-process, on the server's own session and library."""
+        from ui import cli
+        f = self._station_file(a.get("config"))
+        confirmed = _bool(a, "operator_confirmed")
+        mock_part = _s(a, "mock_part")
+        if mock_part is not None and not self.mock:
+            raise ArgError("mock_part is MOCK ONLY")
+        if not self.mock and not confirmed:
+            raise rules.RuleViolation("the real rig needs the operator's confirmation of the "
+                                      "physical setup (part placed, rig untouched)")
+        argv = ["--json", "--library", str(self.root)] + (["--mock"] if self.mock else [])
+        argv += (["--mock-part", mock_part] if mock_part else [])
+        argv += ["run", str(f)] + (["--operator-confirmed"] if confirmed else [])
+        args = cli.build_parser().parse_args(argv)
+        args.preset_given = False
+        ctx = cli.Ctx(args)
+        ctx.session = self.session
+        ctx._outputs_before = len(self.session.store.outputs())
+        try:
+            code, data = cli.cmd_run(ctx)
+            res, run_dir = data["result"], Path(data["run_dir"])
+        except Exception as e:          # noqa: BLE001 - a refused / crashed run is INVALID
+            res = getattr(e, "run_result", None)
+            if res is None:
+                raise
+            run_dir = Path(e.run_dir)
+            code = cli.EXIT_REFUSED
+            res = {**res, "error": f"{type(e).__name__}: {e}"}
+        self._runs[res["run_id"]] = run_dir
+        return {"exit_code": code, **res}, self._run_links(res, run_dir)
+
+    def _run_links(self, res: dict, run_dir: Path) -> dict:
+        links = {"result_json": f"/runs/{res['run_id']}/result.json",
+                 "log": f"/runs/{res['run_id']}/run.log.jsonl"}
+        dm = (res.get("outputs") or {}).get("deviation_map")
+        if dm:
+            p = Path(dm)
+            if p.parent.resolve() == run_dir.resolve() and p.name in RUN_FILES:
+                links["preview"] = f"/runs/{res['run_id']}/{p.name}"
+            elif self.root is not None and inside(self.root, p.resolve()):
+                links["preview"] = "/files/" + rel_path(p, self.root)
+        return {k: _UILink(v) for k, v in links.items()}
+
+    def run_file(self, run_id: str, name: str) -> Path:
+        d = self._runs.get(run_id)
+        if d is None or name not in RUN_FILES:
+            raise HTTPError(404, f"no run file {run_id}/{name} (only this server's runs)")
+        f = Path(d) / name
+        if not f.is_file():
+            raise HTTPError(404, f"no file {name} in run {run_id}")
+        return f
+
+    def _v_rig_check(self, a):
+        shift = _num_list(a, "mock_shift_px")
+        if shift is not None:
+            if not self.mock:
+                raise ArgError("mock_shift_px is MOCK ONLY")
+            if len(shift) != 2:
+                raise ArgError("mock_shift_px must be [dx, dy] camera px")
+        r = api.rig_check(self._preset(), _bool(a, "set_reference"), _num(a, "tol_px", 0.5),
+                          shift)
+        return r, ({"flood": Path(r["path"]) / "flood.png"}
+                   if r.get("path") and (Path(r["path"]) / "flood.png").is_file() else {})
+
     def _v_mock_place(self, a):
         from engine.capture.mock_bench import VALIDATION_OBJECT, Box, Label
         bench = api.mock_bench()               # raises in real mode: physical steps are human
@@ -2637,6 +2847,11 @@ ROUTES = [
     ("GET", r"/api/outputs", "outputs"),
     ("GET", r"/api/pointcloud/(?P<oid>[^/]+)", "pointcloud"),
     ("GET", r"/api/log", "log"),
+    ("GET", r"/quick(?:\.html)?", "quick"),
+    ("GET", r"/api/stations", "stations"),
+    ("GET", r"/api/cmd/state", "cmd_state"),
+    ("POST", r"/api/cmd/(?P<name>start|abort|home|trigger|arm|disarm|workstate|reset)", "cmd"),
+    ("GET", r"/runs/(?P<run_id>[A-Za-z0-9_.\-]+)/(?P<name>[A-Za-z0-9_.\-]+)", "run_file"),
 ]
 _ROUTES = [(m, re.compile(p), name) for m, p, name in ROUTES]
 
@@ -2757,6 +2972,39 @@ class Handler(BaseHTTPRequestHandler):
     # -------------------------------------------------------------- static
     def r_index(self, q, body):
         self._file(STATIC_DIR / "index.html", STATIC_TYPES[".html"])
+
+    def r_quick(self, q, body):
+        self._file(STATIC_DIR / "quick.html", STATIC_TYPES[".html"])
+
+    def r_stations(self, q, body):
+        self._json({"stations": self.app.refresh_workstates(),
+                    "mode": "mock" if self.app.mock else "real",
+                    "dir": str(self.app.stations_dir)})
+
+    def r_cmd_state(self, q, body):
+        snap = self.app.bus.snapshot()
+        snap["jobs"] = dict(self.app._bus_jobs)
+        self._json(snap)
+
+    def r_cmd(self, q, body, name):
+        """One command through the bus (page buttons, keys, a PLC / HMI gateway). 200 when
+        accepted, 409 when the state machine refused it (the reply says why).
+        body: operator_confirmed (start / trigger / arm on the real rig), workstate (a
+        config name or a 1-based index), home: set_reference, tol_px, mock_shift_px."""
+        app = self.app
+        cmd = {"workstate": "SELECT_WORKSTATE"}.get(name, name.upper())
+        if cmd == "HOME":
+            app._home_args = {k: body[k] for k in ("set_reference", "tol_px", "mock_shift_px")
+                              if body.get(k) is not None}
+        src = str(body.get("source") or "http")[:40]
+        r = app.bus.command(cmd, source=src, arg=body.get("workstate"),
+                            confirmed=bool(body.get("operator_confirmed")))
+        out = {**r.to_dict(), "bus": app.bus.snapshot(),
+               "jobs": dict(app._bus_jobs)}
+        self._json(out, 200 if r.accepted else 409)
+
+    def r_run_file(self, q, body, run_id, name):
+        self._file(self.app.run_file(run_id, name), RUN_FILES[name])
 
     def r_static(self, q, body, name):
         target = (STATIC_DIR / name).resolve()
@@ -2910,10 +3158,11 @@ class Handler(BaseHTTPRequestHandler):
 # ================================================================== main
 
 def make_server(*, mock: bool, library=None, presets_dir=None, preset: Optional[str] = None,
-                port: int = DEFAULT_PORT, verbose: bool = False):
+                port: int = DEFAULT_PORT, verbose: bool = False, stations_dir=None):
     """-> (httpd, app). The worker is started (engine configured) before the
     socket accepts anything, so no request can see an unconfigured engine."""
-    app = App(mock=mock, library=library, presets_dir=presets_dir, preset_name=preset).start()
+    app = App(mock=mock, library=library, presets_dir=presets_dir, preset_name=preset,
+              stations_dir=stations_dir).start()
     try:
         httpd = bind(app, port, verbose)
     except OSError:
@@ -2942,6 +3191,8 @@ def main(argv=None) -> int:
                                       "SWISS_SCANNER_LIBRARY)")
     ap.add_argument("--presets", help="presets folder (default: <repo>/presets)")
     ap.add_argument("--preset", help=f"preset to load at start (default: {DEFAULT_PRESET})")
+    ap.add_argument("--stations", help="station configs folder for the operator page /quick "
+                                       "(default: <repo>/stations)")
     ap.add_argument("--open", action="store_true", help="open the browser")
     ap.add_argument("--verbose", action="store_true", help="log every HTTP request")
     args = ap.parse_args(argv)
@@ -2949,7 +3200,7 @@ def main(argv=None) -> int:
     # an engine start-up failure (library folder, preset...) is reported as itself;
     # only the socket bind means "is another UI already running?"
     app = App(mock=args.mock, library=args.library, presets_dir=args.presets,
-              preset_name=args.preset).start()
+              preset_name=args.preset, stations_dir=args.stations).start()
     try:
         httpd = bind(app, args.port, args.verbose)
     except OSError as e:
@@ -2961,6 +3212,7 @@ def main(argv=None) -> int:
     print(f"  mode    : {'MOCK (simulated bench)' if app.mock else 'REAL HARDWARE'}")
     print(f"  library : {app.root}")
     print(f"  url     : {url}   (Ctrl+C to stop)")
+    print(f"  operator: {url}quick   (START / ABORT / HOME)")
     if not app.mock:
         print("  REAL rig: close the LightCrafter GUI first. Nothing touches the rig until you")
         print("            run an action in the page. Don't move camera/projector between base")

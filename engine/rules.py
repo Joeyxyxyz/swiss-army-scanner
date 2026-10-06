@@ -45,6 +45,12 @@ class RigBusy(RuleViolation):
     """Another process is driving the camera + DMD (capture/riglock.py)."""
 
 
+class Cancelled(RuntimeError):
+    """The operator aborted the job (ScanSession.cancel was set). Checked between
+    captures: the rig is closed (projector black / idle, rig lock released) on
+    the way out, and nothing half-measured is reported."""
+
+
 class EntryInUse(RuleViolation):
     """Rule 7: a library entry could not be moved to trash/ in one atomic
     rename (a file in it is open). Nothing was moved; retry once it is free."""

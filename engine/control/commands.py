@@ -1,0 +1,388 @@
+"""
+Station command bus: one state machine for every command source.
+
+Sources (all call CommandBus.command):
+    web UI buttons        /quick START / ABORT / HOME / ARM / TRIGGER
+    keyboard              /quick: Space / Enter START, Esc ABORT, H HOME, T TRIGGER,
+                          A ARM / DISARM, 1-9 work state
+    HTTP                  POST /api/cmd/<start|abort|home|trigger|arm|disarm|workstate>
+                          (a PLC / HMI gateway or an automation flow)
+    hardware (PLACEHOLDER) InputBackend subclasses below: camera GPIO lines, serial /
+                          USB-IO, a 24 V digital I/O module. Config-driven mapping
+                          (stations/io_example.json). Not implemented: they refuse to start.
+
+States and rules:
+    READY     idle, work state selectable          START -> RUNNING, ARM -> ARMED
+    ARMED     waiting for TRIGGER (part present)   TRIGGER -> RUNNING, DISARM -> READY
+    RUNNING   a station run                        ABORT -> ABORTING; done -> READY / ARMED
+    ABORTING  abort requested, run winding down    done -> READY (or HOMING if HOME pressed)
+    HOMING    rig check                            OK -> READY, MOVED / error -> FAULT
+    FAULT     rig check failed / a job crashed     HOME (re-check) or RESET -> READY
+ABORT always wins (it is never refused); HOME only when idle or after an abort;
+TRIGGER is ignored unless ARMED; the work state can't change while a job runs.
+
+Outputs (stack-light style): READY / BUSY / PASS / FAIL / ALARM booleans, published to
+every OutputBackend on each change (the UI lamp reads the same signals).
+
+Pure: no engine, no hardware. The owner (the web server) passes handlers that start /
+abort the actual jobs and calls job_finished() when they end.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Optional
+
+STATES = ("READY", "ARMED", "RUNNING", "ABORTING", "HOMING", "FAULT")
+COMMANDS = ("START", "ABORT", "HOME", "TRIGGER", "SELECT_WORKSTATE", "ARM", "DISARM", "RESET")
+SIGNALS = ("READY", "BUSY", "PASS", "FAIL", "ALARM")
+IDLE = ("READY", "ARMED")
+
+
+@dataclass
+class Reply:
+    accepted: bool
+    command: str
+    state: str
+    message: str = ""
+
+    def to_dict(self) -> dict:
+        return dict(vars(self))
+
+
+@dataclass
+class Handlers:
+    """What the bus asks its owner to do. start(workstate, confirmed) -> job id;
+    abort() and home() -> anything (ids, for the log)."""
+    start: Callable = lambda ws, confirmed: None
+    abort: Callable = lambda: None
+    home: Callable = lambda: None
+
+
+class CommandBus:
+    def __init__(self, handlers: Optional[Handlers] = None, workstates: Optional[list] = None,
+                 require_confirmation: bool = False):
+        self.h = handlers or Handlers()
+        self.workstates = list(workstates or [])
+        self.require_confirmation = bool(require_confirmation)
+        self.state = "READY"
+        self.workstate: Optional[str] = self.workstates[0] if self.workstates else None
+        self.armed_confirmed = False
+        self.last_result: Optional[str] = None      # PASS | FAIL | INVALID | ABORTED
+        self.fault: Optional[str] = None
+        self.home_after_abort = False
+        self._return_armed = False
+        self.outputs: list = []
+        self.history: list = []                      # (time, source, command, accepted, msg)
+        self._lock = threading.RLock()
+
+    # ------------------------------------------------------------ outputs
+    def signals(self) -> dict:
+        s = self.state
+        return {"READY": s in IDLE and self.fault is None,
+                "BUSY": s in ("RUNNING", "ABORTING", "HOMING"),
+                "PASS": s in IDLE and self.last_result == "PASS",
+                "FAIL": s in IDLE and self.last_result == "FAIL",
+                "ALARM": s == "FAULT" or (s in IDLE and self.last_result == "INVALID")}
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"state": self.state, "workstate": self.workstate,
+                    "workstates": list(self.workstates), "last_result": self.last_result,
+                    "fault": self.fault, "signals": self.signals(),
+                    "require_confirmation": self.require_confirmation,
+                    "history": self.history[-20:]}
+
+    def _publish(self) -> None:
+        sig = self.signals()
+        for o in self.outputs:
+            try:
+                o.publish(sig)
+            except Exception as e:          # noqa: BLE001 - an output must not stop the bus
+                self.history.append((_now(), "bus", "OUTPUT", False, f"{type(o).__name__}: {e}"))
+
+    def _go(self, state: str) -> None:
+        self.state = state
+        self._publish()
+
+    # ------------------------------------------------------------ commands
+    def command(self, name: str, source: str = "api", arg=None, confirmed: bool = False) -> Reply:
+        name = str(name).upper()
+        with self._lock:
+            if name not in COMMANDS:
+                r = Reply(False, name, self.state, f"unknown command (one of {', '.join(COMMANDS)})")
+            else:
+                r = getattr(self, "_c_" + name.lower())(arg, bool(confirmed))
+            self.history.append((_now(), source, name, r.accepted, r.message))
+            del self.history[:-200]
+            return r
+
+    def _no(self, cmd, msg) -> Reply:
+        return Reply(False, cmd, self.state, msg)
+
+    def _ok(self, cmd, msg="") -> Reply:
+        return Reply(True, cmd, self.state, msg)
+
+    def _begin(self, cmd: str, confirmed: bool) -> Reply:
+        if self.workstate is None:
+            return self._no(cmd, "no work state selected")
+        if self.require_confirmation and not confirmed:
+            return self._no(cmd, "the real rig needs the operator's confirmation of the setup")
+        self._return_armed = self.state == "ARMED"
+        self.last_result = None
+        self._go("RUNNING")
+        try:
+            self.h.start(self.workstate, confirmed)
+        except Exception as e:              # noqa: BLE001 - the start itself was refused
+            self.fault = f"start failed: {type(e).__name__}: {e}"
+            self._go("FAULT")
+            return self._no(cmd, self.fault)
+        return self._ok(cmd, f"started {self.workstate}")
+
+    def _c_start(self, arg, confirmed):
+        if self.state not in IDLE:
+            return self._no("START", f"not idle ({self.state})")
+        return self._begin("START", confirmed)
+
+    def _c_trigger(self, arg, confirmed):
+        if self.state != "ARMED":
+            return self._no("TRIGGER", f"ignored: not armed ({self.state})")
+        return self._begin("TRIGGER", confirmed or self.armed_confirmed)
+
+    def _c_abort(self, arg, confirmed):
+        """Never refused: it preempts whatever runs."""
+        if self.state in ("RUNNING", "HOMING"):
+            self._go("ABORTING")
+            self.h.abort()
+            return self._ok("ABORT", "abort requested: stops before the next capture")
+        if self.state == "ARMED":
+            self.armed_confirmed = False
+            self._go("READY")
+            return self._ok("ABORT", "disarmed")
+        return self._ok("ABORT", "nothing running")
+
+    def _c_home(self, arg, confirmed):
+        if self.state == "ABORTING":
+            self.home_after_abort = True
+            return self._ok("HOME", "homing after the abort finishes")
+        if self.state in ("RUNNING", "HOMING"):
+            return self._no("HOME", f"refused while {self.state}: ABORT first")
+        self.armed_confirmed = False
+        self._go("HOMING")
+        try:
+            self.h.home()
+        except Exception as e:              # noqa: BLE001
+            self.fault = f"home failed: {type(e).__name__}: {e}"
+            self._go("FAULT")
+            return self._no("HOME", self.fault)
+        return self._ok("HOME", "rig check running")
+
+    def _c_select_workstate(self, arg, confirmed):
+        if self.state not in IDLE + ("FAULT",):
+            return self._no("SELECT_WORKSTATE", f"refused while {self.state}")
+        ws = self.resolve_workstate(arg)
+        if ws is None:
+            return self._no("SELECT_WORKSTATE", f"no work state {arg!r}")
+        self.workstate = ws
+        return self._ok("SELECT_WORKSTATE", ws)
+
+    def _c_arm(self, arg, confirmed):
+        if self.state != "READY":
+            return self._no("ARM", f"not READY ({self.state})")
+        if self.workstate is None:
+            return self._no("ARM", "no work state selected")
+        if self.require_confirmation and not confirmed:
+            return self._no("ARM", "the real rig needs the operator's confirmation to arm")
+        self.armed_confirmed = bool(confirmed)
+        self._go("ARMED")
+        return self._ok("ARM", "armed: TRIGGER starts a cycle")
+
+    def _c_disarm(self, arg, confirmed):
+        if self.state != "ARMED":
+            return self._no("DISARM", f"not armed ({self.state})")
+        self.armed_confirmed = False
+        self._go("READY")
+        return self._ok("DISARM")
+
+    def _c_reset(self, arg, confirmed):
+        if self.state != "FAULT":
+            return self._no("RESET", f"no fault ({self.state})")
+        self.fault = None
+        self._go("READY")
+        return self._ok("RESET")
+
+    def resolve_workstate(self, arg) -> Optional[str]:
+        """A work state name, or a 1-based index (keys 1-9, a PLC number)."""
+        if arg is None:
+            return None
+        if isinstance(arg, int) or (isinstance(arg, str) and arg.isdigit()):
+            i = int(arg) - 1
+            return self.workstates[i] if 0 <= i < len(self.workstates) else None
+        return arg if arg in self.workstates else None
+
+    # ------------------------------------------------------------ job events
+    def job_finished(self, kind: str, result: Optional[str] = None,
+                     error: Optional[str] = None) -> None:
+        """kind 'run' (result PASS / FAIL / INVALID / ABORTED) or 'home' (result OK /
+        MOVED / UNKNOWN / REFERENCE_SET); error = the job crashed."""
+        with self._lock:
+            if kind == "run" and self.state in ("RUNNING", "ABORTING"):
+                aborted = self.state == "ABORTING"
+                self.last_result = "ABORTED" if aborted else (result or "INVALID")
+                if error and not aborted:
+                    self.last_result = "INVALID"
+                if aborted and self.home_after_abort:
+                    self.home_after_abort = False
+                    self._go("HOMING")
+                    try:
+                        self.h.home()
+                    except Exception as e:  # noqa: BLE001
+                        self.fault = f"home failed: {type(e).__name__}: {e}"
+                        self._go("FAULT")
+                    return
+                keep = self._return_armed and not aborted
+                if not keep:
+                    self.armed_confirmed = False
+                self._go("ARMED" if keep else "READY")
+            elif kind == "home" and self.state in ("HOMING", "ABORTING"):
+                if error or result in ("MOVED", "UNKNOWN"):
+                    self.fault = error or f"rig check {result}: re-home / recalibrate"
+                    self._go("FAULT")
+                else:
+                    self.fault = None
+                    self._go("READY")
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# ================================================================ I/O backends
+
+class InputBackend:
+    """A hardware command source. start(bus) begins delivering commands (bus.command(
+    name, source=self.name)); stop() releases the hardware. `mapping` maps the backend's
+    inputs (lines, bits, serial tokens) to commands, from the I/O config."""
+    name = "input"
+
+    def __init__(self, mapping: Optional[dict] = None, **options):
+        self.mapping = dict(mapping or {})
+        self.options = options
+
+    def start(self, bus: CommandBus) -> None:
+        raise NotImplementedError(f"{type(self).__name__} is a placeholder: not implemented yet")
+
+    def stop(self) -> None:
+        pass
+
+
+class SimulatedInput(InputBackend):
+    """Tests / mock: inject(input_name) acts like that line going active."""
+    name = "simulated"
+
+    def start(self, bus: CommandBus) -> None:
+        self.bus = bus
+
+    def inject(self, line: str, arg=None) -> Reply:
+        cmd = self.mapping.get(line)
+        if cmd is None:
+            raise KeyError(f"input {line!r} is not mapped (mapping: {self.mapping})")
+        return self.bus.command(cmd, source=f"{self.name}:{line}", arg=arg)
+
+
+class CameraGpioInput(InputBackend):
+    """PLACEHOLDER: the machine-vision camera's opto-isolated GPIO lines as inputs
+    (e.g. Line0 = trigger / part present, Line2 = abort). Intended GenICam nodes (via the
+    camera SDK, never opened here): LineSelector = LineN, LineMode = Input,
+    LineInverter, LineStatus (polled) or an EventLine*RisingEdge event, LineDebouncerTime.
+    Must share the camera handle with the capture session (one owner of the camera)."""
+    name = "camera_gpio"
+
+
+class SerialIOInput(InputBackend):
+    """PLACEHOLDER: a serial / USB-IO box sending text tokens ("START\\n", "TRIG\\n") or
+    bit masks; options: port, baud. Mapping: token -> command."""
+    name = "serial_io"
+
+
+class DigitalIOInput(InputBackend):
+    """PLACEHOLDER: a 24 V digital I/O module (fieldbus / Modbus-TCP / vendor DLL); options:
+    host, unit, poll_ms. Mapping: input bit "DI0".."DI15" -> command (rising edge)."""
+    name = "digital_io"
+
+
+class OutputBackend:
+    """Stack-light style outputs: publish({"READY": bool, "BUSY": .., "PASS": .., "FAIL": ..,
+    "ALARM": ..}); `mapping` maps signals to the backend's outputs."""
+    name = "output"
+
+    def __init__(self, mapping: Optional[dict] = None, **options):
+        self.mapping = dict(mapping or {})
+        self.options = options
+
+    def publish(self, signals: dict) -> None:
+        raise NotImplementedError(f"{type(self).__name__} is a placeholder: not implemented yet")
+
+
+class SimulatedOutput(OutputBackend):
+    name = "simulated"
+
+    def __init__(self, mapping: Optional[dict] = None, **options):
+        super().__init__(mapping, **options)
+        self.log: list = []
+        self.current: dict = {}
+
+    def publish(self, signals: dict) -> None:
+        self.current = {self.mapping.get(k, k): bool(v) for k, v in signals.items()}
+        self.log.append(dict(self.current))
+
+
+class CameraGpioOutput(OutputBackend):
+    """PLACEHOLDER: camera GPIO output lines (LineSelector = Line1, LineMode = Output,
+    LineSource = UserOutputN, UserOutputSelector / UserOutputValue)."""
+    name = "camera_gpio"
+
+
+class DigitalIOOutput(OutputBackend):
+    """PLACEHOLDER: 24 V digital outputs DO0..DO15 driving a stack light / PLC inputs."""
+    name = "digital_io"
+
+
+INPUTS = {c.name: c for c in (SimulatedInput, CameraGpioInput, SerialIOInput, DigitalIOInput)}
+OUTPUTS = {c.name: c for c in (SimulatedOutput, CameraGpioOutput, DigitalIOOutput)}
+
+
+def load_io_config(path) -> tuple:
+    """stations/io_example.json -> ([InputBackend], [OutputBackend]); entries with
+    "enabled": false are skipped. Unknown kinds / commands / signals are refused."""
+    return load_io_doc(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def load_io_doc(doc: dict) -> tuple:
+    """load_io_config on an already-parsed mapping."""
+    ins, outs = [], []
+    for spec in doc.get("inputs", []):
+        if not spec.get("enabled", True):
+            continue
+        kind = spec.get("kind")
+        if kind not in INPUTS:
+            raise ValueError(f"input kind {kind!r} must be one of {sorted(INPUTS)}")
+        bad = [c for c in spec.get("map", {}).values() if c not in COMMANDS]
+        if bad:
+            raise ValueError(f"input {kind}: unknown commands {bad}")
+        ins.append(INPUTS[kind](spec.get("map"), **spec.get("options", {})))
+    for spec in doc.get("outputs", []):
+        if not spec.get("enabled", True):
+            continue
+        kind = spec.get("kind")
+        if kind not in OUTPUTS:
+            raise ValueError(f"output kind {kind!r} must be one of {sorted(OUTPUTS)}")
+        bad = [s for s in spec.get("map", {}) if s not in SIGNALS]
+        if bad:
+            raise ValueError(f"output {kind}: unknown signals {bad}")
+        outs.append(OUTPUTS[kind](spec.get("map"), **spec.get("options", {})))
+    return ins, outs

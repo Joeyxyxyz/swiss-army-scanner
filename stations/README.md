@@ -18,6 +18,19 @@ real rig without operator confirmation), `4` crashed, `5` INVALID. A refused or
 crashed run that got as far as creating its folder still writes `result.json`
 with `"result": "INVALID"` and the reason.
 
+Metric job (mm from the stereo calibration, no base): `example_metric_check.json`.
+Without a stereo calibration at the preset's geometry the run is INVALID and says how to
+calibrate (`charuco`, `calib-pose` x 12-20, `calibrate-stereo --square MM`). Max deviation is
+the 99.9th percentile of |deviation| (robust to stray triangulated points); `deviation_mm`
+also carries `rms`, `method` (`plane_fit` / `compare_metric_golden`) and `n_points`, and
+`outputs.deviation_map` is `deviation.png` in the run folder.
+
+`result` may also be `ABORTED` (an operator ABORT from the operator page / command bus):
+the run stopped before its next capture; exit 1.
+
+The operator page (`/quick`) lists every `*.json` here as a work state (`io_*.json` are
+command I/O mappings, see `io_example.json`, not stations).
+
 Copy `example_cell_station.json` (or the `.yaml`, which needs PyYAML) and change
 `station_id`, `preset`, the threshold and the job. The station id comes only from
 this file.
@@ -32,8 +45,10 @@ this file.
 | `runs_dir` | where run folders go; `$SCANNER_RUNS_DIR` overrides |
 | `operator_confirmed` | a human confirmed the physical setup; the real rig refuses without it (or `--operator-confirmed`) |
 | `require_mm` | `true`: a px-only result (no calibration at this geometry) is INVALID |
-| `threshold_mm` | FAIL threshold in mm; `null` = the preset's `tolerance.ch_fail_mm` |
-| `job.type` | `inspect` (defect blobs vs the base) or `compare` (vs `job.golden`) |
+| `threshold_mm` | FAIL threshold in mm; `null` = the preset's `tolerance.ch_fail_mm` (metric jobs: required, INVALID without it) |
+| `job.type` | `inspect` (defect blobs vs the base) or `compare` (vs `job.golden`): base-relief depth calibration; `metric`: stereo calibration (`calibrate-stereo`) |
+| `job.scan`, `job.axis`, `job.steps`, `job.periods` | metric: `fast` (`scan_fast`, axis `xy` default) or `metric` (`scan_metric`) |
+| `job.measure`, `job.roi`, `job.golden` | metric: `plane` (flatness in `roi` = `[x0, y0, x1, y1]` camera px, `null` = whole field) or `golden` (vs a golden metric scan id / label / `latest`) |
 | `job.base` | `latest` usable base, or `capture` a new one (the scene must be empty). In `--mock`, a missing base is captured automatically. |
 | `job.zone`, `job.average`, `job.n_sigma`, `job.min_area_px` | passed to the engine verbs |
 | `part.role`, `part.label` | `golden` / `test`, and the scan label |

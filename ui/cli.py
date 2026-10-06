@@ -2455,7 +2455,8 @@ def cmd_multiorient(ctx):
 
 def cmd_flash_pack(ctx):
     a = ctx.args
-    p = Path(api.make_flash_pack(ctx.preset(), (a.axes,), a.video_port, a.label))
+    p = Path(api.make_flash_pack(ctx.preset(), (a.axes,), a.video_port, a.label, a.period_us,
+                                 a.pattern_exposure_us, a.trigger_mode or "trigout"))
     ctx.say(f"Flash pack ({'video port' if a.video_port else 'flash'}, axis {a.axes}): {p}",
             "  files only; the rig was not touched. A HUMAN enters pattern mode in the TI GUI.",
             "  procedure: procedure.txt in the pack;  docs/FLASH_PATTERN_MODE.md")
@@ -2466,12 +2467,18 @@ def cmd_fastscan_pack(ctx):
     a = ctx.args
     ctx.preset()                                  # geometry_id of the active preset
     p = Path(api.make_fastscan_pack(a.zone_ring, a.zone_mask, a.band_cam, a.band_field,
-                                    a.margin, a.calibration, a.study, a.label))
+                                    a.margin, a.calibration, a.study, a.label, a.period_us,
+                                    a.trigger_mode or "freerun", a.pattern_exposure_us,
+                                    a.camera_exposure))
     m = json.loads((p / "manifest.json").read_text(encoding="utf-8"))
     t = m["timing"]
+    hw = t.get("hardware_trigger")
     ctx.say(f"Fast-scan 1-bit pack ({', '.join(m['variants'])}): {p}",
-            f"  16 one-bit slots per image on G0..G7, R0..R7; internal timer, "
+            f"  16 one-bit slots per image on G0..G7, R0..R7; {t['trigger']} timer, "
             f"{t['pattern_period_us']} us per slot, loop {t['loop_ms']:g} ms, repeat",
+            (f"  hardware trigger ({hw['mode']}): TRIG_OUT_1 -> camera, one frame per pattern, "
+             f"camera exposure {hw['camera']['exposure_us']:g} us; {hw['set_ms']:g} ms per set"
+             if hw else "  soft sync (free-running camera)"),
             "  files only; the rig was not touched. A HUMAN loads the images and plays the "
             "sequence in the 4500 MKII GUI.",
             "  procedure: procedure.txt in the pack;  docs/FLASH_FASTSCAN_4500.md")
@@ -2519,6 +2526,49 @@ def cmd_scan_flash(ctx):
                                f"coherence < {pe['min_coherence']:g})"]] if pe else [])
            + [["times", ", ".join(f"{k[:-2]} {v:g} s" for k, v in r["times_s"].items())],
               ["recording", str(r.get("recording") or "-")]])
+    ctx.warn(r.get("warnings"))
+    return EXIT_OK, r
+
+
+def cmd_trigger_test(ctx):
+    a = ctx.args
+    r = api.trigger_test(a.line, a.seconds, a.expect_period_ms, a.exposure, ctx.preset())
+    pm = r.get("period_ms") or {}
+    ctx.say(f"Trigger test on {r['line']} ({r['seconds']:g} s, camera exposure "
+            f"{r['exposure_us']:g} us): {r['verdict']}")
+    ctx.kv([["pulses", str(r["count"])],
+            ["rate", f"{_f(r.get('rate_hz'), 2)} Hz"],
+            ["period", (f"mean {pm['mean']:g} ms, std {pm['std']:g}, min {pm['min']:g}, max "
+                        f"{pm['max']:g}") if pm else "-"],
+            ["expected", f"{r['expect_period_ms']:g} ms" if r.get("expect_period_ms") else "-"],
+            ["missed (est.)", "-" if r.get("missed_pulses") is None else str(r["missed_pulses"])],
+            ["frame-id gaps", str(r["frame_id_gaps"])], ["timeouts", str(r["timeouts"])],
+            ["TriggerMode", f"{r['trigger_mode_restored']} (restored)"]])
+    ctx.warn(r.get("notes"))
+    return (EXIT_OK if r["verdict"] == "OK" else EXIT_NOT_OK), r
+
+
+def cmd_scan_trigger(ctx):
+    a = ctx.args
+    from engine.capture.patternmode import ACK_PHRASE
+    if not a.pattern_mode_set_by_human:
+        raise CLIError("scan-trigger needs --pattern-mode-set-by-human: a HUMAN has put the "
+                       "projector in Pattern Sequence mode (flash, TRIG_OUT_1 wired to the "
+                       "camera) in the 4500 MKII GUI. The engine never switches the projector "
+                       "mode (docs/TRIGGER_FULLSPEED_TEST.md)")
+    r = api.scan_trigger(a.pack, a.variant, a.label, ctx.preset(), a.line, a.repeats,
+                         a.exposure, ACK_PHRASE, a.first_timeout)
+    t = r["timing"]
+    pf = t.get("per_frame_ms") or {}
+    ctx.say(f"Hardware-triggered scan {r['id']} (EXPERIMENTAL): {r['n_points']} points in mm "
+            f"(plane), calibration {r['calibration_id']}")
+    ctx.kv([["frames", f"{t['frames']} ({t['loops_captured']} x {t['frames_per_loop']}), "
+                       f"{t['drops']} dropped"],
+            ["capture", f"{t['total_ms']:g} ms; per frame {pf.get('mean', '-')} ms "
+                        f"(min {pf.get('min', '-')}, max {pf.get('max', '-')}); expected "
+                        f"{t['expected_period_ms']:g} ms, {t['set_ms']:g} ms per set"],
+            ["valid", f"{_f(r['valid_pct'], 1)} %"],
+            ["times", ", ".join(f"{k[:-2]} {v:g} s" for k, v in r["times_s"].items())]])
     ctx.warn(r.get("warnings"))
     return EXIT_OK, r
 
@@ -3017,6 +3067,12 @@ Surfer atlas (regions become zones atlas:<name>/<region>, e.g. scan part --zone 
                                          (exit 2: the loop is not playing / not in order);
                                          --dry-run prints the timing plan; --fine-prefilter 1
                                          low-passes the fine fringes (sharp projector)
+  scan trigger-test [--line Line0] [--seconds 5] [--expect-period-ms P]
+                                         EXPERIMENTAL: count TRIG_OUT_1 pulses at the camera
+                                         (camera only; exit 0 OK, 1 NO PULSES / RATE MISMATCH)
+  scan scan-trigger <label> --pack DIR [--variant full] [--line Line0] [--repeats N]
+          --pattern-mode-set-by-human    EXPERIMENTAL hardware-triggered scan, one frame per
+                                         pattern (docs/TRIGGER_FULLSPEED_TEST.md)
   scan sort-flash <recording.npz> [--decode]   offline: re-sort a saved recording
                                          (docs/FLASH_SOFTSYNC.md)
 
@@ -3528,6 +3584,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--axes", choices=("x", "y"), default="x", help="one axis per pack")
     p.add_argument("--video-port", action="store_true")
     p.add_argument("--label")
+    p.add_argument("--period-us", type=int, help="uniform pattern period, us (8-bit >= ~8563)")
+    p.add_argument("--pattern-exposure-us", type=int, help="pattern exposure, us")
+    p.add_argument("--trigger-mode", choices=("trigout", "external"),
+                   help="DLPC350 timer + TRIG_OUT_1 (default) or external TRIG_IN_1")
     p = cmd("fastscan-pack", cmd_fastscan_pack, "build the 1-bit soft-sync fast-scan pack "
                                                 "(full + zone flash images; files only)",
             "the fast-scan pack")
@@ -3544,6 +3604,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--study", action="store_true",
                    help="simulate the per-level decode error into the manifest")
     p.add_argument("--label")
+    p.add_argument("--period-us", type=int, help="pattern period, us (default 10000; triggered "
+                                                  "full frame >= 4425)")
+    p.add_argument("--pattern-exposure-us", type=int, help="pattern exposure (default = period)")
+    p.add_argument("--camera-exposure", type=int, metavar="US", help="camera exposure, us")
+    p.add_argument("--trigger-mode", choices=("freerun", "trigout", "external"),
+                   help="freerun = soft sync (default); trigout / external = TRIG_OUT_1 -> "
+                        "camera (docs/TRIGGER_FULLSPEED_TEST.md)")
     p = cmd("scan-flash", cmd_scan_flash, "fast metric scan: the flash loop a human plays in the "
                                           "4500 MKII GUI + free-running camera (soft sync)",
             "the flash soft-sync scan")
@@ -3564,6 +3631,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fine-prefilter", type=float, metavar="PX",
                    help="camera-px low-pass of the fine fringes (1 = the pack's recommendation "
                         "at a sharp projector; default off)")
+    p = cmd("trigger-test", cmd_trigger_test, "EXPERIMENTAL: count hardware trigger pulses at "
+                                              "the camera (camera only)", "the trigger test")
+    p.add_argument("--line", default="Line0", choices=("Line0", "Line2", "Line3"))
+    p.add_argument("--seconds", type=float, default=5.0)
+    p.add_argument("--expect-period-ms", type=float, help="the GUI's Pattern Period, ms")
+    p.add_argument("--exposure", type=float, default=1000.0, metavar="US",
+                   help="camera exposure (short; default 1000 us)")
+    p = cmd("scan-trigger", cmd_scan_trigger, "EXPERIMENTAL hardware-triggered metric scan of a "
+                                              "flash pack (TRIG_OUT_1 -> camera)",
+            "the hardware-triggered scan")
+    p.add_argument("label", nargs="?", default="trigger")
+    p.add_argument("--pack", metavar="DIR", required=True, help="the pack the GUI plays")
+    p.add_argument("--variant", choices=("full", "zone"), help="fast-scan pack image played")
+    p.add_argument("--line", default="Line0", choices=("Line0", "Line2", "Line3"))
+    p.add_argument("--repeats", type=_positive_int, default=1, help="loops to average")
+    p.add_argument("--exposure", type=float, metavar="US", help="camera exposure (default: "
+                                                               "the pack's)")
+    p.add_argument("--first-timeout", type=float, default=30.0, metavar="S",
+                   help="seconds to wait for the first trigger")
+    p.add_argument("--pattern-mode-set-by-human", action="store_true",
+                   help="REQUIRED: a human put the projector in pattern mode in the GUI")
     p = cmd("sort-flash", cmd_sort_flash, "offline: sort a saved flash recording into "
                                           "per-pattern images", "the offline sort")
     p.add_argument("recording", help="output/flashscans/<...>.npz from scan-flash")

@@ -76,7 +76,7 @@ class TriggeredSequenceCapture:
 
     def __init__(self, camera, manifest: dict, *, acknowledge: Optional[str] = None,
                  first_timeout_s: float = 30.0, frame_timeout_ms: Optional[int] = None,
-                 gap_tolerance: float = 0.5):
+                 gap_tolerance: float = 0.5, allow_extra: bool = False):
         if acknowledge != ACK_PHRASE:
             raise PatternModeRefused(
                 "hardware-trigger pattern mode is a separate, explicitly entered mode. "
@@ -102,6 +102,7 @@ class TriggeredSequenceCapture:
         self.frame_timeout_ms = int(frame_timeout_ms if frame_timeout_ms is not None
                                     else max(1000, 10 * longest / 1000))
         self.gap_tolerance = float(gap_tolerance)
+        self.allow_extra = bool(allow_extra)     # a repeating loop: frames keep coming
 
     @staticmethod
     def _expected_periods_us(manifest: dict, seq: list) -> list:
@@ -147,7 +148,7 @@ class TriggeredSequenceCapture:
                 disarm()
         report = self._check(ids, ts)
         extra = getattr(self.camera, "pending", None)
-        if callable(extra) and extra() > 0:
+        if not self.allow_extra and callable(extra) and extra() > 0:
             raise MissingFrames(
                 f"{extra()} extra frame(s) after the {n} expected: the sequence is set to "
                 "repeat, or the camera was triggered by something else — uncheck Repeat")

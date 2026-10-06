@@ -946,9 +946,13 @@ def multi_orientation_scan(region, preset: Optional[Preset] = None,
 
 @_verb
 def make_flash_pack(preset: Optional[Preset] = None, axes: tuple = ("x",),
-                    video_port: bool = False, label: Optional[str] = None) -> Path:
+                    video_port: bool = False, label: Optional[str] = None,
+                    period_us: Optional[int] = None, exposure_us: Optional[int] = None,
+                    trigger_mode: str = "trigout") -> Path:
     """Build a DLPC350 flash / video-port pattern pack (files only; never touches the rig).
-    One axis per pack (the controller holds 2 images ready)."""
+    One axis per pack (the controller holds 2 images ready). period_us / exposure_us: a
+    uniform pattern timing, trigger_mode 'trigout' | 'external'; infeasible DLPC350 /
+    camera timing is refused (TimingError)."""
     import sys as _sys
     root = str(Path(__file__).resolve().parents[1])
     if root not in _sys.path:
@@ -956,26 +960,36 @@ def make_flash_pack(preset: Optional[Preset] = None, axes: tuple = ("x",),
     from tools.make_flash_pack import make_pack, DEFAULT_OUT
     p = _preset(preset)
     return make_pack(p.name, axes=tuple(axes), video_port=video_port,
-                     out_root=DEFAULT_OUT, label=label)
+                     out_root=DEFAULT_OUT, label=label, period_us=period_us,
+                     exposure_us=exposure_us, trigger_mode=trigger_mode)
 
 
 @_verb
 def make_fastscan_pack(zone_rings: tuple = (), zone_masks: tuple = (),
                        band_cam: Optional[str] = None, band_field: Optional[str] = None,
                        margin_px: int = 6, calibration: Optional[str] = None,
-                       study: bool = False, label: Optional[str] = None) -> Path:
+                       study: bool = False, label: Optional[str] = None,
+                       period_us: Optional[int] = None, trigger_mode: str = "freerun",
+                       pattern_exposure_us: Optional[int] = None,
+                       camera_exposure_us: Optional[int] = None) -> Path:
     """Build the 1-bit soft-sync fast-scan pack (files only; never touches the rig):
     one 24-bit flash image full field + one zone-masked when zone sources are given
     (face_dmd_ring.npy rims -> ellipse + margin_px, DMD mask .npy files, a camera band
     mapped by a both-axes field.npz) -> output/flashpacks/<ts>_<label>/.
-    A human loads it and plays it in the 4500 MKII GUI (docs/FLASH_FASTSCAN_4500.md)."""
+    A human loads it and plays it in the 4500 MKII GUI (docs/FLASH_FASTSCAN_4500.md).
+    period_us (default 10000) / pattern_exposure_us / trigger_mode 'freerun' (soft sync) |
+    'trigout' | 'external' (hardware trigger, docs/TRIGGER_FULLSPEED_TEST.md); infeasible
+    timing is refused (TimingError)."""
     import sys as _sys
     root = str(Path(__file__).resolve().parents[1])
     if root not in _sys.path:
         _sys.path.insert(0, root)
-    from tools.make_flash_pack import make_fastscan_pack as _make
+    from tools.make_flash_pack import make_fastscan_pack as _make, FASTSCAN_PERIOD_US, \
+        FASTSCAN_CAMERA_EXPOSURE_US
     s = _engine()
-    return _make(zone_rings=tuple(zone_rings or ()), zone_masks=tuple(zone_masks or ()),
+    return _make(period_us=int(period_us or FASTSCAN_PERIOD_US), trigger_mode=trigger_mode,
+                 pattern_exposure_us=pattern_exposure_us,
+                 camera_exposure_us=int(camera_exposure_us or FASTSCAN_CAMERA_EXPOSURE_US),zone_rings=tuple(zone_rings or ()), zone_masks=tuple(zone_masks or ()),
                  band_cam=band_cam, band_field=band_field, margin_px=int(margin_px),
                  calibration=calibration, study=bool(study), label=label,
                  library=s.store.root,
@@ -1005,6 +1019,41 @@ def fast_scan_flash(pack: Optional[str] = None, variant: Optional[str] = None,
                                       roi, loops, exposure_us, fps, gain_db, method,
                                       bool(keep_recording), bool(dry_run),
                                       fine_prefilter_px=fine_prefilter_px)
+
+
+@_verb
+def trigger_test(line: str = "Line0", seconds: float = 5.0,
+                 expect_period_ms: Optional[float] = None, exposure_us: float = 1000.0,
+                 preset: Optional[Preset] = None) -> dict:
+    """EXPERIMENTAL hardware-trigger check, camera only (the projector is untouched: a
+    HUMAN plays the pattern sequence with TRIG_OUT_1 in the 4500 MKII GUI). The camera
+    is put in hardware trigger on `line` (FrameStart, RisingEdge, short exposure),
+    triggered frames are counted for `seconds` (timeouts count zero) -> count, rate,
+    period mean / std / min / max from camera timestamps, missed pulses vs
+    expect_period_ms and the verdict NO PULSES | RATE MISMATCH | OK. TriggerMode is
+    set back to Off at the end, always (docs/TRIGGER_FULLSPEED_TEST.md)."""
+    from .reconstruct import trigger_scan
+    return trigger_scan.trigger_test(_engine(), _preset(preset), line, float(seconds),
+                                     expect_period_ms, float(exposure_us))
+
+
+@_verb
+def scan_trigger(pack: str, variant: Optional[str] = None, label: str = "trigger",
+                 preset: Optional[Preset] = None, line: str = "Line0", repeats: int = 1,
+                 exposure_us: Optional[float] = None, acknowledge: Optional[str] = None,
+                 first_timeout_s: float = 30.0) -> dict:
+    """EXPERIMENTAL hardware-triggered metric scan of a flash pack (the 8-bit hybrid pack
+    or the 1-bit --fastscan pack): TRIG_OUT_1 -> camera `line`, exactly one full frame
+    per pattern, `repeats` loops (missing / extra frames, spacing +-50 % and the first
+    trigger checked), aligned (1-bit: the sync markers; 8-bit: trigger order), decoded
+    by the existing decoders -> 'plane' triangulation -> a metric scan (meta mode
+    'flash_trigger', capture timing). Refused (PatternModeRefused) unless acknowledge
+    == patternmode.ACK_PHRASE: a HUMAN put the projector in pattern mode. Rule 6 before
+    the camera; the projector is never touched (docs/TRIGGER_FULLSPEED_TEST.md)."""
+    from .reconstruct import trigger_scan
+    return trigger_scan.scan_trigger(_engine(), _preset(preset), pack, variant, label, line,
+                                     int(repeats), exposure_us, acknowledge,
+                                     first_timeout_s=float(first_timeout_s))
 
 
 @_verb

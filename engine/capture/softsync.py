@@ -349,7 +349,10 @@ def fastscan_manifest_problems(manifest: dict, variant: Optional[str] = None) ->
         out.append("timing has no pattern_exposure_us / pattern_period_us")
     else:
         out += [f"timing: {e}" for e in _dlp_1bit_errors(float(X), float(P))]
-    if t.get("trigger", "internal") != "internal" or t.get("repeat", True) is not True:
+    trig = t.get("trigger", "internal")
+    hw_external = (t.get("hardware_trigger") or {}).get("mode") == "external"
+    if (trig != "internal" and not (trig == "external" and hw_external)) \
+            or t.get("repeat", True) is not True:
         out.append(f"timing: trigger {t.get('trigger')!r}, repeat {t.get('repeat')!r} (the loop "
                    "plays on the internal timer, on repeat)")
     variants = _pack_variants(manifest)

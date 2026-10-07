@@ -33,6 +33,7 @@ from engine.capture.mock_stereo import EndFace, MetricCylinder
 from engine.measure.endface import golden as golden_mod
 from engine.measure.endface import locate as locate_mod
 from engine.measure.endface import mfcfar
+from engine.measure.endface import verbs as face_verbs
 from engine.reconstruct import mesh as mesh_mod
 
 DENT = {"depth_mm": 0.3, "size_mm": 3.0, "u_mm": 3.0, "v_mm": -4.0}
@@ -660,6 +661,65 @@ def test_targeted_face_scan_then_profile(mock_face):
                                                             {"kind": "flood", "level": 0}]
     assert np.load(fs1.path / "polar_frames_r1.npy").shape[0] == 2
     assert api.face_profile(fs1).stats["flood_pair"]
+
+
+def test_tilephase_face_scan_matches_multifreq_with_half_the_frames(mock_face):
+    """mode tilephase (experimental): 36 depth frames vs 74, the same projector coordinates
+    on the face (no fringe-order error) and the same heights within noise."""
+    p = _m(mock_face)
+    fa = api.targeted_face_scan(None, p, "mf_ref", repeats=1, duty=0.7, polar=False)
+    fb = api.targeted_face_scan(None, p, "tp", repeats=1, duty=0.7, polar=False, mode="tilephase")
+    assert fa.meta["depth_frames"] == 74 and fb.meta["depth_frames"] == 36
+    assert fb.meta["depth_set"]["basis"] == "tilephase" and fb.meta["depth_set"]["experimental"]
+    ms = {m.id: m for m in api.list_library("metric")}
+    A, B = ms[fa.metric_scan_ids[0]], ms[fb.metric_scan_ids[0]]
+    assert B.meta["depth_mode"] == "tilephase"
+    full, _, _ = face_verbs.face_cam_mask(mock_face["face"])
+    for ax in ("corr_x", "corr_y"):
+        a, b = getattr(A.field, ax), getattr(B.field, ax)
+        both = full & np.isfinite(a) & np.isfinite(b)
+        assert both.sum() > 0.9 * full.sum()
+        dd = np.abs(b - a)[both]
+        assert np.mean(dd > 4.0) == 0.0                       # no fringe-order error
+        assert np.median(dd) < 0.1, (ax, np.median(dd))
+    za = np.where(A.cloud.mask & full, A.cloud.xyz[..., 2], np.nan)
+    zb = np.where(B.cloud.mask & full, B.cloud.xyz[..., 2], np.nan)
+    assert np.nanmedian(np.abs(zb - za)) < 0.05               # mm
+    assert api.face_profile(fb).stats["flatness_rms_mm"] < 0.06
+    # a face bigger than the code's unique window is refused before the rig
+    with pytest.raises(ValueError, match="unique window"):
+        api.targeted_face_scan(None, p, "tp3", repeats=1, mode="tilephase", code_bits=3)
+    with pytest.raises(ValueError, match="mode"):
+        api.targeted_face_scan(None, p, "x", repeats=1, mode="nope")
+
+
+def test_tilephase_decode_offline_blur_noise_inverted():
+    """The tile+phase decode on a synthetic camera = the DMD itself (identity map) with blur,
+    noise and the inverted HDMI path: 0 order errors, sub-0.1 px median error."""
+    import cv2
+    from engine.bases.tilephase import TilePhaseBasis
+    b = TilePhaseBasis((456.0, 570.0))
+    pats = b.generate()
+    assert len(pats) == b.n_frames() == 36
+    rng = np.random.default_rng(0)
+    y0, y1, x0, x1 = 520, 620, 410, 500                       # inside the 128 px window
+    lit = np.zeros(pats[0].shape, bool)
+    lit[y0:y1, x0:x1] = True
+    frames = []
+    for pt in pats:
+        img = cv2.GaussianBlur((255.0 - pt).astype(np.float32), (0, 0), 0.8)   # inverted path
+        img = np.where(lit, 20 + 0.7 * img, 3.0) + rng.normal(0, 1.0, img.shape)
+        frames.append(img.astype(np.float32))
+    f = b.decode(frames, "g")
+    tx = b._coord("x", pats[0].shape)[y0 + 4:y1 - 4, x0 + 4:x1 - 4]
+    ty = b._coord("y", pats[0].shape)[y0 + 4:y1 - 4, x0 + 4:x1 - 4]
+    ex = f.corr_x[y0 + 4:y1 - 4, x0 + 4:x1 - 4] - tx
+    ey = f.corr_y[y0 + 4:y1 - 4, x0 + 4:x1 - 4] - ty
+    assert f.meta["polarity_flipped"]
+    assert np.isfinite(ex).mean() > 0.99 and np.isfinite(ey).mean() > 0.99
+    assert np.nanmax(np.abs(ex)) < 1.0 and np.nanmax(np.abs(ey)) < 1.0      # no order error
+    assert np.nanmedian(np.abs(ex)) < 0.1 and np.nanmedian(np.abs(ey)) < 0.1
+    assert not np.isfinite(f.corr_x[~lit]).any()
 
 
 def test_face_verbs_refuse_before_the_rig(mock_face, monkeypatch):

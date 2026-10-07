@@ -1464,7 +1464,8 @@ def auto_intensity(face=None, preset: Optional[Preset] = None, target_dn: float 
 def targeted_face_scan(face=None, preset: Optional[Preset] = None, label: str = "face",
                        repeats: int = 3, margin_dmd_px: float = 6.0, polar: bool = True,
                        duty: Optional[float] = None, steps: Optional[int] = None,
-                       periods: Optional[list] = None, polar_steps: int = 8):
+                       periods: Optional[list] = None, polar_steps: int = 8,
+                       mode: str = "multifreq", code_bits: int = 5):
     """Targeted end-face scan: the DMD lights only the face ellipse (+ margin_dmd_px); per
     repeat the multifreq depth set (x + y) triangulated ray-plane (column axis; the calibration's
     row axis is not trusted) -> a metric scan, and (polar) concentric rings (0.08 / 0.25 rim
@@ -1472,11 +1473,17 @@ def targeted_face_scan(face=None, preset: Optional[Preset] = None, label: str = 
     detector's reflectance FIR needs it), saved as camera frames -> FaceScan in
     facescans/<geometry>/ naming its repeat metric scans. duty overrides
     projection.duty for this scan only (auto_intensity). Refused before the rig without a
-    stereo calibration (rule 6) or with a face target of another geometry (rule 5)."""
+    stereo calibration (rule 6) or with a face target of another geometry (rule 5).
+    mode='tilephase' (EXPERIMENTAL): the depth set is one fine phase level (steps, default 12, at
+    periods = [8] DMD px) + code_bits (5) Gray tile-code planes per axis: 36 frames instead of
+    74, about 2x faster. Limits: the fringe order is unique only inside a 2 ** (code_bits - 1)
+    x period DMD px window on the face (refused when the lit face does not fit), binary code
+    planes are more sensitive to blur, tilt and glints, only a two-code consistency check, and
+    motion during the code frames corrupts the order (engine/bases/tilephase.py)."""
     from .measure.endface import verbs as face_verbs
     return face_verbs.targeted_face_scan(_engine(), _preset(preset), face, label, int(repeats),
                                          float(margin_dmd_px), bool(polar), duty, steps, periods,
-                                         int(polar_steps))
+                                         int(polar_steps), mode=mode, code_bits=int(code_bits))
 
 
 @_verb

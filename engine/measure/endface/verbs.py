@@ -57,6 +57,7 @@ TARGET_DN = 200.0
 MIN_DUTY = 0.05
 SATURATED_DN = 254.0
 REPEAT_WARN_MM = 0.05
+DEPTH_MODES = ("multifreq", "tilephase")    # targeted_face_scan depth sets (tilephase: experimental)
 UNITS_FACE = {"centre_mm": "mm, camera frame (x right, y down, z forward)",
               "normal": "unit vector toward the camera", "camera": "camera px (full frame)",
               "dmd": "native DMD px (col, row)", "tilt_deg": "deg", "rim_rms_mm": "mm"}
@@ -575,9 +576,14 @@ def as_facescan(s, fs) -> FaceScan:
 def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int = 3,
                        margin_dmd_px: float = 6.0, polar: bool = True, duty: Optional[float] = None,
                        steps=None, periods=None, polar_steps: int = patterns.POLAR_STEPS,
-                       ring_periods=patterns.RING_PERIODS_R, spokes=patterns.SPOKES) -> FaceScan:
+                       ring_periods=patterns.RING_PERIODS_R, spokes=patterns.SPOKES,
+                       mode: str = "multifreq", code_bits: int = 5) -> FaceScan:
     """N repeats of: depth set (multifreq xy, ray-plane triangulation) + optional polar set,
-    lit only through the face ellipse (+ margin). Rule 6 before the rig."""
+    lit only through the face ellipse (+ margin). Rule 6 before the rig.
+    mode="tilephase" (EXPERIMENTAL, bases/tilephase.py): one fine phase level (steps, default
+    12, at periods[0], default 8 px) + code_bits Gray tile planes per axis instead of the
+    multifreq ladder (5 bits: 36 depth frames vs 74); refused when the lit face (+ margin) does
+    not fit the code's unique window (2 ** (code_bits - 1) x period DMD px per axis)."""
     from ...calibrate import flow, stereo
     from ...reconstruct import metric_scan
     from ...reconstruct.triangulate import triangulate
@@ -599,10 +605,30 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
         warnings.append(f"face target {t.id} was located under stereo calibration {t.calibration_id}; "
                         f"the current one is {cal.id} (the camera mask and DMD ring are px, still "
                         "valid if the rig did not move)")
-    basis = flow.multifreq_basis(p, cal.diamond_parity, steps, periods)
+    if mode not in DEPTH_MODES:
+        raise ValueError(f"mode must be one of {list(DEPTH_MODES)}, got {mode!r}")
+    mask = patterns.face_mask(t.dmd_ellipse, margin_dmd_px)
+    if mode == "tilephase":
+        from ...bases.tilephase import DEFAULT_PERIOD, DEFAULT_STEPS, TilePhaseBasis
+        if periods is not None and len(list(periods)) != 1:
+            raise ValueError("mode tilephase takes one period (the fine fringe), e.g. [8]")
+        basis = TilePhaseBasis((t.dmd_ellipse["cx"], t.dmd_ellipse["cy"]),
+                               steps if steps is not None else DEFAULT_STEPS,
+                               float(list(periods)[0]) if periods is not None else DEFAULT_PERIOD,
+                               code_bits, cal.diamond_parity)
+        why = basis.fits(mask)
+        if why:
+            raise ValueError(f"tilephase: {why}")
+        set_meta = {"basis": "tilephase", "axis": "xy", "steps": basis.steps,
+                    "periods_px": [basis.T], "code_bits_per_axis": basis.bits,
+                    "window_px": basis.window_px, "diamond_parity": cal.diamond_parity,
+                    "experimental": True}
+    else:
+        basis = flow.multifreq_basis(p, cal.diamond_parity, steps, periods)
+        set_meta = {"basis": "multifreq", "axis": "xy", "steps": basis.steps,
+                    "periods_px": basis.periods, "diamond_parity": cal.diamond_parity}
     depth_pats = basis.generate()
     nb = len(depth_pats)
-    mask = patterns.face_mask(t.dmd_ellipse, margin_dmd_px)
     off = patterns.off_dmd_pct(t.dmd_ellipse)
     if off > 0.5:
         warnings.append(f"{off:.0f}% of the face maps outside the DMD: that part is never lit "
@@ -632,7 +658,8 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
             lab = f"{label}_r{k + 1}"
             fld.meta.update({"preset": p.name, "label": lab, "mock": s.mock})
             ms = metric_scan._save(s, fld, cloud, lab, cal, fp, p.name,
-                                   {"capture_s": cap, "steps": basis.steps, "periods_px": basis.periods,
+                                   {"capture_s": cap, "steps": basis.steps,
+                                    "periods_px": set_meta["periods_px"], "depth_mode": mode,
                                     "diamond_parity": cal.diamond_parity, "zone": "custom:face_ellipse",
                                     "targeted": True, "face_target": t.id, "facescan": d.name,
                                     "repeat": k + 1, "duty": p.projection.duty})
@@ -657,8 +684,7 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
                 "invert": p.projection.invert, "exposure_us": p.camera.exposure_us,
                 "average": p.camera.average, "margin_dmd_px": float(margin_dmd_px),
                 "dmd_ellipse": t.dmd_ellipse, "method": "plane",
-                "depth_set": {"basis": "multifreq", "axis": "xy", "steps": basis.steps,
-                              "periods_px": basis.periods, "diamond_parity": cal.diamond_parity},
+                "depth_set": set_meta, "depth_frames": nb,
                 "polar": bool(polar), "polar_patterns": specs, "crop_x0y0x1y1": list(box),
                 "metric_scans": ids, "repeats": reps, "mock": s.mock,
                 "note": "polar coords: R = 1 at the face rim (the DMD face ellipse normalised); "

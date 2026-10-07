@@ -2046,9 +2046,11 @@ def cmd_face_scan(ctx):
         ctx.say(f"auto intensity: duty {duty:g} (face p99 {r['p99_dn']:.0f} DN)")
         ctx.warn(r.get("warnings"))
     fs = api.targeted_face_scan(face, p, a.label, a.repeats, a.margin, not a.no_polar, duty,
-                                a.steps, _periods(a.periods), a.polar_steps)
+                                a.steps, _periods(a.periods), a.polar_steps, mode=a.mode,
+                                code_bits=a.code_bits)
     ctx.say(f"Face scan {fs.id} (face {fs.face_id}, {len(fs.metric_scan_ids)} repeat(s), polar "
-            f"{'yes' if fs.polar else 'no'}, duty {fs.meta.get('duty'):g})")
+            f"{'yes' if fs.polar else 'no'}, duty {fs.meta.get('duty'):g}, depth set "
+            f"{a.mode}: {fs.meta.get('depth_frames')} frames)")
     ctx.table(["repeat", "metric scan", "face decoded", "capture"],
               [[i + 1, r["metric_scan"], _u(r["face_decoded_pct"], "%", 1), _u(r["capture_s"], "s", 1)]
                for i, r in enumerate(fs.repeats)])
@@ -3473,7 +3475,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--auto-intensity", dest="auto_intensity", action="store_true",
                    help="run face-intensity first and scan at its duty")
     p.add_argument("--steps", type=_positive_int, help="depth-set phase steps (default 12)")
-    p.add_argument("--periods", help="depth-set T,T,T DMD px")
+    p.add_argument("--periods", help="depth-set T,T,T DMD px (tilephase: one T, default 8)")
+    p.add_argument("--mode", choices=("multifreq", "tilephase"), default="multifreq",
+                   help="depth set: multifreq (default; 3 phase levels, 74 frames) or tilephase "
+                        "(EXPERIMENTAL: 1 phase level + Gray tile code, 36 frames, ~2x faster; the "
+                        "order is unique only in a 2^(bits-1) x 8 px window on the face, more "
+                        "sensitive to blur / tilt / glints / motion, weaker consistency check)")
+    p.add_argument("--code-bits", dest="code_bits", type=_positive_int, default=5,
+                   help="tilephase: Gray code planes per axis (5 = a 128 DMD px window)")
     p = cmd("face-profile", cmd_face_profile, "face height map, radial profile, sections, "
                                               "flatness, repeatability (+ PNG, CSV, STL)",
             "the face profile")

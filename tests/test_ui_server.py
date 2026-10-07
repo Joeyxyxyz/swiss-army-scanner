@@ -175,13 +175,18 @@ def test_every_response_forbids_framing(ui):
 
 def test_every_engine_verb_is_exposed():
     """The VERBS whitelist is 'every engine.api verb except configure /
-    mock_bench' (bank_remove was once missing, so a wrong bank member could
-    only be fixed by trashing the whole bank)."""
+    mock_bench and the CLI-only hardware-trigger / raw-pattern verbs'
+    (bank_remove was once missing, so a wrong bank member could only be
+    fixed by trashing the whole bank). trigger_test / scan_trigger need the
+    projector put in pattern mode by a human first, and project_capture
+    projects arbitrary images: they stay off the web UI / agent surface."""
     verbs = {n for n, f in vars(api).items()
              if not n.startswith("_") and callable(f) and getattr(f, "__wrapped__", None)
              and getattr(f, "__module__", "") == api.__name__}
     assert "bank_remove" in verbs and "list_library" in verbs
-    missing = verbs - set(ui_server.VERBS) - {"configure", "mock_bench"}
+    cli_only = {"trigger_test", "scan_trigger", "project_capture"}
+    missing = verbs - set(ui_server.VERBS) - {"configure", "mock_bench"} - cli_only
+    assert not cli_only & set(ui_server.VERBS)
     assert not missing, f"engine verbs not exposed to the web UI / agents: {sorted(missing)}"
     assert set(ui_server.RIG_FREE_VERBS) <= set(ui_server.VERBS)
     for v in ("capture_base", "capture_object", "check_signal", "project_grid", "load_preset",

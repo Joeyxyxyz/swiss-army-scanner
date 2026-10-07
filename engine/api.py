@@ -559,6 +559,77 @@ def read_codes(preset: Optional[Preset] = None, label: str = "codes",
     return reading
 
 
+PROJECT_CAPTURE_MAX = 256
+
+
+def _custom_patterns(patterns) -> list:
+    """Validate user DMD images: (1140, 912) or (1140, 912, 3) uint8, 1..PROJECT_CAPTURE_MAX."""
+    if isinstance(patterns, np.ndarray):
+        # one image (H, W) / (H, W, 3), or a stack (N, H, W) / (N, H, W, 3)
+        one = patterns.ndim == 2 or (patterns.ndim == 3 and patterns.shape[-1] == 3)
+        pats = [patterns] if one else list(patterns)
+    else:
+        pats = list(patterns)
+    if not 1 <= len(pats) <= PROJECT_CAPTURE_MAX:
+        raise ValueError(f"project_capture takes 1..{PROJECT_CAPTURE_MAX} patterns, got {len(pats)}")
+    out = []
+    for i, p in enumerate(pats):
+        a = np.asarray(p)
+        if a.dtype != np.uint8:
+            raise ValueError(f"pattern {i}: dtype must be uint8, got {a.dtype}")
+        if a.shape not in ((1140, 912), (1140, 912, 3)):
+            raise ValueError(f"pattern {i}: shape must be (1140, 912) or (1140, 912, 3) "
+                             f"(DMD rows x cols), got {a.shape}")
+        out.append(a)
+    return out
+
+
+@_verb
+def project_capture(patterns, preset: Optional[Preset] = None, label: str = "custom",
+                    raw: bool = False, average: Optional[int] = None,
+                    hold_s: Optional[float] = None) -> dict:
+    """Project your own DMD images and photograph each one: one camera frame per pattern, in
+    order, through the normal rig (HDMI window only, never USB; the rig lock; pumped holds).
+    patterns: a list / stack of (1140, 912) or (1140, 912, 3) uint8 images, at most 256.
+    raw=False sends them through the preset chain (duty, polarity, gamma) like a scan; raw=True
+    exactly as given. average / hold_s override camera.average / projection.min_hold_s for
+    this run only. Stores frames.npz (frames: (N, H, W) float32 camera DN, + the patterns) and
+    meta.json under library/readings/ -> {path, frames_npz, meta_json, n, capture_s}. No
+    decoding: what the frames mean is up to the caller."""
+    import time
+    from dataclasses import replace as _replace
+    from .library.store import safe_label
+    pats = _custom_patterns(patterns)
+    safe_label(label)
+    p = _preset(preset)
+    if average is not None:
+        if isinstance(average, bool) or int(average) != average or not 1 <= int(average) <= 64:
+            raise ValueError(f"average must be a whole number 1..64, got {average!r}")
+        p = _replace(p, camera=_replace(p.camera, average=int(average)))
+    if hold_s is not None:
+        if not 0 <= float(hold_s) <= 10:
+            raise ValueError(f"hold_s must be 0..10 s, got {hold_s!r}")
+        p = _replace(p, projection=_replace(p.projection, min_hold_s=float(hold_s)))
+    s = _engine()
+    rules.check_led_duration(p.projection.led, None, "a custom pattern capture")
+    t0 = time.perf_counter()
+    with s.rig(p) as sync:
+        frames = [np.asarray(sync.shoot(x, raw=bool(raw)), np.float32) for x in pats]
+    cap = round(time.perf_counter() - t0, 2)
+    d = s.store.new_dir("readings", label=label)
+    with s.store.filling(d):
+        same = len({x.shape for x in pats}) == 1
+        npz = s.store.write_npz(d / "frames.npz", frames=np.stack(frames),
+                                **({"patterns": np.stack(pats)} if same else {}))
+        meta = {"kind": "custom_capture", "label": label, "preset": p.name,
+                "geometry_id": p.geometry_id, "n": len(pats), "raw": bool(raw),
+                "average": p.camera.average, "min_hold_s": p.projection.min_hold_s,
+                "invert": p.projection.invert, "capture_s": cap, "mock": s.mock,
+                "units": {"frames": "camera DN (averaged), pattern order"}}
+        mj = s.store.write_json(d / "meta.json", meta)
+    return {"path": d, "frames_npz": npz, "meta_json": mj, "n": len(pats), "capture_s": cap}
+
+
 @_verb
 def inspect(scan: ObjectScan, n_sigma: float = 6.0, min_area_px: int = 50,
             bg_window: int = 121, whole_field: bool = False) -> Inspection:
@@ -1601,7 +1672,8 @@ def list_library(kind: str = "bases", geometry_id: Optional[str] = None) -> list
     if kind == "readings":
         out = []
         for d in s.store.entries("readings"):
-            out.append({"id": d.name, "path": d, **(_read_json(d / "codes.json") or {})})
+            out.append({"id": d.name, "path": d, **(_read_json(d / "codes.json") or {}),
+                        **(_read_json(d / "meta.json") or {})})
         return out
     if kind == "bases":
         return base_lib.list_bases(s.store, geometry_id)

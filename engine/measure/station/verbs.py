@@ -174,7 +174,9 @@ def _report(r: dict, ms: MetricScan, cal, geo, fp, prm, fsrc, label, warnings) -
             "params": prm.to_dict(), "cells": cells, "pairs": pairs,
             "frame": {"origin_mm": _r(fr["O"], 4), "n": _r(fr["n"], 6), "e1": _r(fr["e1"], 6),
                       "e2": _r(fr["e2"], 6)},
-            "ct": ct, "zones": zones, "units": UNITS, "mock": False, "warnings": warnings}
+            "ct": ct, "zones": zones, "set_aside": [{"camera_px": _r(x["camera_px"], 1),
+                                                     "why": x["why"]} for x in r.get("set_aside", [])],
+            "units": UNITS, "mock": False, "warnings": warnings}
 
 
 def _csv_measure(rep: dict) -> str:

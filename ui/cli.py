@@ -1079,6 +1079,41 @@ def cmd_grid(ctx):
         "then": [" ".join(h.split()[:4]) for h in howto]}}
 
 
+def _load_patterns(src: str) -> list:
+    """DMD images from an .npz (key 'patterns', else its first array) or a folder of PNGs
+    (sorted by name; grey stays one channel)."""
+    p = Path(src)
+    if p.is_dir():
+        import cv2
+        files = sorted(p.glob("*.png"))
+        if not files:
+            raise ValueError(f"no .png files in {p}")
+        out = []
+        for f in files:
+            img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise ValueError(f"could not read {f}")
+            out.append(img[..., :3] if img.ndim == 3 else img)
+        return out
+    if p.suffix.lower() == ".npz" and p.is_file():
+        with np.load(p) as z:
+            if not z.files:
+                raise ValueError(f"{p} holds no arrays")
+            return z["patterns" if "patterns" in z.files else z.files[0]]   # api splits a stack
+    raise ValueError(f"{src}: expected an .npz of patterns or a folder of .png files")
+
+
+def cmd_project_capture(ctx):
+    ctx.header()
+    a = ctx.args
+    # the global --average already sets camera.average on ctx.preset() for this run
+    r = api.project_capture(_load_patterns(a.patterns), ctx.preset(), a.label, a.raw,
+                            hold_s=a.hold)
+    ctx.say(f"Captured {r['n']} frames in {r['capture_s']} s")
+    ctx.kv([["frames", str(r["frames_npz"])], ["meta", str(r["meta_json"])]])
+    return EXIT_OK, {"project_capture": r}
+
+
 # ------------------------------------------------------------ virtual sensors
 
 def _pt(p, nd: int = 1) -> str:
@@ -2197,6 +2232,8 @@ def _station_params(a, band: str = "band", flag: str = "--band") -> dict:
               centre_method=a.centre)
     if a.no_ct:
         prm["ct"] = False
+    if getattr(a, "no_strict", False):
+        prm["strict"] = False
     return prm
 
 
@@ -2229,6 +2266,9 @@ def cmd_station(ctx):
     ctx.say(f"Station {m.label}: scan {m.scan_id}, {len(m.cells)} cells, "
             f"{sum(1 for z in m.zones if z.get('included'))} CT zones (flood: {m.flood_source})")
     _print_station(ctx, m)
+    for x in (m.meta or {}).get("set_aside") or []:
+        ctx.say(f"  set aside at camera px ({x['camera_px'][0]:.0f}, {x['camera_px'][1]:.0f}): "
+                f"{x['why']}")
     ctx.warn(m.warnings)
     return EXIT_OK, {"station": m}
 
@@ -3228,6 +3268,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spacing", type=_positive_int, default=96, help="cell size, DMD px")
     p.add_argument("--label", default="grid")
     p.add_argument("--hold", type=float, default=0.0, help="keep the grid up N s to look at it")
+    p = cmd("project-capture", cmd_project_capture, "project your own DMD images (1140 x 912 "
+                                                    "uint8, <= 256) and photograph each one",
+            "the custom pattern capture")
+    p.add_argument("patterns", help="an .npz (key 'patterns' or its first array) or a folder of "
+                                    "PNGs (name order)")
+    p.add_argument("--label", default="custom")
+    p.add_argument("--hold", type=float, metavar="S", help="HDMI hold per pattern (default: the "
+                                                           "preset's min_hold_s)")
+    p.add_argument("--raw", action="store_true", help="send the images as given (no duty / "
+                                                      "polarity / gamma chain)")
     p = cmd("maps", cmd_maps, "list projector maps; maps <scan> bakes the surface map stack")
     p.add_argument("id", nargs="?", help="scan id / label / latest: bake its surface maps")
     p.add_argument("--geometry", help="only this geometry id (listing)")
@@ -3509,6 +3559,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--centre", choices=("rim_circle", "ellipse_ray"),
                    help="face centre method (default rim_circle)")
     p.add_argument("--no-ct", dest="no_ct", action="store_true", help="cells only")
+    p.add_argument("--no-strict", dest="no_strict", action="store_true",
+                   help="drop the strict cell gates (rim outline rms <= 1.0 mm, >= 70 %% of the "
+                        "disc measured, a plausible height / spacing to the other cells)")
     p = cmd("station-golden", cmd_station_golden, "station golden from GOOD measurements (metric "
                                                   "scans or station .json) + limits", "station golden")
     p.add_argument("items", nargs="+", help="metric scans (id / label) or station .json files")

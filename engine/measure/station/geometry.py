@@ -85,6 +85,14 @@ class StationParams:
     zone_max_fit_rms_mm: Optional[float] = None  # set: zones whose edge misfits the wave by more are out
     zone_skip: list = field(default_factory=lambda: [0, 0])   # drop zones at the (left, right) end
     zone_min_px: int = 20
+    # quality gates against a background patch taken for a cell (a deep scene: a bright disc on
+    # the wall behind can pass the flat / proud checks above); strict=False keeps only those
+    strict: bool = True
+    max_outline_rms_mm: float = 1.0     # flood rim circle rms on the face plane (good faces ~0.2-0.7)
+    strict_min_coverage: float = 0.7    # measured fraction of the disc
+    max_pair_dz_diam: float = 2.0       # |height difference| to an accepted face, x diameter
+    max_pair_spacing_diam: float = 6.0  # 3D centre spacing to an accepted face, x diameter
+    min_pair_spacing_diam: float = 0.9  # ... and at least this (two faces cannot overlap)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -132,6 +140,15 @@ class StationParams:
             raise ValueError("ct_band_halfwidth_mm must be > 0")
         if not 0 < p.zone_min_coverage <= 1:
             raise ValueError("zone_min_coverage must be in (0, 1]")
+        if not 0 < p.strict_min_coverage <= 1:
+            raise ValueError("strict_min_coverage must be in (0, 1]")
+        for k in ("max_outline_rms_mm", "max_pair_dz_diam", "max_pair_spacing_diam",
+                  "min_pair_spacing_diam"):
+            v = getattr(p, k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not np.isfinite(v) or v < 0:
+                raise ValueError(f"{k} must be a number >= 0, got {v!r}")
+        if p.min_pair_spacing_diam >= p.max_pair_spacing_diam:
+            raise ValueError("min_pair_spacing_diam must be < max_pair_spacing_diam")
         return p
 
 
@@ -469,6 +486,31 @@ def surround_same_frac(X: np.ndarray, cell: dict, f: dict, band=(1.2, 1.6),
     return float(np.sum(np.isfinite(h) & (np.abs(h) < tol_mm)) / ring.sum())
 
 
+def strict_gate(f: dict, others: list, prm: StationParams) -> str:
+    """'' when the fitted face f passes the strict quality gates, else every reason (joined):
+    its flood outline is ragged, too little of it is measured, or it sits implausibly far
+    (height along the accepted face's normal, or 3D spacing) from a face already accepted."""
+    why = []
+    rms = (f.get("outline") or {}).get("rms_mm")
+    if rms is not None and rms > prm.max_outline_rms_mm:
+        why.append(f"ragged outline (rim circle rms {rms:.2f} mm > {prm.max_outline_rms_mm:g})")
+    if f["coverage"] < prm.strict_min_coverage:
+        why.append(f"only {100 * f['coverage']:.0f} % of the disc measured "
+                   f"(< {100 * prm.strict_min_coverage:.0f} %)")
+    D = prm.face_diameter_mm
+    for o in others:
+        dv = f["centre"] - o["centre"]
+        dz = float(dv @ o["normal"])
+        sp = float(np.linalg.norm(dv))
+        if abs(dz) > prm.max_pair_dz_diam * D:
+            why.append(f"{dz:+.1f} mm in height from an accepted face (> {prm.max_pair_dz_diam:g} "
+                       "x the diameter: background?)")
+        elif not prm.min_pair_spacing_diam * D <= sp <= prm.max_pair_spacing_diam * D:
+            why.append(f"{sp:.1f} mm from an accepted face (plausible {prm.min_pair_spacing_diam:g}"
+                       f"..{prm.max_pair_spacing_diam:g} x the diameter)")
+    return "; ".join(why)
+
+
 def common_frame(faces: list) -> tuple:
     """(O, n, e1, e2): n = normalised sum of the face normals, O = mean face centre."""
     n = np.sum([f["normal"] for f in faces], axis=0)
@@ -786,7 +828,7 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
     if X.shape[:2] != flood_d.shape:
         raise StationError(f"flood {flood_d.shape} and scan {X.shape[:2]} differ in size")
     r_exp = expected_radius_px(X, K, prm.face_diameter_mm / 2)
-    fits = {}
+    fits, accepted = {}, []
 
     def validate(c):
         if r_exp and abs(c["r_px"] - r_exp) > 0.25 * r_exp:
@@ -804,7 +846,12 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
         if same > prm.max_surround_same_frac:
             return False, (f"not a proud face: {100 * same:.0f} % of its surround continues its "
                            "plane (a flat patch of a larger surface)")
+        if prm.strict:
+            why = strict_gate(f, [fits[k] for k in accepted], prm)
+            if why:
+                return False, why
         f["surround_same_frac"] = same
+        accepted.append(id(c))
         fits[id(c)] = f
         return True, "ok"
 
@@ -840,7 +887,9 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
                         f"{rejected[0]['why']})")
     out = {"cells": cells, "faces": faces, "names": names, "frame": {"O": O, "n": n, "e1": e1, "e2": e2},
            "pairs": pairs, "r_expected_px": r_exp, "warnings": warnings, "ct": None,
-           "zones": [], "arrays": {}, "rejected_discs": rejected}
+           "zones": [], "arrays": {}, "rejected_discs": rejected,
+           "set_aside": [{"camera_px": [float(x["hough_px"][0]), float(x["hough_px"][1])],
+                          "why": x["why"]} for x in rejected]}
     if not prm.ct or len(faces) < 1:
         return out
     ct = ct_mask(X, cells, faces, O, n, prm)

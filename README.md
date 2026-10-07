@@ -138,6 +138,7 @@ Recalibrate after any zoom / focus / mount change. Mock: `scan.bat --mock calibr
 | Codes | `read_codes` | QR/1D/Data Matrix (OpenCV + zxing-cpp, every decoder on the raw, CLAHE and 2× CLAHE image) under bracketed brightness and **red**/green/blue/white light; one entry per symbology + data (`EAN_13` = `EAN13`), and an EAN-13 starting with 0 is reported as the 12-digit UPC-A printed on the label (`raw` keeps the EAN-13). Needs about 2.5–3 camera px per module. Exit 0 when a code is found, 1 when none. **Experimental:** `codes --anti-glare [--strip-cols C0,C1]` for a glossy label with a saturated specular stripe: many-level flood bracket → HDR (unsaturated samples, frames ordered by measured brightness), optional narrow DMD column-strip sweep (each pixel keeps its own strip's energy: no bloom), de-veil (local min/max envelope, ~9 × 3 px: gloss is an additive offset) → the normal decoder (`engine/sense/antiglare.py`). Mock-tested on synthetic glare; one bench trial. |
 | Spectral | `spectral_capture`, `learn_material`, `classify`, `separate_light` | R/G/B LED reflectance signatures → material map. Direct vs global light from shifted checkerboards. |
 | Grid & zones | `capture_map`, `project_grid`, `project_zones` | A lettered grid (A1, B2, …) photographed with upright labels. Say "H8:I11@96" to light and scan just those cells. Custom machine-vision zones. |
+| Custom patterns | `project_capture` | Your own DMD images (1140 × 912 uint8, grey or 3-channel, at most 256) projected one by one through the normal rig (HDMI window only, never USB; the rig lock; pumped holds) and photographed in order. `raw=True` sends them as given (no duty / polarity / gamma chain); `average` / `hold_s` override the preset for this run only. `frames.npz` (+ the patterns) and `meta.json` under `library/readings/`; no decoding. CLI `project-capture <npz | folder of PNGs> --label L [--average N] [--hold S] [--raw]`. |
 | Sensors | `spot_size`, `project_spot`, `teach_presence`, `check_presence`, `teach_alignment`, `check_alignment` | A laser-spot-sensor-style spot of a chosen **diameter in mm** (nominal or your **measured** mm/mirror). **Part present** (photoelectric, or background suppression by triangulation). **Alignment** (dx/dy/dθ vs a taught pose). |
 | Cell & 3D | `export_mesh`, `cell_unwrap`, `cell_dents`, `bake_maps`, `checker_scan` | STL/OBJ (relief, base, open-arc cylinder), cell/tube unwrap → dent map + cell height, surface-map stack (cavity, normal, albedo, subsurface, dust). |
 | Surfer + fast mode | `import_atlas`, `flood_verify`, `anti_glare_sweep`, `multi_orientation_scan`, `make_flash_pack` | Atlas regions as zones (`atlas:cell/cell`), flood-verify with a black surround, glare-dodging patterns, H/V/diagonal fusion; flash pattern packs for the triggered fast path (`docs/FLASH_PATTERN_MODE.md`). |
@@ -316,6 +317,10 @@ The full suite takes about 35 min. It is mock only, apart from tests that assert
 | HDMI fast zone scan, station measurement (cells + cooling tube: heights, spacing, zones T1..Tn, golden, check) | ✅ built; synthetic + mock tests; reproduced offline on the saved bench station scans (`engine/measure/station/`); `scan-fast` and `station` run on the rig through the engine |
 
 The engine verbs (`api.*`, the `scan` CLI, the web UI) are the only supported path to the hardware.
+
+## Acknowledgements
+
+Developed by Joey Messina with AI collaborators Claude (Anthropic) and Grok (xAI). Grok contributed pattern/grid methods (including the tile+phase fast scan), bug reports and independent testing.
 
 ## License
 

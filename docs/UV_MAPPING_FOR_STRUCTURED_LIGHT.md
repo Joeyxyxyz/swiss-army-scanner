@@ -20,23 +20,23 @@ So most game-texturing concepts have a direct structured-light meaning:
 | **Checker texture to test distortion** | project a checker, measure how cells stretch in the camera: the local Jacobian of the UV map | local magnification, surface slope/normal, focus, and a lens-distortion check, all from one image |
 | Texel density | mm per DMD pixel on the surface (varies with distance and tilt) | the true sampling resolution per region; tells you where sub-mm is achievable |
 | **Seams** | where the map breaks: shadows, occlusion, depth edges, the ±24 px unwrap jumps | put "cuts" where the camera can't see anyway; explicit seam masks instead of noisy edges |
-| **Planar / cylindrical / spherical mapping** | fit a primitive to the part, and parameterize its surface | **unwrap a cell can into a flat (θ, z) image**, see below |
-| UV islands, no overlap | per-face or per-zone patches | box faces, cell side vs top cap, grid zones |
+| **Planar / cylindrical / spherical mapping** | fit a primitive to the part, and parameterize its surface | **unwrap a cylindrical can into a flat (θ, z) image**, see below |
+| UV islands, no overlap | per-face or per-zone patches | box faces, cylinder side vs top cap, grid zones |
 | UDIM / multi-tile | several tiles per object | several zones or views of one part, each its own tile, stitched |
 | Ptex (per-face, no unwrap) | per-zone data with no global parameterization | today's zone scans are effectively Ptex |
 | Baked maps (cavity, density, dust, subsurface) | derived per-pixel maps | a per-part "material stack" for inspection, see below |
 
-## 1. Cylindrical unwrap for cells (serves cell height and dent)
+## 1. Cylindrical unwrap for cylinders (serves end-face height and dent)
 
-A cylindrical cell is exactly the "cylindrical mapping (arms, legs)" case:
-1. Fit a cylinder (axis, radius) to the cell's relief / point cloud.
+A cylindrical part is exactly the "cylindrical mapping (arms, legs)" case:
+1. Fit a cylinder (axis, radius) to the part's relief / point cloud.
 2. Give each point coordinates **θ** (angle around the axis) and **z** (along the axis), and store the **radial deviation** r − R.
 3. The result is a flat **dent map**: an image in (θ, z) where the healthy can is flat zero, and a dent is a dark blob whose depth is the pixel value.
 
 **Why it helps:**
-- **Placement-invariant.** A cell rotated or shifted in the fixture unwraps to the same image, only shifted in θ. That makes the good-memory bank and golden compare work on cells without a jig to the pixel.
-- **Constant texel density.** Each unwrapped pixel is a fixed arc length × height, so dent area and depth mean the same thing everywhere. The raw camera view foreshortens toward the cell's silhouette.
-- **Cell height falls out.** It's the z-extent of the valid band, or the step between the top cap and the tray in the same fit, measured along the true axis rather than the camera's.
+- **Placement-invariant.** A cylinder rotated or shifted in the fixture unwraps to the same image, only shifted in θ. That makes the good-memory bank and golden compare work on cylinders without a jig to the pixel.
+- **Constant texel density.** Each unwrapped pixel is a fixed arc length × height, so dent area and depth mean the same thing everywhere. The raw camera view foreshortens toward the cylinder's silhouette.
+- **End-face height falls out.** It's the z-extent of the valid band, or the step between the top cap and the tray in the same fit, measured along the true axis rather than the camera's.
 - **Seam placement.** Put the θ seam on the side the camera can't see (the limb/shadow side), just as games hide seams under arms.
 - **Dents become "cavity map" blobs**, so the existing `inspect` blob logic runs unchanged on the unwrapped image, with a much simpler background (a plane instead of a curved can).
 
@@ -62,7 +62,7 @@ Game engines bake several maps onto one UV layout. We can bake a stack per scan,
 
 | Map | From | Inspection meaning |
 |---|---|---|
-| Height / displacement | relief (calibrated) | geometry, cell height |
+| Height / displacement | relief (calibrated) | geometry, end-face height |
 | **Cavity** | curvature (Laplacian) of height | dents, pits and scratches pop out, regardless of overall shape |
 | Normal | height gradient | orientation, bulges, the checker Jacobian |
 | Albedo / colour | `spectral_capture` | labels, coatings, contamination |
@@ -82,12 +82,12 @@ Because the map is invertible, anything computed in UV/part space can be **paint
 
 This extends the grid/zone machinery that already works on the rig. It turns the scanner into an in-place AR display for the operator, or for Grok to "point" at things.
 
-## Suggested order (fits the stated priority: cell dent and cell height)
+## Suggested order (fits the stated priority: cylinder dent and end-face height)
 
-1. **Cylinder fit + (θ, z) unwrap + dent map + height from the unwrap**, prototyped on the mock bench (add a cylinder object to `MockBench`), then on a real cell.
+1. **Cylinder fit + (θ, z) unwrap + dent map + height from the unwrap**, prototyped on the mock bench (add a cylinder object to `MockBench`), then on a real cylinder.
 2. **Cavity map + existing `inspect` on the unwrapped image**, then the good-memory bank in UV space (placement-invariant).
 3. **Planar per-face unwrap**, reusing the case scans already in the library as test data.
 4. **Checkerboard basis**: local Jacobian/normal map, focus map, then stereo calibration.
 5. **Baked-map stack** and projecting results back onto the part.
 
-Items 1–3 need no rig time to develop: the mock bench plus stored scans are enough. They only need a real cell scan at the end.
+Items 1–3 need no rig time to develop: the mock bench plus stored scans are enough. They only need a real cylinder scan at the end.

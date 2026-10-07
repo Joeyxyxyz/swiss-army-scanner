@@ -328,7 +328,7 @@ already scanned against a base at geometry "wall ~2.6–2.8 ft" (gc_conf ~89,
 valid ~38%, relief range ≈ ±48 px). Use it as the first `known_dims`
 object: it seeds Z calibration (height) and lateral calibration (W, L),
 and `measure()` must reproduce ~107/56.5/21.9 within tolerance. If the
-engine can correctly dimension THIS, it can dimension cell cans.
+engine can correctly dimension THIS, it can dimension cylindrical cans.
 Caveats: 107 mm is tall for the current depth-of-field/focus — expect the
 top surface to be softer; prefer measuring W/L from the base footprint and
 Z from the well-resolved region. Add small known steps (0.5–5 mm) later for

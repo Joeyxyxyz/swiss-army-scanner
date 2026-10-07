@@ -14,15 +14,15 @@ The public verbs (§2) — the ONLY thing a UI, CLI or AI agent imports.
     api.list_library("objects")
     codes = api.read_codes()                 # barcode / QR under DMD illumination
     insp = api.inspect(obj)                  # defect blobs, mm verdict vs 0.7 mm trigger
-    ds   = api.capture_dent_set("H9:I12", "cell1", long_p, short_p)   # dents on a shiny cell
-    null = api.calibrate_dent_null([good_ds], 21.05)                  # known-good cell first
+    ds   = api.capture_dent_set("H9:I12", "part1", long_p, short_p)   # dents on a shiny cylinder
+    null = api.calibrate_dent_null([good_ds], 21.05)                  # known-good part first
     rep  = api.detect_dents(ds)                                         # the matching null
-    face = api.locate_face(locate_scan, 21.05)            # a cell's end face toward the camera
+    face = api.locate_face(locate_scan, 21.05)            # a cylinder's end face toward the camera
     fs   = api.targeted_face_scan(face, repeats=3)        # face-only lighting, N repeats
     chk  = api.check_face(api.face_profile(fs), golden)   # golden = face_golden([good ...])
     fast = api.fast_scan_flash(pack_dir, "zone")          # flash loop + free-run camera, ~0.3-0.5 s
     scan = api.scan_fast("F10:J12")                       # HDMI: columns only, avg 2, ~5 s
-    st   = api.station_measure(scan)                      # cells + cooling tube (CT) zones
+    st   = api.station_measure(scan)                      # parts + tube edge zones
     gold = api.station_golden([st], cell_height_tol_mm=0.15, ct_zone_tol_mm=0.3)
     chk  = api.station_check(api.scan_fast("F10:J12"))    # PASS / FAIL / INCOMPLETE
 
@@ -903,8 +903,8 @@ def export_mesh(scan, fmt: str = "stl", stride: int = 2, kind: str = "relief",
 
 @_verb
 def cell_unwrap(scan, radius_mm: Optional[float] = None, step: Optional[float] = None):
-    """Cylinder fit + (theta, z) unwrap of a standing cell / tube -> CellUnwrap
-    (open arc only, dent map, cell height); saves npz + heatmap preview."""
+    """Cylinder fit + (theta, z) unwrap of a standing cylinder / tube -> CellUnwrap
+    (open arc only, dent map, end-face height); saves npz + heatmap preview."""
     from .measure import cell as cell_mod
     s = _engine()
     u = cell_mod.unwrap_cell(scan, _scan_calibration(scan), radius_mm, step)
@@ -925,7 +925,7 @@ def cell_unwrap(scan, radius_mm: Optional[float] = None, step: Optional[float] =
 @_verb
 def cell_dents(scan, radius_mm: Optional[float] = None, n_sigma: float = 5.0,
                min_area_bins: int = 6, depth_trigger_mm: Optional[float] = None):
-    """Dents on the unwrapped cell; mm verdict vs the trigger (rule 6)."""
+    """Dents on the unwrapped cylinder; mm verdict vs the trigger (rule 6)."""
     from .measure import cell as cell_mod
     s = _engine()
     tol, tol_warn = _tolerance_for(scan)
@@ -1307,13 +1307,13 @@ def export_metric_mesh(scan, fmt: str = "stl", stride: int = 1,
     return p
 
 
-# ------------------------------------ dent detection (shiny cylindrical cells)
+# ------------------------------------ dent detection (shiny cylindrical parts)
 #
 # A dent set is ONE pose of a cell under two exposures (+ one metric scan of
 # the same zone). Four finders (pattern warp, photometric, HDR phase depth,
-# reflected-line kink) are calibrated on a KNOWN-GOOD cell of the same type in
+# reflected-line kink) are calibrated on a KNOWN-GOOD part of the same type in
 # the same fixture (calibrate_dent_null: the negative control) and fused by
-# detect_dents. Depth, size and the cell coordinates are mm only with the
+# detect_dents. Depth, size and the cylinder coordinates are mm only with the
 # stereo calibration the metric scans were made with (rule 6); detection
 # refuses without it. Legacy offline dent sets (a folder with dataset.json)
 # are accepted wherever a dent set is.
@@ -1325,7 +1325,7 @@ def capture_dent_set(zone: Optional[str] = None, label: str = "dentset",
                      metric: bool = True, metric_preset: Optional[Preset] = None,
                      steps: Optional[int] = None, periods: Optional[list] = None,
                      pattern_set: str = "production"):
-    """One pose of a cell for the dent detector: long pass (the dark preset, 66 667 us) with
+    """One pose of a cylinder for the dent detector: long pass (the dark preset, 66 667 us) with
     floods 255/0 + sin0 T12, sin0 T36, sin90 T12, sin90 T36 (8 steps each), short pass
     (16 667 us) with floods 0/128/255 + the same sinusoids (+ lines_v x10), one rig session
     each, then ONE metric scan of the same zone -> library/dentsets/<geometry>/.
@@ -1354,12 +1354,12 @@ def capture_dent_set(zone: Optional[str] = None, label: str = "dentset",
 def calibrate_dent_null(dentsets: list, cell_diameter_mm: float, label: str = "null",
                         metric_scans: Optional[list] = None, fixture: Optional[str] = None,
                         subset: str = "all") -> dict:
-    """Negative control: run the dent finders on dent set(s) of KNOWN-GOOD cells of one type
+    """Negative control: run the dent finders on dent set(s) of KNOWN-GOOD parts of one type
     in one fixture; each finder's maximum on the good face and the fused maximum are stored
     as a geometry-bound calibration (calibrations/<geometry>/<ts>_dentnull_<label>/), bound
-    to the cell diameter, the fixture (default: the dent sets' zone; a named fixture must
+    to the cylinder diameter, the fixture (default: the dent sets' zone; a named fixture must
     then be passed to detect_dents too), the pattern set and the stereo calibration. A
-    finder with no response on the good cell (e.g. no mirrored room line) is excluded, with
+    finder with no response on the good part (e.g. no mirrored room line) is excluded, with
     a warning. A dent set is a DentSet, a dentset id or a folder (legacy dataset.json
     accepted, then metric_scans names its metric scans). subset: all | production |
     production_nolines | minimal (the frames the finders use; detect_dents must use the
@@ -1374,13 +1374,13 @@ def detect_dents(dentset, metric_scans: Optional[list] = None,
                  cell_diameter_mm: Optional[float] = None, null_calibration=None,
                  label: Optional[str] = None, subset: str = "all",
                  fixture: Optional[str] = None):
-    """Dents / scratches on a cell -> DentReport: candidates with camera px, (theta, s) on the
-    cell, fused score (1.0 = the good cell's maximum), level (detection > 1.25, watch
+    """Dents / scratches on a cylinder -> DentReport: candidates with camera px, (theta, s) on the
+    cylinder, fused score (1.0 = the good part's maximum), level (detection > 1.25, watch
     0.8-1.25, edge), depth in mm (+ = pushed in, depth_reliable false in specular / dark-band
     zones, depth_significant above 1.5 x the scan's depth noise p90), size, per-finder
     evidence and kind (dent / scratch / speck); overlay PNG, json and maps ->
     output/defects. null_calibration defaults to the newest one matching the geometry, the
-    cell diameter (None: the matching nulls' one diameter), the fixture (default: the dent
+    cylinder diameter (None: the matching nulls' one diameter), the fixture (default: the dent
     set's zone), the pattern set and the current stereo calibration. Refused without the
     metric scans' stereo calibration, or with a null made under another one (rule 6)."""
     from .measure.dents import verbs as dent_verbs
@@ -1390,7 +1390,7 @@ def detect_dents(dentset, metric_scans: Optional[list] = None,
 
 # ------------------------------------------ end faces (a cylinder's circular end face)
 #
-# A cell lying with its END FACE toward the camera + projector (bench: 21.05 mm face ~795 mm
+# A cylinder lying with its END FACE toward the camera + projector (bench: 21.05 mm face ~795 mm
 # away, tilted 7-23 deg). locate_face finds the face in a metric scan (depth, the true rim
 # against far background, fixed-radius circle, camera -> DMD affine on the decoded face),
 # aim_ring / check_ring project its ring + cross (placement guide / check), auto_intensity
@@ -1410,7 +1410,7 @@ def locate_face(scan, face_diameter_mm: float = 21.05, label: str = "face", roi=
     face-shaped depth-continuous surface (nearer non-face objects are set aside); roi
     (x0, y0, x1, y1 camera px) narrows the search; params: LocateParams fields of
     engine.measure.endface.locate (near_band_mm 12, far_gap_mm 30, ...). A neighbour a few mm
-    behind the face (a cooling tube) merges with it in depth: then the face is split off by its
+    behind the face (a ribbed tube) merges with it in depth: then the face is split off by its
     robust plane (face_band_mm 1.0) and its rim is where surface lies near_gap_mm (2.0) behind
     that plane; if the depth rim test still fails, the face outline in `flood` (None = the
     scan's own flood pair, else its decode modulation; an array / file / another metric scan)
@@ -1521,7 +1521,7 @@ def face_golden(placements: list, label: str = "golden", k_sigma: float = 4.0,
     smooth_cells), floor_mm), rim zone r > rim_r_mm x rim_factor (min rim_min_mm), maps
     Gaussian-smoothed height_smooth_mm, triggers >= min_area_mm2. mf_params: other MF-CFAR
     settings (engine.measure.endface.mfcfar.MF_DEFAULTS). Records leave-one-out false triggers
-    of every detector and the synthetic-dent battery of the default one (synthetic: True, False
+    of every detector and the synthetic-dent set of the default one (synthetic: True, False
     or {depths_mm, widths_mm, positions, seed}; dents injected per camera pixel)."""
     from .measure.endface import verbs as face_verbs
     mf = dict(mf_params or {})
@@ -1591,18 +1591,18 @@ def scan_fast(zone=None, preset: Optional[Preset] = None, label: str = "fast", s
                                float(min_hold_s), axis, label, faces, float(margin_dmd_px))
 
 
-# ------------------------------------------------------------------ station (cells + cooling tube)
+# ------------------------------------------------------------------ station (cylinders + ribbed tube)
 @_verb
 def station_measure(scan, flood=None, label: Optional[str] = None, n_cells: int = 2,
                     face_diameter_mm: float = 21.05, params: Optional[dict] = None):
-    """Cells with their end faces toward the camera + the cooling tube (CT) between them, from
+    """Cylinders with their end faces toward the camera + a ribbed/serpentine tube between them, from
     one metric scan (mm; its stereo calibration must be current, rule 6) and a flood pair
     (flood: None = the scan's own (scan_fast keeps one; else the decode's fringe modulation,
     with a warning), a (2, H, W) [white, black] array, a .npy / .npz file, or another metric
-    scan's flood) -> StationMeasurement: cells C1..Cn (image order) with face centre, height
+    scan's flood) -> StationMeasurement: cylinders C1..Cn (image order) with face centre, height
     vs the mean face plane (mm, + toward the camera), flatness; pairs Cj-Ci: height difference
-    along the common face normal, spacing in the face plane; CT: edge height band (auto),
-    trapezoid wave (pitch, amplitude, phase vs the cell-pair centre), zones T1..Tn with the
+    along the common face normal, spacing in the face plane; tube: edge height band (auto),
+    trapezoid wave (pitch, amplitude, phase vs the cylinder-pair centre), zones T1..Tn with the
     edge height vs the mean face plane (median / p5 / p95) -> PNG + JSON + CSV in
     output/measurements. params: engine.measure.station.geometry.StationParams fields
     (ct_band_mm, ct_roi, zone_skip, centre_method, ...). Never touches the rig."""
@@ -1619,10 +1619,10 @@ def station_golden(measurements: list, label: str = "golden", cell_height_tol_mm
                    params: Optional[dict] = None, flood=None):
     """Station golden from >= 1 GOOD measurements (StationMeasurements, their .json, or metric
     scans measured here with `params`) -> station_golden/<geometry>/ (append-only, bound to
-    geometry + fingerprint + stereo calibration): nominal cell height differences, spacings and
-    CT zone heights (mean), the first measurement's zone model (pitch + phase) and numbering,
-    and the user-set limits: a cell pair triggers outside nominal +- cell_height_tol_mm (and /
-    or the absolute cell_height_band_mm [lo, hi]), a CT zone outside nominal +-
+    geometry + fingerprint + stereo calibration): nominal end-face height differences, spacings and
+    tube zone heights (mean), the first measurement's zone model (pitch + phase) and numbering,
+    and the user-set limits: a cylinder pair triggers outside nominal +- cell_height_tol_mm (and /
+    or the absolute cell_height_band_mm [lo, hi]), a tube zone outside nominal +-
     ct_zone_tol_mm (and / or ct_zone_band_mm), spacing only with spacing_tol_mm; bands =
     {"C2-C1": [lo, hi], "T3": [lo, hi], "C2-C1 spacing": [lo, hi]} per-item absolute bands."""
     from .measure.station import verbs as st
@@ -1649,7 +1649,7 @@ def list_library(kind: str = "bases", geometry_id: Optional[str] = None) -> list
     'metric' (metric scans) | 'calib_poses' (stereo calibration board poses) |
     'dentsets' (dent-detector captures) | 'faces' (located end faces) |
     'facescans' (targeted end-face scans) | 'face_golden' (golden end faces) |
-    'station_golden' (station goldens: cells + cooling tube) |
+    'station_golden' (station goldens: cylinders + ribbed tube) |
     'outputs' (the output bin index; the 2nd argument filters by output kind) |
     'incomplete' (half-written base/object entries the listings skip; move
     them to trash/ with delete(path))."""

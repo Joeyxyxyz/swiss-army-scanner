@@ -33,9 +33,9 @@ from . import geometry as geo_mod
 
 UNITS = {"centre_mm": "mm, camera frame (x right, y down, z forward)",
          "height_mm": "mm along the common face normal; + = toward the camera (proud), "
-                      "- = behind the mean cell-face plane",
+                      "- = behind the mean end-face plane",
          "spacing_mm": "mm, face centres in the face plane", "camera_px": "camera px (full frame)",
-         "angles": "deg", "s_mm": "mm along the cooling tube's run (e1, ~ image right) from the "
+         "angles": "deg", "s_mm": "mm along the ribbed tube's run (e1, ~ image right) from the "
                                   "mean face centre"}
 DEFAULT_LIMITS = {"cell_height_tol_mm": 0.15, "cell_height_band_mm": None,
                   "ct_zone_tol_mm": 0.30, "ct_zone_band_mm": None,
@@ -111,7 +111,7 @@ def resolve_flood(s, ms: MetricScan, flood, geo: str, fp) -> tuple:
         a = _scan_flood(ms)
         if a is not None:
             return geo_mod.flood_diff(a), "scan", warnings
-        warnings.append("no flood pair stored with this scan: the cells were found on the "
+        warnings.append("no flood pair stored with this scan: the end faces were found on the "
                         "decode's fringe modulation (pass flood=, or scan with scan_fast, which "
                         "keeps its flood pair)")
         return geo_mod.conf_flood(ms.field.conf), "decode", warnings
@@ -129,7 +129,7 @@ def resolve_flood(s, ms: MetricScan, flood, geo: str, fp) -> tuple:
         raise ValueError(f"metric scan {other.id} has no flood pair (flood.npz): only scan_fast "
                          "stores one")
     if other.id != ms.id:
-        warnings.append(f"flood pair from another scan ({other.id}): the cells must not have moved")
+        warnings.append(f"flood pair from another scan ({other.id}): the parts must not have moved")
     return geo_mod.flood_diff(a), f"scan:{other.id}", warnings
 
 
@@ -200,12 +200,12 @@ def _csv_measure(rep: dict) -> str:
     if ct.get("trap_fit"):
         t = ct["trap_fit"]
         for k in ("pitch_mm", "amp_mm", "phase_mm", "plateau_frac", "fit_rms_mm"):
-            w.writerow(["CT wave", k, t[k], "" if k == "plateau_frac" else "mm", "", "", "", "", ""])
+            w.writerow(["tube wave", k, t[k], "" if k == "plateau_frac" else "mm", "", "", "", "", ""])
     for z in rep["zones"]:
         if not z.get("included"):
             continue
         uv = z.get("cam_uv") or ["", ""]
-        w.writerow([z["label"], f"CT edge height, zone k={z['k']} (median)", z.get("median_mm"),
+        w.writerow([z["label"], f"tube edge height, zone k={z['k']} (median)", z.get("median_mm"),
                     "mm", z.get("p5_mm"), z.get("p95_mm"), z["n_px"], *uv])
     return buf.getvalue()
 
@@ -429,7 +429,7 @@ def station_golden(s, measurements: list, label: str = "golden", limits: Optiona
                    params: Optional[dict] = None, flood=None) -> StationGolden:
     """Golden from >= 1 GOOD station measurements (StationMeasurements, their .json, or metric
     scans - measured here with `params` and their own flood, or `flood` for a single scan):
-    nominal = the mean; the first measurement's zone model (pitch + phase vs the cell-pair
+    nominal = the mean; the first measurement's zone model (pitch + phase vs the cylinder-pair
     centre) and numbering become the golden's."""
     safe_label(label)
     lim = check_limits(limits)
@@ -464,7 +464,7 @@ def station_golden(s, measurements: list, label: str = "golden", limits: Optiona
             raise rules.GeometryMismatch("station_golden: measurements under different stereo "
                                          f"calibrations ({ref.calibration_id} vs {m.calibration_id})")
         if len(m.cells) != len(ref.cells):
-            raise ValueError("station_golden: the measurements have different cell counts")
+            raise ValueError("station_golden: the measurements have different end-face counts")
         if _plain(m.params) != _plain(ref.params):
             raise ValueError("station_golden: the measurements were made with different station "
                              "parameters; measure them alike")
@@ -501,8 +501,8 @@ def station_golden(s, measurements: list, label: str = "golden", limits: Optiona
                 warnings.append(f"zone {z['label']} measured in {len(v)} of {len(ms_list)} "
                                 "measurements")
     if not zones:
-        warnings.append("no cooling-tube zones in the reference measurement: the golden checks "
-                        "the cells only")
+        warnings.append("no tube zones in the reference measurement: the golden checks "
+                        "the end faces only")
     _check_golden_limits(lim, _golden_items(pairs, zones), warnings)
     nominal = {"cells": [{"name": c["name"], "height_mm": c["height_mm"]} for c in ref.cells],
                "pairs": pairs, "zones": zones,

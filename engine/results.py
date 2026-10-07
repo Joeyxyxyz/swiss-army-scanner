@@ -264,14 +264,14 @@ class DentSet:
 
 @dataclass
 class DentReport:
-    """detect_dents result. Positions in camera px AND cell coordinates
+    """detect_dents result. Positions in camera px AND cylinder coordinates
     (theta_deg about the axis; s_mm along it from the axis point level with
-    the camera's optical axis - not a cell end - and s_from_top_mm from the
+    the camera's optical axis - not a cylinder end - and s_from_top_mm from the
     top end of the decoded cell); depth / size in mm (rule 6: only with the
     stereo calibration the metric scans were made with); score = fused
-    evidence / the good cell's maximum (null calibration); a detection needs
+    evidence / the good part's maximum (null calibration); a detection needs
     score > thresholds['thr'] (default 1.25, a margin over the one good
-    cell's own maximum)."""
+    part's own maximum)."""
     verdict: str                    # "FLAG" (>= 1 detection) | "CLEAR"
     candidates: list                # dicts, strongest first (see units)
     n_detections: int
@@ -406,7 +406,7 @@ class FaceGolden:
     calibration. It holds every detector's model (MF-CFAR: radial profile + the reflectance
     FIR's coefficients; band: median map + tolerance band); params['detector'] is the default
     one, params its settings. leave_one_out = false triggers on the good placements (each vs
-    the others), sensitivity = the synthetic-dent battery."""
+    the others), sensitivity = the synthetic-dent set."""
     id: str
     label: str
     geometry_id: str
@@ -445,12 +445,12 @@ class FaceCheck:
 
 @dataclass
 class StationMeasurement:
-    """station_measure: one metric scan of a station (cells with their end faces toward the
-    camera + the cooling tube (CT) between them). cells: per cell (C1..Cn, image order) the
+    """station_measure: one metric scan of a station (cylinders with their end faces toward the
+    camera + a ribbed/serpentine tube between them). cells: per cell (C1..Cn, image order) the
     camera circle, face centre / normal (mm, camera frame), height vs the mean face plane (mm,
     + toward the camera), flatness; pairs: 'Cj-Ci' height difference along the common face
     normal, centre spacing in the face plane; ct: the edge height band, pixels, trapezoid wave;
-    zones: T1..Tn part-fixed zones (index k vs the cell-pair centre) with the CT edge height
+    zones: T1..Tn part-fixed zones (index k vs the cylinder-pair centre) with the tube edge height
     vs the mean face plane (median / p5 / p95, mm; - = behind the faces)."""
     label: str
     scan_id: str
@@ -471,8 +471,8 @@ class StationMeasurement:
 
 @dataclass
 class StationGolden:
-    """Handle to a station golden (library/station_golden/<geometry>/<entry>): the nominal cell
-    height differences, spacings and CT zone heights (mean of the good measurements), the zone
+    """Handle to a station golden (library/station_golden/<geometry>/<entry>): the nominal end-face
+    height differences, spacings and tube zone heights (mean of the good measurements), the zone
     model (pitch + phase: the zones every check uses) and numbering, the station parameters and
     the user-set limits (tolerances around nominal and / or absolute bands), bound to the
     geometry + fingerprint and the stereo calibration."""

@@ -2,7 +2,7 @@
 
 **Status:** the patterns, the pack tool and this procedure exist and are tested offline (`tests/test_flash_fastscan.py`). The capture side is `docs/FLASH_SOFTSYNC.md`, and the two are tested together end to end in mock (`tests/test_flash_e2e_mock.py`, §9). **Nothing has run on the rig yet.** The HDMI video path is still the default scan path.
 
-**Goal:** the column-axis multifreq measurement of the fast HDMI scan (4 steps × periods 8 / 80 / 1280 DMD columns + white / black, 5.3 s for the two cell end faces and the cooling-tube band) in about **0.5 s**. The DLPC350 plays the patterns from flash on its own timer. The camera free-runs faster than the pattern rate, and the frames are sorted in software. There is no trigger cable.
+**Goal:** the column-axis multifreq measurement of the fast HDMI scan (4 steps × periods 8 / 80 / 1280 DMD columns + white / black, 5.3 s for the two cylinder end faces and the tube band) in about **0.5 s**. The DLPC350 plays the patterns from flash on its own timer. The camera free-runs faster than the pattern rate, and the frames are sorted in software. There is no trigger cable.
 
 | | HDMI video mode (today) | Flash fast scan (this doc) |
 |---|---|---|
@@ -32,7 +32,7 @@ python tools/make_flash_pack.py --unpack-check <pack folder>                # re
 The same build is the `make_fastscan_pack` verb (web UI) and `scan fastscan-pack` in the CLI (`--zone-ring`, `--zone-mask`, `--band-cam`, `--band-field`, `--margin`, `--calibration`, `--study`, `--label`).
 
 - `--zone-ring` takes a `face_dmd_ring.npy` (DMD col, row points on a face rim). The tool fits an ellipse and adds `--zone-margin` (default 6 DMD px) on each side.
-- `--zone-band-cam` + `--zone-band-field` map a camera-space band (the cooling tube) to the DMD through a **both-axes** decoded field (`corr_x` and `corr_y`). Small specks are dropped and the band is closed.
+- `--zone-band-cam` + `--zone-band-field` map a camera-space band (the ribbed tube) to the DMD through a **both-axes** decoded field (`corr_x` and `corr_y`). Small specks are dropped and the band is closed.
 - `--zone-mask` adds any DMD-shaped mask `.npy`.
 - `--calibration` gives the real scale: **1.54 camera px per DMD column** and **1.84 mm of range per DMD column** at 780 mm on the camera axis (1.47 px and 1.94 mm on the faces, measured). The 0.36 figure sometimes quoted for this rig is **mm per camera pixel** (0.364 mm at 780 mm), not camera px per column.
 - `--led R,G,B` sets the start currents written in the procedure (default R35 G50 B45). Values above the continuous limits are refused.
@@ -264,7 +264,7 @@ Use `--period-us`, `--camera-exposure-us`, `--camera-fps` and `--loops` to chang
 
 ## 9. Pack and capture together (mock, end to end)
 
-`tests/test_flash_e2e_mock.py` runs the whole chain on the pinhole stereo mock. The pack is built by this tool, and its zone is the two face rims on the DMD, as for the bench pack. A simulated DLPC350 plays that pack's own BMP bit-planes, read back and unpacked, on its internal timer. The free-running camera records it, then the frames are sorted and decoded, and `fast_scan_flash` stores a metric scan. The scene is bench-like: two cell end faces tilted 20°, a 0.6 mm deep cosine dent (FWHM 1.5 mm) in C1, and C2 0.48 mm proud of C1. The same planes are also captured directly, held on the DMD for the whole exposure and averaged as often as the soft sync averaged them: this is the ideal synchronous capture. The HDMI 8-bit multifreq fringes go through the same optics as a third reference.
+`tests/test_flash_e2e_mock.py` runs the whole chain on the pinhole stereo mock. The pack is built by this tool, and its zone is the two face rims on the DMD, as for the bench pack. A simulated DLPC350 plays that pack's own BMP bit-planes, read back and unpacked, on its internal timer. The free-running camera records it, then the frames are sorted and decoded, and `fast_scan_flash` stores a metric scan. The scene is bench-like: two cylinder end faces tilted 20°, a 0.6 mm deep cosine dent (FWHM 1.5 mm) in C1, and C2 0.48 mm proud of C1. The same planes are also captured directly, held on the DMD for the whole exposure and averaged as often as the soft sync averaged them: this is the ideal synchronous capture. The HDMI 8-bit multifreq fringes go through the same optics as a third reference.
 
 **The contract.** For both images, the planes in the BMP equal the loop the sorter and decoder assume: the same order, sync markers and dithering. A manifest with another bit order, pattern version, dither, sync bars, decode order, timing, trigger or image index is refused before the camera opens, and so is a changed zone mask.
 

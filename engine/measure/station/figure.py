@@ -1,6 +1,6 @@
-"""Station figure (cv2 only; matplotlib is not a dependency): the flood crop with the cell rims,
-the cooling-tube edge pixels coloured by zone (triggered zones red) and the zone labels, and
-below it the CT edge height per zone (median, p5-p95) with the golden bands of a check."""
+"""Station figure (cv2 only; matplotlib is not a dependency): the flood crop with the end-face rims,
+the tube edge pixels coloured by zone (triggered zones red) and the zone labels, and
+below it the tube edge height per zone (median, p5-p95) with the golden bands of a check."""
 
 from __future__ import annotations
 
@@ -116,11 +116,11 @@ def station_png(report: dict, flood_d: np.ndarray, ct_mask: Optional[np.ndarray]
                 cv2.line(ch, (x, ymap(z["p5_mm"])), (x, ymap(z["p95_mm"])), col, 1)
                 cv2.circle(ch, (x, ymap(z["median_mm"])), 4, col, -1)
             cv2.putText(ch, z["label"], (x - 10, B + 18), font, 0.4, BLACK, 1)
-        cv2.putText(ch, "CT edge height vs the mean cell-face plane (mm; median, p5-p95"
+        cv2.putText(ch, "tube edge height vs the mean end-face plane (mm; median, p5-p95"
                         + ("; green: golden band" if items else "") + ")", (L, 24), font, 0.5,
                     BLACK, 1)
     else:
-        cv2.putText(ch, "no cooling-tube zones measured", (L, Hc // 2), font, 0.6, BLACK, 1)
+        cv2.putText(ch, "no tube zones measured", (L, Hc // 2), font, 0.6, BLACK, 1)
     # ---- header
     hdr = np.full((70, Wc, 3), 255, np.uint8)
     pairs = "   ".join(f"{p['pair']} {p['height_diff_mm']:+.3f} mm, spacing "

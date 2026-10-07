@@ -13,7 +13,7 @@ Library (append-only, rule 7; meta.json written LAST = the completeness marker):
                                            reflectance FIR's 49 coefficients; band: golden, band,
                                            sigma; the placements' height maps), preview.png,
                                            meta.json (params: the default detector + every
-                                           setting, leave-one-out, synthetic battery)
+                                           setting, leave-one-out, synthetic set)
 Output bin: previews/ (locate overlay, ring photo + overlay + json), tuning/ (auto_intensity),
 profiles/ (face PNG, radial + section CSV, JSON, NPZ: height map + per-pixel repeat data + the
 flood pair), pointclouds/ (face STL + meta), defects/ (check_face JSON, overlay PNG, maps NPZ).
@@ -270,7 +270,7 @@ def locate_face(s, scan, face_diameter_mm: float = locate_mod.FACE_DIAMETER_MM,
     off = patterns.off_dmd_pct(r["dmd_ellipse"])
     if off > 0.5:
         warnings.append(f"{off:.0f}% of the face maps outside the DMD: the projector cannot light "
-                        "that part (never measured); move the cell toward the middle of the zone")
+                        "that part (never measured); move the part toward the middle of the zone")
     if r["rejected_components"]:
         warnings.append(f"{len(r['rejected_components'])} nearer non-face surface(s) set aside "
                         f"(e.g. {r['rejected_components'][0]['why']} at z "
@@ -425,7 +425,7 @@ def project_ring(s, preset, face=None, mode: str = "aim", hold_s: float = 0.0,
                            f"from the located centre (ring size ratio {ratio:.2f})")
             verdict = "OFF" if why else "ON_FACE"
             if why:
-                warnings.append("; ".join(why) + ": the cell moved since locate_face (or the camera "
+                warnings.append("; ".join(why) + ": the part moved since locate_face (or the camera "
                                 "-> DMD map is off) - re-locate before scanning")
     photo_p = projmap.write_png(s.store.output_path("previews", f"{label}_photo", ".png"),
                                    zones._photo_u8(photo))
@@ -632,7 +632,7 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
     off = patterns.off_dmd_pct(t.dmd_ellipse)
     if off > 0.5:
         warnings.append(f"{off:.0f}% of the face maps outside the DMD: that part is never lit "
-                        "(the check will call the face INCOMPLETE); re-place the cell")
+                        "(the check will call the face INCOMPLETE); re-place the part")
     # polar=False drops the rings / spokes (no added sensitivity in the research) but keeps
     # the flood pair: the MF detector's reflectance FIR needs it
     specs = patterns.polar_specs(ring_periods if polar else (), spokes if polar else (),
@@ -674,7 +674,7 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
                          "consistency": cloud.consistency_stats()})
             if n_face < 0.5 * full.sum():
                 warnings.append(f"repeat {k + 1}: only {reps[-1]['face_decoded_pct']:.0f}% of the face "
-                                "decoded (dark or glinting face? run auto_intensity; moved cell? "
+                                "decoded (dark or glinting face? run auto_intensity; moved part? "
                                 "check_ring)")
         if flood is not None:
             s.store.write_preview(d / "preview.png", flood[y0:y1, x0:x1])
@@ -850,7 +850,7 @@ def face_profile(s, scans=None, face=None, label: Optional[str] = None,
         warnings.append("one scan: no repeatability (targeted_face_scan repeats >= 2)")
     elif st["repeatability_median_mm"] is not None and st["repeatability_median_mm"] > REPEAT_WARN_MM:
         warnings.append(f"per-point repeatability {st['repeatability_median_mm']:.3f} mm (median) is "
-                        f"above {REPEAT_WARN_MM:g} mm: dim / glinting face or a moving cell?")
+                        f"above {REPEAT_WARN_MM:g} mm: dim / glinting face or a moving part?")
     if st["grid_coverage_pct"] is not None and st["grid_coverage_pct"] < 90:
         warnings.append(f"only {st['grid_coverage_pct']:.0f}% of the face grid is measured")
     if t.calibration_id != cal.id:
@@ -1024,7 +1024,7 @@ def face_golden(s, placements: list, label: str = "golden", params: Optional[dic
     """Golden face from >= 2 (3+ for leave-one-out) GOOD placements: every detector's model
     (MF radial profile + reflectance FIR, band median + tolerance band), the default detector
     and all settings in the record; leave-one-out false triggers (every detector) and the
-    synthetic-dent battery (the default detector)."""
+    synthetic-dent set (the default detector)."""
     safe_label(label)
     if callable(detector):
         raise ValueError("face_golden: detector must be a name "
@@ -1065,12 +1065,12 @@ def face_golden(s, placements: list, label: str = "golden", params: Optional[dic
     spread = golden_mod.placement_spread(np.stack([p.height for p in pls]), g, bp.rim_r_mm)
     if len(profs) < 3:
         warnings.append("fewer than 3 placements: no leave-one-out check (false triggers) and no "
-                        "synthetic battery")
+                        "synthetic set")
     n_false = sum(r["n_face"] + (r["n_rim"] if det != "band" else 0) for r in loo)
     if loo and n_false:
         warnings.append(f"leave-one-out: {n_false} trigger(s) on GOOD placements with '{det}' - "
                         + ("add placements, or raise k_sigma / floor_mm" if det == "band" else
-                           "check those placements (saturated flood? moved cell?) or raise z_thresh"))
+                           "check those placements (saturated flood? moved part?) or raise z_thresh"))
     if loo and det != "band":
         zs = [r["max_z"] for r in loo if r.get("max_z") is not None]
         if zs and max(zs) * 1.1 > mprm["z_thresh"]:

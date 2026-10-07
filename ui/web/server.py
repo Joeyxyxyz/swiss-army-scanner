@@ -119,7 +119,7 @@ LIVE_PATTERNS = ("flood", "stripes", "checker")
 # UI-only listings (not engine list_library kinds): light separations for
 # bake_maps, Surfer atlases with their regions
 UI_LIST_KINDS = ("lights", "atlases")
-REGION_DOC = ("'atlas:<name>/<region>' (import_atlas first, e.g. atlas:cell/cell), a grid zone "
+REGION_DOC = ("'atlas:<name>/<region>' (import_atlas first, e.g. atlas:part/part), a grid zone "
               "'P17:P22@48', or a DMD rect [x0, y0, x1, y1]")
 ORIENTATIONS = ("v", "h", "d45", "d135")
 FLASH_DOC = "docs/FLASH_PATTERN_MODE.md"
@@ -251,13 +251,13 @@ VERBS: dict = {
                     "or the measured open cylinder arc (never a closed, invented tube).",
                     {"object_id": "scan id", "fmt": "stl | obj", "kind": "relief | base | cylinder",
                      "stride": "int >= 1, camera px per vertex (default 2)",
-                     "radius_mm": "cylinder: known cell radius, mm (optional)",
+                     "radius_mm": "cylinder: known cylinder radius, mm (optional)",
                      "roi": "[x0, y0, x1, y1] camera px (optional)"}),
-    "cell_unwrap": ("Cylinder fit + (theta, z) unwrap of a standing cell -> arc degrees, cell "
+    "cell_unwrap": ("Cylinder fit + (theta, z) unwrap of a standing cylinder -> arc degrees, end-face "
                     "height, dent heatmap PNG (open arc only).",
                     {"object_id": "scan id", "radius_mm": "known radius, mm (optional)",
                      "step": "grid step, units (optional)"}),
-    "cell_dents": ("Dents on the unwrapped cell -> PASS / FAIL / INDETERMINATE (mm verdict only "
+    "cell_dents": ("Dents on the unwrapped cylinder -> PASS / FAIL / INDETERMINATE (mm verdict only "
                    "with a depth calibration, rule 6) + table and heatmap.",
                    {"object_id": "scan id", "radius_mm": "known radius, mm (optional)",
                     "n_sigma": "detection threshold x noise (default 5)",
@@ -276,7 +276,7 @@ VERBS: dict = {
     # Surfer atlas + methods
     "import_atlas": ("Copy a Surfer atlas JSON into library/atlases/<geometry>/<name>/ (the source "
                      "is only read). Its regions then work as zones 'atlas:<name>/<region>'.",
-                     {"path": "local .json file", "name": "atlas name (e.g. cell)"}),
+                     {"path": "local .json file", "name": "atlas name (e.g. part)"}),
     "list_atlases": ("Imported atlases (+ their regions).", {"geometry_id": "filter"}),
     "flood_verify": ("Light only a region (black elsewhere), photograph, report where it lands.",
                      {"region": REGION_DOC, "level": "DMD level 1-255", "label": "text"}),
@@ -403,8 +403,8 @@ VERBS: dict = {
                             "stride": "camera px per vertex (default 1)",
                             "max_edge_mm": "longest triangle edge (default 4 x spacing)",
                             "foreground_only": "bool: drop the background plane"}),
-    # dent detection on shiny cylindrical cells (mm only with a stereo calibration, rule 6)
-    "capture_dent_set": ("One pose of a cell for the dent detector: long pass (the active preset, "
+    # dent detection on shiny cylindrical parts (mm only with a stereo calibration, rule 6)
+    "capture_dent_set": ("One pose of a cylinder for the dent detector: long pass (the active preset, "
                          "normally the dark 66 667 us one: floods + sin0 T12/T36 + sin90 "
                          "T12/T36) and "
                          "short pass (16 667 us: floods + the same sinusoids + lines_v), one rig "
@@ -419,17 +419,17 @@ VERBS: dict = {
                           "steps": "metric scan phase steps", "periods": "[T, ...] DMD px",
                           "pattern_set": "production | minimal (drops sin90 T36)"}),
     "calibrate_dent_null": ("Negative control for the dent detector: run the four finders on "
-                            "dent set(s) of KNOWN-GOOD cells of one type in one fixture; their "
-                            "maxima become a geometry-bound calibration (1.0 = the good cell's "
+                            "dent set(s) of KNOWN-GOOD parts of one type in one fixture; their "
+                            "maxima become a geometry-bound calibration (1.0 = the good part's "
                             "strongest response).",
                             {"dentset_ids": "[dent set ids] (library dent sets only)",
-                             "cell_diameter_mm": "cell diameter, mm", "label": "text",
+                             "cell_diameter_mm": "cylinder diameter, mm", "label": "text",
                              "metric_ids": "[metric scan ids] of the one good dent set (default: "
                                            "its own)", "fixture": "fixture name (default: zone; "
                                                                   "detect_dents then needs it)",
                              "subset": "|".join(DENT_SUBSETS)}),
-    "detect_dents": ("Dents / scratches on a cell -> candidates (camera px, theta / s on the cell, "
-                     "fused score x the good-cell max, level detection (> 1.25) / watch / edge, "
+    "detect_dents": ("Dents / scratches on a cylinder -> candidates (camera px, theta / s on the cylinder, "
+                     "fused score x the good-part max, level detection (> 1.25) / watch / edge, "
                      "depth mm with reliability and significance flags, size, per-finder "
                      "evidence, kind dent / scratch / speck) + overlay PNG. FLAG when any "
                      "detection.",
@@ -440,7 +440,7 @@ VERBS: dict = {
                       "null_id": "dent null calibration id (default: newest matching)",
                       "fixture": "fixture the null was made for (default: the dent set's zone)",
                       "label": "text", "subset": "|".join(DENT_SUBSETS)}),
-    # end faces: a cell lying with its circular END FACE toward the camera (mm: rule 6)
+    # end faces: a cylinder lying with its circular END FACE toward the camera (mm: rule 6)
     "locate_face": ("Locate a circular end face in a metric scan (both axes; scan_metric with "
                     "method plane and a zone around the face): face plane, centre, fixed-radius "
                     "rim circle, tilt, camera face mask and the camera -> DMD affine on the "
@@ -492,7 +492,7 @@ VERBS: dict = {
     "face_golden": ("Golden end face from GOOD placements (face scans), bound to geometry, face "
                     "diameter, grid and stereo calibration: MF-CFAR (+ the reflectance FIR from the "
                     "flood pair; default detector) and band models, leave-one-out false triggers "
-                    "and a synthetic-dent battery -> face_golden/ (append-only).",
+                    "and a synthetic-dent set -> face_golden/ (append-only).",
                     {"facescan_ids": "[face scan ids] of GOOD placements (>= 2, 3+ for "
                                      "leave-one-out)", "label": "text",
                      "detector": "mf_fir | mf | band (default mf_fir)",
@@ -504,7 +504,7 @@ VERBS: dict = {
                      "rim_r_mm": "band rim zone r > (default 9.75)", "rim_factor": "(default 2)",
                      "rim_min_mm": "(default 0.3)", "height_smooth_mm": "(default 0.25)",
                      "min_area_mm2": "band: smallest trigger (default 0.25)",
-                     "synthetic": "bool: synthetic-dent battery (default true)"}),
+                     "synthetic": "bool: synthetic-dent set (default true)"}),
     "check_face": ("A placement (face scan) vs the golden face: dents (zone face / rim, r, theta, "
                    "depth_mm, width_mm, z (MF) or dev_mm (band), area_mm2) -> PASS / FAIL / "
                    "INCOMPLETE + overlay PNG.",
@@ -513,7 +513,7 @@ VERBS: dict = {
                     "golden's)", "z_thresh": "MF trigger z (default: the golden's)",
                     "min_depth_mm": "MF: ignore shallower dents (optional)",
                     "min_area_mm2": "smallest trigger (optional)"}),
-    # HDMI fast zone scan + station (cells with end faces toward the camera + cooling tube)
+    # HDMI fast zone scan + station (cylinders with end faces toward the camera + ribbed tube)
     "scan_fast": ("HDMI fast zone scan: the column-axis multifreq set only (default 4 steps x "
                   "8 / 80 / 1280 DMD px + white / black), lit through a zone and / or located "
                   "faces, camera average + HDMI hold for this run only (average < 2 is raised "
@@ -525,9 +525,9 @@ VERBS: dict = {
                    "steps": "phase steps (default 4)", "periods": "[T, ...] DMD px",
                    "average": "camera frames per pattern (default 2, min 2)",
                    "min_hold_s": "HDMI hold per pattern, s (default 0.12)", "axis": "x | xy"}),
-    "station_measure": ("Cells with their end faces toward the camera + the cooling tube (CT) "
-                        "between them, from one metric scan + a flood pair: cell heights along "
-                        "the common face normal, Cj-Ci, spacing; CT edge band, trapezoid wave, "
+    "station_measure": ("Cylinders with their end faces toward the camera + a ribbed/serpentine tube "
+                        "between them, from one metric scan + a flood pair: end-face heights along "
+                        "the common face normal, Cj-Ci, spacing; tube edge band, trapezoid wave, "
                         "zones T1..Tn with the edge height vs the face plane -> PNG + JSON + CSV "
                         "(output/measurements).",
                         {"metric_id": "metric scan id",
@@ -535,11 +535,11 @@ VERBS: dict = {
                                             "scan's own, else its decode modulation)",
                          "label": "text", "n_cells": "int (default 2)",
                          "face_diameter_mm": "mm (default 21.05)",
-                         "ct_band_mm": "[lo, hi] CT edge height band, mm (default auto)",
+                         "ct_band_mm": "[lo, hi] tube edge height band, mm (default auto)",
                          "zone_skip": "[left, right] zones dropped at the ends (default [0, 0])",
                          "centre_method": "rim_circle | ellipse_ray"}),
-    "station_golden": ("Station golden from GOOD scans (measured here): nominal cell height "
-                       "differences, spacings and CT zone heights, the zone model + numbering, and "
+    "station_golden": ("Station golden from GOOD scans (measured here): nominal end-face height "
+                       "differences, spacings and tube zone heights, the zone model + numbering, and "
                        "the limits -> station_golden/ (append-only, bound to geometry + stereo "
                        "calibration).",
                        {"metric_ids": "[metric scan ids] of GOOD placements", "label": "text",
@@ -550,7 +550,7 @@ VERBS: dict = {
                         "ct_zone_band_mm": "[lo, hi] absolute (optional)",
                         "bands": "{item: [lo, hi]}, e.g. {'C2-C1': [-0.4, 0.1], 'T3': [-5, -4]}",
                         "n_cells": "int (default 2)", "face_diameter_mm": "mm (default 21.05)",
-                        "ct_band_mm": "[lo, hi] CT edge height band for the measurement (default "
+                        "ct_band_mm": "[lo, hi] tube edge height band for the measurement (default "
                                       "auto)",
                         "zone_skip": "[left, right] (default [0, 0]): the golden's numbering",
                         "centre_method": "rim_circle | ellipse_ray"}),
@@ -2108,7 +2108,7 @@ class App:
         if isinstance(ids, str):
             ids = [ids]
         if not ids or not isinstance(ids, list):
-            raise ArgError("dentset_ids must list the dent sets of KNOWN-GOOD cells")
+            raise ArgError("dentset_ids must list the dent sets of KNOWN-GOOD parts")
         sets = [self._dentset_arg({"dentset_id": i}) for i in ids]
         return api.calibrate_dent_null(sets, _num(a, "cell_diameter_mm", required=True),
                                        _s(a, "label", "null"), self._metric_list(a),

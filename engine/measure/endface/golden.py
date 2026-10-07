@@ -15,7 +15,7 @@ for no better sensitivity.
 
 Defaults = the bench's best band trade-off: k_sigma 4, floor 0.10 mm, height maps
 Gaussian-smoothed 0.25 mm, sigma median 5 x 5 cells, rim zone r > 9.75 mm at x2 (min 0.3 mm),
-triggers >= 0.25 mm^2. Leave-one-out, the synthetic battery and the images: detectors.py.
+triggers >= 0.25 mm^2. Leave-one-out, the synthetic set and the images: detectors.py.
 """
 
 from __future__ import annotations

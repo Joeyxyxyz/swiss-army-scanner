@@ -230,7 +230,7 @@ def _positive_int(text: str) -> int:
     return v
 
 
-CYL_DEFAULT = (24.05, 90.0, 1.5)        # radius, height, dent depth (mm): a standing cell
+CYL_DEFAULT = (24.05, 90.0, 1.5)        # radius, height, dent depth (mm): a standing cylinder
 
 
 def _mock_part(text: str) -> str:
@@ -468,7 +468,7 @@ def _mock_place(ctx, spec: Optional[str] = None) -> None:
         dents = [{"depth_mm": dent, "size_mm": 12.0, "angle_deg": 10.0, "z_mm": hh / 2}] \
             if dent > 0 else []
         obj = Cylinder(radius_mm=r, height_mm=hh, dents=dents)
-        desc = f"a standing cell (R {r:g}, H {hh:g} mm" + \
+        desc = f"a standing cylinder (R {r:g}, H {hh:g} mm" + \
             (f", one {dent:g} mm dent at 10 deg, mid-height)" if dents else ", no dent)")
     else:
         vals = [float(v) for v in spec.split(",")]
@@ -1605,7 +1605,7 @@ def cmd_mesh(ctx):
             ["to scale", meta.get("to_scale", "?")], ["meta", str(mp or "-")]])
     if a.kind == "cylinder":
         ctx.kv([["arc", _u(meta.get("arc_deg"), "deg", 1)],
-                ["cell height", _u(meta.get("cell_height"), units, 2)]])
+                ["end-face height", _u(meta.get("cell_height"), units, 2)]])
     if meta.get("note"):
         ctx.say(f"  note: {meta['note']}")
     if units != "mm":
@@ -1620,9 +1620,9 @@ def cmd_unwrap(ctx):
     n0 = len(ctx.session.store.outputs())
     u = api.cell_unwrap(scan, a.radius, a.step)
     files = _new_files(ctx, n0, (".png", ".npz"))
-    ctx.say(f"Cell unwrap of {scan.id}  (units {u.units}, {u.calibration_id})")
+    ctx.say(f"Cylinder unwrap of {scan.id}  (units {u.units}, {u.calibration_id})")
     ctx.kv([["seen arc", _u(u.arc_deg, "deg (open arc only)", 1)],
-            ["cell height", _u(u.cell_height, u.units, 2)], ["radius", _u(u.radius, u.units, 3)],
+            ["end-face height", _u(u.cell_height, u.units, 2)], ["radius", _u(u.radius, u.units, 3)],
             ["grid step", _u(u.step, u.units, 3)], ["fit rms", _u(u.fit.rms, u.units, 4)],
             *[[k, str(v)] for k, v in files.items()]])
     ctx.warn(u.warnings)
@@ -1638,7 +1638,7 @@ def cmd_dents(ctx):
     ctx.preset()
     scan = _find_scan(a.id)
     rep = api.cell_dents(scan, a.radius, a.sigma, a.min_area, a.trigger)
-    ctx.say(f"Cell dents of {scan.id}: {rep.verdict}  (units {rep.units}, seen arc "
+    ctx.say(f"Cylinder dents of {scan.id}: {rep.verdict}  (units {rep.units}, seen arc "
             f"{_f(rep.arc_deg, 1)} deg)")
     ctx.kv([["noise sigma", _u(rep.noise_sigma, rep.units, 4)],
             ["threshold", _u(rep.threshold, rep.units, 4)],
@@ -1811,7 +1811,7 @@ def cmd_metric_list(ctx):
     return EXIT_OK, {"metric": rows}
 
 
-# ------------------------------------------------ dent detection (shiny cells)
+# ------------------------------------------------ dent detection (shiny cylinders)
 
 def _find_dentset(key: str):
     """A dent set by id / label / 'latest', or a folder (engine entry or legacy dataset.json)."""
@@ -1863,9 +1863,9 @@ def cmd_dent_null(ctx):
     sets = [_find_dentset(k) for k in a.dentsets]
     r = api.calibrate_dent_null(sets, a.diameter, a.label, _metric_arg(a.metric), a.fixture,
                                 a.subset)
-    ctx.say(f"Dent null calibration {r['id']}  (cell {r['cell_diameter_mm']:g} mm, fixture "
+    ctx.say(f"Dent null calibration {r['id']}  (diameter {r['cell_diameter_mm']:g} mm, fixture "
             f"{r.get('fixture') or '-'}, patterns {r['subset']})")
-    ctx.table(["finder", "good-cell max (T)"],
+    ctx.table(["finder", "good-part max (T)"],
               [[k, _f(v, 3) if v is not None else "EXCLUDED (no response)"]
                for k, v in r["T"].items()] + [["fused (T_F)", _f(r["T_F"], 3)]])
     ctx.warn(r.get("warnings"))
@@ -1880,8 +1880,8 @@ def cmd_dent_detect(ctx):
                            a.fixture)
     thr = rep.thresholds.get("thr")
     ctx.say(f"Dents on {rep.dentset_id}: {rep.verdict} ({rep.n_detections} detection(s) above "
-            f"{_f(thr, 2)}; max score {_f(rep.max_score, 2)} x the good-cell maximum; null "
-            f"{rep.null_calibration_id}, cell {rep.cell_diameter_mm:g} mm)")
+            f"{_f(thr, 2)}; max score {_f(rep.max_score, 2)} x the good-part maximum; null "
+            f"{rep.null_calibration_id}, diameter {rep.cell_diameter_mm:g} mm)")
     rows = []
     for i, c in enumerate(rep.candidates[:25], 1):
         dep = "-" if c["depth_mm"] is None else \
@@ -1895,7 +1895,7 @@ def cmd_dent_detect(ctx):
                "size", "evidence (x good max)"], rows)
     if not rep.candidates:
         ctx.say(f"  nothing above the watch level ({_f(rep.thresholds.get('watch'), 2)} x the "
-                "good-cell maximum)")
+                "good-part maximum)")
     ctx.kv([[k, str(v)] for k, v in rep.files.items()])
     ctx.warn(rep.warnings)
     return (EXIT_OK if rep.verdict == "CLEAR" else EXIT_NOT_OK), {"report": rep}
@@ -1911,7 +1911,7 @@ def cmd_dentsets(ctx):
     return EXIT_OK, {"dentsets": rows}
 
 
-# ------------------------------------------------ end faces (a cell's end face toward the camera)
+# ------------------------------------------------ end faces (a cylinder's end face toward the camera)
 
 def _find_face(key: Optional[str]):
     """A face target by id / label / 'latest' or its folder; None = the engine's default."""
@@ -2188,7 +2188,7 @@ def cmd_faces(ctx):
     return EXIT_OK, {"faces": faces, "facescans": scans, "face_golden": golds}
 
 
-# ------------------------------------------------ HDMI fast zone scan + station (cells + CT)
+# ------------------------------------------------ HDMI fast zone scan + station (parts + tube)
 
 def cmd_scan_fast(ctx):
     a = ctx.args
@@ -2224,7 +2224,7 @@ def _flood_arg(key: Optional[str]):
 
 
 def _station_params(a, band: str = "band", flag: str = "--band") -> dict:
-    """Station parameters from the options; `band` names the CT edge height band option
+    """Station parameters from the options; `band` names the tube edge height band option
     (`station --band`, `station-golden --edge-band`: there --band is the per-item limit)."""
     bv = getattr(a, band, None)
     prm = _kw(ct_band_mm=(_numbers(bv, 2, f"{flag} lo,hi (mm)") if bv else None),
@@ -2240,7 +2240,7 @@ def _station_params(a, band: str = "band", flag: str = "--band") -> dict:
 
 
 def _print_station(ctx, m) -> None:
-    ctx.table(["cell", "camera px", "height mm", "flatness mm", "coverage", "outline mm"],
+    ctx.table(["face", "camera px", "height mm", "flatness mm", "coverage", "outline mm"],
               [[c["name"], f"({c['camera_px'][0]:.1f}, {c['camera_px'][1]:.1f})",
                 _f(c["height_mm"], 4), _f(c["flat_rms_mm"], 4), _f(c["coverage"], 2),
                 _f(c["outline_diameter_mm"], 2)] for c in m.cells])
@@ -2250,9 +2250,9 @@ def _print_station(ctx, m) -> None:
     ct = m.ct or {}
     if ct.get("trap_fit"):
         t = ct["trap_fit"]
-        ctx.kv([["CT edge", f"{ct['n_px']} px, band {ct['band_mm']} mm ({ct['band_source']}), "
+        ctx.kv([["tube edge", f"{ct['n_px']} px, band {ct['band_mm']} mm ({ct['band_source']}), "
                             f"median {_u((ct.get('edge_height_all') or {}).get('median_mm'), 'mm', 3)}"],
-                ["CT wave", f"pitch {_u(t['pitch_mm'], 'mm', 3)}, amplitude {_u(t['amp_mm'], 'mm', 3)}, "
+                ["tube wave", f"pitch {_u(t['pitch_mm'], 'mm', 3)}, amplitude {_u(t['amp_mm'], 'mm', 3)}, "
                             f"phase {_u(t['phase_mm'], 'mm', 2)}, fit rms {_u(t['fit_rms_mm'], 'mm', 3)}"]])
     zs = [z for z in m.zones if z.get("included")]
     ctx.table(["zone", "k", "edge height mm", "p5", "p95", "px", "coverage"],
@@ -2265,8 +2265,8 @@ def cmd_station(ctx):
     ms = _find_metric(a.metric)
     m = api.station_measure(ms, _flood_arg(a.flood), a.label, a.cells, a.diameter,
                             _station_params(a) or None)
-    ctx.say(f"Station {m.label}: scan {m.scan_id}, {len(m.cells)} cells, "
-            f"{sum(1 for z in m.zones if z.get('included'))} CT zones (flood: {m.flood_source})")
+    ctx.say(f"Station {m.label}: scan {m.scan_id}, {len(m.cells)} end faces, "
+            f"{sum(1 for z in m.zones if z.get('included'))} tube zones (flood: {m.flood_source})")
     _print_station(ctx, m)
     for x in (m.meta or {}).get("set_aside") or []:
         ctx.say(f"  set aside at camera px ({x['camera_px'][0]:.0f}, {x['camera_px'][1]:.0f}): "
@@ -2302,7 +2302,7 @@ def cmd_station_golden(ctx):
                                                   if a.ct_band else None),
                                  bands=bands or None, flood=_flood_arg(a.flood)))
     ctx.say(f"Station golden {g.id}: {g.n_measurements} measurement(s), "
-            f"{len(g.nominal['zones'])} CT zones, calibration {g.calibration_id}")
+            f"{len(g.nominal['zones'])} tube zones, calibration {g.calibration_id}")
     ctx.table(["pair", "height diff mm", "spread", "spacing mm"],
               [[p["pair"], _f(p["height_diff_mm"], 4), _f(p["height_diff_spread_mm"], 4),
                 _f(p["spacing_inplane_mm"], 4)] for p in g.nominal["pairs"]])
@@ -2310,9 +2310,9 @@ def cmd_station_golden(ctx):
               [[z["label"], z["k"], _f(z["median_mm"], 3), _f(z["spread_mm"], 3), z["n"]]
                for z in g.nominal["zones"]])
     lim = g.limits
-    ctx.kv([["limits", f"cell height +-{_f(lim['cell_height_tol_mm'], 3)} mm"
+    ctx.kv([["limits", f"end-face height +-{_f(lim['cell_height_tol_mm'], 3)} mm"
                        + (f" and within {lim['cell_height_band_mm']}" if lim["cell_height_band_mm"] else "")
-                       + f"; CT zone +-{_f(lim['ct_zone_tol_mm'], 3)} mm"
+                       + f"; tube zone +-{_f(lim['ct_zone_tol_mm'], 3)} mm"
                        + (f" and within {lim['ct_zone_band_mm']}" if lim["ct_zone_band_mm"] else "")
                        + (f"; spacing +-{lim['spacing_tol_mm']:g} mm" if lim["spacing_tol_mm"] else "")
                        + (f"; item bands {lim['bands']}" if lim["bands"] else "")],
@@ -2343,7 +2343,7 @@ def cmd_station_check(ctx):
 def cmd_stations(ctx):
     gs = api.list_library("station_golden", ctx.args.geometry)
     ctx.say("Station goldens:")
-    ctx.table(["id", "measurements", "cells", "zones", "calibration"],
+    ctx.table(["id", "measurements", "faces", "zones", "calibration"],
               [[g.id, g.n_measurements, g.meta.get("n_cells"), len(g.nominal["zones"]),
                 g.calibration_id] for g in gs])
     if not gs:
@@ -2729,7 +2729,7 @@ METRIC_MAX_PCT = 99.9           # 'max' deviation: robust to isolated triangulat
 
 def _mock_place_metric(ctx) -> None:
     """Mock only: the stereo (mm) bench. validation / none = the empty wall (flat),
-    H,W,L = a block standing out of the wall, cylinder[:R,H,dent] = a standing cell."""
+    H,W,L = a block standing out of the wall, cylinder[:R,H,dent] = a standing cylinder."""
     if not ctx.mock:
         return
     from engine.capture.mock_stereo import Block, MetricCylinder
@@ -2746,7 +2746,7 @@ def _mock_place_metric(ctx) -> None:
                  if dent > 0 else [])
         bench.place(MetricCylinder(center=(0, 0, 823.0 - r - 1.0), radius=r, height=hh,
                                    dents=dents))
-        ctx.say(f"[mock] stereo bench: placed a standing cell (R {r:g}, H {hh:g} mm)")
+        ctx.say(f"[mock] stereo bench: placed a standing cylinder (R {r:g}, H {hh:g} mm)")
         return
     h, w, l = [float(v) for v in spec.split(",")][:3]
     bench.place(Block(center=(0.0, 0.0, 823.0 - l / 2), half=(w / 2, h / 2, l / 2)))
@@ -3005,7 +3005,7 @@ def _add_globals(p: argparse.ArgumentParser, sub: bool) -> None:
     p.add_argument("--mock-part", metavar="SPEC", type=_mock_part, default=d("validation"),
                    help="mock only: what the simulated human places for scan / wizard / "
                         "check-presence: validation | none | H,W,L[,albedo] (mm; albedo 0..1) | "
-                        "cylinder[:R,H,dent_mm] (a standing cell, default 24.05,90,1.5) | "
+                        "cylinder[:R,H,dent_mm] (a standing cylinder, default 24.05,90,1.5) | "
                         "qr:TEXT (a QR label, for codes)")
     p.add_argument("--json", action="store_true", default=d(False),
                    help="print one JSON document (for scripts and AI agents)")
@@ -3038,9 +3038,9 @@ virtual sensors (the DMD draws the spot, the camera is the receiver):
   scan check-align fixture <scan>        exit 0 ALIGNED, 1 NOT_ALIGNED or INDETERMINATE
   scan sensors                           taught sensors;  delete <name> trashes one
 
-3D meshes, cells, surface maps (work on a stored scan; mm only when calibrated):
+3D meshes, cylinders, surface maps (work on a stored scan; mm only when calibrated):
   scan mesh <scan> [--kind relief|base|cylinder] [--fmt stl|obj] [--stride 2] [--radius 24.05]
-  scan unwrap <scan> [--radius MM]       cylinder fit: seen arc, cell height, dent heatmap
+  scan unwrap <scan> [--radius MM]       cylinder fit: seen arc, end-face height, dent heatmap
   scan dents <scan> [--trigger MM]       exit 0 PASS, 1 FAIL or INDETERMINATE (open arc only)
   scan maps <scan> [--spectral ID --light ID --golden ID]   height/cavity/normal/... PNGs
   scan checker [--square 32 --shifts 1]  checker corners + local Jacobian (stretch, contrast)
@@ -3057,20 +3057,20 @@ metric (mm from a stereo calibration of the same geometry; refused otherwise):
   scan metric-mesh <metric>              STL / OBJ in mm, open surface only
   mock: scan --mock calibrate-stereo --mock-poses 12
 
-dents on shiny cells (needs a stereo calibration; the null calibration is the good cell):
-  scan --preset DARK dent-scan good1 --zone H9:I12 --short-preset SHORT   a KNOWN-GOOD cell
-  scan dent-null good1 --diameter 21.05     finders' maxima on the good cell (per fixture)
+dents on shiny cylinders (needs a stereo calibration; the null calibration is the good part):
+  scan --preset DARK dent-scan good1 --zone H9:I12 --short-preset SHORT   a KNOWN-GOOD part
+  scan dent-null good1 --diameter 21.05     finders' maxima on the good part (per fixture)
   scan --preset DARK dent-scan cell7 --zone H9:I12 --short-preset SHORT
   scan dent-detect cell7                    exit 0 CLEAR, 1 FLAG, 4 detector error (+ PNG, json)
   scan dentsets                             captured dent sets (legacy folders work too)
 
-end faces (a cell lying with its circular end face toward the camera; stereo calibration first):
+end faces (a cylinder lying with its circular end face toward the camera; stereo calibration first):
   scan --preset P face-locate --zone H10:I12   locate scan (ray-plane) -> face plane, rim circle,
                                             camera -> DMD affine (or face-locate <metric scan>:
                                             it needs x AND y decoded - scan-fast --axis xy or
                                             scan-metric; an x-only scan-fast is refused)
   scan face-aim --hold 30                   ring + cross on the face: the placement guide
-  scan face-aim --check                     exit 0 ON_FACE, 1 OFF (the cell moved: re-locate)
+  scan face-aim --check                     exit 0 ON_FACE, 1 OFF (the part moved: re-locate)
   scan face-intensity                       projection.duty for a ~200 DN face (never the LEDs)
   scan face-scan c1 --auto-intensity        only the face lit: 3 repeats + polar set
   scan face-profile c1                      height map, radial, sections, flatness (+ PNG/CSV/STL)
@@ -3080,19 +3080,19 @@ end faces (a cell lying with its circular end face toward the camera; stereo cal
                                             z; overlay PNG)
   scan faces                                face targets, face scans, golden faces
 
-HDMI fast zone scan + station (cells with end faces toward the camera + the cooling tube, CT):
+HDMI fast zone scan + station (cylinders with end faces toward the camera + a ribbed tube edge):
   scan --preset P scan-fast st1 --zone F10:J12   columns only, 4 steps x 8/80/1280 + floods,
                                             average 2 (--average N; < 2 is raised: HDMI
                                             flicker), --hold 0.12 s; keeps its flood pair;
                                             --axis xy for a scan face-locate can use
-  scan station st1                          cells C1..Cn: heights, Cj-Ci, spacing; CT edge
+  scan station st1                          cylinders C1..Cn: heights, Cj-Ci, spacing; tube edge
                                             band, trapezoid wave, zones T1..Tn (+ PNG/JSON/CSV)
   scan station-golden st1 st2 --cell-tol 0.15 --ct-tol 0.3 [--band T3=-5,-4]
   scan station-check st7                    exit 0 PASS, 1 FAIL / INCOMPLETE (triggers named),
-                                            2 refused (e.g. a cell not found), 4 crashed
+                                            2 refused (e.g. an end face not found), 4 crashed
   scan stations                             station goldens
 
-Surfer atlas (regions become zones atlas:<name>/<region>, e.g. scan part --zone atlas:cell/cell):
+Surfer atlas (regions become zones atlas:<name>/<region>, e.g. scan part --zone atlas:part/part):
   scan atlas-import <path.json> <name>   copy an atlas into the library (source only read)
   scan atlases                           imported atlases + their regions
   scan flood <region>                    light only the region, photograph (exit 0 lands)
@@ -3132,7 +3132,7 @@ library: bases | scans | calibrations | readings | materials | banks | maps |
          sensors | outputs;  bank-remove <scan> --bank NAME drops one bank member.
 mock: --mock-part H,W,L[,albedo] is what the simulated human places for scan,
       wizard and check-presence (the bench is albedo 0.6; 'none' = empty);
-      --mock-part cylinder[:R,H,dent_mm] places a standing cell; qr:TEXT a QR
+      --mock-part cylinder[:R,H,dent_mm] places a standing cylinder; qr:TEXT a QR
       label for codes.
 
 ids: a full id, a label (newest wins), 'latest', or any unique piece of the id.
@@ -3295,13 +3295,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fmt", choices=("stl", "obj"), default="stl")
     p.add_argument("--stride", type=_positive_int, default=2, help="camera px per vertex")
     p.add_argument("--radius", type=float, metavar="MM", help="cylinder: known radius, mm")
-    p = cmd("unwrap", cmd_unwrap, "cylinder fit + (theta, z) unwrap of a standing cell",
-            "the cell unwrap")
+    p = cmd("unwrap", cmd_unwrap, "cylinder fit + (theta, z) unwrap of a standing cylinder",
+            "the cylinder unwrap")
     p.add_argument("id")
     p.add_argument("--radius", type=float, metavar="MM", help="known radius, mm")
     p.add_argument("--step", type=float, help="grid step, units")
-    p = cmd("dents", cmd_dents, "dents on the unwrapped cell: exit 0 PASS, 1 FAIL / "
-                                "INDETERMINATE", "cell dent inspection")
+    p = cmd("dents", cmd_dents, "dents on the unwrapped cylinder: exit 0 PASS, 1 FAIL / "
+                                "INDETERMINATE", "cylinder dent inspection")
     p.add_argument("id")
     p.add_argument("--radius", type=float, metavar="MM", help="known radius, mm")
     p.add_argument("--sigma", type=float, default=5.0, help="detection threshold, x noise")
@@ -3378,8 +3378,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--foreground", action="store_true", help="drop the background plane")
     cmd("metric", cmd_metric_list, "list metric scans")
 
-    # dent detection on shiny cylindrical cells (mm only with a stereo calibration)
-    p = cmd("dent-scan", cmd_dent_scan, "one pose of a cell for the dent detector: long + short "
+    # dent detection on shiny cylindrical parts (mm only with a stereo calibration)
+    p = cmd("dent-scan", cmd_dent_scan, "one pose of a cylinder for the dent detector: long + short "
                                         "exposure patterns + one metric scan", "the dent capture")
     p.add_argument("label", nargs="?", default="dentset")
     p.add_argument("--zone", help='light and keep only these grid cells, e.g. "H9:I12"')
@@ -3397,21 +3397,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--periods", help="metric scan T,T,T DMD px")
     p.add_argument("--pattern-set", dest="pattern_set", choices=("production", "minimal"),
                    default="production", help="minimal drops sin90 T36 (weaker on small dents)")
-    p = cmd("dent-null", cmd_dent_null, "calibrate the dent finders on KNOWN-GOOD cell(s)",
+    p = cmd("dent-null", cmd_dent_null, "calibrate the dent finders on KNOWN-GOOD part(s)",
             "the dent null calibration")
     p.add_argument("dentsets", nargs="+", help="dent set id / label / latest / folder")
-    p.add_argument("--diameter", type=float, required=True, metavar="MM", help="cell diameter, mm")
+    p.add_argument("--diameter", type=float, required=True, metavar="MM", help="cylinder diameter, mm")
     p.add_argument("--label", default="null")
     p.add_argument("--metric", nargs="*", help="metric scans of the (one) good dent set")
     p.add_argument("--fixture", help="fixture name (default: the dent set's zone)")
     p.add_argument("--subset", choices=("all", "production", "production_nolines", "minimal"),
                    default="all")
-    p = cmd("dent-detect", cmd_dent_detect, "dents / scratches on a cell: exit 0 CLEAR, 1 FLAG, "
+    p = cmd("dent-detect", cmd_dent_detect, "dents / scratches on a cylinder: exit 0 CLEAR, 1 FLAG, "
                                             "4 the detector failed", "dent detection")
     p.set_defaults(unexpected_exit=EXIT_ERROR)
     p.add_argument("dentset", help="dent set id / label / latest / folder")
     p.add_argument("--diameter", type=float, metavar="MM",
-                   help="cell diameter, mm (default: that of the newest matching null "
+                   help="cylinder diameter, mm (default: that of the newest matching null "
                         "calibration; needed when nulls of several diameters match)")
     p.add_argument("--metric", nargs="*",
                    help="metric scans of the same pose (default: the dent set's own)")
@@ -3424,7 +3424,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = cmd("dentsets", cmd_dentsets, "list dent sets")
     p.add_argument("--geometry", help="only this geometry id")
 
-    # end faces: a cell lying with its circular END FACE toward the camera
+    # end faces: a cylinder lying with its circular END FACE toward the camera
     face_help = "face target id / label / latest (default: the newest at the preset's geometry)"
     p = cmd("face-locate", cmd_face_locate, "locate a circular end face in a metric scan: plane, "
                                             "centre, rim circle, camera -> DMD map", "face locate")
@@ -3440,7 +3440,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--far-gap", dest="far_gap", type=float, metavar="MM",
                    help="background: this far behind the face (default 30)")
     p.add_argument("--near-gap", dest="near_gap", type=float, metavar="MM",
-                   help="a neighbour (cooling tube) this far behind the face plane marks the rim "
+                   help="a neighbour (ribbed tube) this far behind the face plane marks the rim "
                         "(default 2)")
     p.add_argument("--flood", help="flood .npy/.npz or a metric scan: the face outline when the "
                                    "depth rim fails (default: the scan's own, else its decode "
@@ -3507,9 +3507,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-fir", dest="no_fir", action="store_true",
                    help="no reflectance FIR (from the flood pair)")
     p.add_argument("--no-synthetic", dest="no_synthetic", action="store_true",
-                   help="skip the synthetic-dent battery")
+                   help="skip the synthetic-dent set")
     p.add_argument("--positions", type=_positive_int,
-                   help="synthetic battery: random dent centres per size per placement (default 6)")
+                   help="synthetic set: random dent centres per size per placement (default 6)")
     p.add_argument("--k", type=float, help="band = k x sigma (default 4)")
     p.add_argument("--floor", type=float, metavar="MM", help="band floor (default 0.10)")
     p.add_argument("--smooth-cells", dest="smooth_cells", type=_positive_int,
@@ -3535,7 +3535,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = cmd("faces", cmd_faces, "list face targets, face scans and golden faces")
     p.add_argument("--geometry", help="only this geometry id")
 
-    # HDMI fast zone scan + station (cells with end faces + cooling tube)
+    # HDMI fast zone scan + station (cylinder end faces + tube edge)
     p = cmd("scan-fast", cmd_scan_fast, "HDMI fast zone scan: columns only (4 steps x 8/80/1280 + "
                                         "floods), average 2, hold 0.12 s -> metric scan + flood "
                                         "pair", "fast scan")
@@ -3551,9 +3551,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="HDMI hold per pattern for this run (default 0.12 s)")
     p.add_argument("--axis", choices=("x", "xy"), default="x",
                    help="x (default, enough for station heights) or xy (needed by face-locate)")
-    station_help = ("station parameters: --band LO,HI (CT edge height band, mm; default auto), "
+    station_help = ("station parameters: --band LO,HI (tube edge height band, mm; default auto), "
                     "--roi, --skip-zones L,R, --centre")
-    p = cmd("station", cmd_station, "cells (end faces) + cooling-tube edge zones of a metric scan: "
+    p = cmd("station", cmd_station, "cylinder end faces + tube edge zones of a metric scan: "
                                     "heights, spacing, T1..Tn (+ PNG, JSON, CSV)", "station")
     p.add_argument("metric", help="metric scan id / label / latest")
     p.add_argument("--flood", help="flood .npy/.npz or a metric scan with a flood pair (default: "
@@ -3562,43 +3562,43 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cells", type=_positive_int, default=2)
     p.add_argument("--diameter", type=float, default=21.05, metavar="MM")
     p.add_argument("--band", metavar="LO,HI", help=station_help)
-    p.add_argument("--roi", metavar="X0,Y0,X1,Y1", help="CT search window, camera px")
+    p.add_argument("--roi", metavar="X0,Y0,X1,Y1", help="tube search window, camera px")
     p.add_argument("--skip-zones", dest="skip_zones", metavar="L,R",
-                   help="drop this many CT zones at the left / right end (e.g. a lead-in)")
+                   help="drop this many tube zones at the left / right end (e.g. a lead-in)")
     p.add_argument("--centre", choices=("rim_circle", "ellipse_ray"),
                    help="face centre method (default rim_circle)")
-    p.add_argument("--no-ct", dest="no_ct", action="store_true", help="cells only")
+    p.add_argument("--no-ct", dest="no_ct", action="store_true", help="end faces only")
     p.add_argument("--no-strict", dest="no_strict", action="store_true",
-                   help="drop the strict cell gates (rim outline rms <= 1.0 mm, >= 70 %% of the "
-                        "disc measured, a plausible height / spacing to the other cells)")
+                   help="drop the strict end-face gates (rim outline rms <= 1.0 mm, >= 70 %% of the "
+                        "disc measured, a plausible height / spacing to the other end faces)")
     p = cmd("station-golden", cmd_station_golden, "station golden from GOOD measurements (metric "
                                                   "scans or station .json) + limits", "station golden")
     p.add_argument("items", nargs="+", help="metric scans (id / label) or station .json files")
     p.add_argument("--label", default="golden")
     p.add_argument("--cell-tol", dest="cell_tol", type=float, metavar="MM",
-                   help="cell height difference: nominal +- this (default 0.15)")
+                   help="end-face height difference: nominal +- this (default 0.15)")
     p.add_argument("--ct-tol", dest="ct_tol", type=float, metavar="MM",
-                   help="CT zone edge height: nominal +- this (default 0.30)")
+                   help="tube zone edge height: nominal +- this (default 0.30)")
     p.add_argument("--spacing-tol", dest="spacing_tol", type=float, metavar="MM")
     p.add_argument("--cell-band", dest="cell_band", metavar="LO,HI",
-                   help="absolute band for every cell height difference, mm")
+                   help="absolute band for every end-face height difference, mm")
     p.add_argument("--ct-band", dest="ct_band", metavar="LO,HI",
-                   help="absolute band for every CT zone height, mm")
+                   help="absolute band for every tube zone height, mm")
     p.add_argument("--band", action="append", metavar="ITEM=LO,HI",
                    help="per-item band, e.g. C2-C1=-0.4,0.1 or T3=-5,-4 (repeatable)")
     p.add_argument("--flood", help="flood for a single metric scan (file or scan)")
     # station parameters for metric-scan items (as `station` takes them; station .json items
     # keep the parameters they were measured with)
-    p.add_argument("--cells", type=_positive_int, help="cells per scan (default 2)")
+    p.add_argument("--cells", type=_positive_int, help="cylinder end faces per scan (default 2)")
     p.add_argument("--diameter", type=float, metavar="MM", help="face diameter (default 21.05)")
     p.add_argument("--edge-band", dest="edge_band", metavar="LO,HI",
-                   help="CT edge height band for the measurement, mm (default auto)")
-    p.add_argument("--roi", metavar="X0,Y0,X1,Y1", help="CT search window, camera px")
+                   help="tube edge height band for the measurement, mm (default auto)")
+    p.add_argument("--roi", metavar="X0,Y0,X1,Y1", help="tube search window, camera px")
     p.add_argument("--skip-zones", dest="skip_zones", metavar="L,R",
-                   help="drop this many CT zones at the left / right end (the golden's numbering)")
+                   help="drop this many tube zones at the left / right end (the golden's numbering)")
     p.add_argument("--centre", choices=("rim_circle", "ellipse_ray"),
                    help="face centre method (default rim_circle)")
-    p.add_argument("--no-ct", dest="no_ct", action="store_true", help="cells only")
+    p.add_argument("--no-ct", dest="no_ct", action="store_true", help="end faces only")
     p = cmd("station-check", cmd_station_check, "a metric scan vs the station golden: exit 0 PASS, "
                                                 "1 FAIL / INCOMPLETE, 2 refused, 4 crashed (+ PNG, JSON, CSV)",
             "the station check")

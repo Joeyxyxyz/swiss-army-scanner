@@ -17,4 +17,4 @@ job:
   min_area_px: 50
 part:
   role: test               # golden | test
-  label: cell
+  label: part

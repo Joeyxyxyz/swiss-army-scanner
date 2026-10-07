@@ -18,7 +18,7 @@ the golden; the trigger settings (z_thresh, min_depth_mm, min_area_mm2) can be o
 per check.
 
 Leave-one-out (golden, FIR and noise from the OTHER placements, the held-out one checked) and
-the synthetic-dent battery (paraboloid dents injected per camera pixel, integrated over the
+the synthetic-dent set (paraboloid dents injected per camera pixel, integrated over the
 pixel footprint, into every repeat, re-gridded through the same operator: the research's
 protocol) measure a golden's false triggers and sensitivity on good data.
 

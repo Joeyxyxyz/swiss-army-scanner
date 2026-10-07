@@ -18,6 +18,6 @@
   },
   "part": {
     "role": "test",
-    "label": "cell"
+    "label": "part"
   }
 }

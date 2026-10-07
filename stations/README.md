@@ -68,7 +68,7 @@ this file.
                   "reprojection_error_px": {"camera": null, "projector": null}},
   "capture": {"preset": "...", "geometry_id": "...", "patterns": "...", "exposure_us": 16667,
               "average": 8, "zone": null},
-  "part": {"role": "test", "label": "cell", "scan_id": "..."},
+  "part": {"role": "test", "label": "part", "scan_id": "..."},
   "deviation_mm": {"max": 0.0, "mean": null, "rms": null, "method": "relief_inspect"},
   "deviation_units": "mm",
   "threshold_mm": 0.7,

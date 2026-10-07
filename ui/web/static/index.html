@@ -43,7 +43,7 @@
   <a href="#spectral" data-tab="spectral"><i>8</i>Spectral</a>
   <a href="#grid" data-tab="grid"><i>9</i>Grid &amp; zones</a>
   <a href="#sensors" data-tab="sensors"><i>10</i>Sensors</a>
-  <a href="#cell" data-tab="cell"><i>11</i>Cell &amp; 3D</a>
+  <a href="#cell" data-tab="cell"><i>11</i>Cylinder &amp; 3D</a>
   <a href="#outputs" data-tab="outputs"><i>12</i>Output bin</a>
   <a href="#log" data-tab="log"><i>13</i>Log</a>
 </nav>
@@ -386,7 +386,7 @@
     <div class="card">
       <h3>3 &middot; Scan this zone</h3>
       <div class="formgrid">
-        <label class="f"><span>Zone</span><input id="zoneText" placeholder="C4, C4:D6, B2,E5 or atlas:cell/cell" spellcheck="false"></label>
+        <label class="f"><span>Zone</span><input id="zoneText" placeholder="C4, C4:D6, B2,E5 or atlas:part/part" spellcheck="false"></label>
         <label class="f"><span>Label</span><input id="zoneLabel" value="zone-part"></label>
         <label class="f"><span>Base</span><select id="zoneBase" data-bases></select></label>
         <label class="f"><span>Known H</span><input id="zoneH" type="number" step="any" placeholder="optional"><em>mm</em></label>
@@ -416,16 +416,16 @@
   </div>
   <div class="card">
     <div class="cardhead"><h3>Surfer: atlas regions</h3><button id="atlasRefresh" class="ghost">Refresh</button></div>
-    <p class="muted small">An atlas names DMD regions (for example the held cell). After import, a region works anywhere a zone does: <code>atlas:cell/cell</code>, including <b>Scan this zone</b> above.</p>
+    <p class="muted small">An atlas names DMD regions (for example the held part). After import, a region works anywhere a zone does: <code>atlas:part/part</code>, including <b>Scan this zone</b> above.</p>
     <div class="row">
       <label class="f inline"><span>Atlas file</span><input id="atlasPath" class="w30" spellcheck="false" value="" placeholder="path to an atlas .json"></label>
-      <label class="f inline"><span>Name</span><input id="atlasName" value="cell" class="w10"></label>
+      <label class="f inline"><span>Name</span><input id="atlasName" value="part" class="w10"></label>
       <button id="atlasImport" class="primary">Import atlas</button>
     </div>
     <div id="atlasOut"></div>
     <div id="atlasList"></div>
     <div class="row">
-      <label class="f inline"><span>Region</span><input id="surfRegion" value="atlas:cell/cell" class="w20" spellcheck="false" title="atlas:<name>/<region>, a zone like P17:P22@48, or x0,y0,x1,y1 DMD px"></label>
+      <label class="f inline"><span>Region</span><input id="surfRegion" value="atlas:part/part" class="w20" spellcheck="false" title="atlas:<name>/<region>, a zone like P17:P22@48, or x0,y0,x1,y1 DMD px"></label>
       <button id="floodBtn">Flood verify</button>
     </div>
     <div id="floodOut"></div>
@@ -523,13 +523,13 @@
 
 <!-- ============================================================ 11 CELL & 3D -->
 <section id="tab-cell" class="tab">
-  <div class="tabhead"><h2>Cell &amp; 3D</h2>
-    <p>Work on a stored scan: export a mesh for CAD / printing, unwrap a standing cell (cylinder fit, seen arc, dent map) and bake per-pixel surface maps. Numbers are in mm only with a matching depth calibration; otherwise they are relief px (rule 6). The rig sees an <b>open arc</b> of the can, never the back.</p></div>
+  <div class="tabhead"><h2>Cylinder &amp; 3D</h2>
+    <p>Work on a stored scan: export a mesh for CAD / printing, unwrap a standing cylinder (cylinder fit, seen arc, dent map) and bake per-pixel surface maps. Numbers are in mm only with a matching depth calibration; otherwise they are relief px (rule 6). The rig sees an <b>open arc</b> of the can, never the back.</p></div>
   <div class="card">
     <div class="row">
       <label class="f inline"><span>Scan</span><select id="cellScan" data-objects></select></label>
       <label class="f inline"><span>Radius</span><input type="number" id="cellRadius" value="24.05" step="any" min="0" class="w5"><em>mm</em></label>
-      <span class="muted small">Radius is the known cell radius (used by cylinder mesh, unwrap and dents; clear it to let the fit decide).</span>
+      <span class="muted small">Radius is the known cylinder radius (used by cylinder mesh, unwrap and dents; clear it to let the fit decide).</span>
     </div>
   </div>
   <div class="split">
@@ -544,14 +544,14 @@
       <div id="meshOut"></div>
     </div>
     <div class="card">
-      <h3>Cell unwrap</h3>
+      <h3>Cylinder unwrap</h3>
       <p class="muted small">Fits the cylinder and unwraps the seen surface to (angle, height). The heatmap shows deviation from the fitted can.</p>
-      <button id="unwrapBtn" class="primary">Unwrap cell</button>
+      <button id="unwrapBtn" class="primary">Unwrap cylinder</button>
       <div id="unwrapOut"></div>
     </div>
   </div>
   <div class="card">
-    <h3>Cell dents</h3>
+    <h3>Cylinder dents</h3>
     <div class="row">
       <label class="f inline"><span>Sigma</span><input type="number" id="dentSigma" value="5" step="any" min="1" class="w5"><em>× noise</em></label>
       <label class="f inline"><span>Min area</span><input type="number" id="dentArea" value="6" min="1" class="w5"><em>bins</em></label>
@@ -633,7 +633,7 @@
   <button id="benchBox">Place box</button>
   <h4>QR label</h4>
   <div class="formgrid tight">
-    <label class="f wide"><span>Text</span><input id="qrData" value="SAS-0001 cell can lot 42"></label>
+    <label class="f wide"><span>Text</span><input id="qrData" value="SAS-0001 part lot 42"></label>
     <label class="f"><span>x</span><input type="number" id="qrX" value="-60" step="any"><em>mm</em></label>
     <label class="f"><span>y</span><input type="number" id="qrY" value="0" step="any"><em>mm</em></label>
     <label class="f"><span>size</span><input type="number" id="qrS" value="45" step="any"><em>mm</em></label>

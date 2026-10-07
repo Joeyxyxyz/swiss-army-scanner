@@ -1144,7 +1144,7 @@ function objItem(o) {
  */
 function zoneForEngine(zone, grid) {
   const raw = String(zone || '').trim();
-  // Surfer atlas regions ('atlas:cell/cell') are names, not cells: sent as typed, never pinned
+  // Surfer atlas regions ('atlas:part/part') are names, not cells: sent as typed, never pinned
   if (/^atlas:/i.test(raw)) return 'atlas:' + raw.slice(6).trim();
   const z = raw.toUpperCase();
   if (!z || z.includes('@')) return z;
@@ -1998,7 +1998,7 @@ async function projectGrid() {
 }
 async function scanZone() {
   const zone = $('#zoneText').value.trim();
-  if (!zone) { put($('#zoneOut'), h('div', { class: 'alert warn' }, 'Enter a zone like C4, C4:D6, B2,E5 or atlas:cell/cell (or click cells on the photo).')); return; }
+  if (!zone) { put($('#zoneOut'), h('div', { class: 'alert warn' }, 'Enter a zone like C4, C4:D6, B2,E5 or atlas:part/part (or click cells on the photo).')); return; }
   await captureObject({ label: $('#zoneLabel').value || 'zone-part', base_id: $('#zoneBase').value, H: $('#zoneH').value, zone,
     btn: $('#zoneScan'), out: $('#zoneOut') });
 }
@@ -2692,7 +2692,7 @@ function bind() {
   on('#glareBtn', 'click', antiGlare);
   on('#moBtn', 'click', multiOrient);
 
-  // cell & 3D, fast mode
+  // cylinder & 3D, fast mode
   on('#meshBtn', 'click', exportMesh);
   on('#unwrapBtn', 'click', cellUnwrap);
   on('#dentBtn', 'click', cellDents);
@@ -2753,7 +2753,7 @@ async function exportMesh() {
   add(out, h('div', { class: 'alert ' + (m.finite_vertices === false ? 'bad' : 'ok') },
     h('b', null, `${kind} mesh (${r.fmt.toUpperCase()})`), ` ${fmt(m.n_vertices, 0)} vertices · ${fmt(m.n_triangles, 0)} triangles · units ${units}`),
   kv([['finite vertices', m.finite_vertices == null ? '—' : (m.finite_vertices ? 'yes' : 'NO')], ['to scale', m.to_scale == null ? '—' : (m.to_scale ? 'yes (mm)' : 'no')],
-    m.arc_deg != null ? ['seen arc', m.arc_deg, 'deg', 1] : null, m.cell_height != null ? ['cell height', m.cell_height, units, 2] : null,
+    m.arc_deg != null ? ['seen arc', m.arc_deg, 'deg', 1] : null, m.cell_height != null ? ['end-face height', m.cell_height, units, 2] : null,
     m.radius != null ? ['radius', m.radius, units, 3] : null, ['calibration', h('span', { class: 'mono small' }, m.calibration_id || '—')]]),
   m.note ? h('div', { class: 'muted small' }, m.note) : null,
   units !== 'mm' ? h('div', { class: 'alert warn' }, 'Uncalibrated: coordinates are not mm (rule 6). The shape is right, the scale is not.') : null,
@@ -2767,7 +2767,7 @@ async function cellUnwrap() {
   const u = job.result;
   add(out, h('div', { class: 'tiles2' },
     metric('seen arc', u.arc_deg, 'deg', u.arc_deg < 90 ? 'warn' : '', 'open arc only', 1),
-    metric('cell height', u.cell_height, u.units, '', '', 2),
+    metric('end-face height', u.cell_height, u.units, '', '', 2),
     metric('radius', u.radius, u.units, '', u.units === 'mm' ? 'fitted' : 'relief px', 3),
     metric('fit rms', u.fit && u.fit.rms, u.units, '', '', 4)),
   figures([job.links && job.links.png, 'dent heatmap (deviation from the fitted can)']),
@@ -2788,7 +2788,7 @@ async function cellDents() {
       { k: 'snr', label: 'SNR', n: true, f: (v) => fmt(v, 1) },
       { k: 'exceeds_trigger', label: 'over trigger', f: (v) => (v == null ? '—' : (v ? tag('yes', 'bad') : 'no')) },
     ], r.dents) : h('div', { class: 'muted small' }, 'No dents found on the seen arc.'),
-    figures([job.links && job.links.png, 'dents on the unwrapped cell']),
+    figures([job.links && job.links.png, 'dents on the unwrapped cylinder']),
     warningsList(r.warnings));
 }
 async function refreshCellPickers() {

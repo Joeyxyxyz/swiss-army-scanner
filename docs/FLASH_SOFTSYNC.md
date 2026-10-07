@@ -27,14 +27,14 @@ The engine never sends a DLPC350 USB/HID command and never opens the HDMI projec
 ## Commands
 
 ```
-scan scan-flash cell --pack library\output\flashpacks\<ts>_<label> --variant zone --roi 500,300,940,780
+scan scan-flash part --pack library\output\flashpacks\<ts>_<label> --variant zone --roi 500,300,940,780
 scan scan-flash --pack <pack dir> --dry-run          # the timing plan; opens nothing
-scan scan-flash cell --pack <pack dir> --variant zone --fine-prefilter 1   # optional fine low-pass
+scan scan-flash part --pack <pack dir> --variant zone --fine-prefilter 1   # optional fine low-pass
 scan sort-flash library\output\flashscans\<ts>_cell.npz --decode   # offline re-sort
 ```
 
 ```python
-r = api.fast_scan_flash(pack_dir, "zone", "cell", roi=[500, 300, 940, 780])
+r = api.fast_scan_flash(pack_dir, "zone", "part", roi=[500, 300, 940, 780])
 r["scan"]                       # a normal MetricScan (meta mode 'flash_softsync')
 r["frame_stats"], r["confidence"], r["times_s"], r["recording"]
 api.sort_flash_recording(r["recording"], decode=True)

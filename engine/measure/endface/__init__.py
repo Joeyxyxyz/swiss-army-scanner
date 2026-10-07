@@ -20,7 +20,7 @@ side is verbs.py.
                  repeatability across repeats, PNG / CSV
     detectors.py the detector hook: 'mf_fir' (default) | 'mf' | 'band' (or a band trigger
                  function); every detector's golden model, leave-one-out false triggers, the
-                 synthetic-dent battery (dents injected per camera pixel), overlay PNGs
+                 synthetic-dent set (dents injected per camera pixel), overlay PNGs
     mfcfar.py    MF-CFAR: per-repeat planes, deviation from the golden RADIAL profile, a
                  dent-shaped matched filter bank (1-3 mm), z against the face's own robust
                  noise; the reflectance FIR (7x7 camera px on the flood pair) removes the

@@ -1,5 +1,5 @@
 """
-Station geometry: cell end faces + the cooling tube (CT) edge, from ONE metric scan (column-axis
+Station geometry: cylinder end faces + a ribbed/serpentine tube edge, from ONE metric scan (column-axis
 ray-plane cloud, mm) and a flood image. Plain numpy / OpenCV / scipy on arrays; verbs.py does the
 library side (rules, output bin, goldens).
 
@@ -27,10 +27,10 @@ library side (rules, output bin, goldens).
      per camera column the THIN runs (the ribbon's edge seen end-on), then connected components
      wider than min_width_px.
   6. trapezoid wave: the edge centreline's lateral position w(s) in the face plane fitted by a
-     trapezoid wave (pitch, phase vs the cell-pair centre, amplitude, plateau fraction, offset,
+     trapezoid wave (pitch, phase vs the cylinder-pair centre, amplitude, plateau fraction, offset,
      slope) - part-fixed zones: one zone = one plateau + the two half-ramps beside it (half a
      pitch); zones are numbered T1..Tn left -> right over the zones kept (coverage, fit
-     residual, optional end skips). Per zone: CT edge height vs the mean face plane (median,
+     residual, optional end skips). Per zone: tube edge height vs the mean face plane (median,
      p5, p95, pixels).
 
 Units: mm (camera frame: x right, y down, z forward), camera px, degrees.
@@ -70,7 +70,7 @@ class StationParams:
     centre_method: str = "rim_circle"   # 'rim_circle': sub-pixel flood rim edges back-projected
                                         # onto the face plane, circle fitted there; 'ellipse_ray':
                                         # the camera ray through the rim ellipse centre
-    ct: bool = True                     # measure the cooling-tube edge
+    ct: bool = True                     # measure the tube edge
     ct_roi: Optional[list] = None       # [x0, y0, x1, y1] camera px; None = cell rows +- margin
     ct_rows_margin_r: float = 3.3       # default roi: the cells' rows +- this many face radii
     ct_band_mm: Optional[list] = None   # [lo, hi] edge height band vs the face plane; None = auto
@@ -442,7 +442,7 @@ def face_fit(X: np.ndarray, cell: dict, K, dist, disc_px: Optional[float] = None
     try:
         c, n, keep, P = fit_plane(Q)
     except StationError:
-        raise StationError(f"cell {cell.get('name', '?')}: too few measured points on its face "
+        raise StationError(f"end face {cell.get('name', '?')}: too few measured points on its face "
                            f"({int(np.all(np.isfinite(Q), 1).sum())} of {n_disc} disc px) - is "
                            "the face inside the scanned zone?") from None
     res = (P - c) @ n
@@ -538,7 +538,7 @@ def cell_pairs(faces: list, names: list, O, n) -> list:
     return out
 
 
-# ------------------------------------------------------------------ 5. the CT edge
+# ------------------------------------------------------------------ 5. the tube edge
 
 def default_ct_roi(cells: list, shape, prm: StationParams) -> tuple:
     H, W = shape
@@ -605,7 +605,7 @@ def ct_candidates(X, cells, faces, O, n, prm: StationParams, roi) -> tuple:
 
 
 def auto_band(ok, h, prm: StationParams, roi) -> Optional[list]:
-    """The CT edge height band: a window 2 x ct_band_halfwidth_mm wide slid over the search band
+    """The tube edge height band: a window 2 x ct_band_halfwidth_mm wide slid over the search band
     (0.5 mm steps); the window whose thin runs (wider than min_width_px) cover the most camera
     columns wins (the ribbon's edge seen end-on: its visible side, further back, makes the runs
     too long in a wider window); the band is then centred on the median height of those runs."""
@@ -716,7 +716,7 @@ def fit_trap(s, w, p_range=(15.0, 40.0)) -> dict:
     then soft-L1 least squares (f_scale 0.3 mm) from the best starts."""
     from scipy.optimize import least_squares
     if len(s) < 12:
-        raise StationError(f"only {len(s)} CT edge columns: too few for the trapezoid wave")
+        raise StationError(f"only {len(s)} tube edge columns: too few for the trapezoid wave")
     lo_b = [10, -100, 0.1, 0.0, -50, -1]
     hi_b = [80, 100, 15, 0.9, 50, 1]
     best = None
@@ -898,8 +898,8 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
            "n_px": int(ct["mask"].sum())}
     out["ct"] = ctr
     if ct["mask"].sum() < 20:
-        warnings.append("no cooling-tube edge found (no thin run a few mm behind the faces "
-                        f"in camera px {ct['roi']}): CT not measured")
+        warnings.append("no tube edge found (no thin run a few mm behind the faces "
+                        f"in camera px {ct['roi']}): tube not measured")
         return out
     line = centreline(X, ct["mask"], O, n, e1, e2)
     out["arrays"]["line"] = line
@@ -911,7 +911,7 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
     try:
         fit = fit_trap(line["s"], line["w"], prm.trap_pitch_range_mm)
     except StationError as e:
-        warnings.append(f"CT: {e}")
+        warnings.append(f"tube: {e}")
         return out
     ctr["trap_fit"] = fit
     model = dict(fit)

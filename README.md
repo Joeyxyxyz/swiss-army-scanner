@@ -7,6 +7,7 @@ It is one engine with one small verb API (`engine/api.py`). A web UI, a CLI and 
 - Spec: [`docs/ENGINE_ARCHITECTURE.md`](docs/ENGINE_ARCHITECTURE.md)
 - Agent guide: [`ui/agent.md`](ui/agent.md)
 - Flow-ready jobs: [`stations/README.md`](stations/README.md)
+- Recipes (work-state checks): [`recipes/README.md`](recipes/README.md), checks + plugins [`docs/CHECKS.md`](docs/CHECKS.md), porting to another line [`docs/PORTING.md`](docs/PORTING.md)
 - Seed package: [`swiss_army_sensor/README.md`](swiss_army_sensor/README.md)
 - Blue-lines fix: [`docs/HDMI_TIMING_FIX.md`](docs/HDMI_TIMING_FIX.md)
 
@@ -24,7 +25,7 @@ Lights and Camera are setup panels the operator opens when needed (only while th
 
 1. Start the server: `run_ui.bat` (real rig) or `run_ui_mock.bat` (simulated bench, port 8766).
 2. Open **http://127.0.0.1:8765/quick** (mock: http://127.0.0.1:8766/quick). The full engineering UI stays at `/`; each links to the other.
-3. Pick the **work state**: one entry per station config in `stations/*.json` (shown as `station_id - part label`).
+3. Pick the **work state**: one entry per station config in `stations/*.json` (shown as `station_id - part label`). A recipe work state (`job.type: recipe`) shows its recipe, zones and checks, and paints its verdict on the part after the run (see *Recipes* below).
 4. Press **START**. The lamp shows READY / RUNNING / **PASS** (green) / **FAIL** (red) / **INVALID** (amber: the numbers can't be trusted, never a pass or a fail) / ABORTED, with the key number (max deviation in mm), the time, a link to `result.json` and the deviation map when there is one. The *Lights / Camera / Action* strip follows the job (queued, capturing, verdict).
 
 | Button | What it does |
@@ -125,9 +126,9 @@ Which calibration each job type needs:
 
 Recalibrate after any zoom / focus / mount change. Mock: `scan.bat --mock calibrate-stereo --mock-poses 12`.
 
-### Presets & recipes
+### Presets (profiles)
 
-A preset holds every setting for one rig geometry. Different parts on the same line (boxes, cylinders, panels) each get their own preset: a **recipe**, so the line knows which settings go with which part.
+A preset holds every setting for one rig geometry: the **profile** (capture settings + geometry). Different parts on the same line (boxes, cylinders, panels) can each get their own preset, so the line knows which settings go with which part; a **recipe** (next section) pins one and adds the part's zones and checks.
 
 - **Built-in presets** (`presets/*.json`, in the repo) are **read-only** for the commands below: never edited or deleted by them.
 - **User presets** live in the library: `<library>/presets/<name>/preset.json` + `meta.json` (created, author, description, copied from). They are runtime data like the rest of the library (not in git).
@@ -145,6 +146,43 @@ A preset holds every setting for one rig geometry. Different parts on the same l
 - **Delete** moves a user preset to `<library>/trash/presets/` (recoverable). Refused for built-ins, for the selected or loaded preset (select another first), and for a preset a station config in `stations/` uses (listed; `--force` overrides).
 - **A new rig profile** = a new `geometry_id` (`--geometry rig2_v1`) + its own calibration. Nothing is copied or fitted for it: the new geometry starts **uncalibrated** (no bases, no stereo calibration) until you run the calibration steps above with that preset. Changing a geometry-bound setting (rotate90, DMD size, coded axis, projector side, baseline, standoff) under an existing `geometry_id` is refused.
 - **Work states pin presets.** A station config (`stations/*.json`) names its own `preset`, and that always wins over the selected one. On the operator page (`/quick`), switching the work state loads that station's preset; the active preset is shown next to the work state. Preset changes (select, load, delete) are refused while a station run is busy.
+
+### Recipes (work-state checks)
+
+A recipe turns the scanner into a work-state check that ports to any line with a DMD projector + a camera: what to scan, where to look, what is recognised there, and what the projector paints on the part afterwards. It is versioned data (JSON / YAML): nothing part-specific lives in code.
+
+| layer | what it holds | where |
+|---|---|---|
+| preset (profile) | rig geometry + capture settings; its stereo calibration gives the mm | `presets/`, `scan preset-add` |
+| recipe | pins a preset; scan kind (fast / metric / trigger), lit zone, part frame (reference plane), golden scan | `recipes/*.json` (built-in, read-only), `<library>/recipes/` (user) |
+| zones | rect / circle / polygon / grid cells, in camera px, projector (DMD) px or part-frame mm (always said) | `zones[]` |
+| checks | what is recognised in a zone: presence, position vs golden, height / step, flatness, defect (end-face MF-CFAR or local), edge straightness / position, code read, or a plugin | `zones[].checks[]`, [`docs/CHECKS.md`](docs/CHECKS.md) |
+| verdict | any FAIL -> FAIL; else any INVALID -> INVALID (never a pass); else PASS | `result.json` `zones[]` |
+| feedback | the verdict painted ON the part: green outline = PASS; red fill + a cross at each fault = FAIL; amber = not measured | `feedback.*` |
+| outputs | run folder (`result.json` + `run.log.jsonl` + overlay + DMD image), PASS / FAIL / ALARM + a result-code register on the I/O bus | `outputs.*`, `stations/io_example.json` |
+
+```json
+{"schema_version": 1, "name": "lid_present", "preset": "bench_9in_metric",
+ "zones": [{"id": "lid", "shape": "rect", "units": "part_mm", "coords": [-40, -25, 40, 25],
+            "checks": [{"type": "presence", "params": {"min_height_mm": 20}},
+                       {"type": "flatness", "params": {"tol_mm": 0.5, "min_height_mm": 20}}]}]}
+```
+
+**The projector is also the work-state indicator.** After the verdict the DMD lights the part itself: a misaligned tube gets its misaligned section filled red with a cross where it is furthest off, a missing part leaves its zone red, a good part is outlined green. The operator sees where to act without reading a screen, which shortens recovery. The light goes where the scan's own decoded correspondences say each camera pixel was lit from, so it lands on the surfaces the camera saw at any depth; a zone whose camera -> DMD map is not consistent (local affine residual above `feedback.max_fit_px`) is not drawn, and the run says why. The hold is a normal pumped HDMI hold; ABORT clears it, and on the operator page so does the next command (START, TRIGGER, HOME, a new work state).
+
+```bat
+scan.bat --mock --library library_mock --mock-part scene:box_lid:ajar recipe-run box_lid
+scan.bat recipe-run my_part --operator-confirmed           :: exit 0 PASS, 1 FAIL, 2 refused, 4 crashed, 5 INVALID
+scan.bat run stations\example_recipe_box_lid.json          :: a station config whose work state IS a recipe
+```
+
+| | CLI | Python |
+|---|---|---|
+| list / show / check types / validate | `recipe-list`, `recipe-show NAME`, `recipe-checks`, `recipe-validate NAME` | `api.recipe_list()`, `recipe_show`, `recipe_checks`, `recipe_validate` |
+| add (copy + override) / select / delete (to trash) | `recipe-add NAME --from BASE --set key=value`, `recipe-select`, `recipe-delete --reason` | `api.recipe_add`, `recipe_select`, `recipe_delete` |
+| golden (a good part) / run | `recipe-golden NAME`, `recipe-run NAME [--scan ID] [--no-feedback]` | `api.recipe_golden`, `api.recipe_run(recipe, preset=None, operator_confirmed=False, project_feedback=True)` |
+
+Built-in examples (all runnable in `--mock` with `--mock-part scene:...`): `box_lid` (presence, height, flatness per lid half), `flat_plate` (flatness, local defects, edge straightness), `cylinder_end_faces` (end-face dents, height difference between faces), `ribbed_tube_alignment` (section position + edge position vs the golden). Schema and run folder: [`recipes/README.md`](recipes/README.md). Porting to another line (projector, camera, calibration, recipe, I/O, and how to prove the numbers on site: calibration check, known-object check, Gauge R&R): [`docs/PORTING.md`](docs/PORTING.md).
 
 ## Modes (UI tabs ↔ verbs)
 
@@ -222,6 +260,8 @@ Everything is under `library\` (the default is next to this README; override wit
 | &nbsp;&nbsp;`output\flashscans\` | flash soft-sync recordings (camera frames + timestamps + the loop layout) and offline sorts |
 | &nbsp;&nbsp;`output\sensors\` | sensor checks |
 | &nbsp;&nbsp;`output\index.csv` | one row per output file: time, kind, label, geometry, source |
+| `recipes\` | user recipes (`<name>\recipe.json` + `meta.json`), `active.jsonl` = the selected recipe |
+| `runs\` | recipe run folders from `recipe-run` (`result.json`, `run.log.jsonl`, `overlay.png`, `feedback_dmd.png`, `feedback_photo.png`) |
 | `sessions\` | `log.jsonl` of every action |
 | `trash\` | "deleted" entries (recoverable) |
 
@@ -331,6 +371,8 @@ The full suite takes about 35 min. It is mock only, apart from tests that assert
 | Anti-glare code reading (`codes --anti-glare`) | 🧪 experimental: synthetic mock test; one bench trial |
 | Virtual sensors (spot, part present, alignment), good-memory bank | ✅ mock-tested; real-rig trials next |
 | Flow-ready job (`run`: station config → `result.json` + JSON-lines log, exit code = verdict) | ✅ built, mock-tested (`tests/test_run_job_mock.py`); not yet run on the rig |
+| Recipes (work-state checks: zones, checks, verdict painted on the part; `recipe-*`, `run` job.type recipe, `/quick` work states, result-code register) | ✅ built, mock-tested (`tests/test_recipes_mock.py`, `tests/test_recipe_run_mock.py`: synthetic scans of the mock scenes + the full mock capture path); **not yet run on the rig**: tolerances in the examples are illustrative, prove them on site (`docs/PORTING.md`) |
+| Industrial I/O (Modbus TCP, OPC UA, EtherNet/IP), camera GPIO, serial, digital I/O | placeholders: clean interfaces + intended mapping, not implemented |
 | Hardware-trigger pattern mode (USB, guarded) | future (architecture step 10) |
 | Hardware trigger (full speed): TRIG_OUT_1 → camera, one frame per pattern (`trigger-test`, `scan-trigger`, packs with `--trigger-mode trigout --period-us 10000/5000/4500`) | 🧪 experimental: mock-tested (`tests/test_trigger_fullspeed_mock.py`); **not yet run on the rig**. Bench checklist with wiring: [`docs/TRIGGER_FULLSPEED_TEST.md`](docs/TRIGGER_FULLSPEED_TEST.md) |
 | Flash soft-sync fast scan (1-bit pack, free-running camera, software sort) | ✅ built, mock-tested (simulated DLP loop + free-running camera, GUI mistakes, dropped frames; pack → loop → camera → sort → decode → metric scan end to end vs an ideal synchronous capture and the HDMI fringes, `tests/test_flash_e2e_mock.py`); PySpin free-run code and the real loop not yet run on the rig |

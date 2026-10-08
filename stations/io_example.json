@@ -1,5 +1,5 @@
 {
-  "_comment": "Example command I/O mapping for the command bus (engine/control/commands.py). Hardware backends are PLACEHOLDERS (not implemented): keep them disabled. Inputs map an input name to a command; outputs map a signal (READY, BUSY, PASS, FAIL, ALARM) to an output name.",
+  "_comment": "Example command I/O mapping for the command bus (engine/control/commands.py). Hardware backends (camera GPIO, serial, digital I/O, Modbus TCP, OPC UA, EtherNet/IP) are PLACEHOLDERS (not implemented): keep them disabled. Inputs map an input name (line, bit, coil, node, tag) to a command; outputs map a signal (READY, BUSY, PASS, FAIL, ALARM) to an output name; fieldbus outputs also write the result_code / state_code / workstate registers named in their options.",
   "inputs": [
     {"kind": "simulated", "enabled": true,
      "map": {"trigger": "TRIGGER", "abort": "ABORT", "start": "START", "home": "HOME"}},
@@ -10,13 +10,40 @@
      "options": {"port": "COM5", "baud": 115200}},
     {"kind": "digital_io", "enabled": false,
      "map": {"DI0": "TRIGGER", "DI1": "ABORT", "DI2": "HOME", "DI3": "ARM"},
-     "options": {"host": "192.168.0.50", "poll_ms": 10}}
+     "options": {"host": "192.168.0.50", "poll_ms": 10}},
+    {"kind": "modbus_tcp", "enabled": false,
+     "map": {"coil:0": "START", "coil:1": "ABORT", "coil:2": "HOME", "coil:3": "TRIGGER",
+             "coil:4": "ARM", "coil:5": "DISARM", "coil:6": "RESET"},
+     "options": {"host": "192.168.0.60", "port": 502, "unit": 1, "poll_ms": 10,
+                 "workstate_register": 100}},
+    {"kind": "opc_ua", "enabled": false,
+     "map": {"ns=2;s=Cell.Start": "START", "ns=2;s=Cell.Abort": "ABORT",
+             "ns=2;s=Cell.Home": "HOME", "ns=2;s=Cell.Trigger": "TRIGGER"},
+     "options": {"endpoint": "opc.tcp://192.168.0.61:4840", "workstate_node": "ns=2;s=Cell.WorkState"}},
+    {"kind": "ethernet_ip", "enabled": false,
+     "map": {"Cell_Start": "START", "Cell_Abort": "ABORT", "Cell_Home": "HOME",
+             "Cell_Trigger": "TRIGGER"},
+     "options": {"host": "192.168.0.62", "slot": 0, "poll_ms": 10, "workstate_tag": "Cell_WorkState"}}
   ],
   "outputs": [
     {"kind": "simulated", "enabled": true, "map": {}},
     {"kind": "digital_io", "enabled": false,
      "map": {"READY": "DO0", "BUSY": "DO1", "PASS": "DO2", "FAIL": "DO3", "ALARM": "DO4"},
      "options": {"host": "192.168.0.50"}},
-    {"kind": "camera_gpio", "enabled": false, "map": {"BUSY": "Line1"}}
+    {"kind": "camera_gpio", "enabled": false, "map": {"BUSY": "Line1"}},
+    {"kind": "modbus_tcp", "enabled": false,
+     "map": {"READY": "coil:16", "BUSY": "coil:17", "PASS": "coil:18", "FAIL": "coil:19",
+             "ALARM": "coil:20"},
+     "options": {"host": "192.168.0.60", "port": 502, "unit": 1, "result_register": 101,
+                 "state_register": 102, "workstate_register": 103}},
+    {"kind": "opc_ua", "enabled": false,
+     "map": {"READY": "ns=2;s=Scanner.Ready", "BUSY": "ns=2;s=Scanner.Busy",
+             "PASS": "ns=2;s=Scanner.Pass", "FAIL": "ns=2;s=Scanner.Fail",
+             "ALARM": "ns=2;s=Scanner.Alarm"},
+     "options": {"endpoint": "opc.tcp://192.168.0.61:4840", "result_node": "ns=2;s=Scanner.ResultCode"}},
+    {"kind": "ethernet_ip", "enabled": false,
+     "map": {"READY": "Scan_Ready", "BUSY": "Scan_Busy", "PASS": "Scan_Pass", "FAIL": "Scan_Fail",
+             "ALARM": "Scan_Alarm"},
+     "options": {"host": "192.168.0.62", "slot": 0, "result_tag": "Scan_ResultCode"}}
   ]
 }

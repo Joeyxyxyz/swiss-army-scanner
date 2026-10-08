@@ -24,7 +24,9 @@ EXAMPLE = ROOT / "stations" / "example_cell_station.json"
 RESULT_KEYS = {"schema_version", "run_id", "run_folder", "mode", "station",
                "operator_confirmed", "job", "calibration", "capture", "part", "deviation_mm",
                "deviation_units", "threshold_mm", "result", "invalid_reason", "engine_verdict",
-               "warnings", "outputs", "software", "started", "finished"}
+               "warnings", "outputs", "software", "started", "finished",
+               # schema 0.2: recipe jobs fill these; null / [] for the other job types
+               "recipe", "zones", "feedback"}
 
 
 def _station(tmp_path, name="cfg.json", **over) -> Path:
@@ -118,6 +120,7 @@ def test_run_folders_are_new_and_files_never_overwritten(tmp_path):
         RJ.RunLog(run_dir / "run.log.jsonl", run_id)
     res = RJ.empty_result(cfg, run_id, str(run_dir), True, False)
     assert set(res) == RESULT_KEYS and res["result"] == "INVALID"
+    assert res["schema_version"] == "0.2" and res["zones"] == [] and res["recipe"] is None
     with pytest.raises(ValueError):
         RJ.write_result(run_dir, {**res, "result": "MAYBE"})
     RJ.write_result(run_dir, res)

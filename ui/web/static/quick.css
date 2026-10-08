@@ -72,3 +72,11 @@ kbd { font: 12px var(--mono); padding: 1px 5px; border: 1px solid var(--line2); 
 .qpanel summary b, .qaction b { margin-right: 8px; }
 .qaction { color: var(--muted); }
 .qrow { display: flex; gap: 10px; flex-wrap: wrap; }
+.qlinks a + a { margin-left: 14px; }
+.qzonelist { list-style: none; padding: 0; margin: 8px 0 0; display: grid; gap: 4px; }
+.qzonelist li { padding: 6px 10px; border-radius: var(--r); border: 1px solid var(--line2);
+  font-size: 14px; overflow-wrap: anywhere; }
+.qzonelist li b { margin-right: 8px; }
+.qzonelist li.z-pass { border-color: #23a866; }
+.qzonelist li.z-fail { border-color: #d0352c; background: rgba(179, 38, 30, .18); }
+.qzonelist li.z-invalid { border-color: #e0a100; }

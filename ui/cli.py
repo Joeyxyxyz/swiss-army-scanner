@@ -27,7 +27,8 @@ Exit codes let a script or an agent branch without parsing the text:
      crash is never read as FLAG (1) or CLEAR (0)
   5  run only: the job ran but its result is INVALID (numbers not trusted)
 `run <station config>` is the flow-ready entry point: one job, a new run
-folder with result.json + run.log.jsonl (ui/run_job.py).
+folder with result.json + run.log.jsonl (ui/run_job.py). `recipe-run <recipe>` runs a
+recipe (work-state check: zones, checks, projected verdict) the same way.
 --json prints one JSON document per command instead of tables.
 """
 
@@ -234,6 +235,13 @@ CYL_DEFAULT = (24.05, 90.0, 1.5)        # radius, height, dent depth (mm): a sta
 
 
 def _mock_part(text: str) -> str:
+    if text.strip().lower().startswith("scene:"):
+        from engine.capture import mock_scenes
+        try:
+            name, variant = mock_scenes.parse(text)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e)) from None
+        return f"scene:{name}:{variant}"
     if text.strip().lower().startswith("qr:") and text.strip()[3:].strip():
         return "qr:" + text.strip()[3:].strip()          # a QR label (codes), text kept as typed
     t = text.strip().lower()
@@ -461,6 +469,9 @@ def _mock_place(ctx, spec: Optional[str] = None) -> None:
     if spec == "none":
         ctx.say("[mock] simulated bench left empty")
         return
+    if spec.startswith("scene:"):
+        raise CLIError(f"--mock-part {spec}: scenes are for the metric (stereo) bench: "
+                       "metric / recipe jobs, recipe-run, recipe-golden")
     if spec.startswith("qr:"):
         from engine.capture.mock_bench import Label
         obj, desc = Label(spec[3:], center_mm=(0, 0), size_mm=45), f"a QR label {spec[3:]!r}"
@@ -695,6 +706,160 @@ def cmd_preset_show(ctx):
         ctx.say(f"  ! INVALID: {_one_line(r.get('error'))}")
     ctx.say(json.dumps(r["preset"], indent=2))
     return EXIT_OK, {"preset": r}
+
+
+# ------------------------------------------------------------ recipes (work-state checks)
+
+def cmd_recipes(ctx):
+    items = api.recipe_list()
+    sel = api.recipe_active()
+    paths = api.paths()
+    ctx.say(f"Recipes: built-in {paths['recipes']} (read-only), user {paths['user_recipes']}")
+    ctx.say(f"  (* = selected: {sel or 'none'})")
+    ctx.table(["", "name", "tier", "preset", "scan", "zones", "checks", "golden", "valid"],
+              [["*" if i["name"] == sel else "", i["name"], i["tier"], i.get("preset", "-"),
+                i.get("scan", "-"), ",".join(i.get("zones") or []) or "-",
+                ",".join(i.get("checks") or []) or "-", i.get("golden") or "-",
+                "yes" if i.get("valid") else f"NO: {_one_line(i.get('error'))[:60]}"]
+               for i in items])
+    return EXIT_OK, {"recipes": items, "selected": sel}
+
+
+def cmd_recipe_show(ctx):
+    r = api.recipe_show(ctx.args.name)
+    ctx.kv([["name", r["name"]], ["tier", r["tier"] + (" (read-only)" if r["tier"] == "builtin"
+                                                      else "")],
+            ["selected", "yes" if r.get("active") else "no"], ["preset", r.get("preset") or "-"],
+            ["file", r.get("path")], ["description", r.get("description") or "-"],
+            ["golden", r.get("golden") or "-"], ["mock scene", r.get("mock_scene") or "-"]])
+    if not r.get("valid", True):
+        ctx.say(f"  ! INVALID: {_one_line(r.get('error'))}")
+    ctx.say(json.dumps(r["recipe"], indent=2))
+    return EXIT_OK, {"recipe": r}
+
+
+def cmd_recipe_checks(ctx):
+    av = api.recipe_checks()
+    for cid, d in av.items():
+        ctx.say(f"{cid}: {d['title']}" + (f"  (needs {', '.join(d['needs'])})" if d["needs"] else ""))
+        ctx.table(["param", "kind", "unit", "default", "doc"],
+                  [[k, v["kind"], v.get("unit") or "-",
+                    "required" if v["required"] else json.dumps(v.get("default")), v["doc"]]
+                   for k, v in d["params"].items()], indent="    ")
+    return EXIT_OK, {"checks": av}
+
+
+def cmd_recipe_validate(ctx):
+    v = api.recipe_validate(ctx.args.recipe)
+    if v["valid"]:
+        r = v["recipe"]
+        ctx.say(f"Recipe {r['name']}: valid (schema {r['schema_version']}, preset {r['preset']}, "
+                f"{len(r['zones'])} zone(s))")
+    else:
+        ctx.say(f"Recipe {ctx.args.recipe}: {len(v['problems'])} problem(s)")
+        for pr in v["problems"]:
+            ctx.say(f"  - {_one_line(pr)}")
+    return (EXIT_OK if v["valid"] else EXIT_REFUSED), {"validation": v}
+
+
+def cmd_recipe_add(ctx):
+    a = ctx.args
+    r = api.recipe_add(a.name, a.base, _parse_sets(a.set), a.desc or "", a.replace)
+    ctx.say(f"User recipe {r['name']} added (copied from {a.base}): {r['path']}")
+    if r.get("replaced"):
+        ctx.say(f"  the previous {r['name']} moved to {r['replaced']}")
+    ctx.say(f"  run it: scan recipe-run {r['name']}, or scan recipe-select {r['name']}")
+    return EXIT_OK, {"recipe": r}
+
+
+def cmd_recipe_select(ctx):
+    r = api.recipe_select(ctx.args.name)
+    ctx.say(f"Selected recipe {r['name']} ({r['tier']}): the default of recipe-run")
+    return EXIT_OK, {"selected": r}
+
+
+def cmd_recipe_delete(ctx):
+    a = ctx.args
+    r = api.recipe_delete(a.name, a.reason, force=a.force,
+                          stations_dir=Path(a.stations).resolve() if a.stations else None)
+    ctx.say(f"User recipe {r['name']} moved to {r['trashed']} (recoverable: move it back)")
+    if r.get("forced"):
+        ctx.say(f"  ! still referenced by station config(s): {', '.join(r['stations'])}")
+    return EXIT_OK, {"deleted": r}
+
+
+def _recipe_arg(ctx):
+    name = ctx.args.recipe or api.recipe_active()
+    if not name:
+        raise CLIError("which recipe? give a name or a file (scan recipe-list), or select one "
+                       "with scan recipe-select NAME")
+    r = api.recipe_load(name)
+    if ctx.args.average is not None:
+        r.scan["average"] = ctx.args.average
+    return r
+
+
+def _recipe_mock_scene(ctx, r) -> Optional[str]:
+    """MOCK: the scene to place (--mock-part when given, else the recipe's mock_scene)."""
+    if not ctx.mock:
+        return None
+    if getattr(ctx.args, "mock_part_given", False):
+        spec = ctx.args.mock_part
+        if not spec.startswith("scene:"):
+            _mock_place_metric(ctx)            # a block / cylinder / the empty wall
+            return None
+        return spec
+    return r.part.get("mock_scene")
+
+
+def cmd_recipe_run(ctx):
+    a = ctx.args
+    r = _recipe_arg(ctx)
+    preset = ctx.preset() if a.preset_given else None
+    if not ctx.mock and not a.operator_confirmed:
+        raise CLIError("the real rig needs a human to confirm the physical setup first (part "
+                       "placed, rig untouched): pass --operator-confirmed")
+    if a.pattern_mode_set_by_human and r.scan["kind"] != "trigger":
+        raise CLIError("--pattern-mode-set-by-human is only for scan.kind trigger recipes")
+    scene = None if a.scan else _recipe_mock_scene(ctx, r)
+    want_fb = r.feedback["enabled"] and not a.no_feedback
+    if want_fb and not ctx.json:
+        ctx.say(f"[{'MOCK' if ctx.mock else 'REAL RIG'}] recipe {r.name} (preset "
+                f"{preset.name if preset else r.preset}); the verdict is projected on the part "
+                f"for {a.hold if a.hold is not None else r.feedback['hold_s']:g} s")
+    out = api.recipe_run(r, preset=preset, operator_confirmed=bool(a.operator_confirmed),
+                         project_feedback=want_fb, scan=a.scan, runs_dir=a.runs_dir,
+                         hold_s=a.hold, label=a.label, mock_scene=scene,
+                         pattern_mode_ack=bool(a.pattern_mode_set_by_human))
+    res = out["result"]
+    dev = res["deviation_mm"]["max"]
+    ctx.say(f"Run {out['run_id']}: {res['result']}"
+            + (f"  ({res['invalid_reason']})" if res["invalid_reason"] else ""))
+    ctx.kv([["recipe", f"{r.name} (preset {res['capture']['preset'] or r.preset})"],
+            ["scan", res["part"]["scan_id"] or "-"],
+            ["headline", f"{res['deviation_mm']['method']}: {_u(dev, 'mm', 4)}"
+             if dev is not None else "-"],
+            ["result code", str((res.get("recipe") or {}).get("result_code"))],
+            ["result.json", str(Path(out["run_dir"]) / "result.json")],
+            ["log", str(Path(out["run_dir"]) / "run.log.jsonl")]])
+    _recipe_summary(ctx, res)
+    ctx.warn(res["warnings"])
+    return out["exit_code"], {"run_id": out["run_id"], "run_dir": str(out["run_dir"]),
+                              "result": res}
+
+
+def cmd_recipe_golden(ctx):
+    a = ctx.args
+    r = _recipe_arg(ctx)
+    preset = ctx.preset() if a.preset_given else None
+    scene = _recipe_mock_scene(ctx, r)
+    ms = api.recipe_golden(r, preset=preset, label=a.label, mock_scene=scene)
+    ctx.say(f"Golden scan for recipe {r.name}: {ms.id} (label {ms.label}, "
+            f"{(ms.meta or {}).get('n_points')} points, calibration {ms.calibration_id})")
+    if (r.golden or {}).get("scan") not in (ms.label, "latest", "last"):
+        ctx.say(f"  ! the recipe's golden.scan is {(r.golden or {}).get('scan')!r}: point it at "
+                f"{ms.label!r} (scan recipe-add ... --set golden.scan={ms.label})")
+    return EXIT_OK, {"golden": ms}
 
 
 def cmd_paths(ctx):
@@ -2805,6 +2970,10 @@ def _mock_place_metric(ctx) -> None:
     bench.clear()
     bench.use_stereo()
     spec = ctx.args.mock_part
+    if spec.startswith("scene:"):
+        from engine.capture import mock_scenes
+        ctx.say(f"[mock] stereo bench: placed {mock_scenes.place(bench, spec)}")
+        return
     if spec in ("none", "validation") or spec.startswith("qr:"):
         ctx.say("[mock] stereo bench: the empty wall (a flat reference)")
         return
@@ -2966,10 +3135,24 @@ def cmd_run(ctx):
     if lib is not None and not a.library:           # --library on the command line wins
         ctx.session = api.configure(lib.resolve(), mock=ctx.mock)
         ctx._outputs_before = len(ctx.session.store.outputs())
+    recipe = None
+    if cfg.job_type == "recipe":                    # the recipe pins its preset
+        try:
+            recipe = api.recipe_load(cfg.recipe)
+        except ValueError as e:
+            raise CLIError(f"job.recipe {cfg.recipe!r}: {e}") from e
+        if not a.preset_given and not cfg.preset:
+            a.preset = recipe.preset
     if cfg.preset and not a.preset_given:           # --preset on the command line wins
         a.preset = cfg.preset
     if cfg.average is not None and a.average is None:
         a.average = cfg.average
+    if ctx.mock and cfg.mock_part and not getattr(a, "mock_part_given", False):
+        try:                                        # the config's simulated human (MOCK only)
+            a.mock_part = _mock_part(cfg.mock_part)
+        except argparse.ArgumentTypeError as e:
+            raise CLIError(f"mock_part {cfg.mock_part!r}: {e}") from e
+        a.mock_part_given = True
     confirmed = bool(a.operator_confirmed or cfg.operator_confirmed)
     run_id, run_dir = RJ.new_run(cfg)
     try:
@@ -2996,6 +3179,8 @@ def cmd_run(ctx):
             _run_metric(ctx, cfg, p, log, res, run_dir)
             code = {"PASS": EXIT_OK, "FAIL": EXIT_NOT_OK}.get(res["result"], EXIT_INVALID)
             return _run_done(ctx, cfg, run_id, run_dir, res, log, code)
+        if cfg.job_type == "recipe":            # stereo calibration: zones, checks, feedback
+            return _run_recipe(ctx, cfg, recipe, p, log, res, run_dir, run_id)
         base = None if cfg.base == "capture" else api.latest_base(p)
         if base is None and cfg.base == "latest" and not ctx.mock:
             raise CLIError(f"no usable base for geometry {p.geometry_id}: clear the scene "
@@ -3038,6 +3223,88 @@ def cmd_run(ctx):
     return _run_done(ctx, cfg, run_id, run_dir, res, log, code)
 
 
+def _recipe_mock_place(ctx, recipe, station_part: Optional[str] = None):
+    """MOCK only: what the simulated human places for a recipe run: --mock-part when given,
+    else the station config's mock_part, else the recipe's part.mock_scene
+    (scene:<name>[:<variant>]), else the empty wall."""
+    if not ctx.mock:
+        return None
+    spec = ctx.args.mock_part if getattr(ctx.args, "mock_part_given", False) else \
+        (station_part or recipe.part.get("mock_scene") or "none")
+    if not str(spec).startswith("scene:"):
+        spec = _mock_part(str(spec))
+
+    def place():
+        old = ctx.args.mock_part
+        ctx.args.mock_part = spec
+        try:
+            _mock_place_metric(ctx)
+        finally:
+            ctx.args.mock_part = old
+    return place
+
+
+def _recipe_summary(ctx, res: dict) -> None:
+    for z in res.get("zones") or []:
+        ctx.say(f"  zone {z['id']}: {z['verdict']}"
+                + (f"  ({z['n_points']} points)" if z.get("n_points") is not None else ""))
+        rows = []
+        for ch in z["checks"]:
+            k = ch.get("key")
+            v = (ch.get("values") or {}).get(k) if k else None
+            rows.append([ch["id"], ch["type"], ch["verdict"],
+                         f"{k} {_f(v, 4)}" + (f" (limit {_f(ch.get('limit'), 4)})"
+                                               if ch.get("limit") is not None else "")
+                         if k else "-", _one_line(ch.get("message", ""))[:90]])
+        ctx.table(["check", "type", "verdict", "value", "message"], rows, indent="    ")
+    fb = res.get("feedback") or {}
+    if fb.get("rendered"):
+        drawn = [z["id"] for z in fb.get("zones", []) if z.get("drawn")]
+        ctx.say(f"  feedback: {len(drawn)} zone(s) drawn, {len(fb.get('crosses', []))} "
+                f"cross(es){', text ' + repr(fb['text']) if fb.get('text') else ''}: "
+                f"{fb.get('image')}")
+    elif fb.get("enabled"):
+        ctx.say(f"  feedback: not projected ({_one_line(fb.get('refused') or '-')})")
+
+
+def _run_recipe(ctx, cfg, recipe, p, log, res, run_dir, run_id) -> tuple:
+    """job.type recipe: engine/recipes/runner (scan, zones, checks, verdict, overlay + DMD
+    feedback image), result.json, then the projected verdict (unless --no-feedback)."""
+    from engine.recipes import runner
+    s = api._engine()
+    if ctx.args.average is not None:                # --average, else the config's job.average
+        recipe.scan["average"] = ctx.args.average
+    label = cfg.part_label if (cfg.raw.get("part") or {}).get("label") else None
+    if label is None:
+        res["part"]["label"] = recipe.part.get("label") or recipe.name
+    res["job"]["recipe"] = recipe.name
+    state = runner.execute(s, recipe, p, res=res, log=log, run_dir=run_dir,
+                           mock_place=_recipe_mock_place(ctx, recipe, cfg.mock_part),
+                           label=label)
+    if res.get("recipe"):
+        res["recipe"]["result_code"] = recipe.outputs["result_codes"].get(res["result"])
+    code = {"PASS": EXIT_OK, "FAIL": EXIT_NOT_OK}.get(res["result"], EXIT_INVALID)
+    res["outputs"]["mesh"] = [o["path"] for o in ctx.new_outputs()
+                              if o["path"].lower().endswith((".stl", ".obj", ".ply"))]
+    want = recipe.feedback["enabled"] if cfg.feedback is None else bool(cfg.feedback)
+    if want and state.get("img") is not None and not ctx.args.no_feedback:
+        ctx.say(f"  projecting the verdict on the part for {recipe.feedback['hold_s']:g} s "
+                "(Ctrl+C / ABORT clears it)")
+    out = runner.finish(s, p, recipe, run_dir, res, log, state,
+                        project_feedback=bool(want and not ctx.args.no_feedback),
+                        cancel=s.cancel, exit_code=code)
+    dev = res["deviation_mm"]["max"]
+    ctx.say(f"Run {run_id}: {res['result']}"
+            + (f"  ({res['invalid_reason']})" if res["invalid_reason"] else ""))
+    ctx.kv([["station", cfg.station_id], ["recipe", f"{recipe.name} (preset {p.name})"],
+            ["headline", f"{res['deviation_mm']['method']}: {_u(dev, 'mm', 4)}"
+             if dev is not None else "-"],
+            ["result.json", str(out)], ["log", str(run_dir / "run.log.jsonl")]])
+    _recipe_summary(ctx, res)
+    ctx.warn(res["warnings"])
+    return code, {"run_id": run_id, "run_dir": str(run_dir), "result": res}
+
+
 def _run_done(ctx, cfg, run_id, run_dir, res, log, code) -> tuple:
     from ui import run_job as RJ
     res["outputs"]["mesh"] = [o["path"] for o in ctx.new_outputs()
@@ -3074,7 +3341,8 @@ def _add_globals(p: argparse.ArgumentParser, sub: bool) -> None:
                    help="mock only: what the simulated human places for scan / wizard / "
                         "check-presence: validation | none | H,W,L[,albedo] (mm; albedo 0..1) | "
                         "cylinder[:R,H,dent_mm] (a standing cylinder, default 24.05,90,1.5) | "
-                        "qr:TEXT (a QR label, for codes)")
+                        "qr:TEXT (a QR label, for codes) | scene:NAME[:VARIANT] (a recipe "
+                        "scene: tube, endfaces, box_lid, plate)")
     p.add_argument("--json", action="store_true", default=d(False),
                    help="print one JSON document (for scripts and AI agents)")
     p.add_argument("--debug", action="store_true", default=d(False),
@@ -3196,12 +3464,24 @@ flow-ready job (one station config in, one run folder out; see stations/):
                                          result.json + run.log.jsonl in <runs_dir>/<run_id>/;
                                          exit 0 PASS, 1 FAIL, 2 refused, 4 crashed, 5 INVALID
 
+recipes (work-state checks: preset -> zones -> checks -> verdict painted on the part):
+  scan recipe-list                       built-in (recipes/, read-only) + user recipes
+  scan recipe-checks                     check types: presence, position, height, flatness,
+                                         defect, edge, code (+ plugins)
+  scan recipe-golden <recipe>            a GOOD part as the recipe's golden scan
+  scan --mock recipe-run box_lid --mock-part scene:box_lid:ajar
+  scan recipe-run <recipe> --operator-confirmed    exit 0 PASS, 1 FAIL, 2 refused,
+                                         4 crashed, 5 INVALID; red on the part at the fault
+  scan recipe-add|recipe-select|recipe-delete|recipe-show|recipe-validate
+  station configs: job.type recipe + job.recipe NAME (the work state is the recipe)
+
 library: bases | scans | calibrations | readings | materials | banks | maps |
          sensors | outputs;  bank-remove <scan> --bank NAME drops one bank member.
 mock: --mock-part H,W,L[,albedo] is what the simulated human places for scan,
       wizard and check-presence (the bench is albedo 0.6; 'none' = empty);
       --mock-part cylinder[:R,H,dent_mm] places a standing cylinder; qr:TEXT a QR
-      label for codes.
+      label for codes; scene:<name>[:<variant>] a recipe scene (tube[:misaligned],
+      endfaces[:dent|proud], box_lid[:ajar|missing], plate[:bump|burr]).
 
 ids: a full id, a label (newest wins), 'latest', or any unique piece of the id.
 exit codes: 0 ok | 1 not ok (verdict/signal/cancel/unexpected) | 2 refused (rule,
@@ -3256,6 +3536,58 @@ def build_parser() -> argparse.ArgumentParser:
     p = cmd("preset-show", cmd_preset_show, "show one preset (tier, calibration, JSON)",
             "preset show")
     p.add_argument("name")
+    cmd("recipe-list", cmd_recipes, "list recipes (work-state checks): built-in + user (tier, "
+                                    "preset, zones, checks, golden)")
+    p = cmd("recipe-show", cmd_recipe_show, "show one recipe (tier, preset, JSON)", "recipe show")
+    p.add_argument("name")
+    cmd("recipe-checks", cmd_recipe_checks, "the check types a recipe can use (params, units)")
+    p = cmd("recipe-validate", cmd_recipe_validate, "validate a recipe (name or file) without "
+            "running it: exit 0 valid, 2 with every problem listed", "recipe validation")
+    p.add_argument("recipe", help="recipe name or a .json / .yaml file")
+    p = cmd("recipe-add", cmd_recipe_add, "add a user recipe: a copy of another recipe (or a "
+            "recipe file) with fields overridden", "recipe add")
+    p.add_argument("name", help="new user recipe name [A-Za-z0-9_.-]")
+    p.add_argument("--from", dest="base", required=True, metavar="BASE",
+                   help="recipe to copy (built-in / user name, or a .json / .yaml file)")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE",
+                   help="override a field, e.g. feedback.hold_s=10, "
+                        "zones.0.checks.0.params.tol_mm=0.4, golden.scan=my_good_part "
+                        "(repeatable; values parse as JSON when they can)")
+    p.add_argument("--desc", metavar="TEXT", help="description (what part / line it is for)")
+    p.add_argument("--replace", action="store_true",
+                   help="replace an existing USER recipe of this name (the old one goes to trash/)")
+    p = cmd("recipe-select", cmd_recipe_select, "select the library's recipe (the default of "
+            "recipe-run)", "recipe select")
+    p.add_argument("name")
+    p = cmd("recipe-delete", cmd_recipe_delete, "move a user recipe to the library trash "
+            "(built-ins are read-only)", "recipe delete")
+    p.add_argument("name")
+    p.add_argument("--reason", required=True, help="why (recorded with the trashed recipe)")
+    p.add_argument("--force", action="store_true",
+                   help="delete even when a station config's job.recipe names it")
+    p.add_argument("--stations", metavar="DIR", help="station configs folder checked for "
+                   "references (default: the repo's stations/)")
+    p = cmd("recipe-run", cmd_recipe_run, "run a recipe: scan, zones, checks, verdict, the "
+            "verdict projected on the part; a new run folder (exit 0 PASS, 1 FAIL, 2 refused, "
+            "4 crashed, 5 INVALID)", "the recipe run")
+    p.add_argument("recipe", nargs="?", help="recipe name or file (default: the selected recipe)")
+    p.add_argument("--scan", metavar="ID", help="check a stored metric scan (id / label / latest) "
+                   "instead of capturing")
+    p.add_argument("--no-feedback", action="store_true", help="do not project the verdict")
+    p.add_argument("--hold", type=float, metavar="S", help="feedback hold, s (default the "
+                   "recipe's feedback.hold_s)")
+    p.add_argument("--runs-dir", metavar="DIR", help="where the run folder goes (default "
+                   "$SCANNER_RUNS_DIR, the recipe's outputs.runs_dir, else <library>/runs)")
+    p.add_argument("--label", help="scan label (default the recipe's part.label)")
+    p.add_argument("--operator-confirmed", action="store_true",
+                   help="a human confirmed the physical setup (required on the real rig)")
+    p.add_argument("--pattern-mode-set-by-human", action="store_true",
+                   help="scan.kind trigger only: a HUMAN put the projector in pattern mode")
+    p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a FAIL verdict (1)
+    p = cmd("recipe-golden", cmd_recipe_golden, "scan a GOOD part with a recipe's scan settings "
+            "as its golden reference (labelled the recipe's golden.scan)", "the recipe golden")
+    p.add_argument("recipe", nargs="?", help="recipe name or file (default: the selected recipe)")
+    p.add_argument("--label", help="scan label (default the recipe's golden.scan)")
     cmd("paths", cmd_paths, "where the library, output bin and presets live")
     cmd("signal", cmd_signal, "live signal check: gc_conf, valid %%, focus, fringe axis",
         "the signal check")
@@ -3834,6 +4166,8 @@ def build_parser() -> argparse.ArgumentParser:
                                   "e.g. stations/example_cell_station.json")
     p.add_argument("--operator-confirmed", action="store_true",
                    help="a human confirmed the physical setup (required on the real rig)")
+    p.add_argument("--no-feedback", action="store_true",
+                   help="recipe jobs: do not project the verdict on the part")
     p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a FAIL verdict (1)
 
     # virtual sensors
@@ -3973,6 +4307,7 @@ def main(argv: Optional[list] = None) -> int:
         parser.print_help()
         return EXIT_REFUSED
     args.preset_given = any(t == "--preset" or t.startswith("--preset=") for t in raw)
+    args.mock_part_given = any(t == "--mock-part" or t.startswith("--mock-part=") for t in raw)
     ctx = Ctx(args)
     try:
         ctx.start()

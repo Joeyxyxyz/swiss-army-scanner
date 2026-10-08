@@ -61,7 +61,12 @@ function showStation() {
   const st = state.stations.find((s) => s.config === $('#qStation').value);
   let txt = '';
   if (st && st.error) txt = `Not usable: ${st.error}`;
-  else if (st) {
+  else if (st && st.job_type === 'recipe') {
+    // a recipe work state: zones + the checks recognised there; the recipe pins its preset
+    txt = `recipe ${st.recipe}: zones ${(st.zones || []).join(', ')} (${(st.checks || []).join(', ')})`
+      + (st.preset ? `, preset ${st.preset}` : '')
+      + (st.feedback ? ', verdict projected on the part' : '');
+  } else if (st) {
     txt = `${st.job_type}${st.measure ? ' / ' + st.measure : ''}, part ${st.part_label}`
       + (st.threshold_mm != null ? `, threshold ${st.threshold_mm} mm` : '')
       + (st.preset ? `, preset ${st.preset}` : '');
@@ -143,7 +148,11 @@ function showRun(job) {
   if (r.invalid_reason) reasons.push(r.invalid_reason);
   for (const w of r.warnings || []) if (/abort/i.test(w)) reasons.push(w);
   $('#qReason').textContent = reasons.join(' | ');
+  showZones(r);
   const links = job.links || {};
+  const fl = $('#qFeedbackLink');
+  fl.hidden = !links.feedback;
+  if (links.feedback) fl.href = links.feedback;
   const a = $('#qResultLink');
   a.hidden = !links.result_json;
   if (links.result_json) a.href = links.result_json;
@@ -151,6 +160,29 @@ function showRun(job) {
   img.hidden = !links.preview;
   if (links.preview) img.src = `${links.preview}?t=${Date.now()}`;
   steps('done', 'done', verdict === 'ABORTED' ? '' : 'done');
+}
+
+function showZones(r) {
+  // recipe runs: one line per zone (verdict + the first failing / invalid check's message)
+  const ul = $('#qZoneList');
+  ul.textContent = '';
+  const zones = r.zones || [];
+  ul.hidden = zones.length === 0;
+  for (const z of zones) {
+    const li = document.createElement('li');
+    li.className = `z-${String(z.verdict || '').toLowerCase()}`;
+    const b = document.createElement('b');
+    b.textContent = `${z.id} ${z.verdict}`;
+    li.appendChild(b);
+    const bad = (z.checks || []).find((c) => c.verdict !== 'PASS');
+    li.appendChild(document.createTextNode(bad ? `${bad.id}: ${bad.message}` : (z.checks || []).map((c) => c.id).join(', ')));
+    ul.appendChild(li);
+  }
+  const fb = r.feedback || null;
+  let t = '';
+  if (fb && fb.rendered) t = `Verdict painted on the part (${fb.hold_s} s; START / HOME / ABORT clears it)`;
+  else if (fb && fb.enabled && fb.refused) t = `Not projected: ${fb.refused}`;
+  $('#qFeedback').textContent = t;
 }
 
 function showRig(job) {

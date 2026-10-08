@@ -61,7 +61,7 @@ OUTPUT_KINDS = ("pointclouds", "defects", "measurements", "codes", "spectral", "
 INDEX_FIELDS = ["time", "kind", "label", "geometry_id", "file", "source"]
 ENTRY_KINDS = ("bases", "objects", "calibrations", "readings", "spectral", "banks", "maps",
                "sensors", "atlases", "calib_poses", "metric", "dentsets", "faces", "facescans",
-               "face_golden", "station_golden", "presets")
+               "face_golden", "station_golden", "presets", "recipes")
 
 LIBRARY_README = """# Swiss Army Scanner library
 
@@ -100,6 +100,8 @@ Written by the engine. Nothing here is overwritten; "delete" moves entries to tr
 | sensors/<geometry_id>/<name>/ | taught virtual sensors (part present, alignment) |
 | output/sensors/ | sensor checks: spot photos + .json verdicts |
 | presets/ | USER PRESETS (part recipes): presets/<name>/preset.json + meta.json (author, description, copied from); presets/active.jsonl records the selected preset (last line wins) |
+| recipes/ | USER RECIPES (work-state checks: preset -> zones -> checks -> projected feedback): recipes/<name>/recipe.json + meta.json; recipes/active.jsonl records the selected recipe (last line wins) |
+| runs/ | recipe run folders (api.recipe_run): result.json + run.log.jsonl + overlay / feedback images, one NEW folder per run |
 | sessions/ | log.jsonl - every action, success or failure |
 | trash/ | deleted entries (recoverable - move back to restore) |
 """
@@ -367,7 +369,7 @@ def json_safe(o):
 _ENTRY_DEPTH = {"bases": 3, "objects": 2, "calibrations": 3, "readings": 2,
                 "spectral": 2, "banks": 3, "maps": 3, "sensors": 3, "atlases": 3,
                 "calib_poses": 3, "metric": 3, "dentsets": 3, "faces": 3, "facescans": 3,
-                "face_golden": 3, "station_golden": 3, "presets": 2}
+                "face_golden": 3, "station_golden": 3, "presets": 2, "recipes": 2}
 _SPECTRAL_SUBDIRS = ("materials", "light")      # spectral/<sub>/<entry>
 _ENTRY_MARKERS = {"bases": ("meta.json", "field.npz"),
                   "objects": ("meta.json", "field.npz", "relief.npz"),
@@ -381,6 +383,7 @@ _ENTRY_MARKERS = {"bases": ("meta.json", "field.npz"),
                   "face_golden": ("meta.json", "golden.npz"),
                   "station_golden": ("meta.json", "golden.json"),
                   "presets": ("preset.json", "meta.json"),
+                  "recipes": ("recipe.json", "meta.json"),
                   "readings": ("codes.json", "full_on.png"),
                   "spectral": ("meta.json", "cube.npz", "*.json"),
                   "banks": ("members.jsonl", "meta.json"),

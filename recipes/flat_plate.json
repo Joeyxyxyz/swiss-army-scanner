@@ -1,0 +1,23 @@
+{
+  "_comment": "Example recipe (built-in, read-only): a flat plate on a fixture. The top face must be flat with no local dent or bump, and the top edge straight. Mock: scene:plate (good), scene:plate:bump, scene:plate:burr.",
+  "schema_version": 1,
+  "name": "flat_plate",
+  "description": "Flat plate: top-face flatness and defects, top-edge straightness",
+  "preset": "bench_9in_metric",
+  "scan": {"kind": "fast", "axis": "xy", "zone": null, "average": null},
+  "part": {"label": "plate", "frame": {"reference": "dominant_plane"}, "mock_scene": "scene:plate"},
+  "zones": [
+    {"id": "top_face", "shape": "rect", "units": "part_mm", "coords": [-54, -34, 54, 34],
+     "checks": [
+       {"type": "flatness", "params": {"tol_mm": 0.3, "min_height_mm": 3.0}},
+       {"type": "defect", "params": {"depth_mm": 0.3, "min_area_mm2": 2.0, "mode": "local",
+                                     "smooth_mm": 8.0, "min_height_mm": 3.0}}
+     ]},
+    {"id": "top_edge", "shape": "rect", "units": "part_mm", "coords": [-54, -50, 54, -30],
+     "checks": [
+       {"type": "edge", "params": {"side": "top", "straightness_tol_mm": 0.8, "min_height_mm": 3.0}}
+     ]}
+  ],
+  "feedback": {"enabled": true, "hold_s": 5.0},
+  "outputs": {"runs_dir": null, "overlay": true}
+}

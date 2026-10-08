@@ -1,0 +1,25 @@
+{
+  "_comment": "Example recipe (built-in, read-only): a box with its lid on. Each half of the lid must be there, at its height and flat: a missing box turns both zones red, a lid left ajar turns the raised side red. Mock: scene:box_lid (good), scene:box_lid:ajar, scene:box_lid:missing.",
+  "schema_version": 1,
+  "name": "box_lid",
+  "description": "Box lid: present, at height and flat (left and right halves)",
+  "preset": "bench_9in_metric",
+  "scan": {"kind": "fast", "axis": "xy", "zone": null, "average": null},
+  "part": {"label": "box", "frame": {"reference": "dominant_plane"}, "mock_scene": "scene:box_lid"},
+  "zones": [
+    {"id": "lid_left", "shape": "rect", "units": "part_mm", "coords": [-40, -25, -5, 25],
+     "checks": [
+       {"type": "presence", "params": {"min_height_mm": 20.0, "min_area_pct": 60.0}},
+       {"type": "height", "params": {"nominal_mm": 40.0, "tol_mm": 1.5, "min_height_mm": 20.0}},
+       {"type": "flatness", "params": {"tol_mm": 0.5, "min_height_mm": 20.0}}
+     ]},
+    {"id": "lid_right", "shape": "rect", "units": "part_mm", "coords": [5, -25, 40, 25],
+     "checks": [
+       {"type": "presence", "params": {"min_height_mm": 20.0, "min_area_pct": 60.0}},
+       {"type": "height", "params": {"nominal_mm": 40.0, "tol_mm": 1.5, "min_height_mm": 20.0}},
+       {"type": "flatness", "params": {"tol_mm": 0.5, "min_height_mm": 20.0}}
+     ]}
+  ],
+  "feedback": {"enabled": true, "hold_s": 5.0},
+  "outputs": {"runs_dir": null, "overlay": true}
+}

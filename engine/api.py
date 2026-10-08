@@ -84,15 +84,18 @@ ZONE_BASE_MAX_AGE_S = 30 * 60
 
 def configure(root: Union[str, Path, None] = None, *, mock: bool,
               presets_dir: Union[str, Path, None] = None,
-              bench: Optional[MockBench] = None, holder: str = "") -> ScanSession:
+              bench: Optional[MockBench] = None, holder: str = "",
+              recipes_dir: Union[str, Path, None] = None) -> ScanSession:
     """Select library root and mock/real. Starts a new session log.
 
     `mock` has no default: the real rig (camera + fullscreen DMD window) is
-    only ever driven after an explicit configure(mock=False)."""
+    only ever driven after an explicit configure(mock=False). recipes_dir: the
+    built-in (read-only) recipes folder (default: the repo's recipes/)."""
     global _session
     _session = ScanSession(Path(root) if root else DEFAULT_ROOT, mock=mock,
                            presets_dir=Path(presets_dir) if presets_dir else None,
                            bench=bench, holder=holder)
+    _session.recipes_dir = Path(recipes_dir) if recipes_dir else None
     _session.store.ensure_readme()
     return _session
 
@@ -108,7 +111,8 @@ def paths() -> dict:
             "output": r / "output", "output_index": r / "output" / "index.csv",
             "sessions": r / "sessions", "trash": r / "trash",
             "presets": _engine().presets_dir or config.PRESETS_DIR,
-            "user_presets": config.user_presets_dir(r)}
+            "user_presets": config.user_presets_dir(r),
+            "recipes": _recipes_dir(), "user_recipes": r / "recipes", "runs": r / "runs"}
 
 
 def calibration_for(geometry_id: str, fingerprint: Optional[dict] = None) -> Optional[Calibration]:
@@ -327,6 +331,210 @@ def preset_delete(name: str, reason: str, force: bool = False,
     s = _engine()
     return preset_lib.delete(s.store, _builtin_dir(), name, reason,
                              Path(stations_dir) if stations_dir else STATIONS_DIR, force)
+
+
+# ------------------------------------------------------- recipes (work-state checks)
+# preset (profile) -> recipe -> zones -> checks -> projected feedback -> outputs. Built-in
+# recipes (the repo's recipes/ folder) are read-only here; user recipes live in the library
+# (<library>/recipes/<name>/) and are added / selected / deleted like user presets.
+
+def _recipes_dir() -> Path:
+    from .recipes import library as recipe_lib
+    return Path(getattr(_engine(), "recipes_dir", None) or recipe_lib.BUILTIN_DIR)
+
+
+def _preset_names() -> list:
+    s = _engine()
+    return config.list_presets(s.presets_dir) + preset_lib.user_names(s.store)
+
+
+def recipe_list() -> list:
+    """Both tiers: name, tier ('builtin' | 'user'), active, preset, zones, checks, scan kind,
+    golden, mock scene, valid / error, description."""
+    from .recipes import library as recipe_lib
+    return recipe_lib.listing(_engine().store, _recipes_dir(), _preset_names())
+
+
+def recipe_show(name: str) -> dict:
+    """One recipe: the listing fields, the file as written and the normalised recipe."""
+    from .recipes import library as recipe_lib
+    return recipe_lib.show(_engine().store, _recipes_dir(), name, _preset_names())
+
+
+def recipe_active() -> Optional[str]:
+    """The library's selected recipe, or None."""
+    from .recipes import library as recipe_lib
+    return recipe_lib.active(_engine().store, _recipes_dir())
+
+
+def recipe_checks() -> dict:
+    """Every check type a recipe can use (built-ins + plugins): params with units, docs."""
+    from . import recipes
+    return recipes.available()
+
+
+def recipe_load(recipe):
+    """A Recipe from a name (built-in / user), a .json / .yaml file or a mapping (validated;
+    RecipeError lists every problem)."""
+    from .recipes import library as recipe_lib
+    return recipe_lib.resolve(_engine().store, _recipes_dir(), recipe)
+
+
+def recipe_validate(recipe) -> dict:
+    """Validate a recipe (name, file or mapping) without running it -> {valid, problems,
+    recipe (normalised) | None}; its preset must exist too."""
+    from .recipes import RecipeError
+    try:
+        r = recipe_load(recipe)
+    except RecipeError as e:
+        return {"valid": False, "problems": list(e.problems), "recipe": None}
+    probs = [] if r.preset in _preset_names() else [f"preset {r.preset!r} does not exist"]
+    return {"valid": not probs, "problems": probs, "recipe": r.to_dict()}
+
+
+@_verb
+def recipe_add(name: str, base=None, overrides: Optional[dict] = None, description: str = "",
+               replace: bool = False, recipe: Optional[dict] = None) -> dict:
+    """Add a USER recipe to this library: a copy of `base` (a built-in / user recipe name or a
+    recipe file) or the mapping `recipe`, with fields overridden ({"feedback.hold_s": 10,
+    "zones.0.checks.0.params.tol_mm": 0.4}); validated like any recipe, its preset must exist.
+    Refuses a built-in name, and an existing user name unless replace=True (old one to trash/)."""
+    from .recipes import library as recipe_lib
+    s = _engine()
+    return recipe_lib.add(s.store, _recipes_dir(), name, base, overrides, description, replace,
+                          recipe=recipe, preset_names=_preset_names())
+
+
+@_verb
+def recipe_select(name: str) -> dict:
+    """Make `name` the library's selected recipe (the default of `scan recipe-run`; a station
+    config's own job.recipe still wins)."""
+    from .recipes import library as recipe_lib
+    s = _engine()
+    return recipe_lib.select(s.store, _recipes_dir(), name, by=s.holder)
+
+
+@_verb
+def recipe_delete(name: str, reason: str, force: bool = False,
+                  stations_dir: Union[str, Path, None] = None) -> dict:
+    """Move a USER recipe to trash/recipes/ (recoverable). Refuses built-ins, the selected
+    recipe, and one a station config's job.recipe names (unless force=True)."""
+    from .recipes import library as recipe_lib
+    s = _engine()
+    return recipe_lib.delete(s.store, _recipes_dir(), name, reason,
+                             Path(stations_dir) if stations_dir else STATIONS_DIR, force)
+
+
+def _recipe_preset(r, preset: Optional[Preset]) -> Preset:
+    """The preset a recipe runs with: the given one, else the recipe's pinned preset (loaded
+    as the active one when it is not already)."""
+    s = _engine()
+    if preset is not None:
+        return _preset(preset)
+    if s.preset is not None and s.preset.name == r.preset and s.preset.mock == s.mock:
+        return s.preset
+    p = config.load_preset(r.preset, presets_dir=s.presets_dir, store=s.store, mock=s.mock)
+    s.preset = p
+    return p
+
+
+def _recipe_runs_dir(r, runs_dir) -> Path:
+    if runs_dir:
+        return Path(runs_dir)
+    env = os.environ.get("SCANNER_RUNS_DIR")
+    if env:
+        return Path(env)
+    rd = r.outputs.get("runs_dir")
+    if rd:
+        p = Path(os.path.expandvars(os.path.expanduser(str(rd))))
+        if not p.is_absolute() and r.source is not None:
+            p = Path(r.source).resolve().parent / p
+        return p
+    return _engine().store.root / "runs"
+
+
+@_verb
+def recipe_run(recipe, preset: Optional[Preset] = None, operator_confirmed: bool = False,
+               project_feedback: bool = True, scan=None, runs_dir: Union[str, Path, None] = None,
+               hold_s: Optional[float] = None, label: Optional[str] = None,
+               mock_scene: Optional[str] = None, pattern_mode_ack: bool = False) -> dict:
+    """Run a recipe (name, file, mapping or Recipe): scan with its preset (the recipe pins it;
+    `preset` overrides), resolve the part frame and the zones, run every check, aggregate
+    (any FAIL -> FAIL; else any INVALID -> INVALID; else PASS), write a NEW run folder
+    (result.json with zones / checks / feedback + run.log.jsonl + overlay.png +
+    feedback_dmd.png) and, with project_feedback, paint the verdict on the part (green
+    outline PASS, red fill + crosses FAIL; hold_s, default the recipe's; ABORT clears it).
+    scan: a stored metric scan (id / label / latest / handle) to check offline instead of
+    capturing. runs_dir default: $SCANNER_RUNS_DIR, the recipe's outputs.runs_dir, else
+    <library>/runs. The real rig needs operator_confirmed. mock_scene (MOCK only):
+    'scene:<name>[:<variant>]' placed first (engine/capture/mock_scenes.py).
+    -> {run_id, run_dir, result (the result.json document), exit_code}"""
+    from .recipes import library as recipe_lib
+    from .recipes import runner
+    s = _engine()
+    r = recipe_load(recipe)
+    p = _recipe_preset(r, preset)
+    place = None
+    if mock_scene:
+        if not s.mock:
+            raise ValueError("mock_scene is MOCK ONLY: physical steps on the real rig are human")
+        from .capture import mock_scenes
+        mock_scenes.parse(mock_scene)                       # refuse a typo before the rig
+        place = (lambda: mock_scenes.place(s.bench, mock_scene))
+    tier = recipe_lib.tier_of(s.store, _recipes_dir(), r.name) if r.source is not None and \
+        r.source.stem == r.name else None
+    return runner.run_recipe(s, r, p, runs_dir=_recipe_runs_dir(r, runs_dir),
+                             operator_confirmed=bool(operator_confirmed),
+                             project_feedback=bool(project_feedback), scan=scan, hold_s=hold_s,
+                             mock_place=place, pattern_mode_ack=bool(pattern_mode_ack),
+                             label=label, tier=tier or ("file" if r.source else "mapping"))
+
+
+@_verb
+def recipe_golden(recipe, preset: Optional[Preset] = None, label: Optional[str] = None,
+                  mock_scene: Optional[str] = None):
+    """Scan a GOOD part with the recipe's scan settings as its golden reference: the metric
+    scan is labelled golden.scan (or `label`, default <recipe>_golden), so recipe_run finds it
+    by that label (newest wins). Refused without a stereo calibration (rule 6). -> MetricScan"""
+    from .recipes import runner
+    s = _engine()
+    r = recipe_load(recipe)
+    p = _recipe_preset(r, preset)
+    lab = label or (r.golden or {}).get("scan") or f"{r.name}_golden"
+    if lab.lower() in ("latest", "last"):
+        lab = f"{r.name}_golden"
+    if mock_scene:
+        if not s.mock:
+            raise ValueError("mock_scene is MOCK ONLY: physical steps on the real rig are human")
+        from .capture import mock_scenes
+        mock_scenes.place(s.bench, mock_scene)
+    return runner._scan(s, r, p, lab, None, {"capture": {"average": None}}, False)
+
+
+@_verb
+def recipe_feedback(run, preset: Optional[Preset] = None, hold_s: Optional[float] = None,
+                    cancel=None) -> dict:
+    """Project a recipe run's feedback again: its run folder (or result.json), the
+    feedback_dmd.png it rendered, for hold_s (default the run's), polarity measured, pumped
+    hold that `cancel` (threading.Event) ends. -> {inverted, hold_s, held_s, cancelled,
+    run_id, verdict}"""
+    from .recipes import feedback as fbm
+    if isinstance(run, dict):                     # recipe_run's return value
+        run = run.get("run_dir") or (run.get("result") or {}).get("run_folder")
+    d = Path(getattr(run, "run_dir", None) or run)
+    if d.is_file():
+        d = d.parent
+    doc = _read_json(d / "result.json") or {}
+    fb = doc.get("feedback") or {}
+    if not fb.get("rendered"):
+        raise ValueError(f"run {d.name} has no rendered feedback image"
+                         + (f" ({fb.get('refused')})" if fb.get("refused") else ""))
+    img = fbm.read_png(d / "feedback_dmd.png")
+    p = _preset(preset)
+    hold = float(fb.get("hold_s", 5.0) if hold_s is None else hold_s)
+    out = fbm.project(_engine(), p, img, hold, cancel=cancel, photo=False)
+    out.pop("photo", None)
+    return {**out, "run_id": doc.get("run_id"), "verdict": doc.get("result")}
 
 
 # ------------------------------------------------------------------ verbs

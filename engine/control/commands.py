@@ -8,7 +8,8 @@ Sources (all call CommandBus.command):
     HTTP                  POST /api/cmd/<start|abort|home|trigger|arm|disarm|workstate>
                           (a PLC / HMI gateway or an automation flow)
     hardware (PLACEHOLDER) InputBackend subclasses below: camera GPIO lines, serial /
-                          USB-IO, a 24 V digital I/O module. Config-driven mapping
+                          USB-IO, a 24 V digital I/O module, and the industrial networks
+                          (Modbus TCP, OPC UA, EtherNet/IP). Config-driven mapping
                           (stations/io_example.json). Not implemented: they refuse to start.
 
 States and rules:
@@ -22,7 +23,12 @@ ABORT always wins (it is never refused); HOME only when idle or after an abort;
 TRIGGER is ignored unless ARMED; the work state can't change while a job runs.
 
 Outputs (stack-light style): READY / BUSY / PASS / FAIL / ALARM booleans, published to
-every OutputBackend on each change (the UI lamp reads the same signals).
+every OutputBackend on each change (the UI lamp reads the same signals), plus registers for
+a PLC: result_code (0 none, PASS 1, FAIL 2, INVALID 3, ABORTED 4 - a recipe may renumber
+them in outputs.result_codes), state_code (index in STATES), workstate (1-based, 0 none).
+
+Work states: the station configs; a recipe work state (job.type recipe) pins its recipe's
+preset, and its result codes come from the recipe.
 
 Pure: no engine, no hardware. The owner (the web server) passes handlers that start /
 abort the actual jobs and calls job_finished() when they end.
@@ -41,6 +47,8 @@ STATES = ("READY", "ARMED", "RUNNING", "ABORTING", "HOMING", "FAULT")
 COMMANDS = ("START", "ABORT", "HOME", "TRIGGER", "SELECT_WORKSTATE", "ARM", "DISARM", "RESET")
 SIGNALS = ("READY", "BUSY", "PASS", "FAIL", "ALARM")
 IDLE = ("READY", "ARMED")
+RESULT_CODES = {"PASS": 1, "FAIL": 2, "INVALID": 3, "ABORTED": 4}       # 0 = no result yet
+REGISTERS = ("result_code", "state_code", "workstate")
 
 
 @dataclass
@@ -75,6 +83,7 @@ class CommandBus:
         self.state = "READY"
         self.workstate: Optional[str] = self.workstates[0] if self.workstates else None
         self.workstate_presets: dict = {}            # work state -> the preset it pins
+        self.workstate_info: dict = {}               # work state -> {recipe, result_codes}
         self.armed_confirmed = False
         self.last_result: Optional[str] = None      # PASS | FAIL | INVALID | ABORTED
         self.fault: Optional[str] = None
@@ -93,10 +102,21 @@ class CommandBus:
                 "FAIL": s in IDLE and self.last_result == "FAIL",
                 "ALARM": s == "FAULT" or (s in IDLE and self.last_result == "INVALID")}
 
+    def registers(self) -> dict:
+        """Numbers for a PLC: result_code (the work state's recipe codes, else RESULT_CODES;
+        0 = none yet), state_code (index in STATES), workstate (1-based, 0 = none)."""
+        codes = (self.workstate_info.get(self.workstate) or {}).get("result_codes") or RESULT_CODES
+        ws = self.workstates.index(self.workstate) + 1 if self.workstate in self.workstates else 0
+        return {"result_code": int(codes.get(self.last_result, 0)) if self.last_result else 0,
+                "state_code": STATES.index(self.state), "workstate": ws}
+
     def snapshot(self) -> dict:
         with self._lock:
             return {"state": self.state, "workstate": self.workstate,
                     "workstate_preset": self.workstate_presets.get(self.workstate),
+                    "workstate_recipe": (self.workstate_info.get(self.workstate) or {}).get(
+                        "recipe"),
+                    "registers": self.registers(),
                     "workstates": list(self.workstates), "last_result": self.last_result,
                     "fault": self.fault, "signals": self.signals(),
                     "require_confirmation": self.require_confirmation,
@@ -104,9 +124,11 @@ class CommandBus:
 
     def _publish(self) -> None:
         sig = self.signals()
+        regs = self.registers()
         for o in self.outputs:
             try:
                 o.publish(sig)
+                o.publish_registers(regs)
             except Exception as e:          # noqa: BLE001 - an output must not stop the bus
                 self.history.append((_now(), "bus", "OUTPUT", False, f"{type(o).__name__}: {e}"))
 
@@ -337,6 +359,10 @@ class OutputBackend:
     def publish(self, signals: dict) -> None:
         raise NotImplementedError(f"{type(self).__name__} is a placeholder: not implemented yet")
 
+    def publish_registers(self, registers: dict) -> None:
+        """Numeric outputs (result_code, state_code, workstate): a no-op for backends that
+        only drive lines (a stack light); fieldbus backends write them to registers / nodes."""
+
 
 class SimulatedOutput(OutputBackend):
     name = "simulated"
@@ -345,10 +371,14 @@ class SimulatedOutput(OutputBackend):
         super().__init__(mapping, **options)
         self.log: list = []
         self.current: dict = {}
+        self.registers: dict = {}
 
     def publish(self, signals: dict) -> None:
         self.current = {self.mapping.get(k, k): bool(v) for k, v in signals.items()}
         self.log.append(dict(self.current))
+
+    def publish_registers(self, registers: dict) -> None:
+        self.registers = dict(registers)
 
 
 class CameraGpioOutput(OutputBackend):
@@ -362,8 +392,127 @@ class DigitalIOOutput(OutputBackend):
     name = "digital_io"
 
 
-INPUTS = {c.name: c for c in (SimulatedInput, CameraGpioInput, SerialIOInput, DigitalIOInput)}
-OUTPUTS = {c.name: c for c in (SimulatedOutput, CameraGpioOutput, DigitalIOOutput)}
+# ---------------------------------------------------- industrial networks (PLACEHOLDERS)
+# Clean interfaces, no protocol stack bundled (no new dependencies): start() / publish() /
+# publish_registers() raise NotImplementedError naming the intended mapping. A site adds its
+# own client by subclassing (or replacing) these and registering the class in INPUTS /
+# OUTPUTS under the same kind. The mapping keys are the protocol's addresses as text.
+#   inputs  (PLC -> scanner): command bits START / ABORT / HOME / TRIGGER / ARM / DISARM /
+#           RESET (rising edge = one command), the work state number (options.workstate_*)
+#   outputs (scanner -> PLC): READY / BUSY / PASS / FAIL / ALARM bits, the result_code /
+#           state_code / workstate registers (options.*_register / *_node / *_tag)
+
+_PLACEHOLDER = ("{cls} is a placeholder: the {proto} adapter is not implemented (no {proto} "
+                "client is bundled). Implement {method} in a subclass with your site's {proto} "
+                "stack. Intended mapping: {mapping}")
+
+
+class ModbusTcpInput(InputBackend):
+    """PLACEHOLDER: Modbus TCP client polling the PLC (options: host, port 502, unit, poll_ms,
+    workstate_register). Mapping 'coil:N' / 'di:N' (a coil or discrete input address) ->
+    command, acted on the rising edge; the holding register options.workstate_register
+    (1-based work state number, 0 = keep) selects the work state when it changes."""
+    name = "modbus_tcp"
+    PROTOCOL = "Modbus TCP"
+
+    def start(self, bus: CommandBus) -> None:
+        raise NotImplementedError(_PLACEHOLDER.format(
+            cls=type(self).__name__, proto=self.PROTOCOL, method="start(bus)",
+            mapping="coils / discrete inputs 'coil:N' -> START / ABORT / HOME / TRIGGER / ARM, "
+                    "holding register workstate_register -> SELECT_WORKSTATE"))
+
+
+class ModbusTcpOutput(OutputBackend):
+    """PLACEHOLDER: Modbus TCP writes (options: host, port 502, unit, result_register,
+    state_register, workstate_register). Mapping signal -> 'coil:N' (READY / BUSY / PASS /
+    FAIL / ALARM); publish_registers writes result_code / state_code / workstate to the
+    holding registers named in options."""
+    name = "modbus_tcp"
+    PROTOCOL = "Modbus TCP"
+
+    def publish(self, signals: dict) -> None:
+        raise NotImplementedError(_PLACEHOLDER.format(
+            cls=type(self).__name__, proto=self.PROTOCOL, method="publish(signals)",
+            mapping="READY / BUSY / PASS / FAIL / ALARM -> coils 'coil:N'"))
+
+    def publish_registers(self, registers: dict) -> None:
+        raise NotImplementedError(_PLACEHOLDER.format(
+            cls=type(self).__name__, proto=self.PROTOCOL, method="publish_registers(registers)",
+            mapping="result_code / state_code / workstate -> holding registers "
+                    "(options result_register, state_register, workstate_register)"))
+
+
+class OpcUaInput(InputBackend):
+    """PLACEHOLDER: OPC UA client subscribed to the PLC's nodes (options: endpoint
+    'opc.tcp://host:4840', security, workstate_node). Mapping node id ('ns=2;s=Cell.Start')
+    -> command on a false -> true change; options.workstate_node (Int) selects the work
+    state."""
+    name = "opc_ua"
+    PROTOCOL = "OPC UA"
+
+    def start(self, bus: CommandBus) -> None:
+        raise NotImplementedError(_PLACEHOLDER.format(
+            cls=type(self).__name__, proto=self.PROTOCOL, method="start(bus)",
+            mapping="Boolean nodes 'ns=..;s=..' -> START / ABORT / HOME / TRIGGER / ARM "
+                    "(data-change subscription), workstate_node -> SELECT_WORKSTATE"))
+
+
+class OpcUaOutput(OutputBackend):
+    """PLACEHOLDER: OPC UA writes (options: endpoint, result_node, state_node,
+    workstate_node). Mapping signal -> Boolean node id; registers -> Int nodes."""
+    name = "opc_ua"
+    PROTOCOL = "OPC UA"
+
+    def publish(self, signals: dict) -> None:
+        raise NotImplementedError(_PLACEHOLDER.format(
+            cls=type(self).__name__, proto=self.PROTOCOL, method="publish(signals)",
+            mapping="READY / BUSY / PASS / FAIL / ALARM -> Boolean nodes"))
+
+    def publish_registers(self, registers: dict) -> None:
+        raise NotImplementedError(_PLACEHOLDER.format(
+            cls=type(self).__name__, proto=self.PROTOCOL, method="publish_registers(registers)",
+            mapping="result_code / state_code / workstate -> Int nodes (options result_node, "
+                    "state_node, workstate_node)"))
+
+
+class EtherNetIpInput(InputBackend):
+    """PLACEHOLDER: EtherNet/IP (CIP) - the scanner as an explicit-messaging client reading
+    PLC tags, or an adapter with an implicit I/O assembly (options: host, slot, poll_ms,
+    workstate_tag). Mapping tag or assembly bit ('Cell_Start', 'in:0.3') -> command on the
+    rising edge; options.workstate_tag (DINT) selects the work state."""
+    name = "ethernet_ip"
+    PROTOCOL = "EtherNet/IP"
+
+    def start(self, bus: CommandBus) -> None:
+        raise NotImplementedError(_PLACEHOLDER.format(
+            cls=type(self).__name__, proto=self.PROTOCOL, method="start(bus)",
+            mapping="BOOL tags / input-assembly bits -> START / ABORT / HOME / TRIGGER / "
+                    "ARM, workstate_tag (DINT) -> SELECT_WORKSTATE"))
+
+
+class EtherNetIpOutput(OutputBackend):
+    """PLACEHOLDER: EtherNet/IP writes (options: host, slot, result_tag, state_tag,
+    workstate_tag). Mapping signal -> BOOL tag or output-assembly bit; registers -> DINT
+    tags."""
+    name = "ethernet_ip"
+    PROTOCOL = "EtherNet/IP"
+
+    def publish(self, signals: dict) -> None:
+        raise NotImplementedError(_PLACEHOLDER.format(
+            cls=type(self).__name__, proto=self.PROTOCOL, method="publish(signals)",
+            mapping="READY / BUSY / PASS / FAIL / ALARM -> BOOL tags / output-assembly bits"))
+
+    def publish_registers(self, registers: dict) -> None:
+        raise NotImplementedError(_PLACEHOLDER.format(
+            cls=type(self).__name__, proto=self.PROTOCOL, method="publish_registers(registers)",
+            mapping="result_code / state_code / workstate -> DINT tags (options result_tag, "
+                    "state_tag, workstate_tag)"))
+
+
+INPUTS = {c.name: c for c in (SimulatedInput, CameraGpioInput, SerialIOInput, DigitalIOInput,
+                              ModbusTcpInput, OpcUaInput, EtherNetIpInput)}
+OUTPUTS = {c.name: c for c in (SimulatedOutput, CameraGpioOutput, DigitalIOOutput,
+                               ModbusTcpOutput, OpcUaOutput, EtherNetIpOutput)}
 
 
 def load_io_config(path) -> tuple:

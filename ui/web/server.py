@@ -24,7 +24,10 @@ whitelisted types from inside the library root. Nothing here talks to
 hardware: the engine enforces §9.
 
 Operator page (/quick): START runs a station config (stations/*.json) through
-the same code path as `scan run` (ui/cli.py cmd_run) as one job; ABORT sets
+the same code path as `scan run` (ui/cli.py cmd_run) as one job (a recipe work state:
+job.type recipe, engine/recipes/; its verdict is then painted on the part by a separate
+`recipe_feedback` job that any next command - START, TRIGGER, HOME, ABORT, a new work
+state - clears); ABORT sets
 the job's cancel event, which the engine checks before every capture (the
 rig is closed on the way out: projector idle, rig lock released) and the run
 is recorded as ABORTED; HOME (when idle, or queued behind an ABORT) runs the
@@ -75,7 +78,9 @@ MAX_JOBS_KEPT = 300
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 STATIONS_DIR = Path(__file__).resolve().parents[2] / "stations"
 RUN_FILES = {"result.json": "application/json", "run.log.jsonl": "text/plain; charset=utf-8",
-             "deviation.png": "image/png"}   # what /runs/<run_id>/ serves of a run folder
+             "deviation.png": "image/png", "overlay.png": "image/png",
+             "feedback_dmd.png": "image/png", "feedback_photo.png": "image/png"}
+# ^ what /runs/<run_id>/ serves of a run folder (recipe runs: overlay + the DMD feedback)
 LIVE_IDLE_S = 30.0            # live view stops when nobody polled it for this long
 MAX_LIVE_S = 1800.0           # longest live view one start may ask for (it holds the rig)
 MAX_HOLD_S = 300.0            # pumped grid / zone holds can't be interrupted: keep them short
@@ -579,6 +584,41 @@ VERBS: dict = {
                       {"metric_id": "metric scan id", "golden_id": "station golden id (default: "
                        "newest matching)", "flood_metric_id": "metric scan whose flood pair to use",
                        "label": "text"}),
+    "recipe_add": ("Add a USER recipe (work-state check) to this library: a copy of `base` (a "
+                   "built-in / user recipe, GET /api/recipes) or the mapping `recipe`, with fields "
+                   "overridden; validated (every problem listed), its preset must exist. Built-in "
+                   "recipes are read-only.",
+                   {"name": "new user recipe name [A-Za-z0-9_.-]",
+                    "base": "recipe to copy (GET /api/recipes)",
+                    "recipe": "a whole recipe mapping instead of base (schema_version 1)",
+                    "overrides": "{\"feedback.hold_s\": 10, \"zones.0.checks.0.params.tol_mm\": "
+                                 "0.4}",
+                    "description": "text", "replace": "bool: replace an existing USER recipe"}),
+    "recipe_select": ("Select the library's recipe (the default of `scan recipe-run`; a station "
+                      "config's job.recipe still wins).", {"name": "recipe name"}),
+    "recipe_delete": ("Move a USER recipe to the library trash (recoverable). Refused for "
+                      "built-ins, the selected recipe and recipes a station config uses (unless "
+                      "force). Needs confirm=true.",
+                      {"name": "user recipe name", "reason": "why (recorded)",
+                       "confirm": "bool: must be true", "force": "bool"}),
+    "recipe_run": ("Run a recipe: scan with its pinned preset, run every zone's checks, verdict "
+                   "PASS / FAIL / INVALID, a new run folder (result.json with zones + checks, "
+                   "run.log.jsonl, overlay.png, feedback_dmd.png), then paint the verdict on the "
+                   "part (green outline PASS, red fill + cross at the fault FAIL) for hold_s "
+                   "(cancel the job to clear it). The real rig needs operator_confirmed.",
+                   {"recipe": "recipe name (GET /api/recipes)",
+                    "operator_confirmed": "bool (required on the real rig)",
+                    "scan_id": "check a stored metric scan instead of capturing (optional)",
+                    "project_feedback": "bool (default true)",
+                    "hold_s": "feedback hold, s (default the recipe's)",
+                    "mock_scene": "MOCK ONLY: scene:<name>[:<variant>] placed first"}),
+    "recipe_golden": ("Scan a GOOD part with a recipe's scan settings as its golden reference "
+                      "(labelled the recipe's golden.scan).",
+                      {"recipe": "recipe name", "mock_scene": "MOCK ONLY: scene:<name>[:<variant>]"}),
+    "recipe_feedback": ("Paint a recipe run's verdict on the part again (its feedback_dmd.png) for "
+                        "hold_s; cancel the job (or any station command) to clear it.",
+                        {"run_id": "a run of this server (GET /runs/<run_id>/result.json)",
+                         "hold_s": "seconds (default the run's)"}),
     "rig_check": ("Rig check (HOME): a fresh flood + a random block pattern vs the stored "
                   "reference -> camera / projector shift in px (phase correlation) and ~mm at "
                   "the working distance; OK | MOVED | UNKNOWN | REFERENCE_SET (first check).",
@@ -624,7 +664,8 @@ RIG_FREE_VERBS = frozenset({
     "cylinder_deviation",
     "compare_metric", "predict_precision", "export_metric_mesh", "calibrate_dent_null",
     "detect_dents", "locate_face", "face_profile", "face_golden", "check_face",
-    "station_measure", "station_golden", "station_check", "preset_add", "preset_delete"})
+    "station_measure", "station_golden", "station_check", "preset_add", "preset_delete",
+    "recipe_add", "recipe_select", "recipe_delete"})
 
 # verbs that change which preset is loaded / selected: refused while a station run is busy
 PRESET_CHANGE_VERBS = frozenset({"load_preset", "preset_select", "preset_delete"})
@@ -632,7 +673,7 @@ PRESET_CHANGE_VERBS = frozenset({"load_preset", "preset_select", "preset_delete"
 
 # running jobs that may be aborted: the engine checks the job's cancel event before every
 # capture (ScanSession.cancel), so the rig is never left mid-sequence
-CANCELLABLE_VERBS = frozenset({"run_station", "rig_check"})
+CANCELLABLE_VERBS = frozenset({"run_station", "rig_check", "recipe_run", "recipe_feedback"})
 
 
 class ArgError(ValueError):
@@ -1302,7 +1343,24 @@ class App:
             return [j.public(full=False) for j in reversed(jobs)]
 
     # ------------------------------------------------------------ command bus
+    def clear_feedback(self, why: str = "cleared by a new command") -> list:
+        """Stop the projected verdict of the last recipe run (queued or holding): the next
+        command needs the rig, and the operator acted on it. -> ids touched."""
+        touched = []
+        with self._cv:
+            for j in [j for j in self._queue if j.verb == "recipe_feedback"]:
+                self._queue.remove(j)
+                self._fail(j, why, "Cancelled")
+                touched.append(j.id)
+            cur = self._current
+            if cur is not None and cur.verb == "recipe_feedback" and cur.status == "running":
+                cur.cancel.set()
+                cur.note = why
+                touched.append(cur.id)
+        return touched
+
     def _bus_start(self, workstate: str, confirmed: bool) -> str:
+        self.clear_feedback("cleared: the next cycle started")
         job = self.submit("run_station", {"config": workstate,
                                           "operator_confirmed": bool(confirmed)})
         self._bus_jobs[job.id] = "run"
@@ -1310,6 +1368,7 @@ class App:
 
     def _bus_select(self, workstate: str, preset: Optional[str]) -> Optional[str]:
         """SELECT_WORKSTATE accepted: load the work state's preset (its part recipe)."""
+        self.clear_feedback("cleared: another work state was selected")
         if not preset or preset not in self.preset_names():
             return None
         return self.submit("load_preset", {"name": preset}).id
@@ -1318,6 +1377,7 @@ class App:
         return self.abort_runs("ABORT")
 
     def _bus_home(self) -> str:
+        self.clear_feedback("cleared: HOME")
         args, self._home_args = self._home_args, {}
         job = self.submit("rig_check", args)
         self._bus_jobs[job.id] = "home"
@@ -1337,6 +1397,9 @@ class App:
         with self.bus._lock:
             self.bus.workstate_presets = {i["config"]: i.get("preset") for i in items
                                           if not i.get("error")}
+            self.bus.workstate_info = {i["config"]: {"recipe": i["recipe"],
+                                                     "result_codes": i.get("result_codes")}
+                                       for i in items if not i.get("error") and i.get("recipe")}
             if self.bus.state in ("READY", "ARMED", "FAULT"):
                 self.bus.workstates = names
                 if self.bus.workstate not in names:
@@ -2688,6 +2751,14 @@ class App:
                             job_type=c.job_type, preset=c.preset, threshold_mm=c.threshold_mm,
                             zone=c.zone,
                             measure=c.measure if c.job_type == "metric" else None)
+                if c.job_type == "recipe":          # the work state IS the recipe
+                    r = api.recipe_load(c.recipe)
+                    item.update(recipe=r.name, preset=c.preset or r.preset,
+                                recipe_preset=r.preset, description=r.description,
+                                zones=[z.id for z in r.zones],
+                                checks=sorted({ch.type for z in r.zones for ch in z.checks}),
+                                zone=r.scan["zone"], feedback=r.feedback["enabled"],
+                                result_codes=dict(r.outputs["result_codes"]))
             except Exception as e:      # noqa: BLE001 - shown as an unusable entry
                 item["error"] = f"{type(e).__name__}: {e}"
             out.append(item)
@@ -2714,9 +2785,10 @@ class App:
                                       "physical setup (part placed, rig untouched)")
         argv = ["--json", "--library", str(self.root)] + (["--mock"] if self.mock else [])
         argv += (["--mock-part", mock_part] if mock_part else [])
-        argv += ["run", str(f)] + (["--operator-confirmed"] if confirmed else [])
+        argv += ["run", str(f), "--no-feedback"] + (["--operator-confirmed"] if confirmed else [])
         args = cli.build_parser().parse_args(argv)
         args.preset_given = False
+        args.mock_part_given = mock_part is not None    # else the config's own mock_part
         act = api.preset_active()               # no station preset: the selected one
         if act:
             args.preset = act
@@ -2734,11 +2806,19 @@ class App:
             code = cli.EXIT_REFUSED
             res = {**res, "error": f"{type(e).__name__}: {e}"}
         self._runs[res["run_id"]] = run_dir
+        fb = res.get("feedback") or {}
+        if fb.get("rendered") and res.get("result") in ("PASS", "FAIL", "INVALID"):
+            # the verdict painted on the part: its own job, so the bus already shows PASS /
+            # FAIL and any next command (START, TRIGGER, HOME, ABORT) clears it
+            res = {**res, "feedback_job": self.submit("recipe_feedback",
+                                                      {"run_id": res["run_id"]}).id}
         return {"exit_code": code, **res}, self._run_links(res, run_dir)
 
     def _run_links(self, res: dict, run_dir: Path) -> dict:
         links = {"result_json": f"/runs/{res['run_id']}/result.json",
                  "log": f"/runs/{res['run_id']}/run.log.jsonl"}
+        if (run_dir / "feedback_dmd.png").is_file():
+            links["feedback"] = f"/runs/{res['run_id']}/feedback_dmd.png"
         dm = (res.get("outputs") or {}).get("deviation_map")
         if dm:
             p = Path(dm)
@@ -2756,6 +2836,73 @@ class App:
         if not f.is_file():
             raise HTTPError(404, f"no file {name} in run {run_id}")
         return f
+
+    # ------------------------------------------------ recipes (work-state checks)
+    def recipe_names(self) -> list:
+        return [i["name"] for i in api.recipe_list()]
+
+    def check_recipe_name(self, name) -> str:
+        if not isinstance(name, str) or not _NAME_RE.match(name) or name not in self.recipe_names():
+            raise ArgError(f"no recipe named {name!r} (GET /api/recipes)")
+        return name
+
+    def _mock_scene(self, a):
+        sc = _s(a, "mock_scene")
+        if sc is not None and not self.mock:
+            raise ArgError("mock_scene is MOCK ONLY")
+        return sc
+
+    def _v_recipe_add(self, a):
+        ov = a.get("overrides")
+        if ov is not None and not isinstance(ov, dict):
+            raise ArgError("'overrides' must be an object {\"feedback.hold_s\": 10, ...}")
+        rec = a.get("recipe")
+        if rec is not None and not isinstance(rec, dict):
+            raise ArgError("'recipe' must be a recipe mapping")
+        base = _s(a, "base")
+        if base is not None:
+            self.check_recipe_name(base)
+        return api.recipe_add(_s(a, "name", required=True), base, ov,
+                              _s(a, "description", "") or "", _bool(a, "replace"), recipe=rec)
+
+    def _v_recipe_select(self, a):
+        return api.recipe_select(self.check_recipe_name(_s(a, "name", required=True)))
+
+    def _v_recipe_delete(self, a):
+        if not _bool(a, "confirm"):
+            raise ArgError("recipe_delete needs confirm=true (the operator confirmed the delete)")
+        return api.recipe_delete(self.check_recipe_name(_s(a, "name", required=True)),
+                                 _s(a, "reason", required=True), _bool(a, "force"),
+                                 stations_dir=self.stations_dir)
+
+    def _v_recipe_run(self, a):
+        name = self.check_recipe_name(_s(a, "recipe", required=True))
+        confirmed = _bool(a, "operator_confirmed")
+        if not self.mock and not confirmed:
+            raise rules.RuleViolation("the real rig needs the operator's confirmation of the "
+                                      "physical setup (part placed, rig untouched)")
+        scan = _s(a, "scan_id")
+        if scan is not None:
+            self._entry("metric", scan)
+        out = api.recipe_run(name, operator_confirmed=confirmed,
+                             project_feedback=_bool(a, "project_feedback", True), scan=scan,
+                             hold_s=_num(a, "hold_s"), mock_scene=self._mock_scene(a))
+        res, run_dir = out["result"], Path(out["run_dir"])
+        self._runs[res["run_id"]] = run_dir
+        return {"exit_code": out["exit_code"], **res}, self._run_links(res, run_dir)
+
+    def _v_recipe_golden(self, a):
+        name = self.check_recipe_name(_s(a, "recipe", required=True))
+        return api.recipe_golden(name, mock_scene=self._mock_scene(a))
+
+    def _v_recipe_feedback(self, a):
+        rid = _s(a, "run_id", required=True)
+        d = self._runs.get(rid)
+        if d is None:
+            raise ArgError(f"no run {rid!r} of this server")
+        me = self._current
+        return api.recipe_feedback(d, self._preset(), _num(a, "hold_s"),
+                                   cancel=me.cancel if me is not None else None)
 
     def _v_rig_check(self, a):
         shift = _num_list(a, "mock_shift_px")
@@ -2919,6 +3066,8 @@ ROUTES = [
     ("GET", r"/api/presets", "presets"),
     ("POST", r"/api/presets", "preset_save"),
     ("GET", r"/api/presets/(?P<name>[^/]+)", "preset_get"),
+    ("GET", r"/api/recipes", "recipes"),
+    ("GET", r"/api/recipes/(?P<name>[^/]+)", "recipe_get"),
     ("POST", r"/api/presets/(?P<name>[^/]+)/load", "preset_load"),
     ("GET", r"/api/library/(?P<kind>[a-z]+)", "library"),
     ("GET", r"/api/outputs", "outputs"),
@@ -3199,6 +3348,20 @@ class Handler(BaseHTTPRequestHandler):
         self.app.check_preset_name(name)
         job = self.app.submit("load_preset", {"name": name})
         self._json(self.app.wait(job.id, float(body.get("wait", 30))))
+
+    def r_recipes(self, q, body):
+        self._json(jsonable({"recipes": api.recipe_list(), "selected": api.recipe_active(),
+                             "checks": api.recipe_checks(),
+                             "dir": str(api.paths()["recipes"]),
+                             "user_dir": str(api.paths()["user_recipes"])}, self.app.root))
+
+    def r_recipe_get(self, q, body, name):
+        if not _NAME_RE.match(name or ""):
+            raise HTTPError(404, f"no recipe named {name!r}")
+        try:
+            self._json(jsonable(api.recipe_show(name), self.app.root))
+        except Exception as e:          # noqa: BLE001 - unknown / invalid: say why
+            raise HTTPError(404, f"{type(e).__name__}: {e}") from None
 
     # ------------------------------------------------------------ library
     def r_library(self, q, body, kind):

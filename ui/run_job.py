@@ -23,10 +23,13 @@ Job types and the calibration each needs:
     metric             stereo calibration (`calibrate-stereo`): mm from
                        triangulation, measured as a plane fit or against a
                        golden metric scan
+    recipe             stereo calibration: a recipe (engine/recipes/, recipes/*.json or a
+                       library recipe) - its preset, scan, zones, checks, projected feedback
+                       and outputs; the work state then IS that recipe
 
-This module only builds the config, the run folder, the log and the result
-document. The measurement itself goes through engine.api verbs (ui/cli.py
-cmd_run), so every engine rule still applies.
+This module only builds the config; the run folder, the log and the result document come
+from engine/runs.py (shared with api.recipe_run). The measurement itself goes through
+engine.api verbs (ui/cli.py cmd_run), so every engine rule still applies.
 """
 
 from __future__ import annotations
@@ -34,18 +37,18 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
-import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-RESULT_SCHEMA_VERSION = "0.1"
-JOB_TYPES = ("inspect", "compare", "metric")
+from engine import runs as _runs
+from engine.runs import RESULT_SCHEMA_VERSION, RESULTS, RunLog, software_info  # noqa: F401
+from engine.runs import write_result  # noqa: F401  (re-exported: callers use run_job.*)
+
+JOB_TYPES = ("inspect", "compare", "metric", "recipe")
 METRIC_SCANS = ("fast", "metric")           # api.scan_fast | api.scan_metric
 METRIC_MEASURES = ("plane", "golden")
-RESULTS = ("PASS", "FAIL", "INVALID", "ABORTED")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -80,6 +83,10 @@ class StationConfig:
     periods: Optional[list] = None
     measure: str = "plane"                  # plane | golden
     roi: Optional[list] = None              # [x0, y0, x1, y1] camera px; None = whole field
+    # recipe jobs: a recipe name (built-in recipes/ or the library) or a recipe file
+    recipe: Optional[str] = None
+    feedback: Optional[bool] = None         # None: the recipe's feedback.enabled
+    mock_part: Optional[str] = None         # MOCK only: what the simulated human places
     source: Optional[Path] = None
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -140,6 +147,7 @@ def load_station_config(path) -> StationConfig:
     if not _ID.match(label):
         raise StationConfigError(f"part.label {label!r}: letters, digits, _ . - only")
     metric = _metric_keys(job, jt)
+    rec = _recipe_keys(job, jt, base_dir)
     thr = doc.get("threshold_mm")
     if thr is not None and (not isinstance(thr, (int, float)) or thr <= 0):
         raise StationConfigError("threshold_mm must be a positive number (mm) or null")
@@ -162,7 +170,36 @@ def load_station_config(path) -> StationConfig:
         n_sigma=float(job.get("n_sigma", 6.0)),
         min_area_px=int(job.get("min_area_px", 50)),
         operator_confirmed=bool(doc.get("operator_confirmed", False)),
-        source=path.resolve(), raw=doc, **metric)
+        mock_part=_mock_part(doc.get("mock_part")),
+        source=path.resolve(), raw=doc, **metric, **rec)
+
+
+def _mock_part(v) -> Optional[str]:
+    if v in (None, ""):
+        return None
+    if not isinstance(v, str):
+        raise StationConfigError("mock_part must be text (as --mock-part), e.g. "
+                                 "scene:tube:misaligned, or null")
+    return v
+
+
+def _recipe_keys(job: dict, jt: str, base_dir: Path) -> dict:
+    """job.recipe (+ job.feedback) for recipe jobs: a recipe name or a .json / .yaml file
+    (relative to this config)."""
+    if jt != "recipe":
+        return {}
+    r = job.get("recipe")
+    if not isinstance(r, str) or not r.strip():
+        raise StationConfigError("job.type recipe needs job.recipe: a recipe name (recipes/ or "
+                                 "the library, see `scan recipe-list`) or a recipe file")
+    r = r.strip()
+    if r.lower().endswith((".json", ".yaml", ".yml")):
+        r = str(_rel(base_dir, r))
+    fb = job.get("feedback")
+    if fb is not None and not isinstance(fb, bool):
+        raise StationConfigError("job.feedback must be true, false or null (null: the recipe's "
+                                 "feedback.enabled)")
+    return {"recipe": r, "feedback": fb}
 
 
 def _metric_keys(job: dict, jt: str) -> dict:
@@ -205,97 +242,19 @@ def _metric_keys(job: dict, jt: str) -> dict:
 
 def new_run(cfg: StationConfig, now: Optional[datetime] = None) -> tuple:
     """(run_id, run_dir): a fresh folder, never an existing one."""
-    now = now or datetime.now(timezone.utc)
-    root = Path(cfg.runs_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    for _ in range(5):
-        run_id = f"{now.strftime('%Y%m%dT%H%M%SZ')}_{cfg.station_id}_{uuid.uuid4().hex[:8]}"
-        run_dir = root / run_id
-        try:
-            run_dir.mkdir()
-            return run_id, run_dir
-        except FileExistsError:
-            continue
-    raise FileExistsError(f"could not create a new run folder under {root}")
-
-
-class RunLog:
-    """JSON-lines event log: one event per line, run_id on every line."""
-
-    def __init__(self, path: Path, run_id: str):
-        self.path = Path(path)
-        self.run_id = run_id
-        self._f = open(self.path, "x", encoding="utf-8")
-
-    def event(self, event: str, level: str = "info", **fields) -> None:
-        rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-               "run_id": self.run_id, "level": level, "event": event, **fields}
-        self._f.write(json.dumps(rec, default=str) + "\n")
-        self._f.flush()
-
-    def close(self) -> None:
-        if not self._f.closed:
-            self._f.close()
+    return _runs.new_run(cfg.runs_dir, cfg.station_id, now)
 
 
 # ------------------------------------------------------------ result document
 
-def software_info() -> dict:
-    try:
-        from importlib.metadata import version
-        pkg = version("swiss-army-scanner")
-    except Exception:                       # noqa: BLE001 - running from a source tree
-        pkg = None
-    commit = None
-    if (_ROOT / ".git").exists():
-        try:
-            out = subprocess.run(["git", "-C", str(_ROOT), "rev-parse", "--short", "HEAD"],
-                                 capture_output=True, text=True, timeout=10)
-            commit = out.stdout.strip() or None if out.returncode == 0 else None
-        except Exception:                   # noqa: BLE001 - git not installed
-            commit = None
-    return {"package_version": pkg, "git_commit": commit}
-
-
 def empty_result(cfg: StationConfig, run_id: str, run_folder: str, mock: bool,
                  operator_confirmed: bool) -> dict:
     """The result skeleton: the same keys every run, filled in as the job goes."""
-    return {
-        "schema_version": RESULT_SCHEMA_VERSION,
-        "run_id": run_id,
-        "run_folder": run_folder,
-        "mode": "MOCK" if mock else "REAL",
-        "station": cfg.station_id,
-        "operator_confirmed": bool(operator_confirmed),
-        "job": {"type": cfg.job_type, "base": cfg.base, "zone": cfg.zone,
-                "config": str(cfg.source.name) if cfg.source else None},
-        "calibration": {"calibration_id": None, "same_geometry": None,
-                        "reprojection_error_px": {"camera": None, "projector": None}},
-        "capture": {"preset": None, "geometry_id": None, "patterns": None,
-                    "exposure_us": None, "average": None, "zone": cfg.zone},
-        "part": {"role": cfg.part_role, "label": cfg.part_label, "scan_id": None},
-        "deviation_mm": {"max": None, "mean": None, "rms": None, "method": None,
-                         "n_points": None},
-        "deviation_units": None,
-        "threshold_mm": cfg.threshold_mm,
-        "result": "INVALID",
-        "invalid_reason": "not run",
-        "engine_verdict": None,
-        "warnings": [],
-        "outputs": {"mesh": [], "deviation_map": None, "report": None, "log": "run.log.jsonl"},
-        "software": software_info(),
-        "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "finished": None,
-    }
-
-
-def write_result(run_dir: Path, result: dict) -> Path:
-    """result.json, written once per run (exclusive create: never overwritten)."""
-    if result.get("result") not in RESULTS:
-        raise ValueError(f"result must be one of {RESULTS}")
-    result["finished"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    out = Path(run_dir) / "result.json"
-    with open(out, "x", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, default=str)
-        f.write("\n")
-    return out
+    job = {"type": cfg.job_type, "base": cfg.base, "zone": cfg.zone,
+           "config": str(cfg.source.name) if cfg.source else None}
+    if cfg.job_type == "recipe":
+        job["recipe"] = cfg.recipe
+    return _runs.empty_result(run_id=run_id, run_folder=run_folder, mock=mock,
+                              operator_confirmed=operator_confirmed, station=cfg.station_id,
+                              job=job, part={"role": cfg.part_role, "label": cfg.part_label},
+                              threshold_mm=cfg.threshold_mm, zone=cfg.zone)

@@ -130,17 +130,20 @@ def test_io_config_and_placeholder_backends():
     assert sim.inject("abort").accepted and bus.state == "ABORTING"
     with pytest.raises(KeyError):
         sim.inject("Line7")
-    for cls in (C.CameraGpioInput, C.SerialIOInput, C.DigitalIOInput):
+    for cls in (C.CameraGpioInput, C.SerialIOInput, C.DigitalIOInput, C.ModbusTcpInput,
+                C.OpcUaInput, C.EtherNetIpInput):
         with pytest.raises(NotImplementedError, match="placeholder"):
             cls({"x": "START"}).start(bus)
-    for cls in (C.CameraGpioOutput, C.DigitalIOOutput):
+    for cls in (C.CameraGpioOutput, C.DigitalIOOutput, C.ModbusTcpOutput, C.OpcUaOutput,
+                C.EtherNetIpOutput):
         with pytest.raises(NotImplementedError, match="placeholder"):
             cls().publish(bus.signals())
     doc = json.loads((ROOT / "stations" / "io_example.json").read_text())
     for spec in doc["inputs"] + doc["outputs"]:                   # every mapping is valid
         spec["enabled"] = True
     ins2, outs2 = C.load_io_doc(doc)
-    assert len(ins2) == 4 and len(outs2) == 3
+    # simulated + camera GPIO / serial / digital I/O + Modbus TCP / OPC UA / EtherNet/IP
+    assert len(ins2) == 7 and len(outs2) == 6
 
 
 def test_bad_io_config_refused(tmp_path):

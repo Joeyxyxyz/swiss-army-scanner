@@ -1,0 +1,36 @@
+{
+  "_comment": "Example recipe (built-in, read-only): a ribbed tube lying left-right on a fixture. Three part-frame zones along the tube compare its position and its top edge with a GOOD part (golden). A misaligned tube turns the zone it left RED on the part, with a cross where it is furthest off. Make the golden with `scan recipe-golden ribbed_tube_alignment` on a good part. Mock: scene:tube (good), scene:tube:misaligned.",
+  "schema_version": 1,
+  "name": "ribbed_tube_alignment",
+  "description": "Ribbed tube: section position and top-edge position vs the good part",
+  "preset": "bench_9in_metric",
+  "scan": {"kind": "fast", "axis": "xy", "zone": null, "average": null},
+  "part": {
+    "label": "tube",
+    "frame": {"reference": "dominant_plane", "plane_band_mm": 1.0, "origin_px": null},
+    "mock_scene": "scene:tube"
+  },
+  "golden": {"scan": "ribbed_tube_alignment_golden"},
+  "zones": [
+    {"id": "left", "label": "left section", "shape": "rect", "units": "part_mm",
+     "coords": [-75, -42, -30, 2],
+     "checks": [
+       {"type": "position", "params": {"tol_mm": 2.0, "tol_deg": 2.0, "min_height_mm": 5.0}},
+       {"type": "edge", "params": {"side": "top", "position_tol_mm": 2.0, "min_height_mm": 5.0}}
+     ]},
+    {"id": "middle", "label": "middle section", "shape": "rect", "units": "part_mm",
+     "coords": [-25, -42, 25, 2],
+     "checks": [
+       {"type": "position", "params": {"tol_mm": 2.0, "tol_deg": 2.0, "min_height_mm": 5.0}},
+       {"type": "edge", "params": {"side": "top", "position_tol_mm": 2.0, "min_height_mm": 5.0}}
+     ]},
+    {"id": "right", "label": "right section", "shape": "rect", "units": "part_mm",
+     "coords": [30, -42, 75, 2],
+     "checks": [
+       {"type": "position", "params": {"tol_mm": 2.0, "tol_deg": 2.0, "min_height_mm": 5.0}},
+       {"type": "edge", "params": {"side": "top", "position_tol_mm": 2.0, "min_height_mm": 5.0}}
+     ]}
+  ],
+  "feedback": {"enabled": true, "hold_s": 5.0, "fill_fail": true, "text": true},
+  "outputs": {"runs_dir": null, "overlay": true}
+}

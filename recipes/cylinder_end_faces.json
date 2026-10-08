@@ -1,0 +1,26 @@
+{
+  "_comment": "Example recipe (built-in, read-only): two cylinders lying with their circular end faces toward the camera. Each face is checked for dents (the MF-CFAR end-face detector, self-referenced); the right face's height is checked against the left one. Mock: scene:endfaces (good), scene:endfaces:dent, scene:endfaces:proud.",
+  "schema_version": 1,
+  "name": "cylinder_end_faces",
+  "description": "Two end faces: dents on each face, height difference between the faces",
+  "preset": "bench_9in_metric_bright",
+  "scan": {"kind": "fast", "axis": "xy", "zone": null, "average": null},
+  "part": {"label": "endfaces", "frame": {"reference": "dominant_plane"},
+           "mock_scene": "scene:endfaces"},
+  "zones": [
+    {"id": "face_left", "shape": "circle", "units": "part_mm",
+     "coords": {"center": [-25, 20], "radius": 10.5},
+     "checks": [
+       {"type": "defect", "params": {"depth_mm": 0.15, "mode": "face", "sign": "dent"}}
+     ]},
+    {"id": "face_right", "shape": "circle", "units": "part_mm",
+     "coords": {"center": [25, 20], "radius": 10.5},
+     "checks": [
+       {"type": "defect", "params": {"depth_mm": 0.15, "mode": "face", "sign": "dent"}},
+       {"type": "height", "id": "vs_left",
+        "params": {"ref": "zone:face_left", "nominal_mm": 0.0, "tol_mm": 0.3, "min_height_mm": 30.0}}
+     ]}
+  ],
+  "feedback": {"enabled": true, "hold_s": 5.0},
+  "outputs": {"runs_dir": null, "overlay": true}
+}

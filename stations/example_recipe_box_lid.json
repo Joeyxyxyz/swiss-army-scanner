@@ -1,0 +1,19 @@
+{
+  "_comment": "Example RECIPE work state for `scan run` and the operator page: job.type recipe runs the recipe (recipes/box_lid.json: zones, checks, the verdict projected on the part) and pins its preset (preset null = the recipe's). mock_part (MOCK only) is what the simulated human places: here a lid left ajar, so the mock run FAILs and paints the raised side red. Paths are relative to this file.",
+  "station_id": "example_box_lid",
+  "preset": null,
+  "library": null,
+  "mock_library": "../library_mock",
+  "runs_dir": "../runs",
+  "operator_confirmed": false,
+  "job": {
+    "type": "recipe",
+    "recipe": "box_lid",
+    "feedback": null
+  },
+  "part": {
+    "role": "test",
+    "label": "box"
+  },
+  "mock_part": "scene:box_lid:ajar"
+}

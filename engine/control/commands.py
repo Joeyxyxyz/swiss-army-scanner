@@ -61,6 +61,9 @@ class Handlers:
     start: Callable = lambda ws, confirmed: None
     abort: Callable = lambda: None
     home: Callable = lambda: None
+    # select(workstate, preset) after SELECT_WORKSTATE is accepted: the owner makes that
+    # work state's preset (part recipe) the loaded one; None = the station names none
+    select: Callable = lambda ws, preset: None
 
 
 class CommandBus:
@@ -71,6 +74,7 @@ class CommandBus:
         self.require_confirmation = bool(require_confirmation)
         self.state = "READY"
         self.workstate: Optional[str] = self.workstates[0] if self.workstates else None
+        self.workstate_presets: dict = {}            # work state -> the preset it pins
         self.armed_confirmed = False
         self.last_result: Optional[str] = None      # PASS | FAIL | INVALID | ABORTED
         self.fault: Optional[str] = None
@@ -92,6 +96,7 @@ class CommandBus:
     def snapshot(self) -> dict:
         with self._lock:
             return {"state": self.state, "workstate": self.workstate,
+                    "workstate_preset": self.workstate_presets.get(self.workstate),
                     "workstates": list(self.workstates), "last_result": self.last_result,
                     "fault": self.fault, "signals": self.signals(),
                     "require_confirmation": self.require_confirmation,
@@ -188,7 +193,12 @@ class CommandBus:
         if ws is None:
             return self._no("SELECT_WORKSTATE", f"no work state {arg!r}")
         self.workstate = ws
-        return self._ok("SELECT_WORKSTATE", ws)
+        preset = self.workstate_presets.get(ws)
+        try:
+            self.h.select(ws, preset)
+        except Exception as e:              # noqa: BLE001 - selected, but its preset didn't load
+            return self._ok("SELECT_WORKSTATE", f"{ws} (preset {preset}: {type(e).__name__}: {e})")
+        return self._ok("SELECT_WORKSTATE", f"{ws} (preset {preset})" if preset else ws)
 
     def _c_arm(self, arg, confirmed):
         if self.state != "READY":

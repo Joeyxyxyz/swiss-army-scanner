@@ -125,6 +125,27 @@ Which calibration each job type needs:
 
 Recalibrate after any zoom / focus / mount change. Mock: `scan.bat --mock calibrate-stereo --mock-poses 12`.
 
+### Presets & recipes
+
+A preset holds every setting for one rig geometry. Different parts on the same line (boxes, cylinders, panels) each get their own preset: a **recipe**, so the line knows which settings go with which part.
+
+- **Built-in presets** (`presets/*.json`, in the repo) are **read-only** for the commands below: never edited or deleted by them.
+- **User presets** live in the library: `<library>/presets/<name>/preset.json` + `meta.json` (created, author, description, copied from). They are runtime data like the rest of the library (not in git).
+
+| | CLI | Python | Web |
+|---|---|---|---|
+| list both tiers (tier, selected, geometry, stereo calibration, description) | `scan presets` | `api.preset_list()` | Setup → Preset library |
+| show one | `scan preset-show NAME` | `api.preset_show(name)` | `GET /api/presets/NAME` |
+| add (copy + override) | `scan preset-add NAME --from BASE [--set key=value ...] [--geometry ID] [--desc TEXT] [--replace]` | `api.preset_add(name, base, overrides={...}, geometry_id=None, description="")` | Add preset |
+| select (the default) | `scan preset-select NAME` | `api.preset_select(name)`, `api.preset_active()` | Select |
+| delete (to trash) | `scan preset-delete NAME --reason TEXT [--force]` | `api.preset_delete(name, reason, force=False)` | Delete (asks for a reason; `confirm=true` is required) |
+
+- **Add** copies a built-in or user preset and overrides fields (`--set camera.exposure_us=33333 --set projection.duty=0.8 --set projection.invert=false`; values are read as JSON when they parse). The result goes through the same validation as `load_preset` (unknown keys, ranges, LED limits). A built-in name is refused; an existing user name too, unless `--replace` (the old one moves to `trash/presets/`).
+- **Select** records the library's active preset (`<library>/presets/active.jsonl`, append-only, the last line wins). The CLI and the web server use it when no `--preset` is given.
+- **Delete** moves a user preset to `<library>/trash/presets/` (recoverable). Refused for built-ins, for the selected or loaded preset (select another first), and for a preset a station config in `stations/` uses (listed; `--force` overrides).
+- **A new rig profile** = a new `geometry_id` (`--geometry rig2_v1`) + its own calibration. Nothing is copied or fitted for it: the new geometry starts **uncalibrated** (no bases, no stereo calibration) until you run the calibration steps above with that preset. Changing a geometry-bound setting (rotate90, DMD size, coded axis, projector side, baseline, standoff) under an existing `geometry_id` is refused.
+- **Work states pin presets.** A station config (`stations/*.json`) names its own `preset`, and that always wins over the selected one. On the operator page (`/quick`), switching the work state loads that station's preset; the active preset is shown next to the work state. Preset changes (select, load, delete) are refused while a station run is busy.
+
 ## Modes (UI tabs ↔ verbs)
 
 | Mode | Verbs | Notes |

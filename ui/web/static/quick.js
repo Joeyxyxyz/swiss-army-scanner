@@ -167,6 +167,7 @@ function showRig(job) {
 async function pollOnce() {
   const b = await api('GET', '/api/cmd/state');
   state.bus = b;
+  $('#qPreset').textContent = b.active_preset || 'none loaded';
   trackJobs(b.jobs);
   if (state.runJobId && state.shownRun !== state.runJobId) {
     const j = await api('GET', `/api/jobs/${state.runJobId}`);

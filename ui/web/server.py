@@ -61,6 +61,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import numpy as np
 
 from engine import api, config, rules
+from engine.library import presets as preset_lib
 from engine.library.store import OUTPUT_KINDS
 from engine.reconstruct import pointcloud
 from engine.results import TIER_DEPTH, TIER_LATERAL, TIER_RELIEF, ToleranceBand
@@ -140,6 +141,24 @@ FLASH_SUMMARY = (
 VERBS: dict = {
     "load_preset": ("Load a preset (validated; binds the latest calibration for its geometry).",
                     {"name": "preset name (GET /api/presets)"}),
+    "preset_add": ("Add a USER preset (part recipe) to this library: a copy of `base` (built-in "
+                   "or user) with fields overridden. Built-in presets are read-only; a new "
+                   "geometry_id starts UNCALIBRATED.",
+                   {"name": "new user preset name [A-Za-z0-9_.-]",
+                    "base": "preset to copy (GET /api/presets)",
+                    "overrides": "{\"camera.exposure_us\": 33333, \"projection.duty\": 0.8, ...}",
+                    "geometry_id": "new geometry_id for a new rig profile (optional)",
+                    "description": "text: what part / line it is for",
+                    "replace": "bool: replace an existing USER preset (old one to trash/)"}),
+    "preset_select": ("Select (and load) the library's active preset: the default when no preset "
+                      "is named. A station config's own preset still wins. Refused while a "
+                      "station run is busy.", {"name": "preset name (GET /api/presets)"}),
+    "preset_delete": ("Move a USER preset to the library trash (recoverable). Refused for "
+                      "built-ins, the active preset, and presets a station config uses (unless "
+                      "force). Needs confirm=true.",
+                      {"name": "user preset name", "reason": "why (recorded)",
+                       "confirm": "bool: must be true (the operator confirmed the delete)",
+                       "force": "bool: delete even when a station config references it"}),
     "check_signal": ("Short live probe: gc_conf, valid %, focus ratio, coded-axis check.", {}),
     "capture_base": ("EMPTY scene -> base reference (the datum) for the active geometry. "
                      "zone: light only that grid zone (use the same zone as the zone scans).",
@@ -605,7 +624,10 @@ RIG_FREE_VERBS = frozenset({
     "cylinder_deviation",
     "compare_metric", "predict_precision", "export_metric_mesh", "calibrate_dent_null",
     "detect_dents", "locate_face", "face_profile", "face_golden", "check_face",
-    "station_measure", "station_golden", "station_check"})
+    "station_measure", "station_golden", "station_check", "preset_add", "preset_delete"})
+
+# verbs that change which preset is loaded / selected: refused while a station run is busy
+PRESET_CHANGE_VERBS = frozenset({"load_preset", "preset_select", "preset_delete"})
 
 
 # running jobs that may be aborted: the engine checks the job's cancel event before every
@@ -1037,7 +1059,7 @@ class App:
         # buttons, keys, POST /api/cmd/*, hardware inputs) goes through its state machine
         from engine.control.commands import CommandBus, Handlers
         self.bus = CommandBus(Handlers(start=self._bus_start, abort=self._bus_abort,
-                                       home=self._bus_home),
+                                       home=self._bus_home, select=self._bus_select),
                               require_confirmation=not self.mock)
         self._bus_jobs: dict = {}               # job id -> "run" | "home"
         self._home_args: dict = {}
@@ -1092,9 +1114,9 @@ class App:
         """Mode is fixed here, once: api.configure(mock=...) on the worker."""
         self.session = api.configure(self.library, mock=self.mock, presets_dir=self.presets_dir)
         self.root = self.session.store.root.resolve()
-        names = config.list_presets(self.presets_path)
-        name = self.preset_name or (DEFAULT_PRESET if DEFAULT_PRESET in names
-                                    else (names[0] if names else None))
+        names = self.preset_names()
+        name = self.preset_name or api.preset_active() or (
+            DEFAULT_PRESET if DEFAULT_PRESET in names else (names[0] if names else None))
         if name:
             try:
                 api.load_preset(name)
@@ -1185,6 +1207,9 @@ class App:
         if extra:
             raise HTTPError(400, f"{verb}: unknown args {sorted(extra)}; expected "
                                  f"{sorted(allowed) or 'none'}")
+        if verb in PRESET_CHANGE_VERBS and self.bus.state in ("RUNNING", "ABORTING", "HOMING"):
+            raise HTTPError(409, f"{verb} refused while the station is {self.bus.state}: "
+                                 "the running job uses the loaded preset")
         with self._cv:
             if self._closing:
                 raise HTTPError(503, "server is shutting down")
@@ -1283,6 +1308,12 @@ class App:
         self._bus_jobs[job.id] = "run"
         return job.id
 
+    def _bus_select(self, workstate: str, preset: Optional[str]) -> Optional[str]:
+        """SELECT_WORKSTATE accepted: load the work state's preset (its part recipe)."""
+        if not preset or preset not in self.preset_names():
+            return None
+        return self.submit("load_preset", {"name": preset}).id
+
     def _bus_abort(self) -> list:
         return self.abort_runs("ABORT")
 
@@ -1304,6 +1335,8 @@ class App:
         items = self.stations()
         names = [i["config"] for i in items if not i.get("error")]
         with self.bus._lock:
+            self.bus.workstate_presets = {i["config"]: i.get("preset") for i in items
+                                          if not i.get("error")}
             if self.bus.state in ("READY", "ARMED", "FAULT"):
                 self.bus.workstates = names
                 if self.bus.workstate not in names:
@@ -1622,7 +1655,14 @@ class App:
 
     # -------------------------------------------------------------- presets
     def preset_names(self) -> list:
-        return config.list_presets(self.presets_path)
+        """Built-in presets, then this library's user presets."""
+        users = preset_lib.user_names(self.session.store) if self.session is not None else []
+        return config.list_presets(self.presets_path) + users
+
+    def preset_tiers(self) -> list:
+        """Both tiers with flags (tier, active = selected, geometry_id, calibrated, description)."""
+        return jsonable(preset_lib.listing(self.session.store, self.presets_path, self.mock),
+                        self.root)
 
     def check_preset_name(self, name: str) -> str:
         """Only names listed in the presets folder: config.resolve_preset_path
@@ -1636,12 +1676,15 @@ class App:
         calibration block survives an edit + save (mock mode ignores it)."""
         name = self.check_preset_name(name)
         try:
-            p = config.load_preset(name, presets_dir=self.presets_path, mock=False)
+            p = config.load_preset(name, presets_dir=self.presets_path, mock=False,
+                                   user_dir=config.user_presets_dir(self.root))
         except Exception as e:          # noqa: BLE001 - shown verbatim in the editor
             raise HTTPError(400, f"{type(e).__name__}: {e}") from None
         rig = p.rig
         active = self.session.preset.name if self.session.preset is not None else None
-        return {"name": name, "active": name == active, "path": str(p.source),
+        tier = preset_lib.tier_of(self.session.store, self.presets_path, name)
+        return {"name": name, "active": name == active, "path": str(p.source), "tier": tier,
+                "selected": name == api.preset_active(),
                 "preset": config.preset_to_dict(p), "warnings": list(p.warnings),
                 "geometry_id": (config.MOCK_PREFIX if self.mock else "") + p.rig_geometry_id,
                 "derived": {"coded_axis": rig.coded_axis,
@@ -1669,6 +1712,37 @@ class App:
         except HTTPError as e:
             raise ArgError(e.msg) from None
         return api.load_preset(name)
+
+    def _v_preset_add(self, a):
+        ov = a.get("overrides")
+        if ov is not None and not isinstance(ov, dict):
+            raise ArgError("'overrides' must be an object {\"camera.exposure_us\": 33333, ...}")
+        base = self.check_preset_name_arg(_s(a, "base", required=True))
+        return api.preset_add(_s(a, "name", required=True), base, ov, _s(a, "geometry_id"),
+                              _s(a, "description", "") or "", _bool(a, "replace"))
+
+    def _v_preset_select(self, a):
+        name = self.check_preset_name_arg(_s(a, "name", required=True))
+        rec = api.preset_select(name)
+        p = api.load_preset(name)
+        return {"selected": rec, "loaded": p.name, "geometry_id": p.geometry_id,
+                "warnings": list(p.warnings)}
+
+    def _v_preset_delete(self, a):
+        if not _bool(a, "confirm"):
+            raise ArgError("preset_delete needs confirm=true (the operator confirmed the delete)")
+        name = self.check_preset_name_arg(_s(a, "name", required=True))
+        p = self.session.preset
+        if p is not None and p.name == name:
+            raise ArgError(f"{name!r} is the loaded preset: load or select another one first")
+        return api.preset_delete(name, _s(a, "reason", required=True), _bool(a, "force"),
+                                 stations_dir=self.stations_dir)
+
+    def check_preset_name_arg(self, name: str) -> str:
+        try:
+            return self.check_preset_name(name)
+        except HTTPError as e:
+            raise ArgError(e.msg) from None
 
     def _v_check_signal(self, a):
         return api.check_signal(self._preset())
@@ -2643,6 +2717,9 @@ class App:
         argv += ["run", str(f)] + (["--operator-confirmed"] if confirmed else [])
         args = cli.build_parser().parse_args(argv)
         args.preset_given = False
+        act = api.preset_active()               # no station preset: the selected one
+        if act:
+            args.preset = act
         ctx = cli.Ctx(args)
         ctx.session = self.session
         ctx._outputs_before = len(self.session.store.outputs())
@@ -2984,6 +3061,8 @@ class Handler(BaseHTTPRequestHandler):
     def r_cmd_state(self, q, body):
         snap = self.app.bus.snapshot()
         snap["jobs"] = dict(self.app._bus_jobs)
+        p = self.app.session.preset
+        snap["active_preset"] = p.name if p is not None else None
         self._json(snap)
 
     def r_cmd(self, q, body, name):
@@ -2999,8 +3078,9 @@ class Handler(BaseHTTPRequestHandler):
         src = str(body.get("source") or "http")[:40]
         r = app.bus.command(cmd, source=src, arg=body.get("workstate"),
                             confirmed=bool(body.get("operator_confirmed")))
+        p = app.session.preset
         out = {**r.to_dict(), "bus": app.bus.snapshot(),
-               "jobs": dict(app._bus_jobs)}
+               "jobs": dict(app._bus_jobs), "active_preset": p.name if p is not None else None}
         self._json(out, 200 if r.accepted else 409)
 
     def r_run_file(self, q, body, run_id, name):
@@ -3105,7 +3185,9 @@ class Handler(BaseHTTPRequestHandler):
     def r_presets(self, q, body):
         p = self.app.session.preset
         self._json({"presets": self.app.preset_names(), "active": p.name if p else None,
-                    "dir": str(self.app.presets_path.resolve())})
+                    "selected": api.preset_active(), "tiers": self.app.preset_tiers(),
+                    "dir": str(self.app.presets_path.resolve()),
+                    "user_dir": str(config.user_presets_dir(self.app.root))})
 
     def r_preset_get(self, q, body, name):
         self._json(self.app.preset_detail(name))

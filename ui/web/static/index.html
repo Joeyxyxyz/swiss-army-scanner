@@ -62,6 +62,20 @@
     </div>
     <div id="presetLoadOut"></div>
   </div>
+  <div class="card">
+    <h3>Preset library (part recipes)</h3>
+    <p class="muted small">Built-in presets are read-only. User presets live in this library: add one from any preset with a few fields changed, select it as the default, or delete it (it goes to the library trash). A new geometry id starts uncalibrated.</p>
+    <div id="presetTable"></div>
+    <div class="row">
+      <label class="f inline"><span>New name</span><input id="paName" class="w10" placeholder="part_a"></label>
+      <label class="f inline"><span>From</span><select id="paBase"></select></label>
+      <label class="f inline"><span>Overrides</span><input id="paSet" class="w20" placeholder="camera.exposure_us=33333, projection.duty=0.8"></label>
+      <label class="f inline"><span>Geometry id</span><input id="paGeo" class="w10" placeholder="(same as source)"></label>
+      <label class="f inline"><span>Description</span><input id="paDesc" class="w20"></label>
+      <button id="paAdd" class="primary">Add preset</button>
+    </div>
+    <div id="presetLibOut"></div>
+  </div>
   <div class="split">
     <div class="card">
       <div class="cardhead"><h3>Editor: <span id="editorName" class="mono">—</span></h3><span id="dirtyBadge" class="tag warn" hidden>unsaved</span></div>

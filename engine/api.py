@@ -54,6 +54,7 @@ from .capture.mock_bench import MockBench
 from .config import Preset
 from .library import bases as base_lib
 from .library import objects as object_lib
+from .library import presets as preset_lib
 from .library.store import json_safe, timestamp
 from .measure import dimensions
 from .measure import inspect as inspect_mod
@@ -106,7 +107,8 @@ def paths() -> dict:
             "faces": r / "faces", "facescans": r / "facescans", "face_golden": r / "face_golden",
             "output": r / "output", "output_index": r / "output" / "index.csv",
             "sessions": r / "sessions", "trash": r / "trash",
-            "presets": config.PRESETS_DIR}
+            "presets": _engine().presets_dir or config.PRESETS_DIR,
+            "user_presets": config.user_presets_dir(r)}
 
 
 def calibration_for(geometry_id: str, fingerprint: Optional[dict] = None) -> Optional[Calibration]:
@@ -118,8 +120,9 @@ def calibration_for(geometry_id: str, fingerprint: Optional[dict] = None) -> Opt
 
 
 def list_presets() -> list:
-    """Preset names available to load_preset."""
-    return config.list_presets(_engine().presets_dir)
+    """Preset names available to load_preset: built-in, then this library's user presets."""
+    s = _engine()
+    return config.list_presets(s.presets_dir) + preset_lib.user_names(s.store)
 
 
 def latest_base(preset: Optional[Preset] = None) -> Optional[BaseRef]:
@@ -249,7 +252,8 @@ def _tolerance_for(scan: ObjectScan) -> tuple:
         return p.tolerance, []
     if name and config.valid_id(name):
         try:
-            own = config.load_preset(name, presets_dir=s.presets_dir, mock=s.mock)
+            own = config.load_preset(name, presets_dir=s.presets_dir, mock=s.mock,
+                                     user_dir=config.user_presets_dir(s.store.root))
             if own.geometry_id == scan.geometry_id:
                 return own.tolerance, []
         except Exception:               # noqa: BLE001 - fall back below, with a warning
@@ -262,6 +266,67 @@ def _tolerance_for(scan: ObjectScan) -> tuple:
            else "no preset is loaded")
     return d, [f"FAIL trigger {d.ch_fail_mm:g} mm is the engine default: the scan's preset "
                f"{name!r} could not be loaded and {why}"]
+
+
+# ------------------------------------------------------- presets & recipes
+# Built-in presets (the presets folder) are read-only here; user presets live in
+# the library (<library>/presets/<name>/) and are added / selected / deleted.
+
+STATIONS_DIR = Path(__file__).resolve().parents[1] / "stations"
+
+
+def _builtin_dir() -> Path:
+    return Path(_engine().presets_dir or config.PRESETS_DIR)
+
+
+def preset_list() -> list:
+    """Both tiers: name, tier ('builtin' | 'user'), active, geometry_id,
+    calibrated (a stereo calibration exists at its geometry), description."""
+    s = _engine()
+    return preset_lib.listing(s.store, _builtin_dir(), mock=s.mock)
+
+
+def preset_show(name: str) -> dict:
+    """One preset: the listing fields plus its JSON."""
+    s = _engine()
+    return preset_lib.show(s.store, _builtin_dir(), name, mock=s.mock)
+
+
+def preset_active() -> Optional[str]:
+    """The library's selected preset (used when no preset is named), or None."""
+    s = _engine()
+    return preset_lib.active(s.store, _builtin_dir())
+
+
+@_verb
+def preset_add(name: str, base: str, overrides: Optional[dict] = None,
+               geometry_id: Optional[str] = None, description: str = "",
+               replace: bool = False) -> dict:
+    """Copy a preset (built-in or user) as a new USER preset with fields overridden
+    ({"camera.exposure_us": 33333, ...}); validated like load_preset. Refuses a
+    built-in name, and an existing user name unless replace=True (the old one goes
+    to trash/). A new geometry_id starts uncalibrated: nothing is copied or fitted."""
+    s = _engine()
+    return preset_lib.add(s.store, _builtin_dir(), name, base, overrides, geometry_id,
+                          description, replace)
+
+
+@_verb
+def preset_select(name: str) -> dict:
+    """Make `name` this library's active preset (the default when none is named;
+    a station config's own preset still wins). Does not load it: load_preset does."""
+    s = _engine()
+    return preset_lib.select(s.store, _builtin_dir(), name, by=s.holder)
+
+
+@_verb
+def preset_delete(name: str, reason: str, force: bool = False,
+                  stations_dir: Union[str, Path, None] = None) -> dict:
+    """Move a USER preset to trash/presets/ (recoverable). Refuses built-ins, the
+    active preset, and one a station config references (unless force=True)."""
+    s = _engine()
+    return preset_lib.delete(s.store, _builtin_dir(), name, reason,
+                             Path(stations_dir) if stations_dir else STATIONS_DIR, force)
 
 
 # ------------------------------------------------------------------ verbs

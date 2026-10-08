@@ -332,6 +332,10 @@ class Ctx:
         lib = Path(self.args.library).resolve() if self.args.library else None
         self.session = api.configure(lib, mock=self.mock)
         self._outputs_before = len(self.session.store.outputs())
+        if not getattr(self.args, "preset_given", True):
+            act = api.preset_active()           # the library's selected preset (preset-select)
+            if act:
+                self.args.preset = act
 
     def preset(self):
         if self._preset is None:
@@ -605,28 +609,92 @@ def _pointcloud_units(path: Path) -> str:
 
 def cmd_presets(ctx):
     rows, data = [], []
-    for name in config.list_presets():
+    tiers = {i["name"]: i for i in api.preset_list()}
+    selected = api.preset_active()
+    for name in api.list_presets():
+        info = tiers.get(name, {})
         mark = "*" if name == ctx.args.preset else ""
+        tier = info.get("tier", "?")
+        stereo = "stereo" if info.get("calibrated") else "-"
         try:
-            p = config.load_preset(name, store=ctx.session.store, mock=ctx.mock)
+            p = config.load_preset(name, presets_dir=ctx.session.presets_dir,
+                                   store=ctx.session.store, mock=ctx.mock)
         except (config.ConfigError, rules.RuleViolation) as e:
-            rows.append([mark, name, f"INVALID: {_one_line(e)}", "", "", "", "", ""])
-            data.append({"name": name, "valid": False, "error": str(e)})
+            rows.append([mark, name, tier, f"INVALID: {_one_line(e)}", "", "", "", "", "", ""])
+            data.append({"name": name, "tier": tier, "valid": False, "error": str(e)})
             continue
         cal = p.calibration
         cal_txt = (f"{cal.id} ({'Z' if cal.has_z else ''}{'+XY' if cal.has_xy else ''})"
                    if cal else "none -> px")
         w, h = p.projection.size
-        rows.append([mark, p.name, p.geometry_id, p.rig.projector_side, f"{w}x{h} px",
+        rows.append([mark, p.name, tier, p.geometry_id, p.rig.projector_side, f"{w}x{h} px",
                      f"{p.camera.exposure_us} us, avg {p.camera.average}", _bases_text(p.bases),
-                     cal_txt])
-        data.append({"name": p.name, "valid": True, "geometry_id": p.geometry_id,
+                     cal_txt, stereo])
+        data.append({"name": p.name, "valid": True, "tier": tier, "geometry_id": p.geometry_id,
                      "projector_side": p.rig.projector_side, "camera": p.camera,
-                     "bases": p.bases, "calibration": cal, "warnings": p.warnings})
-    ctx.say(f"Presets in {config.PRESETS_DIR}  (* = active; pick with --preset NAME)")
-    ctx.table(["", "name", "geometry", "projector", "DMD", "camera", "bases", "calibration"],
-              rows)
-    return EXIT_OK, {"presets": data, "active": ctx.args.preset}
+                     "bases": p.bases, "calibration": cal, "warnings": p.warnings,
+                     "calibrated": bool(info.get("calibrated")), "selected": name == selected,
+                     "description": info.get("description", "")})
+    ctx.say(f"Presets: built-in {ctx.session.presets_dir or config.PRESETS_DIR} (read-only), "
+            f"user {config.user_presets_dir(ctx.session.store.root)}")
+    ctx.say(f"  (* = in use for this run: --preset NAME, else the selected preset "
+            f"{selected or '- none selected, the default'})")
+    ctx.table(["", "name", "tier", "geometry", "projector", "DMD", "camera", "bases",
+               "calibration", "stereo cal"], rows)
+    return EXIT_OK, {"presets": data, "active": ctx.args.preset, "selected": selected}
+
+
+def _parse_sets(items) -> dict:
+    out = {}
+    for it in items or []:
+        key, sep, val = it.partition("=")
+        if not sep or not key.strip():
+            raise Abort(f"--set wants key=value (e.g. camera.exposure_us=33333), got {it!r}")
+        out[key.strip()] = val
+    return out
+
+
+def cmd_preset_add(ctx):
+    a = ctx.args
+    r = api.preset_add(a.name, a.base, _parse_sets(a.set), a.geometry, a.desc or "", a.replace)
+    ctx.say(f"User preset {r['name']} added (copied from {a.base}): {r['path']}")
+    if r.get("replaced"):
+        ctx.say(f"  the previous {r['name']} moved to {r['replaced']}")
+    if r.get("note"):
+        ctx.say(f"  note: {r['note']}")
+    ctx.warn([f"preset: {w}" for w in r.get("warnings") or []])
+    ctx.say(f"  use it: --preset {r['name']}, or scan preset-select {r['name']}")
+    return EXIT_OK, {"preset": r}
+
+
+def cmd_preset_select(ctx):
+    r = api.preset_select(ctx.args.name)
+    ctx.say(f"Selected preset {r['name']} ({r['tier']}): used when no --preset is given "
+            "(a station config's own preset still wins)")
+    return EXIT_OK, {"selected": r}
+
+
+def cmd_preset_delete(ctx):
+    a = ctx.args
+    r = api.preset_delete(a.name, a.reason, force=a.force,
+                          stations_dir=Path(a.stations).resolve() if a.stations else None)
+    ctx.say(f"User preset {r['name']} moved to {r['trashed']} (recoverable: move it back)")
+    if r.get("forced"):
+        ctx.say(f"  ! still referenced by station config(s): {', '.join(r['stations'])}")
+    return EXIT_OK, {"deleted": r}
+
+
+def cmd_preset_show(ctx):
+    r = api.preset_show(ctx.args.name)
+    ctx.kv([["name", r["name"]], ["tier", r["tier"] + (" (read-only)" if r["tier"] == "builtin" else "")],
+            ["selected", "yes" if r.get("active") else "no"], ["geometry_id", r.get("geometry_id")],
+            ["stereo calibration", "yes" if r.get("calibrated") else "none (uncalibrated)"],
+            ["description", r.get("description") or "-"], ["copied from", r.get("base") or "-"],
+            ["created", r.get("created") or "-"], ["author", r.get("author") or "-"]])
+    if not r.get("valid", True):
+        ctx.say(f"  ! INVALID: {_one_line(r.get('error'))}")
+    ctx.say(json.dumps(r["preset"], indent=2))
+    return EXIT_OK, {"preset": r}
 
 
 def cmd_paths(ctx):
@@ -3160,7 +3228,34 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(func=func, mode=mode or name)
         return p
 
-    cmd("presets", cmd_presets, "list rig presets (geometry, camera, calibration)")
+    cmd("presets", cmd_presets, "list rig presets: built-in + user (tier, geometry, calibration)")
+    p = cmd("preset-add", cmd_preset_add, "add a user preset (part recipe): a copy of another "
+            "preset with fields overridden", "preset add")
+    p.add_argument("name", help="new user preset name [A-Za-z0-9_.-]")
+    p.add_argument("--from", dest="base", required=True, metavar="BASE",
+                   help="preset to copy (built-in or user)")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE",
+                   help="override a field, e.g. camera.exposure_us=33333, projection.duty=0.8, "
+                        "projection.invert=false (repeatable; values parse as JSON when they can)")
+    p.add_argument("--geometry", metavar="ID", help="new geometry_id (a new rig profile: starts "
+                   "UNCALIBRATED)")
+    p.add_argument("--desc", metavar="TEXT", help="description (what part / line it is for)")
+    p.add_argument("--replace", action="store_true",
+                   help="replace an existing USER preset of this name (the old one goes to trash/)")
+    p = cmd("preset-select", cmd_preset_select, "select the library's active preset (used when "
+            "no --preset is given)", "preset select")
+    p.add_argument("name")
+    p = cmd("preset-delete", cmd_preset_delete, "move a user preset to the library trash "
+            "(built-ins are read-only)", "preset delete")
+    p.add_argument("name")
+    p.add_argument("--reason", required=True, help="why (recorded with the trashed preset)")
+    p.add_argument("--force", action="store_true",
+                   help="delete even when a station config references it")
+    p.add_argument("--stations", metavar="DIR", help="station configs folder checked for "
+                   "references (default: the repo's stations/)")
+    p = cmd("preset-show", cmd_preset_show, "show one preset (tier, calibration, JSON)",
+            "preset show")
+    p.add_argument("name")
     cmd("paths", cmd_paths, "where the library, output bin and presets live")
     cmd("signal", cmd_signal, "live signal check: gc_conf, valid %%, focus, fringe axis",
         "the signal check")

@@ -776,7 +776,65 @@ async function refreshPresets(select) {
     if (r.presets.includes(keep)) sel.value = keep;
     $('#presetDir').textContent = r.dir;
     renderNameHint();
+    renderPresetLib(r);
   } catch (e) { toast('could not list presets', 'bad', e.message); }
+}
+/** Preset library: both tiers, select / delete user presets, add from any preset. */
+function renderPresetLib(r) {
+  const tiers = r.tiers || [];
+  const base = $('#paBase');
+  const keep = base.value;
+  put(base, ...r.presets.map((n) => h('option', { value: n }, n)));
+  if (r.presets.includes(keep)) base.value = keep;
+  put($('#presetTable'), h('div', { class: 'tablewrap' }, h('table', { class: 't' },
+    h('thead', null, h('tr', null, ...['name', 'tier', 'geometry', 'stereo cal', 'description', ''].map((t) => h('th', null, t)))),
+    h('tbody', null, ...tiers.map((t) => h('tr', null,
+      h('td', null, t.name + (t.active ? ' (selected)' : '') + (t.name === r.active ? ' (loaded)' : '')),
+      h('td', null, t.tier === 'builtin' ? 'built-in (read-only)' : 'user'),
+      h('td', null, t.geometry_id || '?'),
+      h('td', null, t.calibrated ? 'yes' : 'none'),
+      h('td', { class: 'small' }, t.valid === false ? `INVALID: ${t.error}` : (t.description || '')),
+      h('td', null,
+        h('button', { class: 'small', disabled: t.active || t.valid === false, onclick: (e) => selectPreset(t.name, e.currentTarget) }, 'Select'),
+        t.tier === 'user' ? h('button', { class: 'small', disabled: t.active, onclick: (e) => deletePreset(t.name, e.currentTarget) }, 'Delete') : null)))))));
+}
+function parseOverrides(text) {
+  const out = {};
+  for (const part of String(text || '').split(',').map((x) => x.trim()).filter(Boolean)) {
+    const i = part.indexOf('=');
+    if (i < 1) throw new Error(`override "${part}" is not key=value`);
+    out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+async function addPreset() {
+  const out = $('#presetLibOut');
+  let overrides;
+  try { overrides = parseOverrides($('#paSet').value); } catch (e) { put(out, h('div', { class: 'alert bad' }, e.message)); return; }
+  const args = { name: $('#paName').value.trim(), base: $('#paBase').value, overrides, description: $('#paDesc').value.trim() };
+  if ($('#paGeo').value.trim()) args.geometry_id = $('#paGeo').value.trim();
+  const job = await runJob('preset_add', args, { btn: $('#paAdd'), out });
+  if (!done(job)) return;
+  add(out, h('div', { class: 'alert ok' }, h('b', null, `Added user preset ${job.result.name}`), job.result.note || ''), warningsList(job.result.warnings));
+  refreshPresets();
+}
+async function selectPreset(name, btn) {
+  const out = $('#presetLibOut');
+  const job = await runJob('preset_select', { name }, { btn, out });
+  if (!done(job)) return;
+  add(out, h('div', { class: 'alert ok' }, h('b', null, `Selected and loaded ${name}`), 'used when no preset is named; a station config\'s own preset still wins'));
+  await refreshStatus();
+  refreshPresets(name);
+}
+async function deletePreset(name, btn) {
+  const reason = prompt(`Delete user preset "${name}"?\n\nIt moves to the library trash (recoverable). Reason:`);
+  if (reason == null) return;
+  if (!reason.trim()) { toast('a reason is required', 'bad'); return; }
+  const out = $('#presetLibOut');
+  const job = await runJob('preset_delete', { name, reason: reason.trim(), confirm: true }, { btn, out });
+  if (!done(job)) return;
+  add(out, h('div', { class: 'alert ok' }, h('b', null, `Moved ${name} to the trash`), String(job.result.trashed || '')));
+  refreshPresets();
 }
 async function openEditor(name) {
   if (!name) return;
@@ -2592,6 +2650,7 @@ function bind() {
     if (!name) return;
     loadPreset(name);
   });
+  on('#paAdd', 'click', addPreset);
   on('#saveBtn', 'click', () => savePreset(false));
   on('#saveLoadBtn', 'click', () => savePreset(true));
   on('#revertBtn', 'click', () => { if (S.loaded) { S.form = clone(S.loaded); clearInvalid(); fillForm(); put($('#saveOut')); } });

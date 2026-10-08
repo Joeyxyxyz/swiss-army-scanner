@@ -24,6 +24,8 @@ from .bases import registry
 from .results import Calibration
 
 PRESETS_DIR = Path(__file__).resolve().parents[1] / "presets"
+USER_PRESETS = "presets"         # <library>/presets/<name>/preset.json: user presets (recipes)
+USER_PRESET_FILE = "preset.json"
 MOCK_PREFIX = "mock-"
 _ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 GAIN_DB_MAX = 48.0          # Blackfly S (IMX273) analog gain range is 0 .. ~48 dB
@@ -366,13 +368,13 @@ def save_preset(d: dict, *, presets_dir: Optional[Path] = None, overwrite: bool 
     return path
 
 
-def _refuse_geometry_reuse(new: Preset, folder: Path) -> None:
+def _refuse_geometry_reuse(new: Preset, folder: Path, files: Optional[list] = None) -> None:
     """Rules 5/6 at save time: a geometry_id names ONE geometry. Refuse a
     preset (an in-place overwrite, or a new name reusing the id) whose
     geometry-bound settings differ from a saved preset with the same id —
     bases and calibrations stored under that id would silently be reused."""
     want = geometry_fingerprint(new)
-    for f in sorted(folder.glob("*.json")):
+    for f in (files if files is not None else sorted(folder.glob("*.json"))):
         try:
             other = preset_from_dict(json.loads(f.read_text(encoding="utf-8")), source=f)
         except Exception:                       # noqa: BLE001 - a broken file is not ours to judge
@@ -392,16 +394,32 @@ def list_presets(presets_dir: Optional[Path] = None) -> list[str]:
     return sorted(p.stem for p in Path(presets_dir or PRESETS_DIR).glob("*.json"))
 
 
-def resolve_preset_path(name: str, presets_dir: Optional[Path] = None) -> Path:
+def user_presets_dir(library_root) -> Path:
+    """Where a library keeps its user presets (added / deleted by the operator;
+    the built-in presets folder is never written by those commands)."""
+    return Path(library_root) / USER_PRESETS
+
+
+def resolve_preset_path(name: str, presets_dir: Optional[Path] = None,
+                        user_dir: Optional[Path] = None) -> Path:
+    """A built-in preset by name, else a user preset of that name in
+    `user_dir` (built-in and user names never clash: preset_add refuses it)."""
     p = Path(name)
     if p.suffix == ".json" or p.exists():
         return p
-    return Path(presets_dir or PRESETS_DIR) / f"{name}.json"
+    builtin = Path(presets_dir or PRESETS_DIR) / f"{name}.json"
+    if not builtin.exists() and user_dir is not None and valid_id(name):
+        user = Path(user_dir) / name / USER_PRESET_FILE
+        if user.exists():
+            return user
+    return builtin
 
 
 def load_preset(name: str, *, presets_dir: Optional[Path] = None, store=None,
-                mock: bool = False) -> Preset:
-    path = resolve_preset_path(name, presets_dir)
+                mock: bool = False, user_dir: Optional[Path] = None) -> Preset:
+    if user_dir is None and store is not None:
+        user_dir = user_presets_dir(store.root)
+    path = resolve_preset_path(name, presets_dir, user_dir)
     if not path.exists():
         raise ConfigError(f"preset not found: {path}")
     with open(path, encoding="utf-8") as f:

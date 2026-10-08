@@ -15,6 +15,8 @@ Filesystem library (§5): timestamped, append-only. Nothing overwrites.
                                                     frames + meta.json naming the metric scans
     <root>/face_golden/<geometry_id>/<ts>_<label>/  golden end faces: golden.npz + meta.json
     <root>/station_golden/<geometry_id>/<ts>_<label>/  station goldens: golden.json + meta.json
+    <root>/presets/<name>/                          user presets: preset.json + meta.json;
+                                                    presets/active.jsonl = the selected one
     <root>/sessions/<ts>/                           log.jsonl
     <root>/readings/<ts>_<label>/                   code-reading frames + codes.json
     <root>/output/<kind>/<ts>_<label>.<ext>         THE OUTPUT BIN — every derived result,
@@ -59,7 +61,7 @@ OUTPUT_KINDS = ("pointclouds", "defects", "measurements", "codes", "spectral", "
 INDEX_FIELDS = ["time", "kind", "label", "geometry_id", "file", "source"]
 ENTRY_KINDS = ("bases", "objects", "calibrations", "readings", "spectral", "banks", "maps",
                "sensors", "atlases", "calib_poses", "metric", "dentsets", "faces", "facescans",
-               "face_golden", "station_golden")
+               "face_golden", "station_golden", "presets")
 
 LIBRARY_README = """# Swiss Army Scanner library
 
@@ -97,6 +99,7 @@ Written by the engine. Nothing here is overwritten; "delete" moves entries to tr
 | maps/<geometry_id>/ | projector maps (camera <-> DMD pixel), used by grid zones |
 | sensors/<geometry_id>/<name>/ | taught virtual sensors (part present, alignment) |
 | output/sensors/ | sensor checks: spot photos + .json verdicts |
+| presets/ | USER PRESETS (part recipes): presets/<name>/preset.json + meta.json (author, description, copied from); presets/active.jsonl records the selected preset (last line wins) |
 | sessions/ | log.jsonl - every action, success or failure |
 | trash/ | deleted entries (recoverable - move back to restore) |
 """
@@ -364,7 +367,7 @@ def json_safe(o):
 _ENTRY_DEPTH = {"bases": 3, "objects": 2, "calibrations": 3, "readings": 2,
                 "spectral": 2, "banks": 3, "maps": 3, "sensors": 3, "atlases": 3,
                 "calib_poses": 3, "metric": 3, "dentsets": 3, "faces": 3, "facescans": 3,
-                "face_golden": 3, "station_golden": 3}
+                "face_golden": 3, "station_golden": 3, "presets": 2}
 _SPECTRAL_SUBDIRS = ("materials", "light")      # spectral/<sub>/<entry>
 _ENTRY_MARKERS = {"bases": ("meta.json", "field.npz"),
                   "objects": ("meta.json", "field.npz", "relief.npz"),
@@ -377,6 +380,7 @@ _ENTRY_MARKERS = {"bases": ("meta.json", "field.npz"),
                   "facescans": ("meta.json", "masks.npz"),
                   "face_golden": ("meta.json", "golden.npz"),
                   "station_golden": ("meta.json", "golden.json"),
+                  "presets": ("preset.json", "meta.json"),
                   "readings": ("codes.json", "full_on.png"),
                   "spectral": ("meta.json", "cube.npz", "*.json"),
                   "banks": ("members.jsonl", "meta.json"),

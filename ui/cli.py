@@ -25,10 +25,14 @@ Exit codes let a script or an agent branch without parsing the text:
   3  the requested mode is not available yet (engine stub)
   4  dent-detect only: the detector itself failed (an unexpected error), so a
      crash is never read as FLAG (1) or CLEAR (0)
-  5  run only: the job ran but its result is INVALID (numbers not trusted)
+  5  run / recipe-run / station-check / face-check: PULL (quality inspection) -
+     the job ran but its result is in doubt (INVALID, INCOMPLETE, a guard band,
+     an unreadable code): never a pass, never a reject
 `run <station config>` is the flow-ready entry point: one job, a new run
 folder with result.json + run.log.jsonl (ui/run_job.py). `recipe-run <recipe>` runs a
-recipe (work-state check: zones, checks, projected verdict) the same way.
+recipe (work-state check: zones, checks, projected verdict) the same way. Their exit code
+is the disposition (engine/disposition.py): 0 CONTINUE, 1 REJECT, 5 PULL; refused 2,
+crashed 4 and ABORTED 1 keep their codes (disposition PULL in result.json).
 --json prints one JSON document per command instead of tables.
 """
 
@@ -53,6 +57,7 @@ if str(_ROOT) not in sys.path:          # `python ui/cli.py` from anywhere
     sys.path.insert(0, str(_ROOT))
 
 from engine import api, config, rules  # noqa: E402
+from engine import disposition as D  # noqa: E402
 from engine.library import presets as preset_lib  # noqa: E402
 from engine.capture.hwtrigger import TRIGGER_LINES  # noqa: E402
 
@@ -885,6 +890,7 @@ def cmd_recipe_run(ctx):
     dev = res["deviation_mm"]["max"]
     ctx.say(f"Run {out['run_id']}: {res['result']}"
             + (f"  ({res['invalid_reason']})" if res["invalid_reason"] else ""))
+    ctx.say(f"  disposition: {_one_line(D.summary(res))}")
     ctx.kv([["recipe", f"{r.name} (preset {res['capture']['preset'] or r.preset})"],
             ["scan", res["part"]["scan_id"] or "-"],
             ["headline", f"{res['deviation_mm']['method']}: {_u(dev, 'mm', 4)}"
@@ -2428,6 +2434,9 @@ def cmd_face_check(ctx):
                        a.detector, a.z, a.min_depth)
     ctx.say(f"Face check of {r.placement['label']}: {r.verdict} ({r.n_triggers} trigger(s); "
             f"golden {r.golden_id}, detector {r.detector})")
+    disp = _check_disposition(r.verdict, "less than the needed share of the face was measured "
+                              f"({_f((r.stats or {}).get('compared_pct'), 1)} % compared)")
+    ctx.say(f"  disposition: {_one_line(D.summary(disp))}")
     st = r.stats
     if r.detector in ("mf", "mf_fir"):
         ctx.table(["#", "zone", "r mm", "theta deg", "depth mm", "width mm", "z", "dev mm",
@@ -2449,7 +2458,19 @@ def cmd_face_check(ctx):
             ["compared", _u(st["compared_pct"], "% of the inspected face", 1)],
             *[[k, str(v)] for k, v in r.files.items() if v is not None]])
     ctx.warn(r.warnings)
-    return (EXIT_OK if r.verdict == "PASS" else EXIT_NOT_OK), {"check": r}
+    return D.exit_code(disp), {"check": r, **disp}
+
+
+def _check_disposition(verdict: str, incomplete_why: str) -> dict:
+    """face-check / station-check: PASS -> CONTINUE, FAIL -> REJECT, INCOMPLETE (or anything
+    else) -> PULL with its reason. -> {"disposition", "pull_reasons"}"""
+    res = {"result": verdict if verdict in ("PASS", "FAIL") else "INVALID",
+           "invalid_reason": None, "pull_reasons": []}
+    if res["result"] == "INVALID":
+        D.add(res, "incomplete" if verdict == "INCOMPLETE" else "invalid",
+              f"{verdict}: {incomplete_why}")
+    D.settle(res)
+    return {"disposition": res["disposition"], "pull_reasons": res["pull_reasons"]}
 
 
 def cmd_faces(ctx):
@@ -2614,9 +2635,27 @@ def cmd_station_check(ctx):
     if a.golden:
         gold = (str(Path(a.golden).resolve()) if Path(a.golden).is_dir() else
                 _pick(api.list_library("station_golden"), a.golden, "station golden", "stations"))
-    r = api.station_check(_station_item(a.scan), gold, _flood_arg(a.flood), a.label)
+    try:
+        r = api.station_check(_station_item(a.scan), gold, _flood_arg(a.flood), a.label)
+    except ValueError as e:                 # StationError is a ValueError
+        if D.classify(str(e)) != "ambiguous_faces":
+            raise
+        # which discs are the end faces is in doubt: never measured, never a verdict - PULL
+        res = {"result": "INVALID", "invalid_reason": str(e), "pull_reasons": []}
+        D.add(res, "ambiguous_faces", str(e))
+        D.settle(res)
+        ctx.say(f"Station check: not measured ({_one_line(e)})",
+                f"  disposition: {_one_line(D.summary(res))}")
+        return D.exit_code(res), {"check": None, "error": {"type": type(e).__name__,
+                                                            "message": str(e)},
+                                  "disposition": res["disposition"],
+                                  "pull_reasons": res["pull_reasons"]}
     ctx.say(f"Station check of {r.measurement['scan_id']}: {r.verdict} ({r.n_triggers} "
             f"trigger(s); golden {r.golden_id})")
+    missing = [it["item"] for it in r.items if it.get("status") == "missing"]
+    disp = _check_disposition(r.verdict, "not every golden item was measured"
+                              + (f" ({', '.join(map(str, missing[:5]))})" if missing else ""))
+    ctx.say(f"  disposition: {_one_line(D.summary(disp))}")
     ctx.table(["item", "value mm", "nominal mm", "band mm", "status"],
               [[it["item"], _f(it["value_mm"], 3), _f(it["nominal_mm"], 3),
                 "-" if not it.get("band_mm") else
@@ -2624,7 +2663,7 @@ def cmd_station_check(ctx):
                for it in r.items])
     ctx.kv([[k, str(v)] for k, v in r.files.items() if v is not None])
     ctx.warn(r.warnings)
-    return (EXIT_OK if r.verdict == "PASS" else EXIT_NOT_OK), {"check": r}
+    return D.exit_code(disp), {"check": r, **disp}
 
 
 def cmd_stations(ctx):
@@ -3544,7 +3583,9 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     more of them than job.max_outlier_pct of the measured px (golden: of both scans together,
     or of either scan's own once they are two defect clusters' worth), or dropped px dense
     anywhere, or (golden) a foreground region too sparsely decoded to judge, is INVALID
-    (never a PASS)."""
+    (never a PASS). A golden FAIL whose placement did not converge, or whose surfaces agree
+    below job.min_coverage_pct with no defect cluster to account for it, stays FAIL but
+    carries an `incomplete` doubt: PULL, never a REJECT on numbers it marks untrusted."""
     from engine import config as cfgmod
     from engine.calibrate import stereo
     from engine.measure import metric
@@ -3552,6 +3593,7 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     if cfg.threshold_mm is None:
         res["invalid_reason"] = ("metric jobs need threshold_mm (mm) in the station config: "
                                  "there is no preset default for a metric measurement")
+        D.add(res, "invalid", res["invalid_reason"])
         log.event("refused", level="warning", reason=res["invalid_reason"])
         return
     cal = stereo.latest(s.store, p.geometry_id, cfgmod.geometry_fingerprint(p))
@@ -3560,6 +3602,7 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
         res["invalid_reason"] = (f"no stereo calibration for geometry {p.geometry_id} (these rig "
                                  f"settings), so no mm (rule 6): "
                                  + CALIBRATE_STEREO_HOWTO.format(preset=p.name))
+        D.add(res, "uncalibrated", res["invalid_reason"])
         log.event("refused", level="warning", reason=res["invalid_reason"])
         return
     res["calibration"].update(calibration_id=cal.id, same_geometry=True)
@@ -3587,6 +3630,7 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     thr, min_px = cfg.threshold_mm, cfg.min_defect_px
     roi = _roi_mask(cloud.mask.shape, cfg.roi)
     incomplete = None
+    untrusted = None            # why every deviation is in doubt (a FAIL on them is a PULL)
     if cfg.measure == "plane":
         method = "plane_fit"
         region = cloud.mask & roi
@@ -3597,6 +3641,7 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
             res["invalid_reason"] = (f"only {len(P)} points ({cov:.1f} % of the roi) decoded, "
                                      f"below job.min_valid_pct {cfg.min_valid_pct:g} %: too little "
                                      "to measure (check the part, roi, zone and exposure)")
+            D.add(res, "too_few_points", res["invalid_reason"])
             log.event("measure", level="warning", method=method, n_points=int(len(P)), **extra)
             return
         fit, _ = metric.ransac_plane(P, 0.5)
@@ -3607,6 +3652,7 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
             res["invalid_reason"] = (f"the fitted plane is {dist:.1f} mm from the camera, outside "
                                      f"job.plane_range_mm {list(cfg.plane_range_mm)}: no part "
                                      "surface where it should be (part absent or misplaced?)")
+            D.add(res, "invalid", res["invalid_reason"])
             log.event("measure", level="warning", method=method, n_points=int(len(P)), **extra)
             return
         dev = np.full(cloud.mask.shape, np.nan)
@@ -3624,12 +3670,14 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
                  "datum": gc.get("datum")}
         if gc.get("refused"):
             res["invalid_reason"] = gc["refused"]
+            D.add(res, D.classify(gc["refused"], "golden"), res["invalid_reason"])
             log.event("measure", level="warning", method=method, n_points=gc["n_test"], **extra)
             return
         if "robust_max" not in gc:
             res["invalid_reason"] = (f"only {gc['n_test']} test / {gc['n_golden']} golden "
                                      f"foreground points in the roi (golden {golden.id}): wrong "
                                      "part, placement or roi?")
+            D.add(res, "too_few_points", res["invalid_reason"])
             log.event("measure", level="warning", method=method, n_points=gc["n_test"], **extra)
             return
         extra.update(icp_rms_mm=gc["icp"]["rms_mm"], icp_fitness=gc["icp"]["fitness"],
@@ -3644,14 +3692,18 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
         outlier_n, n_measured, dense = gc["outlier_clusters"], gc["n_measured"], gc["dense_strays"]
         extra.update(outlier_side=gc["outlier_side"], unjudged=gc["unjudged"][:5])
         if not gc["icp"]["converged"]:
-            incomplete = ("placing the part on the golden (ICP along the background plane) did "
-                          "not converge: every deviation depends on it, can't be trusted "
-                          "(check the placement)")
+            incomplete = untrusted = (
+                "placing the part on the golden (ICP along the background plane) did not "
+                "converge: every deviation depends on it, can't be trusted (check the "
+                "placement)")
         elif min(gc["golden_found_pct"], gc["test_matched_pct"]) < cfg.min_coverage_pct:
             incomplete = (f"only {gc['golden_found_pct']:g} % of the golden surface and "
                           f"{gc['test_matched_pct']:g} % of the test surface agree within "
                           f"{thr:g} mm (job.min_coverage_pct {cfg.min_coverage_pct:g} %) "
                           "without one defect cluster: scattered or partial data, can't pass")
+            # a defect cluster accounts for the surface that does not agree (missing material
+            # is a defect, measured); without one, a FAIL rests on scattered data
+            untrusted = None if defects else incomplete
         elif gc["unjudged"]:
             u = gc["unjudged"][0]
             incomplete = (f"{len(gc['unjudged'])} foreground region(s) can't be compared: "
@@ -3681,6 +3733,7 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     if mx is None:                              # every measured px was a dropped stray cluster
         res["invalid_reason"] = ("nothing left to judge once the stray points (clusters under "
                                  f"job.min_defect_px {min_px} px) are dropped")
+        D.add(res, "too_few_points", res["invalid_reason"])
         log.event("measure", level="warning", method=method, n_points=int(d.size), **extra)
         return
     big = defects[0] if defects else None
@@ -3699,9 +3752,12 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
         verdict = "PASS"
     if verdict is None:
         res["invalid_reason"] = incomplete
+        D.add(res, "incomplete", incomplete)
     else:
         res["result"] = res["engine_verdict"] = verdict
         res["invalid_reason"] = None
+        if verdict == "FAIL" and untrusted:     # the verdict stands, the reject does not
+            D.add(res, "incomplete", f"FAIL on numbers that can't be trusted: {untrusted}")
     log.event("measure", level="info" if verdict else "warning", method=method,
               max_deviation_mm=res["deviation_mm"]["max"], rms_mm=res["deviation_mm"]["rms"],
               n_points=int(d.size), threshold_mm=thr, min_defect_px=min_px,
@@ -3793,8 +3849,9 @@ def cmd_run(ctx):
                   exposure_us=p.camera.exposure_us, average=p.camera.average)
         if cfg.job_type == "metric":            # stereo calibration: no base involved
             _run_metric(ctx, cfg, p, log, res, run_dir)
-            code = {"PASS": EXIT_OK, "FAIL": EXIT_NOT_OK}.get(res["result"], EXIT_INVALID)
-            return _run_done(ctx, cfg, run_id, run_dir, res, log, code)
+            _settle_metric(res, cfg)
+            api._engine().check_cancel()        # an ABORT up to here: ABORTED, not judged
+            return _run_done(ctx, cfg, run_id, run_dir, res, log, D.exit_code(res))
         if cfg.job_type == "recipe":            # stereo calibration: zones, checks, feedback
             return _run_recipe(ctx, cfg, recipe, p, log, res, run_dir, run_id)
         base = None if cfg.base == "capture" else api.latest_base(p)
@@ -3811,32 +3868,64 @@ def cmd_run(ctx):
                 raise CLIError(f"base {base.id} was auto-rejected: {base.meta['rejected']}")
         log.event("base", base_id=base.id, captured=captured)
         (_run_compare if cfg.job_type == "compare" else _run_inspect)(ctx, cfg, p, base, log, res)
-        code = {"PASS": EXIT_OK, "FAIL": EXIT_NOT_OK}.get(res["result"], EXIT_INVALID)
+        D.settle(res)
+        code = D.exit_code(res)
+        api._engine().check_cancel()            # an ABORT up to here: ABORTED, not judged
     except rules.Cancelled as e:              # the operator pressed ABORT: rig already closed
         res["result"], res["invalid_reason"] = "ABORTED", None
         res["warnings"].append(f"aborted: {e}")
+        D.add(res, "aborted", f"aborted: {e}")
+        _settle_run(res, recipe)              # ABORTED: PULL (exit stays 1, as documented)
         log.event("aborted", level="warning", message=str(e))
         RJ.write_result(run_dir, res)
-        log.event("run_end", result="ABORTED", exit_code=EXIT_NOT_OK, result_json="result.json")
+        log.event("run_end", result="ABORTED", disposition=res["disposition"],
+                  pull_reasons=res["pull_reasons"], exit_code=EXIT_NOT_OK,
+                  result_json="result.json")
         log.close()
-        ctx.say(f"Run {run_id}: ABORTED ({e})", f"  run folder: {run_dir}")
+        ctx.say(f"Run {run_id}: ABORTED ({e})", f"  disposition: {_one_line(D.summary(res))}",
+                f"  run folder: {run_dir}")
         return EXIT_NOT_OK, {"run_id": run_id, "run_dir": str(run_dir), "result": res}
     except (Exception, KeyboardInterrupt) as e:
         ecode, line = _classify_error(e, ctx.mode)
         ecode = _exit_code_for(e, ecode, a)     # what main() exits with: a crash is 4, not 1
         res["result"] = "INVALID"
         res["invalid_reason"] = line
+        # what happened, never keyword-classified (a crash text is not engine wording): a
+        # run that never finished is a PULL, never a reject
+        D.add(res, "refused" if ecode == EXIT_REFUSED else "error", line)
+        _settle_run(res, recipe)                # refused / crashed: PULL (exit 2 / 4 kept)
         log.event("error", level="error", type=type(e).__name__, message=line, exit_code=ecode)
         RJ.write_result(run_dir, res)
         try:                                # callers in-process (the web UI) read the run back
             e.run_result, e.run_dir, e.run_exit_code = res, str(run_dir), ecode
         except AttributeError:
             pass
-        log.event("run_end", result="INVALID", exit_code=ecode, result_json="result.json")
+        log.event("run_end", result="INVALID", disposition=res["disposition"],
+                  pull_reasons=res["pull_reasons"], exit_code=ecode, result_json="result.json")
         log.close()
-        ctx.say(f"Run {run_id}: INVALID ({line})", f"  run folder: {run_dir}")
+        ctx.say(f"Run {run_id}: INVALID ({line})", f"  disposition: {_one_line(D.summary(res))}",
+                f"  run folder: {run_dir}")
         raise
     return _run_done(ctx, cfg, run_id, run_dir, res, log, code)
+
+
+def _settle_run(res: dict, recipe=None) -> dict:
+    """A run's disposition on the ABORTED / refused / crashed paths: a recipe job's through
+    the recipe (its result code follows: a pulled cycle never keeps the PASS code an earlier
+    settle wrote), any other job's from its verdict."""
+    if recipe is not None:
+        from engine.recipes import runner
+        return runner.settle(res, recipe)
+    return D.settle(res)
+
+
+def _settle_metric(res: dict, cfg) -> dict:
+    """A metric job's disposition: its PASS within job.guard_band_pct of threshold_mm (the
+    robust max |deviation| is held to it, one-sided) is a PULL."""
+    tol = None
+    if res.get("result") == "PASS" and res.get("threshold_mm") is not None:
+        tol = [D.tolerance("deviation_mm.max", res["deviation_mm"]["max"], hi=res["threshold_mm"])]
+    return D.settle(res, guard_band_pct=cfg.guard_band_pct, tolerances=tol)
 
 
 def _recipe_mock_place(ctx, recipe, station_part: Optional[str] = None):
@@ -3897,11 +3986,11 @@ def _run_recipe(ctx, cfg, recipe, p, log, res, run_dir, run_id) -> tuple:
     state = runner.execute(s, recipe, p, res=res, log=log, run_dir=run_dir,
                            mock_place=_recipe_mock_place(ctx, recipe, cfg.mock_part),
                            label=label)
-    if res.get("recipe"):
-        res["recipe"]["result_code"] = recipe.outputs["result_codes"].get(res["result"])
-    code = {"PASS": EXIT_OK, "FAIL": EXIT_NOT_OK}.get(res["result"], EXIT_INVALID)
+    runner.settle(res, recipe)                      # disposition + its result code
+    code = D.exit_code(res)
     res["outputs"]["mesh"] = [o["path"] for o in ctx.new_outputs()
                               if o["path"].lower().endswith((".stl", ".obj", ".ply"))]
+    s.check_cancel()                    # an ABORT up to here: ABORTED (cmd_run), not judged
     want = recipe.feedback["enabled"] if cfg.feedback is None else bool(cfg.feedback)
     if want and state.get("img") is not None and not ctx.args.no_feedback:
         ctx.say(f"  projecting the verdict on the part for {recipe.feedback['hold_s']:g} s "
@@ -3912,6 +4001,7 @@ def _run_recipe(ctx, cfg, recipe, p, log, res, run_dir, run_id) -> tuple:
     dev = res["deviation_mm"]["max"]
     ctx.say(f"Run {run_id}: {res['result']}"
             + (f"  ({res['invalid_reason']})" if res["invalid_reason"] else ""))
+    ctx.say(f"  disposition: {_one_line(D.summary(res))}")
     ctx.kv([["station", cfg.station_id], ["recipe", f"{recipe.name} (preset {p.name})"],
             ["headline", f"{res['deviation_mm']['method']}: {_u(dev, 'mm', 4)}"
              if dev is not None else "-"],
@@ -3926,12 +4016,14 @@ def _run_done(ctx, cfg, run_id, run_dir, res, log, code) -> tuple:
     res["outputs"]["mesh"] = [o["path"] for o in ctx.new_outputs()
                               if o["path"].lower().endswith((".stl", ".obj", ".ply"))]
     out = RJ.write_result(run_dir, res)
-    log.event("run_end", result=res["result"], exit_code=code, result_json=out.name,
+    log.event("run_end", result=res["result"], disposition=res["disposition"],
+              pull_reasons=res["pull_reasons"], exit_code=code, result_json=out.name,
               invalid_reason=res["invalid_reason"])
     log.close()
     dev = res["deviation_mm"]["max"]
     ctx.say(f"Run {run_id}: {res['result']}"
             + (f"  ({res['invalid_reason']})" if res["invalid_reason"] else ""))
+    ctx.say(f"  disposition: {_one_line(D.summary(res))}")
     ctx.kv([["station", cfg.station_id], ["part", f"{cfg.part_label} ({cfg.part_role})"],
             ["max deviation", _u(dev, "mm", 4) if dev is not None else "-"],
             ["threshold", _u(res["threshold_mm"], "mm", 3)
@@ -4028,8 +4120,8 @@ end faces (a cylinder lying with its circular end face toward the camera; stereo
   scan face-profile c1                      height map, radial, sections, flatness (+ PNG/CSV/STL)
   scan face-golden good1 good2 good3 good4  golden from GOOD placements: MF-CFAR + reflectance
                                             FIR (default) and band, leave-one-out, synthetic dents
-  scan face-check c7                        exit 0 PASS, 1 FAIL / INCOMPLETE (dents: depth, width,
-                                            z; overlay PNG)
+  scan face-check c7                        exit 0 PASS, 1 FAIL, 5 INCOMPLETE = PULL (quality
+                                            inspection) (dents: depth, width, z; overlay PNG)
   scan faces                                face targets, face scans, golden faces
 
 HDMI fast zone scan + station (cylinders with end faces toward the camera + a ribbed tube edge):
@@ -4040,8 +4132,9 @@ HDMI fast zone scan + station (cylinders with end faces toward the camera + a ri
   scan station st1                          cylinders C1..Cn: heights, Cj-Ci, spacing; tube edge
                                             band, trapezoid wave, zones T1..Tn (+ PNG/JSON/CSV)
   scan station-golden st1 st2 --cell-tol 0.15 --ct-tol 0.3 [--band T3=-5,-4]
-  scan station-check st7                    exit 0 PASS, 1 FAIL / INCOMPLETE (triggers named),
-                                            2 refused (e.g. an end face not found), 4 crashed
+  scan station-check st7                    exit 0 PASS, 1 FAIL (triggers named), 5 PULL
+                                            (INCOMPLETE, ambiguous end faces), 2 refused (e.g.
+                                            an end face not found), 4 crashed
   scan stations                             station goldens
 
 Surfer atlas (regions become zones atlas:<name>/<region>, e.g. scan part --zone atlas:part/part):
@@ -4078,7 +4171,9 @@ flow-ready job (one station config in, one run folder out; see stations/):
   scan --mock run stations/example_cell_station.json
   scan run stations/<station>.json --operator-confirmed
                                          result.json + run.log.jsonl in <runs_dir>/<run_id>/;
-                                         exit 0 PASS, 1 FAIL, 2 refused, 4 crashed, 5 INVALID
+                                         exit 0 CONTINUE (PASS), 1 REJECT (FAIL), 5 PULL
+                                         (quality inspection: INVALID, guard band, ...),
+                                         2 refused, 4 crashed (both PULL in result.json)
 
 recipes (work-state checks: preset -> zones -> checks -> verdict painted on the part):
   scan recipe-list                       built-in (recipes/, read-only) + user recipes
@@ -4086,8 +4181,9 @@ recipes (work-state checks: preset -> zones -> checks -> verdict painted on the 
                                          defect, edge, code (+ plugins)
   scan recipe-golden <recipe>            a GOOD part as the recipe's golden scan
   scan --mock recipe-run box_lid --mock-part scene:box_lid:ajar
-  scan recipe-run <recipe> --operator-confirmed    exit 0 PASS, 1 FAIL, 2 refused,
-                                         4 crashed, 5 INVALID; red on the part at the fault
+  scan recipe-run <recipe> --operator-confirmed    exit 0 CONTINUE, 1 REJECT, 5 PULL
+                                         (quality inspection), 2 refused, 4 crashed; red on
+                                         the part at the fault, an amber frame for PULL
   scan recipe-add|recipe-select|recipe-delete|recipe-show|recipe-validate
   station configs: job.type recipe + job.recipe NAME (the work state is the recipe)
 
@@ -4103,7 +4199,8 @@ ids: a full id, a label (newest wins), 'latest', or any unique piece of the id.
 exit codes: 0 ok | 1 not ok (verdict/signal/cancel/unexpected) | 2 refused (rule,
 geometry, safety, config, rig busy, bad input) | 3 mode not available yet |
 4 dent-detect's detector failed (its unexpected errors are not 1 = FLAG) |
-5 run: INVALID result.
+5 PULL (quality inspection: run / recipe-run INVALID or in doubt, station-check /
+face-check INCOMPLETE).
 --json prints one JSON document ({"ok", "exit_code", ...}) for scripts and agents.
 """
 
@@ -4568,8 +4665,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Gaussian sigma on the height maps (default 0.25)")
     p.add_argument("--min-area", dest="min_area", type=float, metavar="MM2",
                    help="band: smallest trigger (default 0.25)")
-    p = cmd("face-check", cmd_face_check, "a placement vs the golden face: exit 0 PASS, 1 FAIL / "
-                                          "INCOMPLETE (+ overlay PNG, json)", "the face check")
+    p = cmd("face-check", cmd_face_check, "a placement vs the golden face: exit 0 PASS, 1 FAIL, "
+                                          "5 INCOMPLETE = PULL (+ overlay PNG, json)",
+            "the face check")
     p.add_argument("placement", help="face scan (id / label / latest) or face-profile .npz")
     p.add_argument("--golden", help="golden face id / label (default: newest matching)")
     p.add_argument("--label")
@@ -4651,7 +4749,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="face centre method (default rim_circle)")
     p.add_argument("--no-ct", dest="no_ct", action="store_true", help="end faces only")
     p = cmd("station-check", cmd_station_check, "a metric scan vs the station golden: exit 0 PASS, "
-                                                "1 FAIL / INCOMPLETE, 2 refused, 4 crashed (+ PNG, JSON, CSV)",
+                                                "1 FAIL, 5 INCOMPLETE / ambiguous = PULL, "
+                                                "2 refused, 4 crashed (+ PNG, JSON, CSV)",
             "the station check")
     p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a FAIL verdict (1)
     p.add_argument("scan", help="metric scan id / label / latest, or a station .json")
@@ -4953,6 +5052,11 @@ def main(argv: Optional[list] = None) -> int:
         if ctx.json:
             doc = {"ok": code == EXIT_OK, "exit_code": code, "command": args.command,
                    **ctx.meta(), **data, "outputs_written": ctx.new_outputs()}
+            run = data.get("result") if isinstance(data, dict) else None
+            if (args.command in DISPOSITION_COMMANDS and "disposition" not in doc
+                    and isinstance(run, dict)):     # run / recipe-run: top level, as the others
+                doc.update(disposition=run.get("disposition") or "PULL",
+                           pull_reasons=run.get("pull_reasons") or [])
             print(json.dumps(_jsonable(doc), indent=2))
         else:
             ctx.report_outputs()
@@ -4966,9 +5070,29 @@ def main(argv: Optional[list] = None) -> int:
         if ctx.json:
             print(json.dumps(_jsonable({"ok": False, "exit_code": code, "command": args.command,
                                         **ctx.meta(),
-                                        "error": {"type": type(e).__name__, "message": line}}),
+                                        "error": {"type": type(e).__name__, "message": line},
+                                        **_error_disposition(e, args.command, code, line)}),
                              indent=2))
         return code
+
+
+DISPOSITION_COMMANDS = ("run", "recipe-run", "station-check", "face-check")
+
+
+def _error_disposition(e: BaseException, command: str, code: int, line: str) -> dict:
+    """--json of a refused / crashed run, recipe-run, station-check or face-check: its
+    disposition, never missing - the run's own (result.json) when it wrote one, else PULL
+    with `refused` / `error` (it never finished). Other commands: nothing."""
+    if command not in DISPOSITION_COMMANDS:
+        return {}
+    res = getattr(e, "run_result", None)
+    if isinstance(res, dict) and res.get("disposition") in D.DISPOSITIONS:
+        return {"disposition": res["disposition"], "pull_reasons": res.get("pull_reasons") or [],
+                "run_id": res.get("run_id"), "run_dir": getattr(e, "run_dir", None)}
+    r = {"result": "INVALID", "invalid_reason": line, "pull_reasons": []}
+    D.add(r, "refused" if code == EXIT_REFUSED else "error", line)
+    D.settle(r)
+    return {"disposition": r["disposition"], "pull_reasons": r["pull_reasons"]}
 
 
 def _exit(code: int) -> None:

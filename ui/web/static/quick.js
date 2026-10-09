@@ -5,7 +5,7 @@
 
 const $ = (sel) => document.querySelector(sel);
 const state = { setupBusy: false, mode: null, stations: [], bus: null, runJobId: null, homeJobId: null,
-  shownRun: null, shownHome: null, shownWorkstate: null, loadingStations: false };
+  shownRun: null, shownHome: null, shownWorkstate: null, loadingStations: false, lampDisp: null };
 
 async function api(method, path, body) {
   const opt = { method, headers: {} };
@@ -19,10 +19,81 @@ async function api(method, path, body) {
   return data;
 }
 
-function lamp(text, cls) {
+function lamp(text, cls, disp) {
+  // disp: the disposition the lamp now shows (null: a state such as READY / RUNNING / HOMING)
   const el = $('#qLamp');
   el.textContent = text;
   el.className = `qlamp lamp-${cls}`;
+  state.lampDisp = disp || null;
+}
+
+// Dispositions (engine/disposition.py): CONTINUE / REJECT / PULL (quality inspection). A run
+// without a disposition (one that never wrote its result) is a doubt: PULL, never a pass.
+const PULL_TEXT = 'PULL \u2013 quality inspection';
+const DISPOSITIONS = ['CONTINUE', 'REJECT', 'PULL'];
+
+function dispositionOf(job) {
+  const r = job.result || {};
+  const d = r.disposition;
+  if (!DISPOSITIONS.includes(d)) return 'PULL';
+  if (d === 'CONTINUE' && (job.status !== 'done' || r.result !== 'PASS')) return 'PULL';
+  return d;
+}
+
+function pullReasons(job, verdict) {
+  // the reasons a PULL names (result.json pull_reasons), else why the run has no result
+  const r = job.result || {};
+  const out = (r.pull_reasons || []).map((p) => {
+    const where = [p.zone, p.check].filter(Boolean).join('/');
+    return `${where ? where + ': ' : ''}${p.reason}${p.message ? ' (' + p.message + ')' : ''}`;
+  });
+  if (!out.length) out.push(job.error || r.invalid_reason || `result ${verdict}`);
+  return out;
+}
+
+function showDisposition(job, verdict) {
+  const d = dispositionOf(job);
+  if (d === 'CONTINUE') lamp(verdict, 'pass', d);
+  else if (d === 'REJECT') lamp(verdict === 'FAIL' ? 'FAIL' : 'REJECT', 'fail', d);
+  else lamp(PULL_TEXT, 'pull', d);
+  $('#qDisposition').textContent = d === 'PULL' ? 'PULL (quality inspection)' : d;
+  const box = $('#qPull');
+  box.textContent = '';
+  box.hidden = d !== 'PULL';
+  if (d === 'PULL') box.textContent = `Pull reasons: ${pullReasons(job, verdict).join(' | ')}`;
+  return d;
+}
+
+// The lamp reads the same signals as the line (the station bus, engine/control/commands.py):
+// whatever a run's job says, the lamp never shows a PASS the bus does not give - an ABORT
+// after the run's verdict, a START refused on an unusable work state, a crashed job, ...
+// The bus's disposition of the last cycle, while it is idle (null: none, or busy / FAULT).
+function busDisposition(b) {
+  if (!b || !(b.state === 'READY' || b.state === 'ARMED') || !b.last_result) return null;
+  return DISPOSITIONS.includes(b.last_disposition) ? b.last_disposition : 'PULL';
+}
+
+function busWhy(b) {
+  // why the bus says so: the refused START / TRIGGER that set it, else its last result
+  const h = (b.history || [])[(b.history || []).length - 1];
+  if (h && !h[3] && (h[2] === 'START' || h[2] === 'TRIGGER') && h[4]) return `${h[2]} refused: ${h[4]}`;
+  return `station: result ${b.last_result}`
+    + (b.last_result === 'ABORTED' ? ' (ABORT pressed before the cycle ended)' : '');
+}
+
+function applyBus(b) {
+  const d = busDisposition(b);
+  if (d === null || d === state.lampDisp) return;
+  if (d === 'CONTINUE') {
+    // a PASS only when the PASS output is on and the lamp shows no run of its own
+    if (state.lampDisp !== null || !(b.signals && b.signals.PASS)) return;
+    lamp('PASS', 'pass', d);
+  } else if (d === 'REJECT') lamp('FAIL', 'fail', d);
+  else lamp(PULL_TEXT, 'pull', d);
+  $('#qDisposition').textContent = d === 'PULL' ? 'PULL (quality inspection)' : d;
+  const box = $('#qPull');
+  box.hidden = d !== 'PULL';
+  box.textContent = d === 'PULL' ? `Pull reasons: ${busWhy(b)}` : '';
 }
 
 function steps(lights, camera, action) {
@@ -143,7 +214,10 @@ async function send(name, extra) {
     state.bus = r.bus;
     trackJobs(r.jobs);
     syncWorkstate(r.bus);
-    if (!r.accepted) $('#qReason').textContent = `${r.command}: ${r.message}`;
+    if (!r.accepted) {
+      $('#qReason').textContent = `${r.command}: ${r.message}`;
+      applyBus(r.bus);                           // e.g. a refused START: the bus PULLs
+    }
     else if (name === 'start' || name === 'trigger') {
       lamp('RUNNING', 'running');
       steps('active', '', '');
@@ -174,8 +248,7 @@ function showRun(job) {
   const r = job.result || {};
   const verdict = job.status === 'error' ? (/Cancelled/.test(job.error_type || '') ? 'ABORTED' : 'INVALID')
     : (r.result || '-');
-  const cls = { PASS: 'pass', FAIL: 'fail', INVALID: 'invalid', ABORTED: 'aborted' }[verdict] || 'ready';
-  lamp(verdict, cls);
+  const disp = showDisposition(job, verdict);   // the lamp: PASS / FAIL / PULL (amber)
   $('#qVerdict').textContent = verdict;
   const dm = r.deviation_mm || {};
   $('#qNumLabel').textContent = dm.method ? `Max deviation (${dm.method})` : 'Max deviation';
@@ -188,7 +261,7 @@ function showRun(job) {
   if (r.invalid_reason) reasons.push(r.invalid_reason);
   for (const w of r.warnings || []) if (/abort/i.test(w)) reasons.push(w);
   $('#qReason').textContent = reasons.join(' | ');
-  showZones(r);
+  showZones(r, disp);
   const links = job.links || {};
   const fl = $('#qFeedbackLink');
   fl.hidden = !links.feedback;
@@ -202,15 +275,18 @@ function showRun(job) {
   steps('done', 'done', verdict === 'ABORTED' ? '' : 'done');
 }
 
-function showZones(r) {
-  // recipe runs: one line per zone (verdict + the first failing / invalid check's message)
+function showZones(r, disp) {
+  // recipe runs: one line per zone (verdict + the first failing / invalid check's message);
+  // under PULL the zones that caused it are marked pull
   const ul = $('#qZoneList');
   ul.textContent = '';
   const zones = r.zones || [];
   ul.hidden = zones.length === 0;
+  const pulled = new Set((r.pull_reasons || []).map((p) => p.zone).filter(Boolean));
   for (const z of zones) {
     const li = document.createElement('li');
-    li.className = `z-${String(z.verdict || '').toLowerCase()}`;
+    li.className = disp === 'PULL' && pulled.has(z.id) ? 'z-pull'
+      : `z-${String(z.verdict || '').toLowerCase()}`;
     const b = document.createElement('b');
     b.textContent = `${z.id} ${z.verdict}`;
     li.appendChild(b);
@@ -220,7 +296,8 @@ function showZones(r) {
   }
   const fb = r.feedback || null;
   let t = '';
-  if (fb && fb.rendered) t = `Verdict painted on the part (${fb.hold_s} s; START / HOME / ABORT clears it)`;
+  if (fb && fb.rendered) t = `Verdict painted on the part (${fb.hold_s} s; START / HOME / ABORT clears it)`
+    + (disp === 'PULL' ? ': amber frame = PULL' : '');
   else if (fb && fb.enabled && fb.refused) t = `Not projected: ${fb.refused}`;
   $('#qFeedback').textContent = t;
 }
@@ -263,8 +340,12 @@ async function pollOnce() {
   trackJobs(b.jobs);
   if (state.runJobId && state.shownRun !== state.runJobId) {
     const j = await api('GET', `/api/jobs/${state.runJobId}`);
-    if (j.status === 'running') { lamp('RUNNING', 'running'); steps('done', 'active', ''); }
-    else if (j.status === 'done' || j.status === 'error') { showRun(j); state.shownRun = j.id; }
+    const ended = j.status === 'done' || j.status === 'error';
+    // a run is shown once the bus has heard it end (an ABORT may still turn it ABORTED)
+    if (j.status === 'running' || (ended && (b.state === 'RUNNING' || b.state === 'ABORTING'))) {
+      lamp('RUNNING', 'running');
+      steps('done', 'active', '');
+    } else if (ended) { showRun(j); state.shownRun = j.id; }
   }
   if (state.homeJobId && state.shownHome !== state.homeJobId) {
     const j = await api('GET', `/api/jobs/${state.homeJobId}`);
@@ -275,6 +356,7 @@ async function pollOnce() {
   else if ((b.state === 'READY' || b.state === 'ARMED') && $('#qLamp').textContent === 'HOMING') {
     lamp(b.state, 'ready');
   }
+  applyBus(b);                                   // the lamp never contradicts the outputs
   $('#qConn').hidden = true;
   refreshButtons();
 }

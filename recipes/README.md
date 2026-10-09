@@ -81,8 +81,10 @@ of the scan (the fixture), the verdict projected for 5 s.
 | `zones[]` | see below |
 | `feedback` | see below |
 | `outputs.runs_dir` | where run folders go (relative to the recipe file; default `$SCANNER_RUNS_DIR`, else `<library>/runs`) |
-| `outputs.result_codes` | register values for PASS / FAIL / INVALID / ABORTED (default 1 / 2 / 3 / 4; 0 = no result yet) |
+| `outputs.result_codes` | register values for PASS / FAIL / INVALID / ABORTED / PULL (default 1 / 2 / 3 / 4 / 5; 0 = no result yet). PULL may be left out: it gets 5, or the next code the others leave free (a recipe numbered `{"PASS": 5, "FAIL": 6, "INVALID": 7, "ABORTED": 8}` gets PULL 9); no doubt (INVALID, ABORTED, PULL) and no FAIL may share the PASS code, and PULL needs its own (not 0, not FAIL's, INVALID's or ABORTED's) |
 | `outputs.overlay` | write `overlay.png` (camera view with the zones and the verdict) |
+| `pull.guard_band_pct` | the guard band: a PASSing value within this % of the tolerance from a limit is PULLed for quality inspection (two-sided: % of the half width from each limit; one-sided: % of the limit; `presence` expect present: % of the room above `min_area_pct`, up to 100 %). A value on its limit is always in the band. `0` (default) = off; `0 <= pct < 100`, finite. The built-in examples use 10 |
+| `pull.invalid_reasons_to_reject` | doubt reasons this line REJECTS instead of pulling (default `[]`: every doubt is a PULL): any of `uncalibrated`, `stale_calibration`, `px_not_mm`, `too_few_points`, `zone_unresolved`, `golden`, `ambiguous_faces`, `incomplete`, `invalid`, `check_crashed`, `code_unreadable`, `rig_check`; `aborted`, `guard_band`, `refused` and `error` never reject, and a refused or crashed run is never rejected through this list |
 
 **Part frame.** Heights are mm above the reference plane (+ toward the camera); u, v are mm in
 that plane, u ~ camera right, v ~ camera down, from the origin. A `part_mm` zone holds the
@@ -119,7 +121,7 @@ the band centre vs the half width).
 | key | default | |
 |---|---|---|
 | `enabled` | true | needs `scan.axis` xy |
-| `pass_colour`, `fail_colour`, `invalid_colour` | green, red, amber | a name or `[b, g, r]` 0-255 (BGR, as the HDMI window draws) |
+| `pass_colour`, `fail_colour`, `invalid_colour`, `pull_colour` | green, red, amber, amber | a name or `[b, g, r]` 0-255 (BGR, as the HDMI window draws) |
 | `line_px` | 4 | outline width, DMD px |
 | `fill_fail`, `fill_level` | true, 0.6 | failing zones filled at this fraction of the fail colour |
 | `cross_px` | 24 | cross half-length at each fault point, DMD columns |
@@ -129,25 +131,46 @@ the band centre vs the half width).
 | `photo` | true | photograph the projected verdict (`feedback_photo.png`) |
 
 The paint goes where the scan's own decoded correspondences say each camera px was lit
-from, so it lands on the surfaces the camera saw, at any depth.
+from, so it lands on the surfaces the camera saw, at any depth. It shows the disposition:
+CONTINUE green; REJECT red at the failing zones with a cross at each definite fault; PULL an
+amber frame round the whole part (every drawn zone) + "PULL", and amber on the zones that
+caused it (no red, no cross: a doubt is not a defect).
+
+**Pull** (`pull.*`, the disposition on top of the verdict):
+
+```json
+"pull": {"guard_band_pct": 10, "invalid_reasons_to_reject": []}
+```
+
+Each check lists the values it held to a limit in `tolerances` (`[{name, value, lo, hi}]`);
+the guard band reads them (a plugin without `tolerances`: its `key` / `limit`, |value| <=
+limit). A FAIL is a REJECT only when it is definite: a `code` check that read nothing of the
+expected kind FAILs with `pull: "code_unreadable"` (PULL), a code read with the wrong text
+is a REJECT.
 
 ## The run folder
 
 `api.recipe_run` / `scan recipe-run` / `scan run` (job.type recipe) write a NEW folder:
-`result.json` (the station run schema, 0.2: `zones`, `recipe`, `feedback` added), 
-`run.log.jsonl` (run_start, scan, zone, verdict, feedback_shown / feedback_cleared, run_end),
-`overlay.png`, `feedback_dmd.png` (the DMD image), `feedback_photo.png`. Exit codes: 0 PASS,
-1 FAIL, 2 refused, 4 crashed, 5 INVALID.
+`result.json` (the station run schema, 0.3: `zones`, `recipe`, `feedback`, `disposition`,
+`pull_reasons` added), `run.log.jsonl` (run_start, scan, zone, verdict, feedback_shown /
+feedback_cleared, run_end; `verdict` and `run_end` carry the disposition), `overlay.png`,
+`feedback_dmd.png` (the DMD image), `feedback_photo.png`. Exit codes (the disposition):
+0 CONTINUE, 1 REJECT, 5 PULL; 2 refused, 4 crashed, ABORTED 1 (all three PULL in
+result.json).
 
 Verdict: any check FAIL -> FAIL; else any check INVALID -> INVALID (never a pass: no stereo
 calibration, a scan made under another calibration, too few points in a zone, no golden);
-else PASS.
+else PASS. Disposition: a definite FAIL anywhere -> REJECT (even with an INVALID zone);
+else any doubt (an INVALID check, a crashed check, an unreadable code, the rig check MOVED /
+UNKNOWN, ABORTED, a PASS in the guard band) -> PULL; else CONTINUE. The result code follows
+the disposition: PASS only for CONTINUE, FAIL for REJECT, INVALID / ABORTED as such, PULL for
+a PASS or FAIL in doubt.
 
 ## The built-in examples (all runnable in `--mock`)
 
 | recipe | part | zones -> checks | mock scenes |
 |---|---|---|---|
-| `box_lid` | a box with its lid | left / right half: presence, height 40 +- 1.5 mm, flatness 0.5 mm | `scene:box_lid` PASS, `:ajar` FAIL (right half red), `:missing` FAIL (both red) |
+| `box_lid` | a box with its lid | left / right half: presence, height 40 +- 1.5 mm, flatness 0.5 mm (guard band 10 %, as every built-in) | `scene:box_lid` PASS, `:ajar` FAIL (right half red), `:missing` FAIL (both red) |
 | `flat_plate` | a flat plate | top face: flatness 0.3 mm, local defects 0.3 mm; top edge: straightness 0.8 mm | `scene:plate` PASS, `:bump` FAIL, `:burr` FAIL (cross at the burr) |
 | `cylinder_end_faces` | two cylinders, end faces toward the camera | each face: MF-CFAR dents >= 0.15 mm; right face height vs the left 0 +- 0.3 mm | `scene:endfaces` PASS, `:dent` FAIL, `:proud` FAIL |
 | `ribbed_tube_alignment` | a ribbed tube | left / middle / right section: position and top-edge position vs the golden, 2 mm | `scene:tube` PASS, `:misaligned` FAIL (right section red) |

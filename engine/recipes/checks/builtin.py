@@ -13,7 +13,8 @@ Built-in recipe checks: thin wrappers over the engine's measurements.
   code       a barcode / QR code read in the zone (engine/sense/codes.py decoders)
 
 Every value carries its unit in its name (_mm, _deg, _mm2, _pct); every check answers
-INVALID (never PASS) when it cannot measure.
+INVALID (never PASS) when it cannot measure. Every value a check holds to a limit is listed
+in its `tolerances` (the recipe's guard band, engine/disposition.py, reads them).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from typing import Optional
 
 import numpy as np
 
+from ...disposition import tolerance
 from . import register
 from .base import Check, CheckResult, Param, ParamError
 
@@ -126,6 +128,15 @@ class Presence(Check):
                                        f"{p['min_points']})", values=values)
         ok = present == (p["expect"] == "present")
         state = "present" if present else "absent"
+        # the values judged (not their rounded copies); a share can't pass 100 %, so the
+        # guard band of "present" is a % of the room above the limit (span), not of the limit
+        if p["expect"] == "present":
+            tols = [tolerance("part_pct", float(part_pct), lo=p["min_area_pct"],
+                              span=100.0 - p["min_area_pct"])]
+        else:                                   # absent: the worst case (every unseen cell part)
+            worst = part_pct if part_max_pct is None else part_max_pct
+            tols = [tolerance("part_max_pct" if part_max_pct is not None else "part_pct",
+                              float(worst), hi=p["min_area_pct"])]
         faults = []
         if not ok:
             if present:
@@ -134,7 +145,7 @@ class Presence(Check):
                 faults = [{"px": z.centroid_px(), "label": "missing part"}]
         return CheckResult(
             verdict="PASS" if ok else "FAIL", values=values, key="part_pct",
-            limit=p["min_area_pct"], fault_points=faults,
+            limit=p["min_area_pct"], fault_points=faults, tolerances=tols,
             message=(f"part {state}: {part_pct:.1f} % of the zone >= {p['min_height_mm']:g} mm "
                      f"above the reference (expected {p['expect']})"))
 
@@ -222,8 +233,13 @@ class Position(Check):
         key, limit = "offset_mm", p["tol_mm"]                 # the mm value nearest its limit
         if p["tol_height_mm"] is not None and abs(dh) / p["tol_height_mm"] > off / p["tol_mm"]:
             key, limit = "dz_mm", p["tol_height_mm"]
+        tols = [tolerance("offset_mm", off, hi=p["tol_mm"])]          # the values judged
+        if rot is not None:
+            tols.append(tolerance("rotation_deg", float(rot), -p["tol_deg"], p["tol_deg"]))
+        if p["tol_height_mm"] is not None:
+            tols.append(tolerance("dz_mm", dh, -p["tol_height_mm"], p["tol_height_mm"]))
         return CheckResult(verdict="FAIL" if why else "PASS", values=values, key=key,
-                           limit=limit, fault_points=faults, warnings=warn,
+                           limit=limit, fault_points=faults, warnings=warn, tolerances=tols,
                            message="; ".join(why) if why else
                            f"aligned: offset {off:.2f} mm" + (f", rotation {rot:+.2f} deg"
                                                               if rot is not None else ""))
@@ -297,6 +313,7 @@ class Height(Check):
         what = "above " + (p["ref"][5:] if p["ref"] != "plane" else "the reference plane")
         return CheckResult(verdict="FAIL" if bad else "PASS", values=values, key="deviation_mm",
                            limit=half, fault_points=faults,
+                           tolerances=[tolerance("height_mm", float(val), lo, hi)],
                            details={"band_mm": [lo, hi], "centre_mm": centre},
                            message=f"{p['stat']} height {val:+.3f} mm {what} "
                                    f"({'outside' if bad else 'inside'} [{lo:g}, {hi:g}] mm)")
@@ -373,8 +390,11 @@ class Flatness(Check):
         key, limit = "flatness_mm", p["tol_mm"]               # the mm value nearest its limit
         if p["rms_tol_mm"] is not None and rms / p["rms_tol_mm"] > flat / p["tol_mm"]:
             key, limit = "rms_mm", p["rms_tol_mm"]
+        tols = [tolerance("flatness_mm", flat, hi=p["tol_mm"])]       # the values judged
+        if p["rms_tol_mm"] is not None:
+            tols.append(tolerance("rms_mm", rms, hi=p["rms_tol_mm"]))
         return CheckResult(verdict="FAIL" if why else "PASS", values=values, key=key,
-                           limit=limit, fault_points=faults,
+                           limit=limit, fault_points=faults, tolerances=tols,
                            message="; ".join(why) if why else f"flat: {flat:.3f} mm "
                                                                f"peak-to-valley, RMS {rms:.3f} mm")
 
@@ -516,6 +536,7 @@ class Defect(Check):
         return CheckResult(
             verdict="FAIL" if found else "PASS", values=values, key="max_depth_mm",
             limit=p["depth_mm"], fault_points=faults, details={"defects": found[:20]},
+            tolerances=[tolerance("max_depth_mm", float(depth), hi=p["depth_mm"])],
             message=(f"{len(found)} defect(s), worst {abs(found[0]['depth_mm']):.3f} mm over "
                      f"{found[0]['area_mm2']:.1f} mm2" if found else
                      f"no defect >= {p['depth_mm']:g} mm (largest residual {worst:.3f} mm, "
@@ -600,7 +621,11 @@ class Defect(Check):
         for t in trig[:10]:
             X = C0 + t["u_mm"] * e1 + t["v_mm"] * e2
             faults.append({"px": ctx.px_of(X), "label": f"{t['kind']} {abs(t['depth_mm']):.2f} mm"})
-        worst = max((abs(t["depth_mm"]) for t in trig), default=0.0)     # the counted sign
+        # the headline: the deepest dent counted, else the deepest significant one (z over the
+        # threshold, the counted sign) still under depth_mm - so a PASS reports how close it
+        # came to the limit (the recipe's guard band reads it), never a flat 0
+        worst = (max(abs(t["depth_mm"]) for t in trig) if trig else
+                 self._face_near(det, g, prm, p["depth_mm"], p["sign"]))
         values = {"max_depth_mm": round(worst, 4), "n_defects": len(trig),
                   "max_z": det.get("max_z"), "coverage_pct": det.get("coverage_pct"),
                   "face_radius_mm": round(radius, 3), "n_points": int(good.sum())}
@@ -611,12 +636,34 @@ class Defect(Check):
                                        "passed", values=values)
         return CheckResult(
             verdict="FAIL" if trig else "PASS", values=values, key="max_depth_mm",
-            limit=p["depth_mm"], fault_points=faults, details={"triggers": trig[:20],
-                                                               "noise_floor_mm":
-                                                                   det.get("noise_floor_mm")},
+            limit=p["depth_mm"], fault_points=faults,
+            tolerances=[tolerance("max_depth_mm", float(worst), hi=p["depth_mm"])],
+            details={"triggers": trig[:20], "noise_floor_mm": det.get("noise_floor_mm")},
             message=(f"{len(trig)} defect(s) on the face, deepest {abs(trig[0]['depth_mm']):.3f} "
                      f"mm (z {trig[0]['z']:.1f})" if trig else
-                     f"face clear (no dent >= {p['depth_mm']:g} mm at z >= {p['z_thresh']:g})"))
+                     f"face clear (no dent >= {p['depth_mm']:g} mm at z >= {p['z_thresh']:g}"
+                     + (f"; deepest significant {worst:.3f} mm" if worst > 0 else "") + ")"))
+
+    @staticmethod
+    def _face_near(det: dict, g, prm: dict, depth_mm: float, sign: str) -> float:
+        """The deepest significant dent (z >= the detector's threshold, in the inspected
+        zone, the counted sign) shallower than depth_mm, from the detector's own maps; 0.0
+        when there is none."""
+        from ...measure.endface import mfcfar
+        Z, Dm = det.get("z_map"), det.get("depth_map")
+        if Z is None or Dm is None:
+            return 0.0
+        _, _, R = mfcfar.grid_mesh(np.asarray(g, np.float64))
+        thr = np.full(R.shape, float(prm["z_thresh"]))
+        if prm.get("rim_z_thresh") is not None:
+            thr[R > prm["rim_r_mm"]] = float(prm["rim_z_thresh"])
+        with np.errstate(invalid="ignore"):
+            sig = (R <= prm["inspect_r_mm"]) & np.isfinite(Z) & np.isfinite(Dm) & (Z >= thr)
+            if sign == "dent":
+                sig &= Dm > 0
+            d = np.abs(Dm[sig])
+        d = d[d < depth_mm]
+        return float(d.max()) if d.size else 0.0
 
 
 # ================================================================== edge
@@ -842,7 +889,7 @@ class Edge(Check):
         if cur is None:
             return CheckResult.invalid(why)
         cur.pop("_axis")
-        values, fails, faults, ratios = {}, [], [], []
+        values, fails, faults, ratios, tols = {}, [], [], [], []
         compared = 0                                   # tolerances actually compared
         for side, e in cur.items():
             st = float(np.max(np.abs(e["res"])))      # every sample (the trim only fits the line)
@@ -857,6 +904,8 @@ class Edge(Check):
                 compared += 1
                 ratios.append((st / p["straightness_tol_mm"], f"{side}_straightness_mm",
                                p["straightness_tol_mm"]))
+                tols.append(tolerance(f"{side}_straightness_mm", st,
+                                      hi=p["straightness_tol_mm"]))
             if gold is not None:
                 if side not in gold:
                     return CheckResult.invalid(f"golden: no {side} edge to compare with",
@@ -885,11 +934,16 @@ class Edge(Check):
                 if p["position_tol_mm"] is not None:
                     ratios.append((abs(off) / p["position_tol_mm"], f"{side}_offset_mm",
                                    p["position_tol_mm"]))
+                    tols.append(tolerance(f"{side}_offset_mm", off, -p["position_tol_mm"],
+                                          p["position_tol_mm"]))
+                if p["angle_tol_deg"] is not None:
+                    tols.append(tolerance(f"{side}_angle_deg", float(ang),
+                                          -p["angle_tol_deg"], p["angle_tol_deg"]))
         if not compared:                                # nothing was held to a tolerance
             return CheckResult.invalid("no edge tolerance could be compared", values=values)
         _, key, limit = max(ratios) if ratios else (0, None, None)
         return CheckResult(verdict="FAIL" if fails else "PASS", values=values, key=key,
-                           limit=limit, fault_points=faults,
+                           limit=limit, fault_points=faults, tolerances=tols,
                            message="; ".join(fails) if fails else
                            "edge(s) " + ", ".join(f"{k} {v:g}" for k, v in values.items()
                                                   if k.endswith("_mm")))
@@ -903,7 +957,10 @@ class Code(Check):
     (scan.codes: true, engine/sense/codes.py: bracketed floods + red light) whose corners lie
     in the zone, else the zone of the scan's flood image decoded. FAIL when fewer than
     min_count codes match (expect: exact text; pattern: a regular expression; kind: QR,
-    EAN_13, CODE_128, DATA_MATRIX, ...)."""
+    EAN_13, CODE_128, DATA_MATRIX, ...). A FAIL is definite only when a code of the expected
+    kind was read with the wrong text; when the shortfall is codes that could not be read at
+    all, the FAIL carries pull "code_unreadable" (unreadable is not wrong: the part is PULLed
+    for quality inspection, engine/disposition.py)."""
     id = "code"
     title = "Code read (QR / Data Matrix / 1D)"
     params = {
@@ -922,10 +979,13 @@ class Code(Check):
             except re.error as e:
                 raise ParamError(f"pattern is not a valid regular expression: {e}") from None
 
-    def _match(self, c) -> bool:
+    def _kind_ok(self, c) -> bool:
         from ...sense.codes import normalise_kind
+        return self.p["kind"] is None or normalise_kind(c.kind) == normalise_kind(self.p["kind"])
+
+    def _match(self, c) -> bool:
         p = self.p
-        if p["kind"] is not None and normalise_kind(c.kind) != normalise_kind(p["kind"]):
+        if not self._kind_ok(c):
             return False
         if p["expect"] is not None and c.data != p["expect"]:
             return False
@@ -967,13 +1027,18 @@ class Code(Check):
         hits = [c for c in found if self._match(c)]
         values = {"n_codes": len(found), "n_matching": len(hits)}
         ok = len(hits) >= p["min_count"]
-        faults = [] if ok else [{"px": z.centroid_px(), "label": "code missing / wrong"}]
+        wrong = [c for c in found if self._kind_ok(c) and not self._match(c)]
+        unreadable = not ok and not wrong       # nothing of that kind read wrong: unread
+        faults = [] if ok else [{"px": z.centroid_px(),
+                                 "label": "code unreadable" if unreadable else "code wrong"}]
         return CheckResult(
             verdict="PASS" if ok else "FAIL", values=values, key=None, limit=None,
-            fault_points=faults,
+            fault_points=faults, tolerances=[],
+            pull="code_unreadable" if unreadable else None,
             details={"codes": [{"kind": c.kind, "data": c.data, "corners": c.corners}
                                for c in found], "source": source},
             message=(f"{len(hits)} matching code(s): " + ", ".join(repr(c.data) for c in hits)
                      if ok else f"{len(hits)} of {p['min_count']} matching code(s) "
                                 f"({len(found)} read: " + ", ".join(repr(c.data) for c in found)
-                                + ")"))
+                                + ")" + (": the expected code could not be read (unreadable, "
+                                         "not wrong)" if unreadable else "")))

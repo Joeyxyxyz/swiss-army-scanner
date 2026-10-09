@@ -39,6 +39,10 @@ body.quick { font-size: 16px; }
 .lamp-fail { background: #b3261e; color: #fff; border-color: #d0352c; }
 .lamp-invalid { background: #c98a00; color: #1b1300; border-color: #e0a100; }
 .lamp-aborted { background: var(--panel2); color: var(--warn); border-color: var(--warn); }
+/* PULL (quality inspection): its own amber, never the PASS green or the FAIL red */
+.lamp-pull { background: #e8890c; color: #1f1200; border-color: #ffa630; font-size: 34px; }
+.qpull { margin-top: 8px; padding: 8px 12px; border: 2px solid #ffa630; border-radius: var(--r);
+  background: rgba(232, 137, 12, .16); font-size: 14px; overflow-wrap: anywhere; }
 .qresult, .qrig { margin-top: 16px; padding: 14px; background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--r); }
 .qkey { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
@@ -64,6 +68,7 @@ body.quick { font-size: 16px; }
 .qsignals span.on[data-sig="PASS"] { color: #fff; background: #1d8f55; border-color: #23a866; }
 .qsignals span.on[data-sig="FAIL"] { color: #fff; background: #b3261e; border-color: #d0352c; }
 .qsignals span.on[data-sig="ALARM"] { color: #1b1300; background: #c98a00; border-color: #e0a100; }
+.qsignals span.on[data-sig="PULL"] { color: #1f1200; background: #e8890c; border-color: #ffa630; }
 .qlegend { margin-top: 14px; line-height: 1.8; }
 kbd { font: 12px var(--mono); padding: 1px 5px; border: 1px solid var(--line2); border-radius: 3px; }
 .qpanels { display: grid; gap: 8px; margin-bottom: 14px; }
@@ -80,3 +85,4 @@ kbd { font: 12px var(--mono); padding: 1px 5px; border: 1px solid var(--line2); 
 .qzonelist li.z-pass { border-color: #23a866; }
 .qzonelist li.z-fail { border-color: #d0352c; background: rgba(179, 38, 30, .18); }
 .qzonelist li.z-invalid { border-color: #e0a100; }
+.qzonelist li.z-pull { border-color: #ffa630; background: rgba(232, 137, 12, .16); }

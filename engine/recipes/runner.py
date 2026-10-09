@@ -15,6 +15,12 @@ geometry, a scan made under another calibration or other rig settings, a zone wi
 points, no golden scan, ...). A check that raises, or answers anything but a CheckResult
 with PASS / FAIL / INVALID, is INVALID with its error (a bug is never a verdict).
 
+Disposition (engine/disposition.py, the recipe's `pull` section), on top of the verdict:
+CONTINUE (PASS, no doubt), REJECT (a definite measured FAIL, even when another zone is
+INVALID), PULL for quality inspection (any doubt: INVALID of any kind, a crashed check, an
+unreadable code, ABORTED, the rig check MOVED / UNKNOWN, a PASS value in the guard band).
+It decides the exit code (0 / 1 / 5), the result code and what the projector paints.
+
 Golden (the good part position / edge compare with): only a GOLDEN entry, made by
 scan_golden (`scan recipe-golden`, api.recipe_golden) and recorded in
 <library>/recipe_golden/<geometry_id>/, or a metric scan named by its exact id. golden.scan
@@ -23,10 +29,11 @@ newest golden entry with that label. Never the scan being checked, never a plain
 picked by label or 'latest' (an earlier run's own test scan carries the same label), never
 one made at other geometry-bound settings or with another stereo calibration.
 
-result.json = the run schema (engine/runs.py) + `recipe` (name, preset, frame, result code),
-`zones` [{id, verdict, checks: [{id, type, verdict, values (units in the names), key, limit,
-message, fault_points}]}] and `feedback` (what the DMD showed: zones drawn / refused with the
-camera -> DMD fit residuals, crosses, text, image file).
+result.json = the run schema (engine/runs.py) + `recipe` (name, preset, frame, pull config,
+result code), `zones` [{id, verdict, checks: [{id, type, verdict, values (units in the
+names), key, limit, tolerances, pull, message, fault_points}]}], `feedback` (what the DMD
+showed: zones drawn / refused with the camera -> DMD fit residuals, crosses, text, image
+file) and `disposition` / `pull_reasons`.
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from .. import config, rules
+from .. import disposition as D
 from .. import runs as R
 from . import feedback as FB
 from .checks.base import VERDICTS, CheckResult
@@ -236,6 +244,7 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
         res["invalid_reason"] = (f"no stereo calibration for geometry {preset.geometry_id} (these "
                                  f"rig settings), so no mm (rule 6): "
                                  + CALIBRATE_STEREO_HOWTO.format(preset=preset.name))
+        D.add(res, "uncalibrated", res["invalid_reason"])
         log.event("refused", level="warning", reason=res["invalid_reason"])
         return state
     res["calibration"].update(calibration_id=cal.id, same_geometry=True)
@@ -245,6 +254,7 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
         log.event("rig_check", status=rc["status"], message=rc.get("message"))
         if rc["status"] in ("MOVED", "UNKNOWN"):
             res["invalid_reason"] = f"rig check {rc['status']}: {rc.get('message')} (HOME / recalibrate)"
+            D.add(res, "rig_check", res["invalid_reason"])
             return state
         if rc["status"] == "REFERENCE_SET":
             res["warnings"].append("rig check: first check at this geometry, reference stored")
@@ -279,6 +289,7 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
         frame = frame_for(recipe, sv)
     except ZoneError as e:
         res["invalid_reason"] = f"part frame: {e}"
+        D.add(res, D.classify(str(e)), res["invalid_reason"])
         log.event("refused", level="warning", reason=res["invalid_reason"])
         return state
     res["recipe"]["frame"] = frame.summary()
@@ -304,7 +315,8 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
             entry["checks"] = [{"id": c.id, "type": c.type, "verdict": "INVALID",
                                 "values": {}, "units": {}, "key": None, "limit": None,
                                 "message": "the zone could not be resolved on this scan",
-                                "fault_points": [], "warnings": [], "details": {}}
+                                "fault_points": [], "warnings": [], "details": {},
+                                "tolerances": None, "pull": "zone_unresolved"}
                                for c in z.checks]
         else:
             entry.update(n_px=zv.n_px, n_points=zv.n_valid, warnings=list(zv.warnings))
@@ -324,8 +336,10 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
     verdict = aggregate(z["verdict"] for z in checked)
     res["zones"] = zres
     res["result"] = res["engine_verdict"] = verdict
-    res["recipe"]["result_code"] = recipe.outputs["result_codes"].get(verdict)
     res["invalid_reason"] = None if verdict != "INVALID" else _invalid_reason(checked)
+    # the disposition first: the pictures and the result code show it
+    settle(res, recipe)
+    disp, pulls = res["disposition"], res["pull_reasons"]
     _headline(res, zres, ms)
     # camera overlay + the DMD feedback image (files in the run folder)
     fb = recipe.feedback
@@ -333,7 +347,8 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
         try:
             png = FB.write_png(Path(run_dir) / OVERLAY_IMAGE,
                                FB.overlay(sv, frame, {k: v for k, v in views.items() if v},
-                                          zres, fb, verdict))
+                                          zres, fb, verdict, disposition=disp,
+                                          pull_reasons=pulls))
             res["outputs"]["deviation_map"] = png
         except Exception as e:              # noqa: BLE001 - a picture never changes a verdict
             res["warnings"].append(f"overlay image: {type(e).__name__}: {e}")
@@ -341,7 +356,8 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
             "hold_s": fb["hold_s"], "projected": None}
     if fb["enabled"]:
         try:
-            img, rinfo = FB.render({k: v for k, v in views.items() if v}, zres, sv, fb, verdict)
+            img, rinfo = FB.render({k: v for k, v in views.items() if v}, zres, sv, fb, verdict,
+                                   disposition=disp, pull_reasons=pulls)
             info.update(rinfo)
             if img is not None:
                 info["image"] = FB.write_png(Path(run_dir) / FEEDBACK_IMAGE, img)
@@ -355,14 +371,31 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
             res["warnings"].append(f"feedback: {info['frame']['why']}: the whole DMD field is "
                                    f"framed {info['frame']['verdict']}")
     res["feedback"] = info
-    log.event("verdict", result=verdict, zones={z["id"]: z["verdict"] for z in zres},
-              feedback_rendered=info["rendered"])
+    log.event("verdict", result=verdict, disposition=disp, pull_reasons=pulls,
+              zones={z["id"]: z["verdict"] for z in zres}, feedback_rendered=info["rendered"])
     return state
 
 
-def _invalid_check(message: str) -> dict:
+def settle(res: dict, recipe) -> dict:
+    """res["disposition"] / res["pull_reasons"] with the recipe's pull config, and the
+    result code of that disposition (engine/disposition.register_key), on every path (a run
+    refused before the recipe block was filled gets it here). Call it again whenever the
+    verdict changes after it (ABORTED, refused, crashed): a pulled cycle never keeps the
+    PASS code an earlier settle wrote. Idempotent."""
+    pull = getattr(recipe, "pull", None) or {}
+    D.settle(res, guard_band_pct=pull.get("guard_band_pct") or 0.0,
+             reject=pull.get("invalid_reasons_to_reject") or ())
+    if res.get("recipe") is None:
+        res["recipe"] = {**recipe.summary(), "tier": None, "result_code": None, "frame": None}
+    key = D.register_key(res["result"], res["disposition"])
+    res["recipe"]["result_code"] = recipe.outputs["result_codes"].get(key)
+    return res
+
+
+def _invalid_check(message: str, pull: str = "invalid") -> dict:
     return {"verdict": "INVALID", "values": {}, "units": {}, "key": None, "limit": None,
-            "message": message, "fault_points": [], "warnings": [], "details": {}}
+            "message": message, "fault_points": [], "warnings": [], "details": {},
+            "tolerances": None, "pull": pull}
 
 
 def _run_check(c, ctx) -> dict:
@@ -374,10 +407,16 @@ def _run_check(c, ctx) -> dict:
         d = r.to_dict()
         if d.get("verdict") not in VERDICTS:        # e.g. set after construction
             raise ValueError(f"verdict {d.get('verdict')!r} is not one of {', '.join(VERDICTS)}")
-        d["fault_points"], warn = _fault_px(d.get("fault_points") or [], ctx)
-        d["warnings"] = list(d.get("warnings") or []) + warn
+        d["tolerances"] = (None if d.get("tolerances") is None       # malformed: a bug
+                           else D.check_tolerances(d["tolerances"]))
+        warn = []
+        if d.get("pull") is not None and d["pull"] not in D.REASONS:
+            warn.append(f"pull {d['pull']!r} is not a known reason: recorded as 'invalid'")
+            d["pull"] = "invalid"                   # still a doubt, never dropped
+        d["fault_points"], fwarn = _fault_px(d.get("fault_points") or [], ctx)
+        d["warnings"] = list(d.get("warnings") or []) + warn + fwarn
     except Exception as e:                  # noqa: BLE001 - a crashing check is never a verdict
-        d = _invalid_check(f"the check failed: {type(e).__name__}: {e}")
+        d = _invalid_check(f"the check failed: {type(e).__name__}: {e}", "check_crashed")
     d = {"id": c.id, "type": c.type, **d, "params": dict(c.check.p),
          "duration_s": round(time.perf_counter() - t0, 3)}
     return _clean(d)
@@ -526,7 +565,8 @@ def finish(s, preset, recipe, run_dir: Path, res: dict, log, state: dict,
             log.event("feedback_error", level="warning", type=type(e).__name__, message=str(e))
     elif fbinfo.get("rendered"):
         log.event("feedback_skipped", reason="project_feedback off (the caller shows it)")
-    log.event("run_end", result=res["result"], exit_code=exit_code, result_json=out.name,
+    log.event("run_end", result=res["result"], disposition=res.get("disposition"),
+              pull_reasons=res.get("pull_reasons"), exit_code=exit_code, result_json=out.name,
               invalid_reason=res["invalid_reason"])
     log.close()
     return out
@@ -539,7 +579,9 @@ def run_recipe(s, recipe, preset, *, runs_dir, operator_confirmed: bool = False,
                tier: Optional[str] = None) -> dict:
     """One recipe run in a NEW run folder -> {run_id, run_dir, result, exit_code}. On the real
     rig it needs operator_confirmed, except an offline re-check: a stored `scan` with no
-    projected feedback captures and projects nothing (the rig is never opened)."""
+    projected feedback captures and projects nothing (the rig is never opened). exit_code:
+    the disposition's (CONTINUE 0, REJECT 1, PULL 5); refused 2, crashed 4, ABORTED 1 keep
+    theirs (disposition PULL)."""
     run_id, run_dir = R.new_run(runs_dir, run_name or recipe.name)
     res = R.empty_result(run_id=run_id, run_folder=str(run_dir), mock=s.mock,
                          operator_confirmed=operator_confirmed, station=run_name or recipe.name,
@@ -562,10 +604,13 @@ def run_recipe(s, recipe, preset, *, runs_dir, operator_confirmed: bool = False,
                         mock_place=mock_place, pattern_mode_ack=pattern_mode_ack, label=label)
         if res.get("recipe") is not None and tier:
             res["recipe"]["tier"] = tier
-        code = {"PASS": 0, "FAIL": 1}.get(res["result"], 5)
+        settle(res, recipe)
+        code = D.exit_code(res)
+        s.check_cancel()                # an ABORT up to here: the cycle is ABORTED, not judged
     except rules.Cancelled as e:
         res["result"], res["invalid_reason"] = "ABORTED", None
         res["warnings"].append(f"aborted: {e}")
+        D.add(res, "aborted", f"aborted: {e}")
         log.event("aborted", level="warning", message=str(e))
         state, code = {}, 1
     except Exception as e:                      # noqa: BLE001 - refused / crashed: INVALID
@@ -575,8 +620,10 @@ def run_recipe(s, recipe, preset, *, runs_dir, operator_confirmed: bool = False,
         state = {}
         code = 2 if isinstance(e, (rules.RuleViolation, config.ConfigError, ValueError,
                                    LookupError)) else 4
-    if res.get("recipe") is not None:
-        res["recipe"]["result_code"] = recipe.outputs["result_codes"].get(res["result"])
+        # recorded as what happened, never keyword-classified: a crash text is not engine
+        # wording, and a run that never finished is never a reject (engine/disposition.py)
+        D.add(res, "refused" if code == 2 else "error", res["invalid_reason"])
+    settle(res, recipe)                         # every path: ABORTED and refused are PULL
     finish(s, preset, recipe, run_dir, res, log, state, project_feedback, hold_s,
            cancel=s.cancel, exit_code=code)
     return {"run_id": run_id, "run_dir": run_dir, "result": res, "exit_code": code}

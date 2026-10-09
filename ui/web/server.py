@@ -30,8 +30,13 @@ job.type recipe, engine/recipes/; its verdict is then painted on the part by a s
 state - clears); ABORT sets
 the job's cancel event, which the engine checks before every capture (the
 rig is closed on the way out: projector idle, rig lock released) and the run
-is recorded as ABORTED. ABORT in any state also stops what runs outside a cycle: the
-projected verdict, the live view, station / recipe runs and rig checks submitted as jobs.
+is recorded as ABORTED. The lamp shows the run's disposition (engine/disposition.py): PASS
+(CONTINUE), FAIL (REJECT) or, amber, "PULL - quality inspection" with the pull reasons
+(any doubt: INVALID, ABORTED, a guard band, an unreadable code), and never a PASS the bus
+outputs do not give (an ABORT after the run's verdict, a START refused on an unusable work
+state: the bus PULLs, the lamp shows PULL; the job's result and run log say so too, and no
+verdict is projected after an ABORT). ABORT in any state also
+stops what runs outside a cycle: the projected verdict, the live view, station / recipe runs and rig checks submitted as jobs.
 HOME (when idle, or queued behind an ABORT) runs the
 rig check. Every command (page buttons, keys, POST /api/cmd/*, hardware
 inputs) goes through one state machine: engine/control/commands.py. Every bus job
@@ -68,6 +73,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import numpy as np
 
 from engine import api, config, rules
+from engine import disposition as D
+from engine import runs as R
 from engine.control.commands import BUSY as BUS_BUSY
 from engine.library import presets as preset_lib
 from engine.library.store import OUTPUT_KINDS
@@ -613,10 +620,12 @@ VERBS: dict = {
                       {"name": "user recipe name", "reason": "why (recorded)",
                        "confirm": "bool: must be true", "force": "bool"}),
     "recipe_run": ("Run a recipe: scan with its pinned preset, run every zone's checks, verdict "
-                   "PASS / FAIL / INVALID, a new run folder (result.json with zones + checks, "
-                   "run.log.jsonl, overlay.png, feedback_dmd.png), then paint the verdict on the "
-                   "part (green outline PASS, red fill + cross at the fault FAIL) for hold_s "
-                   "(cancel the job to clear it). The real rig needs operator_confirmed.",
+                   "PASS / FAIL / INVALID and disposition CONTINUE / REJECT / PULL (quality "
+                   "inspection: any doubt), a new run folder (result.json with zones + checks, "
+                   "disposition + pull_reasons, run.log.jsonl, overlay.png, feedback_dmd.png), "
+                   "then paint it on the part (green outline CONTINUE, red fill + cross at the "
+                   "fault REJECT, amber frame + PULL) for hold_s (cancel the job to clear it). "
+                   "The real rig needs operator_confirmed.",
                    {"recipe": "recipe name (GET /api/recipes)",
                     "operator_confirmed": "bool (required on the real rig)",
                     "scan_id": "check a stored metric scan instead of capturing (optional)",
@@ -646,7 +655,8 @@ VERBS: dict = {
     # UI verbs (not engine.api verbs)
     "run_station": ("Run one station config (stations/<config>.json) exactly like `scan run`: "
                     "a new run folder with result.json + run.log.jsonl; PASS / FAIL / INVALID / "
-                    "ABORTED (cancel the job to abort between captures). A config naming no "
+                    "ABORTED, disposition CONTINUE / REJECT / PULL (quality inspection) "
+                    "(cancel the job to abort between captures). A config naming no "
                     "preset (and not a recipe) runs the LOADED preset (refused when none is "
                     "loaded). The real rig needs operator_confirmed.",
                     {"config": "station config file name (GET /api/stations)",
@@ -1467,12 +1477,37 @@ class App:
             r = job.result if isinstance(job.result, dict) else {}
             error = job.error if job.status == "error" else None
             if kind == "run":
-                result = r.get("result")
+                result, disp = r.get("result"), r.get("disposition")
                 if error and job.error_type == "Cancelled":    # dropped before it ran: an
-                    result, error = "ABORTED", None             # abort, not a crash
-                self.bus.job_finished("run", result, error)
+                    result, error, disp = "ABORTED", None, None     # abort, not a crash
+                aborting = self.bus.state == "ABORTING"
+                self.bus.job_finished("run", result, error, disposition=disp)
+                if (aborting and self.bus.last_result == "ABORTED" and isinstance(job.result, dict)
+                        and r.get("result") not in (None, "ABORTED")):
+                    job.result = self._aborted_after_verdict(job.result)
             else:
                 self.bus.job_finished("home", r.get("status"), error)
+
+    def _aborted_after_verdict(self, res: dict) -> dict:
+        """ABORT came after the run wrote its verdict (result.json is written once, never
+        rewritten) but before the job ended: the bus counts the cycle ABORTED and PULLs the
+        part, so the job's result says the same (disposition PULL, reason `aborted`) and the
+        run's log records it - the page, the API and the outputs never disagree."""
+        why = (f"ABORT was pressed after this run wrote its verdict ({res.get('result')} / "
+               f"{res.get('disposition')} in result.json): the cycle is ABORTED on the line "
+               "and the part is PULLed")
+        out = {**res, "disposition": "PULL", "line_result": "ABORTED",
+               "pull_reasons": [*(res.get("pull_reasons") or []), D.reason("aborted", why)],
+               "warnings": [*(res.get("warnings") or []), why]}
+        run_dir = self._runs.get(res.get("run_id"))
+        if run_dir is not None and (Path(run_dir) / "run.log.jsonl").is_file():
+            try:
+                R.append_event(Path(run_dir) / "run.log.jsonl", res.get("run_id"),
+                               "aborted_after_verdict", level="warning", result="ABORTED",
+                               disposition="PULL", message=why)
+            except OSError as e:
+                out["warnings"].append(f"run log not updated: {e}")
+        return out
 
     def bus_reconcile(self) -> None:
         """Recovery: a busy bus state (RUNNING / ABORTING / HOMING) with no job left that
@@ -2961,9 +2996,17 @@ class App:
         fb = res.get("feedback") or {}
         if fb.get("rendered") and res.get("result") in ("PASS", "FAIL", "INVALID"):
             # the verdict painted on the part: its own job, so the bus already shows PASS /
-            # FAIL and any next command (START, TRIGGER, HOME, ABORT) clears it
-            res = {**res, "feedback_job": self.submit("recipe_feedback",
-                                                      {"run_id": res["run_id"]}).id}
+            # FAIL and any next command (START, TRIGGER, HOME, ABORT) clears it. Checked and
+            # queued under the job lock: an ABORT either came first (this cycle is ABORTED on
+            # the bus: nothing is painted) or drops the queued feedback job after it
+            with self._cv:
+                cancel = self.session.cancel
+                if cancel is not None and cancel.is_set():
+                    res = {**res, "warnings": [*(res.get("warnings") or []),
+                                               "feedback not projected: ABORT was pressed"]}
+                else:
+                    res = {**res, "feedback_job": self.submit("recipe_feedback",
+                                                              {"run_id": res["run_id"]}).id}
         return {"exit_code": code, **res}, self._run_links(res, run_dir)
 
     def _run_links(self, res: dict, run_dir: Path) -> dict:

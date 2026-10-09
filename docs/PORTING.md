@@ -12,7 +12,7 @@ its I/O backends. Porting = five adapters and one validation procedure:
 | camera | four methods: exposure, flush, grab, close | `engine/capture/camera.py`, interface CameraDriver |
 | geometry + calibration | a preset per rig geometry, its stereo calibration | `presets/`, `scan preset-add`, `scan calibrate-stereo` |
 | recipe | the part's zones, checks, tolerances, feedback | `recipes/`, `scan recipe-add` |
-| I/O | start / abort / home / trigger / work state in; ready / busy / pass / fail / alarm + result code out | `engine/control/commands.py` |
+| I/O | start / abort / home / trigger / work state in; ready / busy / pass / fail / alarm / pull + result code out | `engine/control/commands.py` |
 
 Then prove the numbers on site (the last section) before anybody trusts a PASS.
 
@@ -88,8 +88,13 @@ Start from the closest built-in (`scan recipe-list`) and copy it: `scan recipe-a
 - **Golden**: position and edge-position checks compare with a good part:
   `scan recipe-golden my_part` on a known-good placement (recorded as the recipe's golden;
   only recorded goldens or an exact scan id are used, never a run's own test scan).
-- **Feedback**: the verdict painted on the part (green outline PASS, red fill + a cross at
-  the fault FAIL): set the hold to what the operator needs to act.
+- **Feedback**: the disposition painted on the part (green outline PASS, red fill + a cross
+  at the fault REJECT, an amber frame round the part + "PULL" for quality inspection): set
+  the hold to what the operator needs to act.
+- **Pull** (`pull.*`): `guard_band_pct` (a PASS value this close to a limit, in % of the
+  tolerance, is PULLed: start with 10 and tighten once Gauge R&R says the measurement is
+  better than that) and `invalid_reasons_to_reject` (doubts your line rejects instead of
+  inspecting, e.g. `code_unreadable`; default none).
 
 `scan recipe-validate my_part` lists every problem before anything runs; `scan recipe-run
 my_part --scan <stored scan> --no-feedback` re-checks a stored scan offline while you tune
@@ -101,12 +106,12 @@ projector now, so that form needs `--operator-confirmed` like a live run.
 
 One state machine (`engine/control/commands.py`) takes START / ABORT / HOME / TRIGGER / ARM /
 DISARM / RESET / work-state commands from every source (the operator page, keys, HTTP
-`POST /api/cmd/*`, hardware inputs) and publishes READY / BUSY / PASS / FAIL / ALARM plus three
-registers: `result_code` (the recipe's `outputs.result_codes`: PASS 1, FAIL 2, INVALID 3,
-ABORTED 4 by default; 0 = none yet), `state_code` (index of READY, ARMED, RUNNING, ABORTING,
-HOMING, FAULT) and `workstate` (1-based): the position among ALL station configs in
-file-name order, invalid ones included (marked unusable, START / TRIGGER on them refused with
-result INVALID). The number never shifts because a config broke, and the list is frozen while
+`POST /api/cmd/*`, hardware inputs) and publishes READY / BUSY / PASS / FAIL / ALARM / PULL
+plus three registers: `result_code` (the recipe's `outputs.result_codes`: PASS 1, FAIL 2,
+INVALID 3, ABORTED 4, PULL 5 by default; 0 = none yet), `state_code` (index of READY, ARMED,
+RUNNING, ABORTING, HOMING, FAULT) and `workstate` (1-based): the position among ALL station
+configs in file-name order, invalid ones included (marked unusable, START / TRIGGER on them
+refused with result INVALID). The number never shifts because a config broke, and the list is frozen while
 ARMED or busy; adding or removing config files while idle does renumber, so keep the station
 config file names stable on a line driven by a PLC.
 
@@ -125,12 +130,39 @@ Backends are config-driven (`stations/io_example.json`); the hardware ones are
 Implement `start(bus)` (deliver `bus.command(name, source=...)`) for an input and
 `publish(signals)` / `publish_registers(registers)` for an output with your site's stack,
 register the class under its kind, enable it in the I/O config. A typical handshake:
-PLC sets the work state -> ARM -> part in place -> TRIGGER -> BUSY -> PASS / FAIL + result
-code -> the PLC acts (and the operator sees red on the part where it failed). START /
-TRIGGER / ARM may carry the work state the sender expects (`{"workstate": ...}` over HTTP):
-refused when another one is selected. Changing the work state while ARMED disarms (ARM
+PLC sets the work state -> ARM -> part in place -> TRIGGER -> BUSY -> PASS / FAIL / PULL +
+result code -> the PLC acts (and the operator sees red on the part where it failed, or an
+amber frame when it is pulled). START / TRIGGER / ARM may carry the work state the sender
+expects (`{"workstate": ...}` over HTTP): refused when another one is selected. Changing the work state while ARMED disarms (ARM
 again). Over HTTP, `operator_confirmed` must be a JSON boolean (only `true` confirms; any
 other type is a 400 on START / TRIGGER / ARM); ABORT, DISARM, HOME and RESET ignore it.
+
+**Routing PULL to a quality-inspection lane.** Every cycle ends in exactly one of three
+dispositions (`README.md`, *Dispositions*): CONTINUE (PASS output), REJECT (FAIL output) or
+PULL (PULL output: any doubt - INVALID, ABORTED, the rig check moved, a crashed check, an
+unreadable code, a PASS inside the guard band). Wire the PLC so that:
+
+- **PASS** -> the part continues down the line; nothing else may release it. PULL is never
+  set together with PASS, and a pulled cycle never writes the PASS result code (also when
+  the run crashes or is aborted after it judged the part). A HOME (rig check) ends a PASS:
+  the PASS bit and code never come back for that cycle, after HOME OK or a FAULT and
+  RESET. An ABORT while the station is BUSY makes the cycle ABORTED (PULL), even when the
+  run had already judged the part.
+- **FAIL** -> the reject lane / bin.
+- **PULL** -> a **quality-inspection lane** (a hold station, a divert gate to a QI bench, a
+  red-tag shelf), never back to the line and never to the reject bin by default: a person
+  inspects the part and decides. Map the PULL bit (`stations/io_example.json`: `DO5`,
+  `coil:21`, `Scanner.Pull`, `Scan_Pull`) to that gate. With registers only, route the
+  INVALID (3), ABORTED (4) and PULL (5) codes there - anything that is not exactly the PASS
+  or the FAIL code.
+- **No answer** (BUSY never clears, the scanner is unreachable, READY dropped, ALARM / FAULT)
+  -> treat the part in the station as PULL too: fail closed.
+
+`result.json` (`disposition`, `pull_reasons`) records why each part was pulled, so the QI
+bench sees what to look at (zone, check, reason). A line that would rather reject a given
+doubt (e.g. a missing label = `code_unreadable`) lists it in the recipe's
+`pull.invalid_reasons_to_reject`; that is a line decision to make with quality, not a
+default.
 
 ## 6. Validation: prove the numbers on your site
 

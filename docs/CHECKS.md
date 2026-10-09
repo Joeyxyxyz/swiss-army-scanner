@@ -17,13 +17,17 @@ its parameters, units and defaults.
 | `flatness` | robust plane fit: peak-to-valley between the trimmed percentiles, RMS. "Flat" needs coverage (see below) | `tol_mm`, `rms_tol_mm`, `trim_pct`, `min_height_mm`, `min_valid_pct` | `engine/measure/endface/profile.robust_plane` |
 | `defect` | local dents / bumps. `face` mode (circle zone = an end face): the MF-CFAR matched-filter detector, self-referenced; `local` mode: residual vs the zone's own smooth surface, connected blobs. "No defect" needs coverage (see below) | `depth_mm`, `min_area_mm2`, `mode` auto / face / local, `sign`, `smooth_mm`, `z_thresh`, `min_valid_pct`, `max_gap_mm2` | `engine/measure/endface/mfcfar.py` |
 | `edge` | the part's long edge(s): sub-pixel edge in the flood image (or the height map), robust line fit in the part frame; straightness, and position / angle vs the golden (lines compared undirected) | `side` top / bottom / both (every side asked for must be measured, in the scan and the golden), `straightness_tol_mm`, `position_tol_mm`, `angle_tol_deg` | `engine/recipes/checks/builtin.py` `edge_points` (gradient-peak profiles across the part, parabolic sub-pixel) |
-| `code` | a barcode / QR / Data Matrix in the zone: the codes read under DMD light before the scan (`scan.codes: true`), else the zone of the flood image decoded | `expect`, `pattern` (regex), `kind`, `min_count` | `engine/sense/codes.py` |
+| `code` | a barcode / QR / Data Matrix in the zone: the codes read under DMD light before the scan (`scan.codes: true`), else the zone of the flood image decoded. A code of the expected kind read with the wrong text FAILs (REJECT); nothing of that kind read at all FAILs with `pull: "code_unreadable"` (PULL: unreadable is not wrong) | `expect`, `pattern` (regex), `kind`, `min_count` | `engine/sense/codes.py` |
 
 Verdict rules: a check that cannot measure (too few points, too little of the zone measured,
 no golden, no image) answers **INVALID**; a check that raises, or answers anything but a
 `CheckResult` with PASS / FAIL / INVALID, is recorded as INVALID with its error (a bug is
 never a verdict). A zone is FAIL when any of its checks fails, else PASS when every check
-passed, else INVALID; the run the same over its zones.
+passed, else INVALID; the run the same over its zones. On top of the verdict the run gets a
+disposition (`README.md`, *Dispositions*): REJECT for a definite FAIL, PULL (quality
+inspection) for any doubt - an INVALID or crashed check, a FAIL that carries a `pull`
+reason, a PASS value within the recipe's `pull.guard_band_pct` of a limit in its
+`tolerances` - else CONTINUE.
 
 Coverage is judged over a zone's whole extent in its OWN units, as cells (`engine/recipes/
 geometry.Coverage`): camera px for camera_px; native DMD px, binned to the camera's sampling,
@@ -116,6 +120,20 @@ Rules of thumb:
   edge). The run's `deviation_mm` / `threshold_mm` (and the operator page's key number)
   come from a FAILing check when there is one (the largest |value| / limit among them),
   else from the mm value closest to its limit.
+- `tolerances` (optional): every value the check held to a limit,
+  `[engine.disposition.tolerance(name, value, lo, hi, span=None)]` (PASS means lo <= value
+  <= hi; None on a side = no limit there). Give the value the check judged, not a rounded
+  copy. `span` (optional) is the size of the tolerance the guard band takes its % of when
+  the default does not fit (two-sided: the half width; one-sided: |limit|), e.g. a share
+  that can't pass 100 %: `part_pct >= 92` has span 8. The recipe's guard band reads them;
+  without them the guard band uses `key` / `limit` as |value| <= limit. A malformed list
+  makes the check INVALID (a bug is never a verdict). A PASS whose tolerance (or `key`
+  value) is missing, not a finite number or outside its own limits is PULLed (`invalid`:
+  the verdict and its number disagree), guard band or not; a one-sided limit at 0 needs a
+  `span`, else the guard band can't clear any value of it.
+- `pull` (optional): a reason from `engine.disposition.REASONS` when the verdict is in
+  doubt, e.g. `"code_unreadable"` on a FAIL that read nothing: the part is PULLed for
+  quality inspection instead of rejected. An unknown reason is recorded as `invalid`.
 - `fault_points`: `{"px": [x, y]}` camera px or `{"xyz_mm": [x, y, z]}` (camera frame, mm:
   the runner projects it to camera px); the projector draws a cross at each one of a FAIL
   check, on the surface the camera saw there. A point that cannot be placed is listed in the

@@ -20,7 +20,8 @@
     "golden": null,
     "min_defect_px": 5,
     "min_valid_pct": 30,
-    "plane_range_mm": null
+    "plane_range_mm": null,
+    "guard_band_pct": 0
   },
   "part": {
     "role": "test",

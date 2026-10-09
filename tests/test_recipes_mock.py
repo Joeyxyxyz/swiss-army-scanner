@@ -420,6 +420,7 @@ def test_a_crashing_check_is_invalid_never_a_verdict(eng, tmp_path):
 RESULT_KEYS = {"schema_version", "run_id", "run_folder", "mode", "station",
                "operator_confirmed", "job", "calibration", "capture", "part", "deviation_mm",
                "deviation_units", "threshold_mm", "result", "invalid_reason", "engine_verdict",
+               "disposition", "pull_reasons",
                "warnings", "outputs", "recipe", "zones", "feedback", "software", "started",
                "finished"}
 
@@ -464,7 +465,7 @@ def test_box_lid_pass_and_ajar_fail(eng_lib, tmp_path):
     s, scans = eng_lib
     out, res, run_dir, ev = _run("box_lid", scans["box_lid"], tmp_path, project_feedback=False)
     assert res["result"] == "PASS" and out["exit_code"] == 0, res["invalid_reason"]
-    assert res["schema_version"] == "0.2" and res["job"]["type"] == "recipe"
+    assert res["schema_version"] == "0.3" and res["job"]["type"] == "recipe"
     assert res["recipe"]["name"] == "box_lid" and res["recipe"]["tier"] == "builtin"
     assert res["recipe"]["preset"] == "bench_9in_metric" and res["recipe"]["result_code"] == 1
     assert [z["id"] for z in res["zones"]] == ["lid_left", "lid_right"]

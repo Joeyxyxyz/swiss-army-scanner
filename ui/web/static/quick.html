@@ -69,7 +69,7 @@
     <div class="qsignals" id="qSignals">
       <span data-sig="READY">READY</span><span data-sig="BUSY">BUSY</span>
       <span data-sig="PASS">PASS</span><span data-sig="FAIL">FAIL</span>
-      <span data-sig="ALARM">ALARM</span>
+      <span data-sig="ALARM">ALARM</span><span data-sig="PULL">PULL</span>
     </div>
 
     <ol class="qsteps" id="qSteps">
@@ -85,8 +85,10 @@
 
   <section class="qright">
     <div id="qLamp" class="qlamp lamp-ready">READY</div>
+    <div id="qPull" class="qpull" hidden></div>
     <div class="qresult">
       <div class="qkey"><span>Verdict</span><b id="qVerdict">-</b></div>
+      <div class="qkey"><span>Disposition</span><b id="qDisposition">-</b></div>
       <div class="qkey"><span id="qNumLabel">Max deviation</span><b id="qNumber">-</b></div>
       <div class="qkey"><span>Time</span><b id="qTime">-</b></div>
       <div class="qkey"><span>Run</span><b id="qRunId" class="mono small">-</b></div>

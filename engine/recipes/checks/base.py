@@ -119,7 +119,12 @@ class Param:
 class CheckResult:
     """verdict PASS | FAIL | INVALID; values {name: number} with the unit in the name (and
     in `units`); fault_points [{"px": [x, y]} camera px | {"xyz_mm": [x, y, z]} camera frame
-    mm, optional "label"]; key / limit: the headline value and its limit (same unit)."""
+    mm, optional "label"]; key / limit: the headline value and its limit (same unit).
+    tolerances: every value the check held to a limit, [tolerance(name, value, lo, hi)]
+    (PASS means lo <= value <= hi; the recipe's guard band reads them; None = key / limit
+    in deviation semantics). pull: a reason (engine/disposition.REASONS) when the verdict is
+    in doubt, e.g. "code_unreadable" on a FAIL that read nothing at all: the part is PULLed
+    for quality inspection instead of rejected."""
     verdict: str
     values: dict = field(default_factory=dict)
     units: dict = field(default_factory=dict)
@@ -129,6 +134,8 @@ class CheckResult:
     limit: Optional[float] = None
     warnings: list = field(default_factory=list)
     details: dict = field(default_factory=dict)
+    tolerances: Optional[list] = None
+    pull: Optional[str] = None
 
     def __post_init__(self):
         if self.verdict not in VERDICTS:
@@ -144,7 +151,10 @@ class CheckResult:
         return {"verdict": self.verdict, "values": dict(self.values), "units": dict(self.units),
                 "key": self.key, "limit": self.limit, "message": self.message,
                 "fault_points": [dict(f) for f in self.fault_points],
-                "warnings": list(self.warnings), "details": dict(self.details)}
+                "warnings": list(self.warnings), "details": dict(self.details),
+                "tolerances": (None if self.tolerances is None
+                               else [dict(t) for t in self.tolerances]),
+                "pull": self.pull}
 
 
 def unit_of(name: str) -> str:

@@ -16,7 +16,10 @@ parsing console text. The verdict is only ever PASS / FAIL / INVALID (or
 ABORTED when an operator stopped the run): INVALID means the numbers cannot
 be trusted (no mm calibration at this geometry when mm are required, an
 INDETERMINATE engine verdict, a refused or crashed run) and must never be
-reported as a pass or a fail.
+reported as a pass or a fail. On top of it the disposition (engine/
+disposition.py): CONTINUE (PASS), REJECT (a definite FAIL), PULL for quality
+inspection (any doubt; metric jobs also a PASS within job.guard_band_pct of
+threshold_mm). Exit codes follow it: 0 / 1 / 5.
 
 Job types and the calibration each needs:
     inspect, compare   base-relief depth calibration (`calibrate <scan>`)
@@ -43,6 +46,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from engine import disposition as _disp
 from engine import runs as _runs
 from engine.runs import RESULT_SCHEMA_VERSION, RESULTS, RunLog, software_info  # noqa: F401
 from engine.runs import write_result  # noqa: F401  (re-exported: callers use run_job.*)
@@ -100,6 +104,7 @@ class StationConfig:
     min_valid_pct: float = METRIC_MIN_VALID_PCT
     min_coverage_pct: float = METRIC_MIN_COVERAGE_PCT
     plane_range_mm: Optional[list] = None   # plane: [near, far] plane-to-camera distance, mm
+    guard_band_pct: float = 0.0             # a PASS within this % of threshold_mm: PULL
     # recipe jobs: a recipe name (built-in recipes/ or the library) or a recipe file
     recipe: Optional[str] = None
     feedback: Optional[bool] = None         # None: the recipe's feedback.enabled
@@ -264,9 +269,19 @@ def _golden_ref(golden, part_label: str, what: str = "scan") -> str:
 
 def _metric_keys(job: dict, jt: str, part_label: str) -> dict:
     """job.scan / axis / steps / periods / measure / roi / golden / min_defect_px /
-    max_outlier_pct / min_valid_pct / min_coverage_pct / plane_range_mm for metric jobs."""
+    max_outlier_pct / min_valid_pct / min_coverage_pct / plane_range_mm / guard_band_pct
+    for metric jobs."""
+    gb = job.get("guard_band_pct")
     if jt != "metric":
+        if gb is not None:              # a guard band that does nothing is refused, not ignored
+            raise StationConfigError(
+                "job.guard_band_pct is for metric jobs (a recipe job sets pull.guard_band_pct "
+                f"in its recipe); job.type {jt} has none")
         return {}
+    try:
+        gb = _disp.check_pct(0.0 if gb is None else gb, "job.guard_band_pct")
+    except ValueError as e:
+        raise StationConfigError(str(e)) from None
     scan = str(job.get("scan", "fast"))
     if scan not in METRIC_SCANS:
         raise StationConfigError(f"job.scan {scan!r} must be one of {', '.join(METRIC_SCANS)}")
@@ -319,7 +334,8 @@ def _metric_keys(job: dict, jt: str, part_label: str) -> dict:
             "periods": [float(v) for v in periods] if periods else None,
             "measure": measure, "roi": list(roi) if roi else None,
             "min_defect_px": int(min_px), "max_outlier_pct": float(max_out), **pct,
-            "plane_range_mm": [float(v) for v in rng] if rng is not None else None}
+            "plane_range_mm": [float(v) for v in rng] if rng is not None else None,
+            "guard_band_pct": gb}
 
 
 # ------------------------------------------------------------ run folder + log

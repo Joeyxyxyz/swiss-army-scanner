@@ -24,6 +24,7 @@ EXAMPLE = ROOT / "stations" / "example_cell_station.json"
 RESULT_KEYS = {"schema_version", "run_id", "run_folder", "mode", "station",
                "operator_confirmed", "job", "calibration", "capture", "part", "deviation_mm",
                "deviation_units", "threshold_mm", "result", "invalid_reason", "engine_verdict",
+               "disposition", "pull_reasons",
                "warnings", "outputs", "software", "started", "finished",
                # schema 0.2: recipe jobs fill these; null / [] for the other job types
                "recipe", "zones", "feedback"}
@@ -120,7 +121,7 @@ def test_run_folders_are_new_and_files_never_overwritten(tmp_path):
         RJ.RunLog(run_dir / "run.log.jsonl", run_id)
     res = RJ.empty_result(cfg, run_id, str(run_dir), True, False)
     assert set(res) == RESULT_KEYS and res["result"] == "INVALID"
-    assert res["schema_version"] == "0.2" and res["zones"] == [] and res["recipe"] is None
+    assert res["schema_version"] == "0.3" and res["zones"] == [] and res["recipe"] is None
     with pytest.raises(ValueError):
         RJ.write_result(run_dir, {**res, "result": "MAYBE"})
     RJ.write_result(run_dir, res)
@@ -502,10 +503,33 @@ def test_metric_golden_missing_material_fails(tmp_path, stereo_lib, canned, monk
     code, res, events, _ = _golden_run(tmp_path, stereo_lib, monkeypatch, canned["half"],
                                        "canned_full")
     assert res["result"] == "FAIL" and code == cli.EXIT_NOT_OK, res
+    assert res["disposition"] == "REJECT"       # the low coverage IS the measured defect
     big = res["deviation_mm"]["largest_defect"]
     assert big["side"] == "golden" and big["area_mm2"] > 500
     meas = [e for e in events if e["event"] == "measure"][0]
     assert meas["golden_found_pct"] < 60
+
+
+def test_metric_golden_fail_on_an_unconverged_placement_is_pulled(tmp_path, stereo_lib, canned,
+                                                                  monkeypatch):
+    """The same FAIL on a placement that did not converge (every deviation depends on it):
+    the verdict stays FAIL, the disposition is PULL (exit 5, `incomplete`), never a REJECT
+    on numbers the job itself marks untrusted."""
+    real = cli._golden_compare
+
+    def unconverged(*a, **k):
+        gc = real(*a, **k)
+        if "icp" in gc:
+            gc["icp"] = {**gc["icp"], "converged": False}
+        return gc
+    monkeypatch.setattr(cli, "_golden_compare", unconverged)
+    code, res, events, _ = _golden_run(tmp_path, stereo_lib, monkeypatch, canned["half"],
+                                       "canned_full")
+    assert res["result"] == "FAIL" and code == cli.EXIT_INVALID, res
+    assert res["disposition"] == "PULL"
+    (p,) = res["pull_reasons"]
+    assert p["reason"] == "incomplete" and "converge" in p["message"]
+    assert events[-1]["event"] == "run_end" and events[-1]["disposition"] == "PULL"
 
 
 def test_metric_golden_extra_material_fails(tmp_path, stereo_lib, canned, monkeypatch):

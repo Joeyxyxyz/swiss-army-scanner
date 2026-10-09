@@ -19,5 +19,6 @@
      ]}
   ],
   "feedback": {"enabled": true, "hold_s": 5.0},
-  "outputs": {"runs_dir": null, "overlay": true}
+  "outputs": {"runs_dir": null, "overlay": true},
+  "pull": {"guard_band_pct": 10, "invalid_reasons_to_reject": []}
 }

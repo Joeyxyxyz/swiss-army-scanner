@@ -8,6 +8,15 @@ where to act (a misaligned tube, a missing part, a dent) without reading a scree
     INVALID  the zones that could not be measured outlined amber
     text     optional short text ("FAIL tube_right") next to the zones
 
+With the run's disposition (engine/disposition.py; the runner always passes it):
+    CONTINUE green, as PASS
+    REJECT   red at the failing zones + crosses, as FAIL (a FAIL that is only a doubt, e.g.
+             an unreadable code, is amber, no cross)
+    PULL     an amber frame round the whole part (every drawn zone) + "PULL", and amber on
+             the zones that caused it (pull_reasons); no red, no cross: a doubt is not a
+             defect. pull_colour (default amber) is drawn like every other colour (raw,
+             through the measured polarity).
+
 Camera px -> native DMD (col, row), from the scan's OWN decoded correspondences (each camera
 px knows which DMD row AND column lit it: scan axis xy), so the paint lands on the surfaces
 the camera saw, at whatever depth (a tube 20 mm proud of its fixture and the fixture beside
@@ -237,20 +246,53 @@ def _text(img, A, anchor_px, text: str, colour, text_px: int) -> bool:
 
 
 def colour_for(verdict: str, fb: dict) -> tuple:
-    return tuple(int(c) for c in {"PASS": fb["pass_colour"], "FAIL": fb["fail_colour"]}.get(
+    """BGR of a verdict (PASS / FAIL / INVALID) or of PULL (pull_colour; invalid_colour for a
+    feedback section without one)."""
+    return tuple(int(c) for c in {"PASS": fb["pass_colour"], "FAIL": fb["fail_colour"],
+                                  "PULL": fb.get("pull_colour") or fb["invalid_colour"]}.get(
         verdict, fb["invalid_colour"]))
 
 
-def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> tuple:
+class _Shown:
+    """What a zone is painted as: its verdict, or PULL under the run's disposition. Without a
+    disposition (None) every zone is its verdict, as before dispositions."""
+
+    def __init__(self, disposition: Optional[str], pull_reasons):
+        self.disp = disposition
+        pr = list(pull_reasons or [])
+        self.pull_zones = [r["zone"] for r in pr if r.get("zone")]
+        self.doubt = {(r.get("zone"), r.get("check")) for r in pr if r.get("check")}
+
+    def definite(self, zr: dict, ch: dict) -> bool:
+        """A FAIL check that is a definite FAIL (not a doubt: an unreadable code)."""
+        return ch.get("verdict") == "FAIL" and not (
+            self.disp is not None and (ch.get("pull") or (zr["id"], ch.get("id")) in self.doubt))
+
+    def __call__(self, zr: dict) -> str:
+        v = zr["verdict"]
+        if self.disp is None:
+            return v
+        if v == "FAIL" and not any(self.definite(zr, ch) for ch in zr.get("checks") or []):
+            return "PULL"                       # a FAIL in doubt only: pulled, not rejected
+        if self.disp == "PULL" and zr["id"] in self.pull_zones:
+            return "PULL"
+        return v
+
+
+def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str,
+           disposition: Optional[str] = None, pull_reasons=()) -> tuple:
     """-> (DMD image (1140, 912, 3) uint8 BGR or None, info dict). zone_results: the
     result's zones list (id, verdict, checks with fault_points: camera px, or xyz_mm in the
     camera frame, projected). A FAIL / INVALID zone that is not drawn frames the whole field
-    (info["frame"]); None (info["refused"]) when no zone can be drawn at all."""
+    (info["frame"]); None (info["refused"]) when no zone can be drawn at all. disposition /
+    pull_reasons (the run's): PULL frames the whole part amber (info["part_frame"]) and
+    paints the zones that caused it amber; REJECT crosses only the definite FAILs."""
     cv2 = _cv()
     img = np.zeros(DMD_SHAPE + (3,), np.uint8)
-    info = {"verdict": verdict, "zones": [], "crosses": [], "text": None, "refused": None,
-            "warnings": [], "units": {"dmd": "native DMD px (col, row)",
-                                      "local_p95_px": "DMD px"}}
+    shown = _Shown(disposition, pull_reasons)
+    info = {"verdict": verdict, "disposition": disposition, "zones": [], "crosses": [],
+            "text": None, "refused": None, "warnings": [],
+            "units": {"dmd": "native DMD px (col, row)", "local_p95_px": "DMD px"}}
     if not sv.has_xy:
         info["refused"] = ("the scan decoded columns only: camera -> DMD needs rows and columns "
                            "(scan axis xy)")
@@ -259,24 +301,28 @@ def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> 
     usable, outline_cam = {}, []
     undrawn = []                                             # FAIL / INVALID zones not drawn
     union = np.zeros(sv.shape, bool)
-    order = sorted(zone_results, key=lambda r: {"PASS": 0, "INVALID": 1, "FAIL": 2}.get(
-        r["verdict"], 1))                                    # FAIL drawn last (on top)
+    dmd_all = np.zeros(DMD_SHAPE, bool)                      # every drawn zone (PULL frame)
+    order = sorted(zone_results, key=lambda r: {"PASS": 0, "INVALID": 1, "PULL": 1,
+                                                "FAIL": 2}.get(shown(r), 1))   # FAIL on top
     for zr in order:
         zv = zone_views.get(zr["id"])
+        sv_ = shown(zr)
         if zv is None:
-            if zr["verdict"] != "PASS" and zr.get("checks"):
+            if sv_ != "PASS" and zr.get("checks"):
                 undrawn.append(zr["id"])
-                info["warnings"].append(f"zone {zr['id']}: {zr['verdict']} but not resolved on "
+                info["warnings"].append(f"zone {zr['id']}: {sv_} but not resolved on "
                                         "this scan: not drawn")
             continue
         if not zv.feedback or (zv.datum and not zr.get("checks")):
             continue
-        col = colour_for(zr["verdict"], fb)
+        col = colour_for(sv_, fb)
         fill = None
-        if zr["verdict"] == "FAIL" and fb["fill_fail"]:
+        if sv_ == "FAIL" and fb["fill_fail"]:
             fill = tuple(int(round(c * float(fb["fill_level"]))) for c in col)
         rec = {"id": zv.id, "verdict": zr["verdict"], "drawn": False, "refused": None,
                "local_p95_px": None, "n_tiles": 0, "n_px": 0, "fit": None, "dmd_px": 0}
+        if sv_ != zr["verdict"]:
+            rec["shown"] = sv_
         dm = None
         if zv.units == "projector_px" and zv.dmd_mask is not None:
             dm = zv.dmd_mask
@@ -318,19 +364,20 @@ def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> 
             rec.update(drawn=True, dmd_px=int(dm.sum()))
             usable[zv.id] = zv
             union |= zv.mask
+            dmd_all |= dm.astype(bool)
             outline_cam += [np.asarray(p) for p in zv.outline_px]
         if rec["refused"]:
             info["warnings"].append(f"zone {zv.id}: {rec['refused']}")
-        if not rec["drawn"] and zr["verdict"] != "PASS":
+        if not rec["drawn"] and sv_ != "PASS":
             undrawn.append(zv.id)
         info["zones"].append(rec)
     col = colour_for("FAIL", fb)
     for zr in zone_results:                                  # crosses on top of the fills
         zv = usable.get(zr["id"])
-        if zv is None:
+        if zv is None or shown(zr) != "FAIL":
             continue
         for ch in zr.get("checks", []):
-            if ch["verdict"] != "FAIL":
+            if not shown.definite(zr, ch):                   # a doubt is not a defect: no cross
                 continue
             for fp in ch.get("fault_points", []):
                 px = fault_px_of(sv, fp)
@@ -352,26 +399,51 @@ def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> 
         info["refused"] = ("no zone could be mapped onto the DMD: " + "; ".join(info["warnings"])
                            if info["warnings"] else "nothing to draw")
         return None, info
+    # the run as painted: its verdict, or (with a disposition) PULL / FAIL (REJECT) / PASS
+    run = {"PULL": "PULL", "REJECT": "FAIL", "CONTINUE": "PASS"}.get(disposition, verdict)
+    if run == "PULL":                                        # the whole part, framed amber
+        info["part_frame"] = _part_frame(img, dmd_all, colour_for("PULL", fb), line)
     if fb["text"] and outline_cam:
         pts = np.concatenate(outline_cam)
         anchor = [float(pts[:, 0].min()), float(pts[:, 1].min()) - 6.0]
         dec = np.isfinite(sv.corr_x) & np.isfinite(sv.corr_y)
         g = fit_affine(sv, union) or local_fit(sv, dec, (anchor[0] + 40, anchor[1] - 10), 40)
         if g is not None:
-            fail_z = [z["id"] for z in zone_results if z["verdict"] == "FAIL"]
-            txt = verdict + ((" " + ", ".join(fail_z[:3])) if fail_z else "")
-            if _text(img, g["A"], anchor, txt, colour_for(verdict, fb), int(fb["text_px"])):
+            want = "PULL" if run == "PULL" else "FAIL"
+            bad_z = list(dict.fromkeys(z["id"] for z in zone_results if shown(z) == want))
+            head = "REJECT" if disposition == "REJECT" and verdict != "FAIL" else run
+            txt = head + ((" " + ", ".join(bad_z[:3])) if bad_z and head != "PASS" else "")
+            if _text(img, g["A"], anchor, txt, colour_for(run, fb), int(fb["text_px"])):
                 info["text"] = txt
-    bad_drawn = any(r["drawn"] and r["verdict"] != "PASS" for r in info["zones"])
-    if undrawn or (verdict != "PASS" and not bad_drawn):
+    bad_drawn = any(r["drawn"] and r.get("shown", r["verdict"]) != "PASS" for r in info["zones"])
+    if disposition == "REJECT":         # a REJECT with no red zone (a doubt the line rejects)
+        bad_drawn = any(r["drawn"] and r.get("shown", r["verdict"]) == "FAIL"
+                        for r in info["zones"])
+    if undrawn or (run not in ("PASS", "PULL") and not bad_drawn):
         # never a green-only picture of a run that is not a PASS
-        fv = verdict if verdict in ("FAIL", "INVALID") else "INVALID"
+        fv = run if run in ("FAIL", "INVALID", "PULL") else "INVALID"
         _frame(img, colour_for(fv, fb))
         why = (f"zone(s) {', '.join(undrawn)} ({fv}) could not be drawn" if undrawn else
-               f"no {verdict} zone is drawn")
+               f"no {run} zone is drawn")
         info["frame"] = {"verdict": fv, "px": FRAME_PX, "why": why}
         info["warnings"].append(f"{why}: the whole DMD field is framed {fv}")
     return img, info
+
+
+def _part_frame(img, dmd_all: np.ndarray, colour, line: int) -> Optional[dict]:
+    """PULL: a rectangle round every drawn zone (the whole part as the DMD lights it), FRAME_PX
+    outside them, clipped to the field. -> {"dmd": [c0, r0, c1, r1], ...} or None."""
+    cv2 = _cv()
+    rows, cols = np.nonzero(dmd_all)
+    if not len(rows):
+        return None
+    k = FRAME_PX
+    c0, r0 = max(int(cols.min()) - k, 0), max(int(rows.min()) - k, 0)
+    c1 = min(int(cols.max()) + k, DMD_SHAPE[1] - 1)
+    r1 = min(int(rows.max()) + k, DMD_SHAPE[0] - 1)
+    w = max(2 * int(line), 4)
+    cv2.rectangle(img, (c0, r0), (c1, r1), colour, w, lineType=cv2.LINE_AA)
+    return {"dmd": [c0, r0, c1, r1], "line_px": w, "units": "native DMD px (col, row)"}
 
 
 def _frame(img, colour) -> None:
@@ -397,10 +469,13 @@ def fault_px_of(sv, fp: dict) -> Optional[list]:
 
 # ------------------------------------------------------------------ camera overlay (run folder)
 
-def overlay(sv, frame, zone_views: dict, zone_results: list, fb: dict, verdict: str) -> np.ndarray:
+def overlay(sv, frame, zone_views: dict, zone_results: list, fb: dict, verdict: str,
+            disposition: Optional[str] = None, pull_reasons=()) -> np.ndarray:
     """Camera-space picture of the verdict: the flood (or the height map), zones outlined in
-    their verdict colour, failing zones tinted, crosses at the fault points, zone labels."""
+    their verdict colour (PULL amber with a disposition), failing zones tinted, crosses at the
+    definite fault points, zone labels, the verdict (and disposition) in the corner."""
     cv2 = _cv()
+    shown = _Shown(disposition, pull_reasons)
     base = sv.flood
     if base is None:
         base = frame.uvh[..., 2]
@@ -412,29 +487,33 @@ def overlay(sv, frame, zone_views: dict, zone_results: list, fb: dict, verdict: 
     tint = vis.copy()
     for zr in zone_results:
         zv = zone_views.get(zr["id"])
-        if zv is not None and zr["verdict"] == "FAIL":
+        if zv is not None and shown(zr) == "FAIL":
             tint[zv.mask] = colour_for("FAIL", fb)
     vis = cv2.addWeighted(vis, 0.7, tint, 0.3, 0)
     for zr in zone_results:
         zv = zone_views.get(zr["id"])
         if zv is None:
             continue
-        col = colour_for(zr["verdict"], fb)
+        col = colour_for(shown(zr), fb)
         for poly in zv.outline_px:
             _poly(vis, poly, col, 2)
         if zv.outline_px:
             p = np.concatenate(zv.outline_px)
-            cv2.putText(vis, f"{zv.id} {zr['verdict']}",
+            cv2.putText(vis, f"{zv.id} {shown(zr)}",
                         (int(p[:, 0].min()), max(int(p[:, 1].min()) - 6, 12)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2, cv2.LINE_AA)
         for ch in zr.get("checks", []):
-            for fp in ch.get("fault_points", []) if ch["verdict"] == "FAIL" else []:
+            for fp in ch.get("fault_points", []) if shown.definite(zr, ch) else []:
                 px = fault_px_of(sv, fp)
                 if px is not None:
                     x, y = (int(round(v)) for v in px)
                     cv2.drawMarker(vis, (x, y), colour_for("FAIL", fb), cv2.MARKER_CROSS, 28, 2)
-    cv2.putText(vis, verdict, (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2,
-                colour_for(verdict, fb), 3, cv2.LINE_AA)
+    head, hcol = verdict, colour_for(verdict, fb)
+    if disposition is not None:
+        run = {"PULL": "PULL", "REJECT": "FAIL", "CONTINUE": "PASS"}.get(disposition, "PULL")
+        head = f"{verdict}: " + ("PULL (quality inspection)" if run == "PULL" else disposition)
+        hcol = colour_for(run, fb)
+    cv2.putText(vis, head, (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, hcol, 3, cv2.LINE_AA)
     h, w = vis.shape[:2]
     if w > OVERLAY_W:                            # a picture for people, not a measurement
         vis = cv2.resize(vis, (OVERLAY_W, int(round(h * OVERLAY_W / w))),

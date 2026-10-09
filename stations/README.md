@@ -13,10 +13,12 @@ scan.bat --mock run stations\example_cell_station.json
 scan.bat run stations\my_station.json --operator-confirmed
 ```
 
-Exit codes: `0` PASS, `1` FAIL, `2` refused (bad config, rule, rig busy, no base,
-real rig without operator confirmation), `4` crashed, `5` INVALID. A refused or
-crashed run that got as far as creating its folder still writes `result.json`
-with `"result": "INVALID"` and the reason.
+Exit codes (the disposition, `README.md` *Dispositions*): `0` CONTINUE (PASS), `1`
+REJECT (FAIL), `5` PULL (quality inspection: INVALID, or a metric PASS inside
+`job.guard_band_pct`), `2` refused (bad config, rule, rig busy, no base, real rig without
+operator confirmation), `4` crashed. A refused or crashed run that got as far as creating
+its folder still writes `result.json` with `"result": "INVALID"`, the reason and
+`"disposition": "PULL"`.
 
 Metric job (mm from the stereo calibration, no base): `example_metric_check.json`.
 Without a stereo calibration at the preset's geometry the run is INVALID and says how to
@@ -68,7 +70,15 @@ folder.
   goes to `outputs.report`.
 
 `result` may also be `ABORTED` (an operator ABORT from the operator page / command bus):
-the run stopped before its next capture; exit 1.
+the run stopped before its next capture; exit 1, disposition PULL.
+
+Guard band (metric jobs): `job.guard_band_pct` (default 0 = off; `0 <= pct < 100`) pulls a
+PASS whose `deviation_mm.max` is within that % of `threshold_mm` (e.g. 10: a PASS above
+0.45 mm against 0.5 mm is PULL, exit 5, `pull_reasons` `guard_band`). Other job types refuse
+the key (recipe jobs set `pull.guard_band_pct` in the recipe). A golden FAIL whose placement
+did not converge (or whose surfaces disagree below `job.min_coverage_pct` with no defect
+cluster to account for it) stays `FAIL` but is PULL (exit 5, `incomplete`): never a reject
+on numbers the job marks untrusted.
 
 Recipe job (`example_recipe_box_lid.json`): `"job": {"type": "recipe", "recipe": "box_lid"}`
 runs a recipe (`recipes/README.md`: its preset, scan, zones, checks, projected feedback);
@@ -111,6 +121,7 @@ this file.
 | `mock_part` | MOCK only: what the simulated human places (as `--mock-part`, e.g. `scene:tube:misaligned`) |
 | `job.scan`, `job.axis`, `job.steps`, `job.periods` | metric: `fast` (`scan_fast`, axis `xy` default) or `metric` (`scan_metric`) |
 | `job.measure`, `job.roi`, `job.golden` | metric: `plane` (flatness in `roi` = `[x0, y0, x1, y1]` camera px, `null` = whole field) or `golden` (vs a golden metric scan id / label; never `latest` or this station's `part.label`) |
+| `job.guard_band_pct` | metric: a PASS within this % of `threshold_mm` is PULLed for quality inspection (default 0 = off; `0 <= pct < 100`); refused for other job types |
 | `job.min_defect_px`, `job.max_outlier_pct`, `job.min_valid_pct`, `job.min_coverage_pct`, `job.plane_range_mm` | metric: smallest out-of-tolerance cluster that FAILs (default 5 camera px, 1..50; smaller isolated ones are stray points); share of the measured px that may be dropped as stray points before the run is INVALID (default 0.1 %, 0..5); plane: decoded share of the roi below which the run is INVALID (default 30 %), optional `[near, far]` plane distance from the camera (mm, presence check); golden: share of each surface within the threshold below which the run is INVALID (default 95 %) |
 | `job.base` | `latest` usable base, or `capture` a new one (the scene must be empty). In `--mock`, a missing base is captured automatically. |
 | `job.zone`, `job.average`, `job.n_sigma`, `job.min_area_px` | passed to the engine verbs |
@@ -120,7 +131,7 @@ this file.
 
 ```json
 {
-  "schema_version": "0.2",
+  "schema_version": "0.3",
   "run_id": "20261001T120000Z_example_cell_station_1a2b3c4d",
   "run_folder": "runs/20261001T120000Z_example_cell_station_1a2b3c4d",
   "mode": "MOCK",
@@ -141,6 +152,8 @@ this file.
   "result": "PASS",
   "invalid_reason": null,
   "engine_verdict": "PASS",
+  "disposition": "CONTINUE",
+  "pull_reasons": [],
   "warnings": [],
   "outputs": {"mesh": [], "deviation_map": "...png", "report": "...json", "log": "run.log.jsonl"},
   "recipe": null,
@@ -154,11 +167,14 @@ this file.
 Schema 0.2 added `recipe`, `zones` and `feedback` (null / [] for the other job types), and
 `deviation_mm.n_defects` / `largest_defect` / `outlier_px` / `outlier_clusters` /
 `outlier_pct` / `dense_strays` (metric jobs; null for the others); every 0.1 key is
-unchanged.
+unchanged. Schema 0.3 added `disposition` (CONTINUE / REJECT / PULL) and `pull_reasons`
+(`[{zone?, check?, reason, message}]`: every doubt found, also under REJECT); `result` and
+every 0.2 key are unchanged.
 
 `INVALID` means the numbers cannot be trusted (no mm calibration at this geometry,
 an INDETERMINATE engine verdict, a refused or crashed run). Never report an
-INVALID run as a pass or a fail.
+INVALID run as a pass or a fail: its disposition is PULL (route the part to quality
+inspection).
 
 A fresh `--mock` library has no calibration, so the first mock run is INVALID.
 Calibrate the mock geometry once with the validation object, then runs give

@@ -14,7 +14,10 @@ A recipe is one work-state check, portable to any DMD projector + camera line:
                    recorded by `scan recipe-golden` (by label, or 'latest' for this recipe)
                    or an exact metric scan id; never the scan being checked
       -> feedback  what the projector paints after the verdict (green outline = PASS,
-                   red fill + cross at the fault = FAIL)
+                   red fill + cross at the fault = FAIL, amber = PULL)
+      -> pull      the disposition on top of the verdict (engine/disposition.py): the guard
+                   band (guard_band_pct of a tolerance next to its limit: PULL) and the doubt
+                   reasons the line rejects instead of pulling
       -> outputs   run folder, result codes for the I/O registers, overlay image
 
 validate(doc) -> Recipe, or RecipeError listing EVERY problem with its path
@@ -31,6 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .. import disposition as D
+
 SCHEMA_VERSION = 1
 SUPPORTED_VERSIONS = (1,)
 SCAN_KINDS = ("fast", "metric", "trigger")
@@ -44,18 +49,22 @@ _GRID = re.compile(r"^[A-Za-z]+\d+(\s*:\s*[A-Za-z]+\d+)?(\s*,\s*[A-Za-z]+\d+(\s*
                    r"(@\d+)?$")
 
 TOP_KEYS = {"schema_version", "name", "description", "preset", "scan", "part", "golden",
-            "zones", "feedback", "outputs", "_comment"}
+            "zones", "feedback", "outputs", "pull", "_comment"}
 SCAN_DEFAULTS = {"kind": "fast", "axis": "xy", "zone": None, "average": None, "steps": None,
                  "periods": None, "hold_s": None, "pack": None, "variant": None,
                  "codes": False, "rig_check": False}
 PART_DEFAULTS = {"label": None, "frame": None, "mock_scene": None}
 FRAME_DEFAULTS = {"reference": "dominant_plane", "plane_band_mm": 1.0, "origin_px": None}
 FEEDBACK_DEFAULTS = {"enabled": True, "pass_colour": "green", "fail_colour": "red",
-                     "invalid_colour": "amber", "line_px": 4, "fill_fail": True,
+                     "invalid_colour": "amber", "pull_colour": "amber", "line_px": 4,
+                     "fill_fail": True,
                      "fill_level": 0.6, "cross_px": 24, "text": True, "text_px": 28,
                      "hold_s": 5.0, "max_fit_px": 2.0, "photo": True}
 OUTPUT_DEFAULTS = {"runs_dir": None, "overlay": True,
-                   "result_codes": {"PASS": 1, "FAIL": 2, "INVALID": 3, "ABORTED": 4}}
+                   "result_codes": {"PASS": 1, "FAIL": 2, "INVALID": 3, "ABORTED": 4, "PULL": 5}}
+# the disposition on top of the verdict (engine/disposition.py): guard band in % of a
+# tolerance (0 = off) and the doubt reasons this line rejects instead of pulling ([] = none)
+PULL_DEFAULTS = {"guard_band_pct": 0.0, "invalid_reasons_to_reject": []}
 ZONE_KEYS = {"id", "label", "shape", "units", "coords", "checks", "datum", "feedback"}
 CHECK_KEYS = {"type", "id", "params", "enabled"}
 MAX_HOLD_S = 300.0
@@ -109,6 +118,7 @@ class Recipe:
     golden: Optional[dict] = None
     feedback: dict = field(default_factory=lambda: dict(FEEDBACK_DEFAULTS))
     outputs: dict = field(default_factory=lambda: copy.deepcopy(OUTPUT_DEFAULTS))
+    pull: dict = field(default_factory=lambda: copy.deepcopy(PULL_DEFAULTS))
     source: Optional[Path] = None
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -131,6 +141,7 @@ class Recipe:
                 "description": self.description, "preset": self.preset,
                 "source": str(self.source) if self.source else None,
                 "scan": dict(self.scan), "golden": self.golden,
+                "pull": copy.deepcopy(self.pull),
                 "zones": [{"id": z.id, "shape": z.shape, "units": z.units,
                            "checks": [c.type for c in z.checks]} for z in self.zones]}
 
@@ -140,7 +151,8 @@ class Recipe:
                 "description": self.description, "preset": self.preset,
                 "scan": dict(self.scan), "part": copy.deepcopy(self.part),
                 "golden": copy.deepcopy(self.golden), "zones": [z.to_dict() for z in self.zones],
-                "feedback": dict(self.feedback), "outputs": copy.deepcopy(self.outputs)}
+                "feedback": dict(self.feedback), "outputs": copy.deepcopy(self.outputs),
+                "pull": copy.deepcopy(self.pull)}
 
 
 # ------------------------------------------------------------------ reading
@@ -267,6 +279,8 @@ def validate(doc: dict, source: Optional[Path] = None) -> Recipe:
     _feedback_rules(fb, E)
     outs = _section(doc, "outputs", OUTPUT_DEFAULTS, E)
     _output_rules(outs, E)
+    pull = _section(doc, "pull", PULL_DEFAULTS, E)
+    _pull_rules(pull, E)
 
     zones = _zones(doc.get("zones"), scan, E, registry)
     ref = part["frame"].get("reference")
@@ -298,7 +312,7 @@ def validate(doc: dict, source: Optional[Path] = None) -> Recipe:
         raise RecipeError(f"{who}: {len(E.items)} problem(s):\n  - " + "\n  - ".join(E.items),
                           E.items)
     return Recipe(name=name, preset=preset, zones=zones, schema_version=ver, description=desc,
-                  scan=scan, part=part, golden=golden, feedback=fb, outputs=outs,
+                  scan=scan, part=part, golden=golden, feedback=fb, outputs=outs, pull=pull,
                   source=Path(source) if source else None, raw=copy.deepcopy(doc))
 
 
@@ -359,7 +373,7 @@ def _frame(v, E: _Errors) -> dict:
 def _feedback_rules(fb: dict, E: _Errors) -> None:
     if not isinstance(fb["enabled"], bool):
         E.add("feedback.enabled", "must be true or false")
-    for k in ("pass_colour", "fail_colour", "invalid_colour"):
+    for k in ("pass_colour", "fail_colour", "invalid_colour", "pull_colour"):
         c = _colour(fb[k], f"feedback.{k}", E)
         if c is not None:
             fb[k] = c
@@ -385,10 +399,40 @@ def _output_rules(outs: dict, E: _Errors) -> None:
         E.add("outputs.overlay", "must be true or false")
     rc = outs["result_codes"]
     want = {"PASS", "FAIL", "INVALID", "ABORTED"}
-    if not isinstance(rc, dict) or set(rc) != want or not all(
+    if not isinstance(rc, dict) or set(rc) - {"PULL"} != want or not all(
             isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 65535 for v in rc.values()):
-        E.add("outputs.result_codes", "must map PASS, FAIL, INVALID, ABORTED to register values "
-              "0..65535")
+        E.add("outputs.result_codes", "must map PASS, FAIL, INVALID, ABORTED (and optionally PULL, "
+              "default 5 or the next code they leave free) to register values 0..65535")
+        return
+    if "PULL" not in rc:        # older recipes: PULL gets its own code, one they leave free
+        used = set(rc.values())
+        rc = outs["result_codes"] = {**rc, "PULL": next(
+            c for c in range(OUTPUT_DEFAULTS["result_codes"]["PULL"], 65536) if c not in used)}
+    # fail closed: a doubt or a reject never reads as the PASS code on the register
+    same = [k for k in ("FAIL", "INVALID", "ABORTED", "PULL") if rc[k] == rc["PASS"]]
+    if same:
+        E.add("outputs.result_codes", f"{', '.join(same)} must not share the PASS code "
+              f"{rc['PASS']} (a PLC would read them as a pass)")
+    other = [k for k in ("FAIL", "INVALID", "ABORTED") if rc[k] == rc["PULL"]]
+    if rc["PULL"] == 0 or (other and rc["PULL"] != rc["PASS"]):
+        E.add("outputs.result_codes", f"PULL {rc['PULL']} must differ from 0 (no result yet) "
+              f"and from {', '.join(f'{k} {rc[k]}' for k in other) or 'every other code'} (a "
+              "PLC must tell a pulled part from a rejected or an unmeasured one): give PULL "
+              "its own code")
+
+
+def _pull_rules(pull: dict, E: _Errors) -> None:
+    """pull.guard_band_pct: 0 <= pct < 100, finite; pull.invalid_reasons_to_reject: reasons
+    from engine/disposition.REJECTABLE (each message names its key)."""
+    try:
+        pull["guard_band_pct"] = D.check_pct(pull["guard_band_pct"], "pull.guard_band_pct")
+    except ValueError as e:
+        E.add("", str(e))
+    try:
+        pull["invalid_reasons_to_reject"] = D.check_reject_list(
+            pull["invalid_reasons_to_reject"], "pull.invalid_reasons_to_reject")
+    except ValueError as e:
+        E.add("", str(e))
 
 
 def _zones(v, scan: dict, E: _Errors, registry) -> list:

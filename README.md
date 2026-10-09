@@ -26,7 +26,7 @@ Lights and Camera are setup panels the operator opens when needed (only while th
 1. Start the server: `run_ui.bat` (real rig) or `run_ui_mock.bat` (simulated bench, port 8766).
 2. Open **http://127.0.0.1:8765/quick** (mock: http://127.0.0.1:8766/quick). The full engineering UI stays at `/`; each links to the other.
 3. Pick the **work state**: one entry per station config in `stations/*.json` (shown as `station_id - part label`). A recipe work state (`job.type: recipe`) shows its recipe, zones and checks, and paints its verdict on the part after the run (see *Recipes* below).
-4. Press **START**. The lamp shows READY / RUNNING / **PASS** (green) / **FAIL** (red) / **INVALID** (amber: the numbers can't be trusted, never a pass or a fail) / ABORTED, with the key number (max deviation in mm), the time, a link to `result.json` and the deviation map when there is one. The *Lights / Camera / Action* strip follows the job (queued, capturing, verdict).
+4. Press **START**. The lamp shows READY / RUNNING / **PASS** (green: CONTINUE) / **FAIL** (red: REJECT) / **PULL – quality inspection** (amber: any doubt - INVALID, ABORTED, a value in the guard band, an unreadable code - with the reasons; never a pass), with the verdict, the disposition, the key number (max deviation in mm), the time, a link to `result.json` and the deviation map when there is one. The *Lights / Camera / Action* strip follows the job (queued, capturing, verdict). See *Dispositions* below.
 
 | Button | What it does |
 |---|---|
@@ -46,9 +46,25 @@ Lights and Camera are setup panels the operator opens when needed (only while th
 | TRIGGER (part present) | TRIGGER | T | `/api/cmd/trigger` | camera GPIO Line0, DI0, serial `TRIG` |
 | ARM / DISARM | ARM | A | `/api/cmd/arm`, `/api/cmd/disarm` | DI3 |
 | SELECT_WORKSTATE | work-state list | 1-9 | `/api/cmd/workstate` `{"workstate": "<config>.json" or 1..n}` | - |
-| state + signals | lamp | - | `GET /api/cmd/state` | outputs: READY / BUSY / PASS / FAIL / ALARM (stack light) |
+| state + signals | lamp | - | `GET /api/cmd/state` | outputs: READY / BUSY / PASS / FAIL / ALARM / PULL (stack light; PULL = quality-inspection lane) |
 
 States: READY → START → RUNNING → READY; READY → ARM → ARMED → TRIGGER → RUNNING → ARMED (next part). **ABORT always wins** and is never refused: in every state it also stops the projected verdict, the live view and station / recipe runs or rig checks submitted via `/api/jobs` (RUNNING / HOMING → ABORTING → READY). An aborted or cancelled TRIGGER cycle does not re-arm. **HOME** only when idle (READY / ARMED / FAULT) or queued behind an ABORT: a HOME pressed while aborting runs when the aborted job ends, and a further ABORT cancels it; HOMING → READY, or FAULT when the rig moved (HOME again, or RESET). **TRIGGER** is ignored unless ARMED. START / TRIGGER / ARM may carry the work state the sender expects (`"workstate"`); they are refused (409) when another one is selected, and the /quick page always sends it. Changing the work state while ARMED disarms (ARM again). Work-state numbers (keys 1-9, PLC numbers, the `workstate` register) are every station config in file-name order, invalid ones included: an invalid or vanished config keeps its number, is marked unusable (`unusable` in `GET /api/cmd/state`) and START / TRIGGER on it are refused with result INVALID. The selected work state is never switched automatically, and the list is frozen while ARMED or busy. A refused HTTP command answers 409 with the reason. Hardware inputs (camera GPIO lines, serial / USB-IO, a 24 V digital I/O module) and outputs are **placeholders** with a config-driven mapping (`stations/io_example.json`): not implemented yet, disabled in the example.
+
+---
+
+## Dispositions: CONTINUE / REJECT / PULL (quality inspection)
+
+Every run gets a **disposition** on top of its verdict (`engine/disposition.py`): what happens to the part. When in doubt, the part is pulled for quality inspection; a doubt never passes and is never rejected on numbers nobody can trust.
+
+| disposition | when | exit code | outputs | projected on the part |
+|---|---|---|---|---|
+| **CONTINUE** | the verdict is PASS and nothing about it is in doubt | 0 | PASS + the PASS result code | green outlines |
+| **REJECT** | a definite measured FAIL (a trusted measurement found a bad part) | 1 | FAIL + the FAIL code | red fill + a cross at each fault |
+| **PULL** | any doubt (below) | 5 | PULL (never PASS) + the INVALID / ABORTED code, or the PULL code (5) for a PASS / FAIL in doubt | an amber frame round the whole part + "PULL", amber on the zones that caused it |
+
+**PULL reasons** (`pull_reasons` in `result.json`: `[{zone?, check?, reason, message}]`): INVALID of any kind (`uncalibrated`, `stale_calibration` (a scan made at other rig settings or with another calibration), `px_not_mm`, `too_few_points` (points / coverage), `zone_unresolved`, `golden` (missing or mismatched), `ambiguous_faces`, `incomplete`, `invalid`), `check_crashed`, `code_unreadable` (an expected code that could not be read at all: unreadable is not wrong; a code read with the wrong text is a REJECT), `rig_check` (the rig check a recipe runs before the cycle said MOVED / UNKNOWN), `aborted`, `refused` / `error` (a run refused or crashed before its verdict), and the optional **guard band** (`guard_band`): a PASS value within `guard_band_pct` % of the tolerance from a limit (two-sided: of the half width, from each limit; one-sided: of the limit, or of the tolerance's `span` when it gives one - part present >= 92 % of a share that can't pass 100 % has span 8) is pulled; a value on its limit is always in the band, and a tolerance with no size (zero width, a one-sided limit at 0 without a span) clears nothing. Recipes set it in `pull.guard_band_pct` (the built-in examples: 10), station metric jobs in `job.guard_band_pct` (default 0 = off). A PASS whose own numbers do not hold it up - a value missing, not a finite number, or outside its own limits (the verdict and the number disagree) - is pulled too (`invalid`), guard band or not. The checks hold up the values they judged, not rounded copies; the `defect` check's face mode reports the deepest significant dent still under `depth_mm` on a PASS, so its guard band sees a dent just under the limit.
+
+**Precedence** (one run): any definite measured FAIL -> **REJECT**, even when another zone is INVALID (the doubt is still listed in `pull_reasons`); otherwise any doubt -> **PULL**; otherwise **CONTINUE**. A FAIL is definite only when nothing about it is in doubt: a check FAIL carrying a `pull` reason, or a metric golden FAIL whose placement did not converge (or whose surfaces disagree with no defect cluster to account for it), is a PULL. A recipe may list doubt reasons its line rejects instead (`pull.invalid_reasons_to_reject`, default none); `aborted`, `guard_band`, `refused` and `error` never reject, and a run that was refused or crashed is never rejected through the list (its reason is `refused` / `error`, never guessed from the error text). `result` (PASS / FAIL / INVALID / ABORTED) is unchanged; `result.json` (schema 0.3) and `run.log.jsonl` (`verdict`, `run_end`) add `disposition` and `pull_reasons`. Refused (2), crashed (4) and ABORTED (1) runs keep their exit codes; their disposition is PULL. `face-check` / `station-check` exit 5 (PULL) for INCOMPLETE and for ambiguous end faces. `--json` names the disposition at the top level for `run`, `recipe-run`, `station-check` and `face-check`, also when the command was refused or crashed. The command bus publishes a **PULL** output for the PLC's quality-inspection lane ([`docs/PORTING.md`](docs/PORTING.md)); `/quick` shows it as an amber lamp, *PULL – quality inspection*, with the reasons. The lamp follows the bus: it never shows a PASS the outputs do not give. An ABORT pressed while a cycle runs makes it ABORTED (PULL) on the line even when the run had already judged it: up to `result.json` the run itself records ABORTED; after that, the job's result (`line_result` ABORTED, disposition PULL) and `run.log.jsonl` (`aborted_after_verdict`) say so, and no verdict is projected. A HOME (rig check) ends a PASS: its output and code never come back for that cycle.
 
 ---
 
@@ -100,7 +116,7 @@ scan.bat scan boxA --zone H8:I11@96
 
 Only one program drives the rig at a time: a machine-wide rig lock refuses a second one with `RigBusy`.
 
-**Flow-ready job.** One command runs one job from a station config and writes a new run folder with `result.json` (the same keys every run: PASS / FAIL / INVALID, deviation in mm, calibration id, outputs) and `run.log.jsonl` (one JSON event per line). The exit code is the verdict: 0 PASS, 1 FAIL, 2 refused, 4 crashed, 5 INVALID. See [`stations/README.md`](stations/README.md).
+**Flow-ready job.** One command runs one job from a station config and writes a new run folder with `result.json` (the same keys every run: PASS / FAIL / INVALID, the disposition CONTINUE / REJECT / PULL and its reasons, deviation in mm, calibration id, outputs) and `run.log.jsonl` (one JSON event per line). The exit code is the disposition: 0 CONTINUE (PASS), 1 REJECT (FAIL), 5 PULL (INVALID or any other doubt), 2 refused, 4 crashed. See [`stations/README.md`](stations/README.md).
 
 ```bat
 scan.bat --mock run stations\example_cell_station.json
@@ -158,8 +174,9 @@ A recipe turns the scanner into a work-state check that ports to any line with a
 | zones | rect / circle / polygon / grid cells, in camera px, projector (DMD) px or part-frame mm (always said) | `zones[]` |
 | checks | what is recognised in a zone: presence, position vs golden, height / step, flatness, defect (end-face MF-CFAR or local), edge straightness / position, code read, or a plugin | `zones[].checks[]`, [`docs/CHECKS.md`](docs/CHECKS.md) |
 | verdict | any FAIL -> FAIL; else any INVALID -> INVALID (never a pass); else PASS | `result.json` `zones[]` |
-| feedback | the verdict painted ON the part: green outline = PASS; red fill + a cross at each fault = FAIL; amber = not measured | `feedback.*` |
-| outputs | run folder (`result.json` + `run.log.jsonl` + overlay + DMD image), PASS / FAIL / ALARM + a result-code register on the I/O bus | `outputs.*`, `stations/io_example.json` |
+| disposition | CONTINUE / REJECT (a definite FAIL) / PULL (any doubt, the guard band) | `pull.*`, `result.json` `disposition`, `pull_reasons` |
+| feedback | the disposition painted ON the part: green outline = PASS; red fill + a cross at each fault = REJECT; an amber frame round the part + "PULL", amber on the zones that caused it = PULL | `feedback.*` |
+| outputs | run folder (`result.json` + `run.log.jsonl` + overlay + DMD image), PASS / FAIL / PULL / ALARM + a result-code register on the I/O bus | `outputs.*`, `stations/io_example.json` |
 
 ```json
 {"schema_version": 1, "name": "lid_present", "preset": "bench_9in_metric",
@@ -173,7 +190,7 @@ A recipe turns the scanner into a work-state check that ports to any line with a
 ```bat
 scan.bat --mock --library library_mock --preset bench_9in_metric calibrate-stereo --mock-poses 12   :: once
 scan.bat --mock --library library_mock --mock-part scene:box_lid:ajar recipe-run box_lid
-scan.bat recipe-run my_part --operator-confirmed           :: exit 0 PASS, 1 FAIL, 2 refused, 4 crashed, 5 INVALID
+scan.bat recipe-run my_part --operator-confirmed           :: exit 0 CONTINUE, 1 REJECT, 5 PULL, 2 refused, 4 crashed
 scan.bat run stations\example_recipe_box_lid.json          :: a station config whose work state IS a recipe
 ```
 

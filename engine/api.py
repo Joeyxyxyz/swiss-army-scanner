@@ -471,10 +471,14 @@ def recipe_run(recipe, preset: Optional[Preset] = None, operator_confirmed: bool
                mock_scene: Optional[str] = None, pattern_mode_ack: bool = False) -> dict:
     """Run a recipe (name, file, mapping or Recipe): scan with its preset (the recipe pins it;
     `preset` overrides), resolve the part frame and the zones, run every check, aggregate
-    (any FAIL -> FAIL; else any INVALID -> INVALID; else PASS), write a NEW run folder
-    (result.json with zones / checks / feedback + run.log.jsonl + overlay.png +
-    feedback_dmd.png) and, with project_feedback, paint the verdict on the part (green
-    outline PASS, red fill + crosses FAIL; hold_s, default the recipe's; ABORT clears it).
+    (any FAIL -> FAIL; else any INVALID -> INVALID; else PASS), decide the disposition
+    (engine/disposition.py: CONTINUE, REJECT a definite FAIL, PULL for quality inspection on
+    any doubt - the recipe's `pull` section sets the guard band), write a NEW run folder
+    (result.json with zones / checks / feedback / disposition / pull_reasons + run.log.jsonl
+    + overlay.png + feedback_dmd.png) and, with project_feedback, paint it on the part (green
+    outline PASS, red fill + crosses REJECT, amber part frame + PULL; hold_s, default the
+    recipe's; ABORT clears it). exit_code: CONTINUE 0, REJECT 1, PULL 5 (refused 2, crashed
+    4, ABORTED 1).
     scan: a stored metric scan (id / label / latest / handle) to check offline instead of
     capturing. runs_dir default: $SCANNER_RUNS_DIR, the recipe's outputs.runs_dir, else
     <library>/runs. The real rig needs operator_confirmed (not an offline re-check: a stored
@@ -532,7 +536,7 @@ def recipe_feedback(run, preset: Optional[Preset] = None, hold_s: Optional[float
     """Project a recipe run's feedback again: its run folder (or result.json), the
     feedback_dmd.png it rendered, for hold_s (default the run's), polarity measured, pumped
     hold that `cancel` (threading.Event) ends. -> {inverted, hold_s, held_s, cancelled,
-    run_id, verdict}"""
+    run_id, verdict, disposition}"""
     from .recipes import feedback as fbm
     if isinstance(run, dict):                     # recipe_run's return value
         run = run.get("run_dir") or (run.get("result") or {}).get("run_folder")
@@ -549,7 +553,8 @@ def recipe_feedback(run, preset: Optional[Preset] = None, hold_s: Optional[float
     hold = float(fb.get("hold_s", 5.0) if hold_s is None else hold_s)
     out = fbm.project(_engine(), p, img, hold, cancel=cancel, photo=False)
     out.pop("photo", None)
-    return {**out, "run_id": doc.get("run_id"), "verdict": doc.get("result")}
+    return {**out, "run_id": doc.get("run_id"), "verdict": doc.get("result"),
+            "disposition": doc.get("disposition")}
 
 
 # ------------------------------------------------------------------ verbs

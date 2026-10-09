@@ -29,10 +29,23 @@ name the work state the sender expects: refused when the selected one differs. A
 the owner marked unusable (its config is invalid or gone) is never started: refused, result
 INVALID. A cancelled or aborted cycle never re-arms.
 
-Outputs (stack-light style): READY / BUSY / PASS / FAIL / ALARM booleans, published to
-every OutputBackend on each change (the UI lamp reads the same signals), plus registers for
-a PLC: result_code (0 none, PASS 1, FAIL 2, INVALID 3, ABORTED 4 - a recipe may renumber
-them in outputs.result_codes), state_code (index in STATES), workstate (1-based, 0 none).
+Outputs (stack-light style): READY / BUSY / PASS / FAIL / ALARM / PULL booleans, published
+to every OutputBackend on each change (the UI lamp reads the same signals), plus registers
+for a PLC: result_code (0 none, PASS 1, FAIL 2, INVALID 3, ABORTED 4, PULL 5 - a recipe may
+renumber them in outputs.result_codes), state_code (index in STATES), workstate (1-based, 0
+none).
+
+Dispositions (engine/disposition.py) on top of the verdict: PASS is set only for CONTINUE (a
+PASS with no doubt), FAIL for REJECT (a definite FAIL), PULL for every doubt - INVALID,
+ABORTED, a crashed or never-started job, a PASS in the guard band, an unreadable code: the
+part goes to the quality-inspection lane. PULL never sets PASS. result_code shows the PASS
+code only for CONTINUE, the FAIL code for REJECT, INVALID / ABORTED as such, and the PULL
+code for a PULL whose verdict was PASS or FAIL (engine/disposition.register_key). ALARM is
+unchanged (FAULT, or an INVALID result). A PASS belongs to the cycle that just ended: a
+rig check (HOME) ends it, so the PASS output and the PASS code never come back for that
+cycle (after HOME OK, or a FAULT and RESET); FAIL / PULL stay (they release nothing). An
+ABORT while a run is busy makes that cycle ABORTED (PULL) whatever the job reports after;
+a START whose handler fails leaves INVALID (PULL) and a FAULT.
 
 Work states: the station configs; a recipe work state (job.type recipe) pins its recipe's
 preset, and its result codes come from the recipe.
@@ -51,12 +64,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from .. import disposition as D
+
 STATES = ("READY", "ARMED", "RUNNING", "ABORTING", "HOMING", "FAULT")
 COMMANDS = ("START", "ABORT", "HOME", "TRIGGER", "SELECT_WORKSTATE", "ARM", "DISARM", "RESET")
-SIGNALS = ("READY", "BUSY", "PASS", "FAIL", "ALARM")
+SIGNALS = ("READY", "BUSY", "PASS", "FAIL", "ALARM", "PULL")
 IDLE = ("READY", "ARMED")
 BUSY = ("RUNNING", "ABORTING", "HOMING")
-RESULT_CODES = {"PASS": 1, "FAIL": 2, "INVALID": 3, "ABORTED": 4}       # 0 = no result yet
+RESULT_CODES = {"PASS": 1, "FAIL": 2, "INVALID": 3, "ABORTED": 4, "PULL": 5}  # 0 = none yet
 REGISTERS = ("result_code", "state_code", "workstate")
 
 
@@ -100,6 +115,7 @@ class CommandBus:
         self.unusable: dict = {}                     # work state -> why it can't run (owner)
         self.armed_confirmed = False
         self.last_result: Optional[str] = None      # PASS | FAIL | INVALID | ABORTED
+        self.last_disposition: Optional[str] = None  # CONTINUE | REJECT | PULL
         self.fault: Optional[str] = None
         self.home_after_abort = False                # only ever True while ABORTING
         self.home_args: dict = {}                    # the HOME request's options (owner reads)
@@ -111,20 +127,29 @@ class CommandBus:
 
     # ------------------------------------------------------------ outputs
     def signals(self) -> dict:
-        s = self.state
+        s, d = self.state, self.last_disposition
         return {"READY": s in IDLE and self.fault is None,
                 "BUSY": s in BUSY,
-                "PASS": s in IDLE and self.last_result == "PASS",
-                "FAIL": s in IDLE and self.last_result == "FAIL",
-                "ALARM": s == "FAULT" or (s in IDLE and self.last_result == "INVALID")}
+                "PASS": s in IDLE and self.last_result == "PASS" and d == "CONTINUE",
+                "FAIL": s in IDLE and d == "REJECT",
+                "ALARM": s == "FAULT" or (s in IDLE and self.last_result == "INVALID"),
+                "PULL": s in IDLE and d == "PULL"}
 
     def registers(self) -> dict:
         """Numbers for a PLC: result_code (the work state's recipe codes, else RESULT_CODES;
-        0 = none yet), state_code (index in STATES), workstate (1-based, 0 = none)."""
+        0 = none yet; the code of engine/disposition.register_key: PASS only for CONTINUE),
+        state_code (index in STATES), workstate (1-based, 0 = none)."""
         codes = (self.workstate_info.get(self.workstate) or {}).get("result_codes") or RESULT_CODES
         ws = self.workstates.index(self.workstate) + 1 if self.workstate in self.workstates else 0
-        return {"result_code": int(codes.get(self.last_result, 0)) if self.last_result else 0,
-                "state_code": STATES.index(self.state), "workstate": ws}
+        key = D.register_key(self.last_result, self.last_disposition)
+        code = 0
+        if key is not None:
+            code = codes.get(key)
+            if code is None:                    # older codes without PULL: never the PASS code
+                code = codes.get("INVALID", RESULT_CODES["PULL"]) if key == "PULL" else \
+                    RESULT_CODES.get(key, 0)
+        return {"result_code": int(code), "state_code": STATES.index(self.state),
+                "workstate": ws}
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -135,6 +160,7 @@ class CommandBus:
                     "registers": self.registers(),
                     "workstates": list(self.workstates), "unusable": dict(self.unusable),
                     "last_result": self.last_result,
+                    "last_disposition": self.last_disposition,
                     "fault": self.fault, "signals": self.signals(),
                     "require_confirmation": self.require_confirmation,
                     "history": self.history[-20:]}
@@ -206,7 +232,7 @@ class CommandBus:
             return refused
         why = self._unusable(self.workstate)
         if why:                                 # never started: the cycle's result is INVALID
-            self.last_result = "INVALID"
+            self.last_result, self.last_disposition = "INVALID", "PULL"
             if self.state == "ARMED":
                 self.armed_confirmed = False
                 self._go("READY")
@@ -216,13 +242,15 @@ class CommandBus:
         if self.require_confirmation and not confirmed:
             return self._no(cmd, "the real rig needs the operator's confirmation of the setup")
         self._return_armed = self.state == "ARMED"
-        self.last_result = None
+        self.last_result = self.last_disposition = None
         self._busy_kind = "run"
         self._go("RUNNING")
         try:
             self.h.start(self.workstate, confirmed)
         except Exception as e:              # noqa: BLE001 - the start itself was refused
             self.fault = f"start failed: {type(e).__name__}: {e}"
+            # never started: the cycle's result is INVALID, its part PULLed (as above)
+            self.last_result, self.last_disposition = "INVALID", "PULL"
             self._go("FAULT")
             return self._no(cmd, self.fault)
         return self._ok(cmd, f"started {self.workstate}")
@@ -276,7 +304,11 @@ class CommandBus:
         return self._ok("ABORT", "; ".join(m for m in (msg, note) if m))
 
     def _start_home(self) -> bool:
-        """HOMING + h.home() (which reads home_args); a refused home is a FAULT."""
+        """HOMING + h.home() (which reads home_args); a refused home is a FAULT. A PASS
+        (CONTINUE) ends here: the rig check never hands the old cycle's PASS output or PASS
+        code back (FAIL / PULL stay: they release nothing)."""
+        if self.last_disposition == "CONTINUE":
+            self.last_result = self.last_disposition = None
         self._busy_kind = "home"
         self._go("HOMING")
         try:
@@ -402,9 +434,11 @@ class CommandBus:
 
     # ------------------------------------------------------------ job events
     def job_finished(self, kind: str, result: Optional[str] = None,
-                     error: Optional[str] = None) -> None:
-        """kind 'run' (result PASS / FAIL / INVALID / ABORTED) or 'home' (result OK /
-        MOVED / UNKNOWN / REFERENCE_SET); error = the job crashed."""
+                     error: Optional[str] = None, disposition: Optional[str] = None) -> None:
+        """kind 'run' (result PASS / FAIL / INVALID / ABORTED, disposition CONTINUE / REJECT
+        / PULL: the run's own, else PASS -> CONTINUE, FAIL -> REJECT, anything else PULL; one
+        that does not fit the result is PULL) or 'home' (result OK / MOVED / UNKNOWN /
+        REFERENCE_SET); error = the job crashed (PULL)."""
         with self._lock:
             if self.state == "ABORTING" and self._busy_kind not in (None, kind):
                 return                          # not the job this abort waits for
@@ -413,6 +447,9 @@ class CommandBus:
                 self.last_result = "ABORTED" if aborted else (result or "INVALID")
                 if error and not aborted:
                     self.last_result = "INVALID"
+                self.last_disposition = D.of_result(
+                    self.last_result, None if (aborted or error) else disposition,
+                    error=bool(error) or aborted)
                 if aborted and self.home_after_abort:
                     self.home_after_abort = False   # consumed: the HOME pressed while aborting
                     self._start_home()
@@ -509,7 +546,8 @@ class DigitalIOInput(InputBackend):
 
 class OutputBackend:
     """Stack-light style outputs: publish({"READY": bool, "BUSY": .., "PASS": .., "FAIL": ..,
-    "ALARM": ..}); `mapping` maps signals to the backend's outputs."""
+    "ALARM": .., "PULL": ..}); `mapping` maps signals to the backend's outputs. PULL = route
+    the part to the quality-inspection lane (never set together with PASS)."""
     name = "output"
 
     def __init__(self, mapping: Optional[dict] = None, **options):
@@ -559,8 +597,9 @@ class DigitalIOOutput(OutputBackend):
 # OUTPUTS under the same kind. The mapping keys are the protocol's addresses as text.
 #   inputs  (PLC -> scanner): command bits START / ABORT / HOME / TRIGGER / ARM / DISARM /
 #           RESET (rising edge = one command), the work state number (options.workstate_*)
-#   outputs (scanner -> PLC): READY / BUSY / PASS / FAIL / ALARM bits, the result_code /
-#           state_code / workstate registers (options.*_register / *_node / *_tag)
+#   outputs (scanner -> PLC): READY / BUSY / PASS / FAIL / ALARM / PULL bits, the
+#           result_code / state_code / workstate registers (options.*_register / *_node /
+#           *_tag); PULL routes the part to the quality-inspection lane
 
 _PLACEHOLDER = ("{cls} is a placeholder: the {proto} adapter is not implemented (no {proto} "
                 "client is bundled). Implement {method} in a subclass with your site's {proto} "
@@ -585,7 +624,7 @@ class ModbusTcpInput(InputBackend):
 class ModbusTcpOutput(OutputBackend):
     """PLACEHOLDER: Modbus TCP writes (options: host, port 502, unit, result_register,
     state_register, workstate_register). Mapping signal -> 'coil:N' (READY / BUSY / PASS /
-    FAIL / ALARM); publish_registers writes result_code / state_code / workstate to the
+    FAIL / ALARM / PULL); publish_registers writes result_code / state_code / workstate to the
     holding registers named in options."""
     name = "modbus_tcp"
     PROTOCOL = "Modbus TCP"
@@ -593,7 +632,7 @@ class ModbusTcpOutput(OutputBackend):
     def publish(self, signals: dict) -> None:
         raise NotImplementedError(_PLACEHOLDER.format(
             cls=type(self).__name__, proto=self.PROTOCOL, method="publish(signals)",
-            mapping="READY / BUSY / PASS / FAIL / ALARM -> coils 'coil:N'"))
+            mapping="READY / BUSY / PASS / FAIL / ALARM / PULL -> coils 'coil:N'"))
 
     def publish_registers(self, registers: dict) -> None:
         raise NotImplementedError(_PLACEHOLDER.format(
@@ -626,7 +665,7 @@ class OpcUaOutput(OutputBackend):
     def publish(self, signals: dict) -> None:
         raise NotImplementedError(_PLACEHOLDER.format(
             cls=type(self).__name__, proto=self.PROTOCOL, method="publish(signals)",
-            mapping="READY / BUSY / PASS / FAIL / ALARM -> Boolean nodes"))
+            mapping="READY / BUSY / PASS / FAIL / ALARM / PULL -> Boolean nodes"))
 
     def publish_registers(self, registers: dict) -> None:
         raise NotImplementedError(_PLACEHOLDER.format(
@@ -660,7 +699,8 @@ class EtherNetIpOutput(OutputBackend):
     def publish(self, signals: dict) -> None:
         raise NotImplementedError(_PLACEHOLDER.format(
             cls=type(self).__name__, proto=self.PROTOCOL, method="publish(signals)",
-            mapping="READY / BUSY / PASS / FAIL / ALARM -> BOOL tags / output-assembly bits"))
+            mapping="READY / BUSY / PASS / FAIL / ALARM / PULL -> BOOL tags / output-assembly "
+                    "bits"))
 
     def publish_registers(self, registers: dict) -> None:
         raise NotImplementedError(_PLACEHOLDER.format(

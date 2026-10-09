@@ -16,6 +16,11 @@ projector showed after the verdict, else null). `deviation_mm` also carries `n_d
 `largest_defect`, `outlier_px` / `outlier_clusters` / `outlier_pct` and `dense_strays`
 (metric jobs: the out-of-tolerance clusters, the isolated stray px dropped - golden: the
 worse side - and where dropped px were dense, else null; null for the other jobs).
+
+Schema 0.3 (extends 0.2, every key kept, `result` unchanged): `disposition` (CONTINUE /
+REJECT / PULL: what happens to the part, engine/disposition.py) and `pull_reasons` ([{zone?,
+check?, reason, message}]: every doubt found). write_result never writes a run without a
+disposition, nor a CONTINUE that is not a doubt-free PASS (fail closed).
 """
 
 from __future__ import annotations
@@ -28,7 +33,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-RESULT_SCHEMA_VERSION = "0.2"
+from . import disposition as D
+
+RESULT_SCHEMA_VERSION = "0.3"
 RESULTS = ("PASS", "FAIL", "INVALID", "ABORTED")
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +80,17 @@ class RunLog:
     def close(self) -> None:
         if not self._f.closed:
             self._f.close()
+
+
+def append_event(log_path: Path, run_id: str, event: str, level: str = "info",
+                 **fields) -> None:
+    """One more event on a run's CLOSED log (what happened to the run after run_end, e.g.
+    the line counting the cycle ABORTED after its verdict was written). result.json is
+    never rewritten; the log records it."""
+    rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+           "run_id": run_id, "level": level, "event": event, **fields}
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, default=str) + "\n")
 
 
 def software_info() -> dict:
@@ -121,6 +139,8 @@ def empty_result(*, run_id: str, run_folder: str, mock: bool, operator_confirmed
         "result": "INVALID",
         "invalid_reason": "not run",
         "engine_verdict": None,
+        "disposition": None,                # CONTINUE | REJECT | PULL (engine/disposition.py)
+        "pull_reasons": [],
         "warnings": [],
         "outputs": {"mesh": [], "deviation_map": None, "report": None, "log": "run.log.jsonl"},
         "recipe": None,
@@ -133,9 +153,12 @@ def empty_result(*, run_id: str, run_folder: str, mock: bool, operator_confirmed
 
 
 def write_result(run_dir: Path, result: dict) -> Path:
-    """result.json, written once per run (exclusive create: never overwritten)."""
+    """result.json, written once per run (exclusive create: never overwritten). A missing or
+    inconsistent disposition is settled first (engine/disposition.ensure: never a CONTINUE
+    that is not a doubt-free PASS)."""
     if result.get("result") not in RESULTS:
         raise ValueError(f"result must be one of {RESULTS}")
+    D.ensure(result)
     result["finished"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     out = Path(run_dir) / "result.json"
     with open(out, "x", encoding="utf-8") as f:

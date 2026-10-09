@@ -15,7 +15,17 @@ instead of the multifreq basis's two coarser phase levels.
           the fringe order is read from whichever code is far from its own edges
           (f in [T/4, 3T/4): k1, else k2), so no order is ever decided on a blurred code edge;
           where both codes are clean (f in [T/8, 3T/8) or [5T/8, 7T/8)) they must agree, else
-          the pixel is dropped.
+          the pixel is dropped. k1 and k2 come from the same Gray word, so that test is a
+          parity check of m: it catches any single flipped code bit, but only in that half of
+          the tile. The order of the other half is checked across the face instead: adjacent
+          decoded pixels whose positions differ by < T / 2 are linked (true neighbours differ
+          by far less; a tile-order error is >= T off), and only linked regions that hold
+          parity-checked pixels are kept - a patch decoded a whole tile off is dropped, not
+          returned silently wrong.
+          Polarity (an inverting HDMI path) is read per pixel from white - black, the same
+          reference the code bits are thresholded with; lit pixels whose polarity disagrees
+          with the lit zone's majority are dropped. The unlit rest of the frame (ambient drift
+          between the white and black frames) has no say.
 
 LIMITS (read before using it):
 - The order is unique only inside a window of W x T DMD px per axis (5 bits: 128 px) placed on
@@ -24,8 +34,10 @@ LIMITS (read before using it):
   A full-field scan would alias.
 - Binary code planes clip and blur unlike sinusoids: heavy defocus (> ~2 DMD px), steep tilt
   (the 8 px period compressed in the camera) or glints can flip a code bit.
-- Only the k1 / k2 consistency check guards the order (no multi-level phase check): a tile
-  error where both codes are wrong together is not caught.
+- The order is guarded by the k1 / k2 parity check (half of every tile) and the linked-region
+  check (the other half), not by a multi-level phase check: two code bits wrong together over
+  a region (the parity still holds) or a whole lit region decoded a tile off (nothing correct
+  to link it to) is not caught.
 - Motion during the code frames corrupts the order of the moved pixels (fewer frames make
   it less likely, not impossible).
 - No flood pair beyond white / black and no polar set of its own (targeted_face_scan still
@@ -45,6 +57,7 @@ from .multifreq import DMD_SHAPE
 DEFAULT_PERIOD = 8.0
 DEFAULT_STEPS = 12
 DEFAULT_CODE_BITS = 5
+MIN_CHECKED_PX = 4          # a linked region is kept only with this many parity-checked px
 
 
 def gray_to_bin(g: np.ndarray) -> np.ndarray:
@@ -54,6 +67,38 @@ def gray_to_bin(g: np.ndarray) -> np.ndarray:
         m ^= m >> s
         s *= 2
     return m
+
+
+def linked_regions(pos: np.ndarray, cand: np.ndarray, checked: np.ndarray, max_step: float,
+                   min_checked: int = MIN_CHECKED_PX) -> np.ndarray:
+    """The pixels of cand that lie in a region of 4-adjacent cand pixels whose decoded
+    positions pos differ by < max_step, holding >= min_checked pixels of checked -> bool mask.
+    A patch whose order is a tile off is cut from its correct neighbours (the position jumps
+    by >= the tile period) and holds no pixel that passed a per-pixel order check."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    out = np.zeros(cand.shape, bool)
+    ys, xs = np.nonzero(cand)
+    n = len(ys)
+    if not n:
+        return out
+    idx = np.full(cand.shape, -1, np.int64)
+    idx[ys, xs] = np.arange(n)
+    H, W = cand.shape
+    rows, cols = [], []
+    for dy, dx in ((0, 1), (1, 0)):
+        a, b = (slice(0, H - dy), slice(0, W - dx)), (slice(dy, H), slice(dx, W))
+        with np.errstate(invalid="ignore"):
+            link = cand[a] & cand[b] & (np.abs(pos[a] - pos[b]) < max_step)
+        yy, xx = np.nonzero(link)
+        rows.append(idx[yy, xx])
+        cols.append(idx[yy + dy, xx + dx])
+    r, c = np.concatenate(rows), np.concatenate(cols)
+    g = coo_matrix((np.ones(len(r), np.int8), (r, c)), shape=(n, n))
+    n_comp, lab = connected_components(g, directed=False)
+    n_chk = np.bincount(lab, weights=checked[ys, xs].astype(np.float64), minlength=n_comp)
+    out[ys, xs] = (n_chk >= min_checked)[lab]
+    return out
 
 
 class TilePhaseBasis(PatternBasis):
@@ -140,19 +185,21 @@ class TilePhaseBasis(PatternBasis):
         T, N, W = self.T, self.steps, self.win
         white, black = frames[0].astype(np.float64), frames[1].astype(np.float64)
         con = white - black
-        flipped = float(np.nanmean(con)) < 0
+        # polarity per pixel, from the same white / black the code bits are thresholded
+        # with: the whole-frame mean is ruled by the unlit rest of the frame (a sub-DN
+        # ambient drift there flipped the phase of a small lit face by T / 2)
+        neg = con < 0
         den = np.where(np.abs(con) > 1e-6, con, np.nan)
         base = np.abs(con) > contrast_min
         d = 2 * np.pi * np.arange(N) / N
-        corr, meta_ax, conf = {}, {}, None
+        pos_ax, meta_ax, conf, mod = {}, {}, None, {}
         i = 2
         for ax in ("x", "y"):
             F = frames[i:i + N]
             S = sum(f.astype(np.float64) * np.sin(dk) for f, dk in zip(F, d))
             C = sum(f.astype(np.float64) * np.cos(dk) for f, dk in zip(F, d))
             ph, B = np.arctan2(-S, C), 2.0 / N * np.hypot(S, C)
-            if flipped:
-                ph = ph + np.pi
+            ph = ph + np.pi * neg
             f = np.mod(ph, 2 * np.pi) * T / (2 * np.pi)
             i += N
             g = np.zeros(white.shape, np.int64)
@@ -174,14 +221,32 @@ class TilePhaseBasis(PatternBasis):
             pos = K * T + f - 0.5
             lit = base & (B > conf_min)
             ext = self.extent[ax]
-            good = lit & cons & (pos >= -0.5) & (pos <= ext - 0.5)
-            corr[ax] = np.where(good, pos, np.nan).astype(np.float32)
+            pos_ax[ax] = (pos, lit & cons & (pos >= -0.5) & (pos <= ext - 0.5), zA | zB)
+            mod[ax] = B
             conf = B if conf is None else np.minimum(conf, B)
             meta_ax[ax] = {"modulation_median": float(np.median(B[lit])) if lit.any() else 0.0,
                            "unwrap_rejected_pct": round(100.0 * float((lit & ~cons).sum())
                                                         / max(int(lit.sum()), 1), 3),
                            "code_margin_median": float(np.median(margin[lit])) if lit.any() else 0.0,
                            "window_start_tile": self.K0[ax]}
+        # the lit zone's polarity: the majority of the pixels both axes modulate; a lit pixel
+        # that disagrees (a glint in the white or black frame, motion) is not decoded
+        zone = base & (mod["x"] > conf_min) & (mod["y"] > conf_min)
+        if zone.any():
+            flipped = bool(np.mean(neg[zone]) > 0.5)
+        else:
+            sel = base if base.any() else np.isfinite(con)
+            flipped = bool(sel.any() and float(np.median(con[sel])) < 0)
+        odd = zone & (neg != flipped)
+        corr = {}
+        for ax in ("x", "y"):
+            pos, cand, checked_zone = pos_ax[ax]
+            cand = cand & ~odd
+            # order across the tile: keep the linked regions that hold parity-checked px
+            keep = linked_regions(pos, cand, cand & checked_zone, T / 2)
+            corr[ax] = np.where(keep, pos, np.nan).astype(np.float32)
+            meta_ax[ax]["order_rejected_pct"] = round(100.0 * float((cand & ~keep).sum())
+                                                      / max(int(cand.sum()), 1), 3)
         valid = np.isfinite(corr["x"]) & np.isfinite(corr["y"])
         return DeformationField(
             corr_x=corr["x"], corr_y=corr["y"], corr_diag=None, conf=conf.astype(np.float32),
@@ -190,5 +255,7 @@ class TilePhaseBasis(PatternBasis):
                   "code_bits_per_axis": self.bits, "window_tiles": W, "axis": "xy",
                   "diamond_parity": self.parity, "units": "projector px (native col, row)",
                   "gc_conf": float(np.median(conf[valid])) if valid.any() else 0.0,
-                  "contrast_mean": float(con.mean()), "mod_min": conf_min,
+                  "contrast_mean": float(con.mean()),
+                  "contrast_lit_median": float(np.median(con[zone])) if zone.any() else 0.0,
+                  "polarity_odd_px": int(odd.sum()), "mod_min": conf_min,
                   "experimental": True, "per_axis": meta_ax})

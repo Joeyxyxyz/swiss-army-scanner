@@ -136,7 +136,12 @@ class MultiFreqBasis(PatternBasis):
                              f"{self.steps} steps), got {len(frames)}")
         white, black = frames[0].astype(np.float64), frames[1].astype(np.float64)
         contrast = white - black
-        flipped = float(np.nanmean(contrast)) < 0
+        # polarity from the lit zone (the px well above / below black: their majority sign),
+        # not the whole frame's mean: a small lit zone under a sub-DN ambient drift over the
+        # rest of the frame would otherwise read inverted and decode nothing
+        strong = np.abs(contrast) > contrast_min
+        flipped = (float(np.mean(contrast[strong] < 0)) > 0.5 if strong.any()
+                   else float(np.nanmean(contrast)) < 0)
         if flipped:
             contrast = -contrast
         mod_floor = conf_min if self.mod_min is None else float(self.mod_min)

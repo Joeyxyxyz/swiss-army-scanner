@@ -1854,11 +1854,16 @@ def rig_check(preset: Optional[Preset] = None, set_reference: bool = False,
               tol_px: float = 0.5, mock_shift_px=None, label: str = "rigref") -> dict:
     """Has the camera or projector been nudged? A fresh flood + a seeded random block
     pattern (3 frames, the DMD ends black) vs the reference stored for this geometry
-    (calibrations/<geometry>/<ts>_rigref) -> image shift in camera px by phase correlation
-    (sub-pixel), and ~mm at the working distance when a stereo calibration and a metric
-    scan exist. status OK | MOVED (names camera / projector) | UNKNOWN (no texture) |
-    REFERENCE_SET (first check at this geometry, or set_reference=True). mock_shift_px
-    (dx, dy; mock only) shifts the fresh frames to simulate a nudged camera."""
+    (calibrations/<geometry>/<ts>_rigref) -> image motion over the frame (shift + roll +
+    scale: tile phase correlation + a similarity fit; the largest displacement is judged),
+    camera px and ~mm at the working distance when a stereo calibration and a metric scan
+    exist. status OK (only with the pattern matched and its roll / zoom determined, every
+    matched motion <= tol_px) | MOVED (names camera / projector; also when the pattern is
+    visible but no longer matches) | UNKNOWN (no pattern / no texture, roll / zoom not
+    determined, or the flood shows texture but no longer matches) | REFERENCE_SET (first
+    check at this geometry, or set_reference=True). tol_px must be finite and >= 0
+    (ValueError). mock_shift_px (dx, dy[, roll_deg[, scale]]; mock only) moves the fresh
+    frames to simulate a nudged camera."""
     from .calibrate import rigref
     return rigref.rig_check(_engine(), _preset(preset), bool(set_reference), float(tol_px),
                             mock_shift_px, label)
@@ -1909,7 +1914,8 @@ def station_golden(measurements: list, label: str = "golden", cell_height_tol_mm
                    ct_zone_tol_mm: float = 0.30, spacing_tol_mm: Optional[float] = None,
                    cell_height_band_mm: Optional[list] = None,
                    ct_zone_band_mm: Optional[list] = None, bands: Optional[dict] = None,
-                   params: Optional[dict] = None, flood=None):
+                   params: Optional[dict] = None, flood=None,
+                   face_position_tol_mm: Optional[float] = None):
     """Station golden from >= 1 GOOD measurements (StationMeasurements, their .json, or metric
     scans measured here with `params`) -> station_golden/<geometry>/ (append-only, bound to
     geometry + fingerprint + stereo calibration): nominal end-face height differences, spacings and
@@ -1917,11 +1923,15 @@ def station_golden(measurements: list, label: str = "golden", cell_height_tol_mm
     and the user-set limits: a cylinder pair triggers outside nominal +- cell_height_tol_mm (and /
     or the absolute cell_height_band_mm [lo, hi]), a tube zone outside nominal +-
     ct_zone_tol_mm (and / or ct_zone_band_mm), spacing only with spacing_tol_mm; bands =
-    {"C2-C1": [lo, hi], "T3": [lo, hi], "C2-C1 spacing": [lo, hi]} per-item absolute bands."""
+    {"C2-C1": [lo, hi], "T3": [lo, hi], "C2-C1 spacing": [lo, hi]} per-item absolute bands.
+    Every end face is also checked where it is: its centre within face_position_tol_mm
+    (default the face diameter) of the golden's, so a disc found elsewhere (a background
+    disc, the part missing) never passes as the part."""
     from .measure.station import verbs as st
     lim = {"cell_height_tol_mm": cell_height_tol_mm, "ct_zone_tol_mm": ct_zone_tol_mm,
            "spacing_tol_mm": spacing_tol_mm, "cell_height_band_mm": cell_height_band_mm,
-           "ct_zone_band_mm": ct_zone_band_mm, "bands": dict(bands or {})}
+           "ct_zone_band_mm": ct_zone_band_mm, "face_position_tol_mm": face_position_tol_mm,
+           "bands": dict(bands or {})}
     return st.station_golden(_engine(), list(measurements), label, lim, params, flood)
 
 

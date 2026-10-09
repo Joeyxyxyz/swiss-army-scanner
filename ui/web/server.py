@@ -576,6 +576,8 @@ VERBS: dict = {
                         "cell_height_tol_mm": "nominal +- (default 0.15)",
                         "ct_zone_tol_mm": "nominal +- (default 0.30)",
                         "spacing_tol_mm": "nominal +- (optional)",
+                        "face_position_tol_mm": "each end face within this of its golden "
+                                                "position, 3D mm (default the face diameter)",
                         "cell_height_band_mm": "[lo, hi] absolute (optional)",
                         "ct_zone_band_mm": "[lo, hi] absolute (optional)",
                         "bands": "{item: [lo, hi]}, e.g. {'C2-C1': [-0.4, 0.1], 'T3': [-5, -4]}",
@@ -628,11 +630,16 @@ VERBS: dict = {
                         {"run_id": "a run of this server (GET /runs/<run_id>/result.json)",
                          "hold_s": "seconds (default the run's)"}),
     "rig_check": ("Rig check (HOME): a fresh flood + a random block pattern vs the stored "
-                  "reference -> camera / projector shift in px (phase correlation) and ~mm at "
-                  "the working distance; OK | MOVED | UNKNOWN | REFERENCE_SET (first check).",
+                  "reference -> camera / projector motion over the frame (shift + roll + zoom: "
+                  "tile phase correlation + a similarity fit; the largest displacement is "
+                  "judged), px and ~mm at the working distance. OK only with the pattern "
+                  "matched and its roll / zoom determined | MOVED (also: the pattern visible "
+                  "but no longer matching) | UNKNOWN (no pattern or texture, roll / zoom not "
+                  "determined, or the flood no longer matching) | REFERENCE_SET (first check).",
                   {"set_reference": "bool: store a new reference (after base / calibration)",
-                   "tol_px": "MOVED above this shift (default 0.5)",
-                   "mock_shift_px": "MOCK ONLY: [dx, dy] shift of the fresh frames"}),
+                   "tol_px": "MOVED above this image motion, px (default 0.5; finite, >= 0)",
+                   "mock_shift_px": "MOCK ONLY: [dx, dy] or [dx, dy, roll_deg] or [dx, dy, "
+                                    "roll_deg, scale]: moves the fresh frames"}),
     # UI verbs (not engine.api verbs)
     "run_station": ("Run one station config (stations/<config>.json) exactly like `scan run`: "
                     "a new run folder with result.json + run.log.jsonl; PASS / FAIL / INVALID / "
@@ -2533,6 +2540,7 @@ class App:
                                **_kw(cell_height_tol_mm=_num(a, "cell_height_tol_mm"),
                                      ct_zone_tol_mm=_num(a, "ct_zone_tol_mm"),
                                      spacing_tol_mm=_num(a, "spacing_tol_mm"),
+                                     face_position_tol_mm=_num(a, "face_position_tol_mm"),
                                      cell_height_band_mm=band("cell_height_band_mm"),
                                      ct_zone_band_mm=band("ct_zone_band_mm"), bands=bands),
                                params=prm)
@@ -3040,8 +3048,8 @@ class App:
         if shift is not None:
             if not self.mock:
                 raise ArgError("mock_shift_px is MOCK ONLY")
-            if len(shift) != 2:
-                raise ArgError("mock_shift_px must be [dx, dy] camera px")
+            if not 2 <= len(shift) <= 4:
+                raise ArgError("mock_shift_px must be [dx, dy] camera px (+ roll_deg, + scale)")
         r = api.rig_check(self._preset(), _bool(a, "set_reference"), _num(a, "tol_px", 0.5),
                           shift)
         return r, ({"flood": Path(r["path"]) / "flood.png"}

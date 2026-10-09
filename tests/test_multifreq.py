@@ -61,6 +61,28 @@ def test_decode_recovers_both_axes_exactly(flip):
     assert fld.meta["per_axis"]["x"]["offset_median"] == pytest.approx(100.0, abs=1e-6)
 
 
+@pytest.mark.parametrize("flip", [False, True])
+def test_polarity_comes_from_the_lit_zone(flip):
+    """A small lit zone (0.4 % of the frame) and a sub-DN ambient drift of the other sign over
+    the rest: the whole-frame mean of white - black had the wrong sign, so the lit zone was
+    decoded inverted (nothing valid)."""
+    b = MultiFreqBasis(steps=6, axis="xy")
+    rng = np.random.default_rng(1)
+    u = rng.uniform(0, 911, (100, 100))
+    v = rng.uniform(0, 1139, (100, 100))
+    lit = np.zeros(u.shape, bool)
+    lit[47:53, 47:53] = True
+    frames = _ideal_frames(b, u, v, flip=flip)
+    drift = 0.8 if flip else -0.8                  # the other sign, under one DN
+    frames = [np.where(lit, f, 20.0) for f in frames]
+    frames[0] = np.where(lit, frames[0], 20.0 + drift)
+    assert (float(np.mean(frames[0] - frames[1])) < 0) is not flip     # the old rule's sign
+    fld = b.decode(frames, "g", contrast_min=5, conf_min=5)
+    assert fld.meta["polarity_flipped"] is flip
+    assert fld.mask[lit].all() and not fld.mask[~lit].any()
+    assert np.abs(fld.corr_x[lit] - u[lit]).max() < 2e-3
+
+
 def test_modulation_mask_and_unwrap_rejection():
     b = MultiFreqBasis(steps=6, axis="x")
     u = np.tile(np.linspace(1, 900, 64), (8, 1))

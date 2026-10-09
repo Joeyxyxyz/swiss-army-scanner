@@ -39,7 +39,7 @@ UNITS = {"centre_mm": "mm, camera frame (x right, y down, z forward)",
                                   "mean face centre"}
 DEFAULT_LIMITS = {"cell_height_tol_mm": 0.15, "cell_height_band_mm": None,
                   "ct_zone_tol_mm": 0.30, "ct_zone_band_mm": None,
-                  "spacing_tol_mm": None, "bands": {}}
+                  "spacing_tol_mm": None, "face_position_tol_mm": None, "bands": {}}
 KIND = "station_golden"
 
 
@@ -348,6 +348,7 @@ def check_limits(limits: Optional[dict]) -> dict:
            "ct_zone_tol_mm": _tol(lim["ct_zone_tol_mm"], "ct_zone_tol_mm"),
            "ct_zone_band_mm": _band(lim["ct_zone_band_mm"], "ct_zone_band_mm"),
            "spacing_tol_mm": _tol(lim["spacing_tol_mm"], "spacing_tol_mm"),
+           "face_position_tol_mm": _tol(lim["face_position_tol_mm"], "face_position_tol_mm"),
            "bands": {str(k): _band(v, f"bands[{k!r}]") for k, v in (lim["bands"] or {}).items()}}
     if out["cell_height_tol_mm"] is None and out["cell_height_band_mm"] is None:
         raise ValueError("set cell_height_tol_mm or cell_height_band_mm (or both)")
@@ -414,6 +415,72 @@ def _plain(d) -> dict:
     return json.loads(json.dumps(json_safe(d or {})))
 
 
+STRICT_KEYS = ("strict", "max_outline_rms_mm", "strict_min_coverage",
+               "strict_partial_outline_rms_mm", "max_pair_dz_diam", "max_pair_spacing_diam",
+               "min_pair_spacing_diam")
+
+
+def _gates(params: dict) -> Optional[dict]:
+    """The strict end-face gates a measurement was made with: None = none (strict off, or a
+    measurement that predates the gates: no 'strict' key), else every gate setting."""
+    p = _plain(params)
+    if not p.get("strict", False):
+        return None
+    full = geo_mod.StationParams.from_dict(p).to_dict()
+    return _plain({k: full[k] for k in STRICT_KEYS})
+
+
+def _passes_gates(m: StationMeasurement, params: dict) -> str:
+    """'' when the end faces stored in a measurement made without the strict gates pass them
+    (the gate settings of params), else why not."""
+    prm = geo_mod.StationParams.from_dict(_plain(params))
+    fits = []
+    for c in m.cells:
+        if c.get("centre_mm") is None or c.get("normal") is None or c.get("coverage") is None:
+            return f"{c.get('name', '?')}: its stored values cannot be re-checked"
+        rms = c.get("outline_rms_mm")
+        fits.append({"name": c["name"], "centre": np.asarray(c["centre_mm"], float),
+                     "normal": np.asarray(c["normal"], float), "coverage": float(c["coverage"]),
+                     "outline": {"rms_mm": float(rms)} if rms is not None else None})
+    for f in fits:
+        why = geo_mod.strict_gate(f, [o for o in fits if o is not f], prm)
+        if why:
+            return f"{f['name']}: {why}"
+    return ""
+
+
+def _alike_params(ms_list: list) -> tuple:
+    """Refuse measurements made with different station parameters -> (the params the golden
+    checks with, warnings). The strict end-face gates are compared on their own: a measurement
+    made without them (strict off, or older than the gates: no 'strict' key) goes with ones
+    made with them only when its stored end faces pass those very gates (re-checked here,
+    warned), and the golden then checks with the gates; different gate settings are refused."""
+    base = [{k: v for k, v in _plain(m.params).items() if k not in STRICT_KEYS} for m in ms_list]
+    if any(b != base[0] for b in base[1:]):
+        raise ValueError("station_golden: the measurements were made with different station "
+                         "parameters; measure them alike")
+    gates = [_gates(m.params) for m in ms_list]
+    gated = [m for m, g in zip(ms_list, gates) if g is not None]
+    if any(g is not None and g != _gates(gated[0].params) for g in gates):
+        raise ValueError("station_golden: the measurements were made with different strict "
+                         "end-face gate settings; measure them alike")
+    if not gated:
+        return ms_list[0].params, []
+    warnings = []
+    for m, g in zip(ms_list, gates):
+        if g is not None:
+            continue
+        why = _passes_gates(m, gated[0].params)
+        if why:
+            raise ValueError(f"station_golden: measurement {m.label} was made without the strict "
+                             f"end-face gates and does not pass them ({why}); measure it again "
+                             "with the gates (pass its metric scan) or build the golden from "
+                             "measurements made alike")
+        warnings.append(f"measurement {m.label} was made without the strict end-face gates: its "
+                        "end faces were re-checked against them and pass")
+    return gated[0].params, warnings
+
+
 def _match_zones(ref: list, other: list, pitch: float) -> dict:
     """ref zone k -> the other measurement's zone nearest in s (within a quarter pitch): a
     phase that wrapped by a pitch between the two fits renumbers k, not the part."""
@@ -465,15 +532,14 @@ def station_golden(s, measurements: list, label: str = "golden", limits: Optiona
                                          f"calibrations ({ref.calibration_id} vs {m.calibration_id})")
         if len(m.cells) != len(ref.cells):
             raise ValueError("station_golden: the measurements have different end-face counts")
-        if _plain(m.params) != _plain(ref.params):
-            raise ValueError("station_golden: the measurements were made with different station "
-                             "parameters; measure them alike")
+    gparams, mix = _alike_params(ms_list)
     from ..endface.verbs import _require_current_cal
     fp = ref.meta.get("geometry_fp")
     _require_current_cal(s, ref.geometry_id, fp, ref.calibration_id, "station_golden")  # rule 6
     # the measurements' own warnings (e.g. cells found on the decode modulation, a borrowed
     # flood) stay visible on the golden
     warnings = [f"measurement {m.label}: {w}" for m in ms_list for w in (m.warnings or [])]
+    warnings += mix
     # cell pairs
     pairs = []
     for p in ref.pairs:
@@ -504,11 +570,20 @@ def station_golden(s, measurements: list, label: str = "golden", limits: Optiona
         warnings.append("no tube zones in the reference measurement: the golden checks "
                         "the end faces only")
     _check_golden_limits(lim, _golden_items(pairs, zones), warnings)
-    nominal = {"cells": [{"name": c["name"], "height_mm": c["height_mm"]} for c in ref.cells],
+    cells = []
+    for c in ref.cells:                         # the faces' mean position (camera mm)
+        cs = [q["centre_mm"] for m in ms_list for q in m.cells
+              if q["name"] == c["name"] and q.get("centre_mm") is not None]
+        spread = float(np.max(np.linalg.norm(np.subtract(cs, np.mean(cs, 0)), axis=1))) \
+            if cs else None
+        cells.append({"name": c["name"], "height_mm": c["height_mm"],
+                      "centre_mm": _r(np.mean(cs, 0), 4) if len(cs) == len(ms_list) else None,
+                      "centre_spread_mm": _r(spread, 4)})
+    nominal = {"cells": cells,
                "pairs": pairs, "zones": zones,
                "ct_edge_height_mm": ((ref.ct or {}).get("edge_height_zones") or {}).get("median_mm")}
     g = {"kind": KIND, "limits": lim, "nominal": nominal, "zone_model": zmodel,
-         "zone_labels": {str(z["k"]): z["label"] for z in zones}, "params": ref.params,
+         "zone_labels": {str(z["k"]): z["label"] for z in zones}, "params": gparams,
          "units": UNITS, "measurements": [{"label": m.label, "scan_id": m.scan_id,
                                            "flood_source": m.flood_source,
                                            "file": str(m.files.get("json") or "")} for m in ms_list]}
@@ -568,8 +643,22 @@ def _item(item, kind, value, nominal, band, extra=None) -> dict:
 
 
 def compare(m: StationMeasurement, g: StationGolden) -> list:
+    """Every item of the golden on measurement m: each end face's position (3D distance of
+    its centre from the golden's: a face found somewhere else - a background disc taken
+    with the part missing - is never the part; tolerance face_position_tol_mm, default the
+    face diameter), the cell pairs (height, spacing) and the tube zones."""
     lim = g.limits
     items = []
+    gprm = geo_mod.StationParams.from_dict(g.params)
+    ptol = lim.get("face_position_tol_mm") or float(gprm.face_diameter_mm)
+    by_name = {c["name"]: c for c in m.cells}
+    for c in g.nominal.get("cells") or []:
+        if c.get("centre_mm") is None:
+            continue                            # a golden older than the face positions
+        q = by_name.get(c["name"])
+        v = (float(np.linalg.norm(np.subtract(q["centre_mm"], c["centre_mm"])))
+             if q is not None and q.get("centre_mm") is not None else None)
+        items.append(_item(f"{c['name']} position", "face_position", v, 0.0, [0.0, ptol]))
     for p in g.nominal["pairs"]:
         q = next((x for x in m.pairs if x["pair"] == p["pair"]), None)
         v = q["height_diff_mm"] if q else None
@@ -638,11 +727,18 @@ def station_check(s, scan, golden=None, flood=None, label: Optional[str] = None)
     items = compare(m, g)
     trig = [it for it in items if it["status"] == "trigger"]
     missing = [it for it in items if it["status"] == "missing"]
-    verdict = "FAIL" if trig else ("INCOMPLETE" if missing else "PASS")
+    checked = [it for it in items if it["status"] in ("ok", "trigger")]
+    verdict = "FAIL" if trig else ("INCOMPLETE" if missing or not checked else "PASS")
     warnings = list(m.warnings)
     if missing:
         warnings.append("not measured: " + ", ".join(it["item"] for it in missing)
                         + " (never passed: re-scan with those parts lit and decoded)")
+    if not checked:
+        warnings.append(f"golden {g.label} checks nothing on this part (no cell pair, no tube "
+                        "zone, no face position): never passed - re-make the golden")
+    if not any(it["kind"] == "face_position" for it in items):
+        warnings.append(f"golden {g.label} predates the face positions: where the end faces "
+                        "are is not checked - re-make it")
     rep = {"kind": "station_check", "label": label, "verdict": verdict, "golden_id": g.id,
            "golden_label": g.label, "measurement": {"label": m.label, "scan_id": m.scan_id,
                                                    "file": str(m.files.get("json") or "")},

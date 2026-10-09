@@ -86,13 +86,24 @@ class StationParams:
     zone_skip: list = field(default_factory=lambda: [0, 0])   # drop zones at the (left, right) end
     zone_min_px: int = 20
     # quality gates against a background patch taken for a cell (a deep scene: a bright disc on
-    # the wall behind can pass the flat / proud checks above); strict=False keeps only those
+    # the wall behind can pass the flat / proud checks above); strict=False keeps only those.
+    # The pair gates are judged on the whole set of candidate discs, not against whichever disc
+    # happened to be accepted first (a bright background disc must not set aside the real
+    # faces): the face set is chosen among the discs that pass every per-disc check, and a
+    # validated disc left out of that set that conflicts with it in depth (or is brighter than
+    # its faces) makes the result ambiguous: refused, both named, never guessed
     strict: bool = True
-    max_outline_rms_mm: float = 1.0     # flood rim circle rms on the face plane (good faces ~0.2-0.7)
-    strict_min_coverage: float = 0.7    # measured fraction of the disc
-    max_pair_dz_diam: float = 2.0       # |height difference| to an accepted face, x diameter
-    max_pair_spacing_diam: float = 6.0  # 3D centre spacing to an accepted face, x diameter
-    min_pair_spacing_diam: float = 0.9  # ... and at least this (two faces cannot overlap)
+    max_outline_rms_mm: float = 1.0     # flood rim circle rms on the face plane (good faces ~0.1-0.7)
+    strict_min_coverage: float = 0.7    # measured fraction of the disc; below it (down to
+                                        # min_face_coverage) only with a clean rim circle:
+    strict_partial_outline_rms_mm: float = 0.3   # real faces measured 0.5-0.7 on the bench
+                                        # (glint, zone edge) had rim rms 0.09-0.13 mm (one at
+                                        # 0.699: 0.49); background patches there measured
+                                        # 0.57-0.68 with no rim circle or a 0.8 mm one
+    max_pair_dz_diam: float = 2.0       # |height difference| between any two faces, x diameter
+    max_pair_spacing_diam: float = 6.0  # 3D centre spacing to the NEAREST other face, x diameter
+                                        # (a row of faces may span more; each needs a neighbour)
+    min_pair_spacing_diam: float = 0.9  # ... and to every other face at least this (no overlap)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -142,8 +153,8 @@ class StationParams:
             raise ValueError("zone_min_coverage must be in (0, 1]")
         if not 0 < p.strict_min_coverage <= 1:
             raise ValueError("strict_min_coverage must be in (0, 1]")
-        for k in ("max_outline_rms_mm", "max_pair_dz_diam", "max_pair_spacing_diam",
-                  "min_pair_spacing_diam"):
+        for k in ("max_outline_rms_mm", "strict_partial_outline_rms_mm", "max_pair_dz_diam",
+                  "max_pair_spacing_diam", "min_pair_spacing_diam"):
             v = getattr(p, k)
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not np.isfinite(v) or v < 0:
                 raise ValueError(f"{k} must be a number >= 0, got {v!r}")
@@ -351,13 +362,196 @@ def circle_in_plane(edge_px: np.ndarray, c, n, K, dist, iters: int = 6, k: float
     return c + q[0] * e1 + q[1] * e2, float(rad), float(np.sqrt(np.mean(res[keep] ** 2))), int(keep.sum())
 
 
+MAX_EXAMINED = 60          # strict selection: candidates validated first (brightest), before
+                           # the rest are looked at only when no face set is found among them
+MAX_SEARCH_STEPS = 200000  # strict selection: subset search budget (then refused, never guessed)
+
+
+def _overlap(a: dict, b: dict) -> bool:
+    (ax, ay, ar), (bx, by, br) = a["hough_px"], b["hough_px"]
+    return bool(np.hypot(ax - bx, ay - by) <= ar + br)
+
+
+def _select_cells(cands: list, g: np.ndarray, d: np.ndarray, prm: StationParams,
+                  r_exp_px: Optional[float], validate, pair) -> tuple:
+    """Strict selection: every candidate disc (brightest first) is validated on its own; the
+    face set is then the brightest set of n_cells validated discs in which every pair passes
+    pair(a, b) -> (why, near, depth_conflict), no two overlap, none is dimmer than
+    min_brightness_frac x the set's brightest, and each face has a near neighbour - so no
+    single disc (e.g. a bright background disc) is the reference the others are judged by.
+    Fail closed: a validated disc left out of the chosen set that is incompatible with it and
+    at least as bright as the set's dimmest face, or that conflicts with it in depth and
+    either goes with another left-out disc there (a partial set: the part with a face
+    missing?) or makes a full set of its own, makes the result ambiguous: StationError naming
+    both. A dimmer lone disc at another depth is set aside (named in `rejected`). ->
+    (faces, rejected), faces shorter than n_cells when no set passes."""
+    n = prm.n_cells
+    hint = bool(prm.cell_px_hint)
+    examined = []                                # [(cell, ok, why)] brightest first
+
+    def examine(batch):
+        for m, cx, cy, r in batch:
+            c = _refine(g, cx, cy, r, r_exp_px)
+            c.update({"hough_px": [cx, cy, r], "flood_level": m})
+            c["edge_px"] = rim_edges(d, c["px"][0], c["px"][1], float(r_exp_px or c["r_px"]))
+            ok, why = validate(c) if validate is not None else (True, "ok")
+            examined.append((c, ok, why))
+
+    rel_cache = {}
+
+    def rel(i, j, V):
+        """(why from V[i]'s side vs V[j], near, depth conflict) for two validated discs; the
+        depth conflict is the pair gate's whatever their brightness (a much brighter or much
+        dimmer disc at another depth still makes the choice ambiguous)."""
+        if (i, j) not in rel_cache:
+            a, b = V[i], V[j]
+            if _overlap(a, b):
+                rel_cache[(i, j)] = ("overlaps a brighter disc" if j < i else "", True, False)
+            else:
+                why, near, depth = pair(a, b)
+                if not why and not hint:
+                    if a["flood_level"] <= prm.min_brightness_frac * b["flood_level"]:
+                        why = f"dimmer than {prm.min_brightness_frac:g} x the brightest face"
+                    elif b["flood_level"] <= prm.min_brightness_frac * a["flood_level"]:
+                        why = (f"over {1 / max(prm.min_brightness_frac, 1e-9):.3g} x as bright "
+                               "as the faces")
+                rel_cache[(i, j)] = (why, near, depth)
+        return rel_cache[(i, j)]
+
+    def compatible(i, j, V):
+        return not _overlap(V[i], V[j]) and not rel(i, j, V)[0] and not rel(j, i, V)[0]
+
+    def connected(sel, V):
+        if len(sel) < 2:
+            return True
+        seen, todo = {sel[0]}, [sel[0]]
+        while todo:
+            i = todo.pop()
+            for j in sel:
+                if j not in seen and rel(i, j, V)[1]:
+                    seen.add(j)
+                    todo.append(j)
+        return len(seen) == len(sel)
+
+    split = []                                   # pairwise fine, but no neighbour chain
+
+    def search(V, forced=None):
+        """The first (brightest) feasible set, and the largest pairwise-compatible partial
+        (fewer than n_cells)."""
+        order = [i for i in range(len(V)) if i != forced]
+        best = [list([forced] if forced is not None else [])]
+        steps = [0]
+
+        def rec(start, sel):
+            steps[0] += 1
+            if steps[0] > MAX_SEARCH_STEPS:
+                raise StationError(f"too many candidate end-face discs ({len(V)} pass the per-disc "
+                                   "checks) to choose from: pass cell_px_hint or r_px_range, or "
+                                   "scan a tighter zone")
+            if len(best[0]) < len(sel) < n:
+                best[0] = list(sel)
+            if len(sel) == n:
+                if connected(sel, V):
+                    return list(sel)
+                if not split:
+                    split.append(list(sel))
+                return None
+            for p in range(start, len(order)):
+                i = order[p]
+                if all(compatible(i, j, V) for j in sel):
+                    hit = rec(p + 1, sel + [i])
+                    if hit is not None:
+                        return hit
+            return None
+        return rec(0, [forced] if forced is not None else []), best[0]
+
+    examine(cands[:MAX_EXAMINED])
+    V = [c for c, ok, _ in examined if ok]
+    chosen, partial = search(V)
+    if chosen is None and len(cands) > MAX_EXAMINED:
+        examine(cands[MAX_EXAMINED:])
+        V = [c for c, ok, _ in examined if ok]
+        rel_cache.clear()
+        split.clear()
+        chosen, partial = search(V)
+    if chosen is None and split:
+        D = prm.face_diameter_mm
+        raise StationError(
+            f"{n} end-face discs pass every check (at camera px "
+            + ", ".join(f"({V[i]['hough_px'][0]:.0f}, {V[i]['hough_px'][1]:.0f})" for i in split[0])
+            + f"), but they split into groups more than {prm.max_pair_spacing_diam:g} x the "
+            f"diameter ({prm.max_pair_spacing_diam * D:.0f} mm) apart: raise "
+            "max_pair_spacing_diam, or measure each group in its own scan zone")
+    if chosen is not None:
+        def at(s):
+            return ", ".join(f"({V[i]['hough_px'][0]:.0f}, {V[i]['hough_px'][1]:.0f})"
+                             for i in sorted(s))
+        lo_set = min(V[c]["flood_level"] for c in chosen)
+        out_ = [v for v in range(len(V))
+                if v not in chosen and not any(_overlap(V[v], V[c]) for c in chosen)]
+        deep = [v for v in out_ if any(rel(v, c, V)[2] for c in chosen)]
+        for v in out_:
+            depth = [c for c in chosen if rel(v, c, V)[2]]
+            other = [c for c in chosen if not compatible(v, c, V)]
+            bright = V[v]["flood_level"] >= lo_set and not hint
+            # a validated disc left out that goes with another left-out disc at its depth (a
+            # partial set there: the part with a face missing?)
+            group = depth and any(w != v and compatible(v, w, V) for w in deep)
+            if not ((depth and (bright or group)) or (other and bright)):
+                alt = search(V, forced=v)[0] if depth else None
+                if alt is None:
+                    continue                     # dimmer, alone, no full set of its own
+            else:
+                alt = search(V, forced=v)[0]
+            c = (depth or other)[0]
+            why = rel(v, c, V)[0] or rel(c, v, V)[0]
+            what = (f"the discs at camera px {at(chosen)} and those at {at(alt)} each pass "
+                    "every check" if alt is not None else
+                    f"the discs at camera px {at(chosen)} pass every check, and so does the "
+                    f"disc at {at([v])}")
+            raise StationError(
+                f"ambiguous end faces: {what}, but they do not go together ({why}): which is "
+                "the part - or is a face of it missing? Pass cell_px_hint, or scan a zone "
+                "that leaves the background out")
+    sel = chosen if chosen is not None else partial
+    faces = [V[i] for i in sel]
+    lo = min((c["flood_level"] for c in faces), default=np.inf)
+    rejected = []
+    for c, ok, why in examined:
+        if ok:
+            i = next(k for k, v in enumerate(V) if v is c)
+            if i in sel:
+                continue
+            bad = [rel(i, j, V) for j in sel if not compatible(i, j, V)]
+            if any(_overlap(c, V[j]) for j in sel):
+                continue                                 # another Hough circle on a face
+            if not bad and sel and not any(rel(i, j, V)[1] for j in sel):
+                D = prm.face_diameter_mm
+                bad = [(f"no face within {prm.max_pair_spacing_diam:g} x the diameter "
+                        f"({prm.max_pair_spacing_diam * D:.0f} mm) of it", False, False)]
+            if not bad:
+                continue                                 # a further face beyond n_cells
+            if chosen is not None and c["flood_level"] < lo and not any(b[2] for b in bad) and not hint:
+                continue                                 # dimmer than the faces: not needed
+            rejected.append({"hough_px": c["hough_px"], "why": "; ".join(dict.fromkeys(
+                b[0] for b in bad if b[0]))})
+        else:
+            if chosen is not None and not hint and (c["flood_level"] < lo
+                                                    or any(_overlap(c, f) for f in faces)):
+                continue                                 # never needed / a face's duplicate
+            rejected.append({"hough_px": c["hough_px"], "why": why})
+    return faces, rejected
+
+
 def find_cells(d: np.ndarray, prm: StationParams, r_exp_px: Optional[float] = None,
-               roi=None, validate=None) -> tuple:
+               roi=None, validate=None, pair=None) -> tuple:
     """Face discs on the flood difference image d (0..255) -> ([{px, r_px, hough_px, edge_px,
-    name, ...}] in C1..Cn order, [rejected candidates]). Candidates are taken brightest first,
-    non-overlapping; validate(cell) -> (ok, why) (the depth check: a flat face) sets aside
-    bright discs that are not faces; a disc dimmer than min_brightness_frac x the brightest
-    accepted one is not a face of the same kind."""
+    name, ...}] in C1..Cn order, [rejected candidates]). validate(cell) -> (ok, why) (the depth
+    check: a flat face) sets aside bright discs that are not faces. Without pair (strict off):
+    candidates are taken brightest first, non-overlapping, and a disc dimmer than
+    min_brightness_frac x the brightest accepted one is not a face of the same kind. With
+    pair(a, b) -> (why, near, depth_conflict) (the strict pair gates): the face set is chosen
+    among all validated discs (_select_cells), never anchored on the first one accepted."""
     import cv2
     g = cv2.GaussianBlur(np.clip(d, 0, 255).astype(np.uint8), (5, 5), 1.5)
     H, W = g.shape
@@ -387,28 +581,31 @@ def find_cells(d: np.ndarray, prm: StationParams, r_exp_px: Optional[float] = No
         cands.sort(reverse=True)
         if not cands:
             raise StationError(f"no face disc (radius {rmin}..{rmax} px) found on the flood")
-    out, rejected, top = [], [], None
-    for m, cx, cy, r in cands:
-        if len(out) == prm.n_cells:
-            break
-        if any(np.hypot(cx - c["hough_px"][0], cy - c["hough_px"][1]) <= r + c["hough_px"][2]
-               for c in out):
-            continue                                     # overlaps an accepted disc
-        if top is not None and m <= prm.min_brightness_frac * top:
-            rejected.append({"hough_px": [cx, cy, r], "why": f"dimmer than {prm.min_brightness_frac:g}"
-                                                              " x the brightest face"})
-            continue
-        c = _refine(g, cx, cy, r, r_exp_px)
-        c.update({"hough_px": [cx, cy, r], "flood_level": m})
-        c["edge_px"] = rim_edges(d, c["px"][0], c["px"][1], float(r_exp_px or c["r_px"]))
-        if validate is not None:
-            ok, why = validate(c)
-            if not ok:
-                rejected.append({"hough_px": [cx, cy, r], "why": why})
+    if pair is not None:
+        out, rejected = _select_cells(cands, g, d, prm, r_exp_px, validate, pair)
+    else:
+        out, rejected, top = [], [], None
+        for m, cx, cy, r in cands:
+            if len(out) == prm.n_cells:
+                break
+            if any(np.hypot(cx - c["hough_px"][0], cy - c["hough_px"][1]) <= r + c["hough_px"][2]
+                   for c in out):
+                continue                                     # overlaps an accepted disc
+            if top is not None and m <= prm.min_brightness_frac * top:
+                rejected.append({"hough_px": [cx, cy, r], "why": f"dimmer than {prm.min_brightness_frac:g}"
+                                                                  " x the brightest face"})
                 continue
-        if top is None and not prm.cell_px_hint:
-            top = m
-        out.append(c)
+            c = _refine(g, cx, cy, r, r_exp_px)
+            c.update({"hough_px": [cx, cy, r], "flood_level": m})
+            c["edge_px"] = rim_edges(d, c["px"][0], c["px"][1], float(r_exp_px or c["r_px"]))
+            if validate is not None:
+                ok, why = validate(c)
+                if not ok:
+                    rejected.append({"hough_px": [cx, cy, r], "why": why})
+                    continue
+            if top is None and not prm.cell_px_hint:
+                top = m
+            out.append(c)
     if len(out) < prm.n_cells:
         why = "; ".join(f"({x['hough_px'][0]:.0f}, {x['hough_px'][1]:.0f}): {x['why']}"
                         for x in rejected[:5])
@@ -486,28 +683,59 @@ def surround_same_frac(X: np.ndarray, cell: dict, f: dict, band=(1.2, 1.6),
     return float(np.sum(np.isfinite(h) & (np.abs(h) < tol_mm)) / ring.sum())
 
 
-def strict_gate(f: dict, others: list, prm: StationParams) -> str:
-    """'' when the fitted face f passes the strict quality gates, else every reason (joined):
-    its flood outline is ragged, too little of it is measured, or it sits implausibly far
-    (height along the accepted face's normal, or 3D spacing) from a face already accepted."""
+def strict_disc_gate(f: dict, prm: StationParams) -> list:
+    """The strict per-disc reasons of a fitted face f ([] = passes): its flood outline is
+    ragged, or too little of it is measured - a disc measured below strict_min_coverage passes
+    only with a clean flood rim circle (rms <= strict_partial_outline_rms_mm): the rim is what
+    shows an end face whose decode dropped out, a background patch has none (or a rough one)."""
     why = []
     rms = (f.get("outline") or {}).get("rms_mm")
     if rms is not None and rms > prm.max_outline_rms_mm:
         why.append(f"ragged outline (rim circle rms {rms:.2f} mm > {prm.max_outline_rms_mm:g})")
-    if f["coverage"] < prm.strict_min_coverage:
+    if f["coverage"] < prm.strict_min_coverage and (
+            rms is None or rms > prm.strict_partial_outline_rms_mm):
+        rim = ("no rim circle" if rms is None else
+               f"rim circle rms {rms:.2f} mm > {prm.strict_partial_outline_rms_mm:g}")
         why.append(f"only {100 * f['coverage']:.0f} % of the disc measured "
-                   f"(< {100 * prm.strict_min_coverage:.0f} %)")
+                   f"(< {100 * prm.strict_min_coverage:.0f} %) and {rim}: not shown to be an "
+                   "end face")
+    return why
+
+
+def strict_pair(f: dict, o: dict, prm: StationParams) -> tuple:
+    """The strict pair gate between two fitted faces -> (why from f's side, '' = compatible;
+    near: o within max_pair_spacing_diam x D; depth_conflict). The height difference is taken
+    along both faces' normals, the larger counts (symmetric)."""
     D = prm.face_diameter_mm
+    dv = np.asarray(f["centre"], float) - np.asarray(o["centre"], float)
+    dz = max((float(dv @ o["normal"]), float(dv @ f["normal"])), key=abs)
+    sp = float(np.linalg.norm(dv))
+    near = sp <= prm.max_pair_spacing_diam * D
+    if abs(dz) > prm.max_pair_dz_diam * D:
+        return (f"{dz:+.1f} mm in height from an accepted face (> {prm.max_pair_dz_diam:g} "
+                "x the diameter: background?)", near, True)
+    if sp < prm.min_pair_spacing_diam * D:
+        return (f"{sp:.1f} mm from an accepted face (plausible {prm.min_pair_spacing_diam:g}"
+                f"..{prm.max_pair_spacing_diam:g} x the diameter)", near, False)
+    return "", near, False
+
+
+def strict_gate(f: dict, others: list, prm: StationParams) -> str:
+    """'' when the fitted face f passes the strict quality gates against the faces `others`,
+    else every reason (joined): its flood outline is ragged, too little of it is measured, it
+    sits implausibly far in height from (or overlaps) one of them, or none of them is within
+    max_pair_spacing_diam x the diameter (a face needs a neighbour, not every face near)."""
+    why = strict_disc_gate(f, prm)
+    near, dist = False, []
     for o in others:
-        dv = f["centre"] - o["centre"]
-        dz = float(dv @ o["normal"])
-        sp = float(np.linalg.norm(dv))
-        if abs(dz) > prm.max_pair_dz_diam * D:
-            why.append(f"{dz:+.1f} mm in height from an accepted face (> {prm.max_pair_dz_diam:g} "
-                       "x the diameter: background?)")
-        elif not prm.min_pair_spacing_diam * D <= sp <= prm.max_pair_spacing_diam * D:
-            why.append(f"{sp:.1f} mm from an accepted face (plausible {prm.min_pair_spacing_diam:g}"
-                       f"..{prm.max_pair_spacing_diam:g} x the diameter)")
+        w, nr, _ = strict_pair(f, o, prm)
+        if w:
+            why.append(w)
+        near |= nr
+        dist.append(float(np.linalg.norm(np.asarray(f["centre"], float) - o["centre"])))
+    if others and not near and not any("in height" in w for w in why):
+        why.append(f"{min(dist):.1f} mm from the nearest accepted face (plausible "
+                   f"{prm.min_pair_spacing_diam:g}..{prm.max_pair_spacing_diam:g} x the diameter)")
     return "; ".join(why)
 
 
@@ -828,7 +1056,7 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
     if X.shape[:2] != flood_d.shape:
         raise StationError(f"flood {flood_d.shape} and scan {X.shape[:2]} differ in size")
     r_exp = expected_radius_px(X, K, prm.face_diameter_mm / 2)
-    fits, accepted = {}, []
+    fits = {}
 
     def validate(c):
         if r_exp and abs(c["r_px"] - r_exp) > 0.25 * r_exp:
@@ -847,15 +1075,20 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
             return False, (f"not a proud face: {100 * same:.0f} % of its surround continues its "
                            "plane (a flat patch of a larger surface)")
         if prm.strict:
-            why = strict_gate(f, [fits[k] for k in accepted], prm)
+            why = strict_disc_gate(f, prm)
             if why:
-                return False, why
+                return False, "; ".join(why)
         f["surround_same_frac"] = same
-        accepted.append(id(c))
         fits[id(c)] = f
         return True, "ok"
 
-    cells, rejected = find_cells(flood_d, prm, r_exp, validate=validate)
+    def pair(a, b):
+        return strict_pair(fits[id(a)], fits[id(b)], prm)
+
+    # strict: the pair gates are judged over every validated disc (find_cells chooses the
+    # set), not against whichever disc was accepted first
+    cells, rejected = find_cells(flood_d, prm, r_exp, validate=validate,
+                                 pair=pair if prm.strict else None)
     faces = [fits[id(c)] for c in cells]
     names = [c["name"] for c in cells]
     warnings = []

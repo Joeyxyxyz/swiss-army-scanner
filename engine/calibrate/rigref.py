@@ -67,16 +67,39 @@ def _working_distance(store, geometry_id: str, cal) -> Optional[float]:
 
 
 def _mock_shift(frames: list, shift) -> list:
+    """Mock only: the fresh frames moved as by a nudged camera - (dx, dy) px, optionally
+    (dx, dy, roll_deg) or (dx, dy, roll_deg, scale) about the image centre."""
     from scipy import ndimage
-    dx, dy = (float(v) for v in shift)
-    return [ndimage.shift(np.asarray(f, np.float64), (dy, dx), order=3, mode="nearest")
-            for f in frames]
+    v = [float(x) for x in shift]
+    if not 2 <= len(v) <= 4 or not all(np.isfinite(v)):
+        raise ValueError(f"mock_shift_px must be [dx, dy] (+ roll_deg, + scale), got {shift!r}")
+    dx, dy = v[0], v[1]
+    roll = v[2] if len(v) > 2 else 0.0
+    scale = v[3] if len(v) > 3 else 1.0
+    if roll == 0.0 and scale == 1.0:
+        return [ndimage.shift(np.asarray(f, np.float64), (dy, dx), order=3, mode="nearest")
+                for f in frames]
+    if not scale > 0:
+        raise ValueError(f"mock scale must be > 0, got {scale!r}")
+    out = []
+    for f in frames:
+        a = np.asarray(f, np.float64)
+        H, W = a.shape[:2]
+        c = np.array([(H - 1) / 2.0, (W - 1) / 2.0])
+        t = np.radians(roll)
+        # output (row, col) q <- input p = M^-1 (q - c - d) + c, M = scale x rotation by roll
+        # (x right, y down: the inverse of [[cos, sin], [-sin, cos]] in (row, col) order)
+        R = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]]) / scale
+        off = c - R @ (c + np.array([dy, dx]))
+        out.append(ndimage.affine_transform(a, R, offset=off, order=3, mode="nearest"))
+    return out
 
 
 def rig_check(s, preset, set_reference: bool = False, tol_px: float = rigcheck.DEFAULT_TOL_PX,
               mock_shift_px=None, label: str = "rigref") -> dict:
     if mock_shift_px is not None and not s.mock:
         raise rules.RuleViolation("mock_shift_px is mock-only (it fakes a nudged camera)")
+    tol_px = rigcheck.check_tol(tol_px)                 # before any frame is captured
     fp = config.geometry_fingerprint(preset)
     h, w = preset.projection.size[1], preset.projection.size[0]
     pats = [np.full((h, w), 255, np.uint8), rigcheck.random_block_pattern((h, w)),
@@ -109,9 +132,11 @@ def rig_check(s, preset, set_reference: bool = False, tol_px: float = rigcheck.D
                 "message": "no rig reference at this geometry yet: stored this one (take it "
                            "right after base / calibration, station in its usual empty state)"}
     fr = ref["frames"]
-    fl = rigcheck.phase_shift(fr["white"], white)
-    pt = rigcheck.phase_shift(rigcheck.normalised_pattern(fr["pattern"], fr["white"], fr["black"]),
-                              rigcheck.normalised_pattern(pattern, white, black))
+    # shift + roll + scale over the frame (a global shift alone misses a roll or a zoom /
+    # focus nudge about the image centre)
+    fl = rigcheck.motion(fr["white"], white)
+    pt = rigcheck.motion(rigcheck.normalised_pattern(fr["pattern"], fr["white"], fr["black"]),
+                         rigcheck.normalised_pattern(pattern, white, black))
     dist = _working_distance(s.store, preset.geometry_id, cal)
     mm_per_px = (dist / float(cal.K_cam[0][0])) if (dist and cal is not None) else None
     verdict = rigcheck.assess(fl, pt, tol_px, mm_per_px, dist)

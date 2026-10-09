@@ -226,6 +226,16 @@ def _list_of(cast, what: str):
     return conv
 
 
+def _finite_nonneg(text: str) -> float:
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError("must be a finite number >= 0")
+    return v
+
+
 def _positive_int(text: str) -> int:
     try:
         v = int(text)
@@ -2565,6 +2575,7 @@ def cmd_station_golden(ctx):
                            params=prm or None,
                            **_kw(cell_height_tol_mm=a.cell_tol, ct_zone_tol_mm=a.ct_tol,
                                  spacing_tol_mm=a.spacing_tol,
+                                 face_position_tol_mm=a.position_tol,
                                  cell_height_band_mm=(_numbers(a.cell_band, 2, "--cell-band")
                                                       if a.cell_band else None),
                                  ct_zone_band_mm=(_numbers(a.ct_band, 2, "--ct-band")
@@ -2584,6 +2595,9 @@ def cmd_station_golden(ctx):
                        + f"; tube zone +-{_f(lim['ct_zone_tol_mm'], 3)} mm"
                        + (f" and within {lim['ct_zone_band_mm']}" if lim["ct_zone_band_mm"] else "")
                        + (f"; spacing +-{lim['spacing_tol_mm']:g} mm" if lim["spacing_tol_mm"] else "")
+                       + "; end-face position within "
+                       + (f"{lim['face_position_tol_mm']:g} mm" if lim.get("face_position_tol_mm")
+                          else "the face diameter")
                        + (f"; item bands {lim['bands']}" if lim["bands"] else "")],
             ["stored", str(g.path)]])
     ctx.warn(g.warnings)
@@ -2911,7 +2925,9 @@ def cmd_rig_check(ctx):
     if a.mock_shift:
         if not ctx.mock:
             raise CLIError("--mock-shift needs --mock (it fakes a nudged camera)")
-        shift = _numbers(a.mock_shift, 2, "--mock-shift dx,dy (camera px)")
+        n = len([s for s in re.split(r"[,\s]+", a.mock_shift.strip()) if s])
+        shift = _numbers(a.mock_shift, min(max(n, 2), 4),
+                         "--mock-shift dx,dy[,roll_deg[,scale]] (camera px, deg, x)")
     r = api.rig_check(ctx.preset(), a.set_reference, a.tol, shift)
     ctx.say(f"Rig check: {r['status']}  {r['message']}")
     rows = [["reference", r.get("reference_id") or "-"], ["base", r.get("base_id") or "-"],
@@ -2921,6 +2937,12 @@ def cmd_rig_check(ctx):
         if v:
             rows.append([f"{k} shift", f"dx {v['dx']:+.2f}, dy {v['dy']:+.2f} px "
                                        f"(|{v['shift_px']:.2f}| px, match {v['peak']:.2f})"])
+            if v.get("motion_px") is not None:      # what the verdict judges (shift + roll + zoom)
+                rz = (f"roll {v['rotation_deg']:+.3f} deg, scale {v['scale_pct']:+.3f} %, "
+                      if v.get("similarity") else "roll / zoom not determined, ")
+                rows.append([f"{k} motion", f"{rz}largest {v['motion_px']:.2f} px "
+                                            f"({v.get('tiles_used', 0)}/{v.get('tiles', 0)} "
+                                            "tiles)"])
     if r.get("shift_mm") is not None:
         rows.append(["~mm", f"{r['shift_mm']:.3f} mm at {r.get('working_distance_mm')} mm"])
     ctx.kv(rows)
@@ -4228,7 +4250,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-ct", dest="no_ct", action="store_true", help="end faces only")
     p.add_argument("--no-strict", dest="no_strict", action="store_true",
                    help="drop the strict end-face gates (rim outline rms <= 1.0 mm, >= 70 %% of the "
-                        "disc measured, a plausible height / spacing to the other end faces)")
+                        "disc measured - 50-70 %% only with a clean rim circle - and a plausible "
+                        "height / spacing to the other end faces)")
     p = cmd("station-golden", cmd_station_golden, "station golden from GOOD measurements (metric "
                                                   "scans or station .json) + limits", "station golden")
     p.add_argument("items", nargs="+", help="metric scans (id / label) or station .json files")
@@ -4238,6 +4261,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ct-tol", dest="ct_tol", type=float, metavar="MM",
                    help="tube zone edge height: nominal +- this (default 0.30)")
     p.add_argument("--spacing-tol", dest="spacing_tol", type=float, metavar="MM")
+    p.add_argument("--position-tol", dest="position_tol", type=float, metavar="MM",
+                   help="each end face within this of its golden position, 3D (default: the "
+                        "face diameter): a face found elsewhere is never the part")
     p.add_argument("--cell-band", dest="cell_band", metavar="LO,HI",
                    help="absolute band for every end-face height difference, mm")
     p.add_argument("--ct-band", dest="ct_band", metavar="LO,HI",
@@ -4386,14 +4412,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --decode: camera-px low-pass of the fine fringes (default off)")
     p.add_argument("--label")
     p = cmd("rig-check", cmd_rig_check, "rig check: fresh flood + pattern vs the stored "
-                                        "reference -> camera / projector shift (px, ~mm)",
-            "the rig check")
+                                        "reference -> camera / projector motion (shift, roll, "
+                                        "zoom; px, ~mm)", "the rig check")
     p.add_argument("--set-reference", action="store_true",
                    help="store a new reference (right after base / calibration)")
-    p.add_argument("--tol", type=float, default=0.5, help="MOVED above this shift, px "
-                                                         "(default 0.5)")
-    p.add_argument("--mock-shift", metavar="DX,DY",
-                   help="mock only: shift the fresh frames (simulates a nudged camera)")
+    p.add_argument("--tol", type=_finite_nonneg, default=0.5,
+                   help="MOVED above this image motion, px (default 0.5; finite, >= 0)")
+    p.add_argument("--mock-shift", metavar="DX,DY[,ROLL[,SCALE]]",
+                   help="mock only: move the fresh frames (px, deg, x; simulates a nudged "
+                        "camera)")
     p = cmd("run", cmd_run, "flow-ready job: run a station config, write result.json + "
                             "run.log.jsonl in a new run folder (exit 0 PASS, 1 FAIL, "
                             "2 refused, 4 crashed, 5 INVALID)", "the station job")

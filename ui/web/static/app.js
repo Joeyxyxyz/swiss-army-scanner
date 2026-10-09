@@ -234,7 +234,7 @@ async function runJob(verb, args = {}, o = {}) {
 
 // =================================================================== state + status
 const S = {
-  status: null, geo: undefined, presets: [], form: null, loaded: null, loadedName: null,
+  status: null, geo: undefined, presets: [], builtins: [], form: null, loaded: null, loadedName: null,
   basesAll: [], bases: [], objects: [], banks: [], materials: [], readings: [], sensors: [],
   grid: null, zones: [], cloudId: null, calSel: new Set(), lastJobId: null, lastSpot: null,
 };
@@ -749,9 +749,11 @@ function renderGeoSuggest() {
 }
 function renderNameHint() {
   const name = S.form && S.form.name;
+  const builtin = name && S.builtins.includes(name);
   const exists = name && S.presets.includes(name);
-  $('#saveName').classList.toggle('invalid', !!(exists && !$('#saveOverwrite').checked && isDirty()));
-  $('#saveName').title = exists ? 'a preset with this name exists: pick a new name or tick overwrite' : '';
+  $('#saveName').classList.toggle('invalid', !!(builtin || (exists && !$('#saveOverwrite').checked && isDirty())));
+  $('#saveName').title = builtin ? 'built-in presets are read-only: save under a new name'
+    : (exists ? 'a user preset with this name exists: pick a new name or tick replace' : '');
 }
 function clearInvalid() { $$('#presetForm .fld.bad').forEach((e) => e.classList.remove('bad')); $$('#saveName, #saveGeo, #ledFs').forEach((e) => e.classList.remove('invalid')); }
 function markInvalid(msg) {
@@ -761,7 +763,7 @@ function markInvalid(msg) {
   const ch = /LED ([RGB])=/.exec(msg);
   if (ch) $$(`#ledFs .fld[data-led="${ch[1].toLowerCase()}"]`).forEach((f) => f.classList.add('bad'));
   else if (/\bLED\b|led[.\s]/.test(msg)) $$('#ledFs .fld').forEach((f) => f.classList.add('bad'));
-  if (/preset\.name|exists/.test(msg)) $('#saveName').classList.add('invalid');
+  if (/preset\.name|exists|built-in/.test(msg)) $('#saveName').classList.add('invalid');
   if (/geometry_id/.test(msg)) $('#saveGeo').classList.add('invalid');
   if (/basis|bases/.test(msg)) $$('#presetForm .fld[data-path^="basis:"]').forEach((f) => f.classList.add('bad'));
 }
@@ -770,6 +772,7 @@ async function refreshPresets(select) {
   try {
     const r = await api('/api/presets');
     S.presets = r.presets;
+    S.builtins = (r.tiers || []).filter((t) => t.tier === 'builtin').map((t) => t.name);
     const sel = $('#presetSel');
     const keep = select || sel.value || r.active;
     put(sel, ...r.presets.map((n) => h('option', { value: n }, n + (n === r.active ? '  (active)' : ''))));
@@ -872,14 +875,21 @@ async function savePreset(andLoad) {
   if (!S.form) { add(out, h('div', { class: 'alert warn' }, 'Open a preset in the editor first.')); return; }
   S.form.name = $('#saveName').value.trim();
   S.form.geometry_id = $('#saveGeo').value.trim();
+  if (S.builtins.includes(S.form.name)) {
+    add(out, h('div', { class: 'alert bad' }, h('b', null, `"${S.form.name}" is a built-in preset (read-only)`), 'Save your edits as a user preset under a new name.'));
+    $('#saveName').classList.add('invalid');
+    return;
+  }
   const overwrite = $('#saveOverwrite').checked;
   if (overwrite && S.presets.includes(S.form.name) &&
-      !confirm(`Overwrite preset "${S.form.name}"?\n\nScans already captured keep their recorded settings, but the preset file changes for everything loaded from it later.`)) return;
+      !confirm(`Replace user preset "${S.form.name}"?\n\nThe old version moves to the library trash. Scans already captured keep their recorded settings, but everything loaded from this preset later uses the new settings.`)) return;
   const btns = [$('#saveBtn'), $('#saveLoadBtn')];
   btns.forEach((b) => { b.disabled = true; });
   try {
-    const r = await api('/api/presets', { body: { preset: S.form, overwrite } });
-    add(out, h('div', { class: 'alert ok' }, h('b', null, `Saved ${r.saved}`), h('div', { class: 'msg' }, r.path)));
+    // a USER preset in this library, copied from the preset the editor opened (built-ins
+    // are never written)
+    const r = await api('/api/presets', { body: { preset: S.form, base: S.loadedName, overwrite } });
+    add(out, h('div', { class: 'alert ok' }, h('b', null, `Saved user preset ${r.saved}`), h('div', { class: 'msg' }, r.path), r.note || ''), warningsList(r.warnings || []));
     S.loaded = clone(S.form);
     S.loadedName = r.saved;
     $('#editorName').textContent = r.saved;

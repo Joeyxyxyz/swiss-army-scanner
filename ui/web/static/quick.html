@@ -23,7 +23,7 @@
     <label class="qfield"><span>Work state (station config)</span>
       <select id="qStation"></select></label>
     <div id="qStationInfo" class="qinfo muted"></div>
-    <div class="qinfo">Active preset: <b id="qPreset">-</b></div>
+    <div class="qinfo">Preset START runs: <b id="qPreset">-</b> <span id="qPresetLoaded" class="muted small"></span></div>
 
     <div class="qpanels">
       <details class="qpanel" id="qLights">
@@ -76,7 +76,8 @@
       <li id="qStepCamera"><b>Camera</b><span>capture</span></li>
       <li id="qStepAction"><b>Action</b><span>measure + verdict</span></li>
     </ol>
-    <div class="qlegend muted small">Keys: <kbd>Space</kbd>/<kbd>Enter</kbd> START,
+    <div class="qlegend muted small">Keys: <kbd>Space</kbd>/<kbd>Enter</kbd> START (unless a button
+      or link has the focus: then they press it),
       <kbd>Esc</kbd> ABORT, <kbd>H</kbd> HOME, <kbd>T</kbd> TRIGGER, <kbd>A</kbd> ARM / DISARM,
       <kbd>1</kbd>-<kbd>9</kbd> work state. Also POST /api/cmd/&lt;start|abort|home|trigger|arm|disarm|workstate&gt;.</div>
   </section>

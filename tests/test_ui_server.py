@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from engine import api, rules
+from engine import api, config, rules
 
 from conftest import PRESET, ROOT
 
@@ -97,14 +97,15 @@ def ui(tmp_path_factory):
 @pytest.fixture(scope="module")
 def fast(ui):
     """Save + load a copy of the correct-orientation preset with camera.average=1,
-    through the same endpoints the Setup tab uses."""
+    through the same endpoints the Setup tab uses (a USER preset in the library)."""
     c, app, presets = ui
     _, d = c.get(f"/api/presets/{PRESET}")
     p = d["preset"]
     p["name"], p["camera"]["average"] = "ui_fast", 1
-    status, r = c.post("/api/presets", {"preset": p})
+    status, r = c.post("/api/presets", {"preset": p, "base": PRESET})
     assert status == 200, r
-    assert (presets / "ui_fast.json").exists()
+    assert r["tier"] == "user" and not (presets / "ui_fast.json").exists()
+    assert (config.user_presets_dir(app.root) / "ui_fast" / config.USER_PRESET_FILE).is_file()
     status, j = c.post("/api/presets/ui_fast/load", {})
     assert status == 200 and j["status"] == "done", j
     assert j["result"]["camera"]["average"] == 1
@@ -439,26 +440,67 @@ def test_presets_list_and_get(ui):
 
 
 def test_preset_save_returns_validation_errors_verbatim(ui):
-    c, _, presets = ui
+    c, app, presets = ui
     _, d = c.get(f"/api/presets/{PRESET}")
     p = d["preset"]
 
     hot = json.loads(json.dumps(p))
     hot["name"] = "ui_hot"
     hot["projection"]["led"] = {"mode": "continuous", "r": 200}
-    status, r = c.post("/api/presets", {"preset": hot})
+    status, r = c.post("/api/presets", {"preset": hot, "base": PRESET})
     assert status == 400 and "SafetyViolation" in r["error"] and "thermal limit" in r["error"]
 
     typo = json.loads(json.dumps(p))
     typo["name"] = "ui_typo"
     typo["camera"]["exposure"] = 5000
-    status, r = c.post("/api/presets", {"preset": typo})
+    status, r = c.post("/api/presets", {"preset": typo, "base": PRESET})
     assert status == 400 and "unknown keys" in r["error"] and "exposure" in r["error"]
 
-    status, r = c.post("/api/presets", {"preset": p})          # same name, no overwrite
-    assert status == 400 and "exists" in r["error"]
+    status, r = c.post("/api/presets", {"preset": p})          # a built-in's own name
+    assert status == 400 and "built-in" in r["error"]
+    users = config.user_presets_dir(app.root)
     assert not (presets / "ui_hot.json").exists() and not (presets / "ui_typo.json").exists()
+    assert not any((users / n).exists() for n in ("ui_hot", "ui_typo", PRESET))
     assert c.post("/api/presets", {"nope": 1})[0] == 400
+    new = json.loads(json.dumps(p))
+    new["name"] = "ui_nobase"
+    status, r = c.post("/api/presets", {"preset": new})        # a new name needs its base
+    assert status == 400 and "base" in r["error"]
+    status, r = c.post("/api/presets", {"preset": new, "base": PRESET, "overwrite": "yes"})
+    assert status == 400 and "overwrite" in r["error"]
+
+
+def test_setup_save_writes_a_user_preset_never_the_builtin_folder(ui):
+    """The Setup editor's Save used to write <presets>/<name>.json - the tracked built-in
+    folder (a part / line name ending up in the repo) - and 'overwrite' rewrote a built-in.
+    It now saves a USER preset in the library, like preset_add: built-ins are read-only."""
+    c, app, presets = ui
+    before = {f.name: f.read_bytes() for f in presets.glob("*.json")}
+    _, d = c.get(f"/api/presets/{PRESET}")
+    p = d["preset"]
+    p["name"], p["camera"]["exposure_us"] = "ui_line_part", p["camera"]["exposure_us"] + 1000
+    status, r = c.post("/api/presets", {"preset": p, "base": PRESET})
+    assert status == 200 and r["saved"] == "ui_line_part" and r["tier"] == "user", r
+    users = config.user_presets_dir(app.root)
+    saved = users / "ui_line_part" / config.USER_PRESET_FILE
+    assert Path(r["path"]) == saved and saved.is_file() and not r["overwrote"]
+    assert json.loads(saved.read_text())["camera"]["exposure_us"] == p["camera"]["exposure_us"]
+    _, lst = c.get("/api/presets")
+    assert {t["name"]: t["tier"] for t in lst["tiers"]}["ui_line_part"] == "user"
+    status, r = c.post("/api/presets", {"preset": p, "base": PRESET})     # exists, no replace
+    assert status == 400 and "exists" in r["error"]
+    p["camera"]["exposure_us"] += 1000
+    status, r = c.post("/api/presets", {"preset": p, "base": "ui_line_part", "overwrite": True})
+    assert status == 200 and r["overwrote"] and r["replaced"], r       # old one -> trash
+    assert json.loads(saved.read_text())["camera"]["exposure_us"] == p["camera"]["exposure_us"]
+    assert Path(r["replaced"]).is_dir() and "trash" in Path(r["replaced"]).parts
+    # 'overwrite' never reaches a built-in
+    _, d = c.get(f"/api/presets/{PRESET}")
+    b = d["preset"]
+    b["camera"]["exposure_us"] += 1000
+    status, r = c.post("/api/presets", {"preset": b, "base": PRESET, "overwrite": True})
+    assert status == 400 and "built-in" in r["error"]
+    assert {f.name: f.read_bytes() for f in presets.glob("*.json")} == before
 
 
 def test_load_preset_makes_it_active(fast):
@@ -814,7 +856,7 @@ def test_live_view_duration_is_capped_and_checked_against_led_limits(fast):
     p = d["preset"]
     p["name"] = "ui_burst"
     p["projection"]["led"] = {"mode": "burst", "r": 170, "g": 200, "b": 200}
-    status, r = c.post("/api/presets", {"preset": p})
+    status, r = c.post("/api/presets", {"preset": p, "base": "ui_fast"})
     assert status == 200, r
     try:
         assert c.post("/api/presets/ui_burst/load", {})[1]["status"] == "done"

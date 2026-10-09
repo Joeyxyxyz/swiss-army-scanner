@@ -30,9 +30,13 @@ job.type recipe, engine/recipes/; its verdict is then painted on the part by a s
 state - clears); ABORT sets
 the job's cancel event, which the engine checks before every capture (the
 rig is closed on the way out: projector idle, rig lock released) and the run
-is recorded as ABORTED; HOME (when idle, or queued behind an ABORT) runs the
+is recorded as ABORTED. ABORT in any state also stops what runs outside a cycle: the
+projected verdict, the live view, station / recipe runs and rig checks submitted as jobs.
+HOME (when idle, or queued behind an ABORT) runs the
 rig check. Every command (page buttons, keys, POST /api/cmd/*, hardware
-inputs) goes through one state machine: engine/control/commands.py.
+inputs) goes through one state machine: engine/control/commands.py. Every bus job
+reports back to it when it ends, also when it is cancelled or dropped before it ran;
+a busy state with no job left to report back is settled (never wedged).
 
 Live view: it holds the rig (camera + DMD + the machine-wide rig lock), so
 it stops when a rig job is queued, when the operator presses Stop (even
@@ -64,6 +68,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import numpy as np
 
 from engine import api, config, rules
+from engine.control.commands import BUSY as BUS_BUSY
 from engine.library import presets as preset_lib
 from engine.library.store import OUTPUT_KINDS
 from engine.reconstruct import pointcloud
@@ -156,8 +161,9 @@ VERBS: dict = {
                     "description": "text: what part / line it is for",
                     "replace": "bool: replace an existing USER preset (old one to trash/)"}),
     "preset_select": ("Select (and load) the library's active preset: the default when no preset "
-                      "is named. A station config's own preset still wins. Refused while a "
-                      "station run is busy.", {"name": "preset name (GET /api/presets)"}),
+                      "is named (this server loads it at start; a station run naming no preset "
+                      "uses the LOADED one). A station config's own preset still wins. Refused "
+                      "while a station run is busy.", {"name": "preset name (GET /api/presets)"}),
     "preset_delete": ("Move a USER preset to the library trash (recoverable). Refused for "
                       "built-ins, the active preset, and presets a station config uses (unless "
                       "force). Needs confirm=true.",
@@ -628,8 +634,9 @@ VERBS: dict = {
     # UI verbs (not engine.api verbs)
     "run_station": ("Run one station config (stations/<config>.json) exactly like `scan run`: "
                     "a new run folder with result.json + run.log.jsonl; PASS / FAIL / INVALID / "
-                    "ABORTED (cancel the job to abort between captures). The real rig needs "
-                    "operator_confirmed.",
+                    "ABORTED (cancel the job to abort between captures). A config naming no "
+                    "preset (and not a recipe) runs the LOADED preset (refused when none is "
+                    "loaded). The real rig needs operator_confirmed.",
                     {"config": "station config file name (GET /api/stations)",
                      "operator_confirmed": "bool: a human confirmed the physical setup "
                                            "(required on the real rig)",
@@ -674,6 +681,7 @@ PRESET_CHANGE_VERBS = frozenset({"load_preset", "preset_select", "preset_delete"
 # running jobs that may be aborted: the engine checks the job's cancel event before every
 # capture (ScanSession.cancel), so the rig is never left mid-sequence
 CANCELLABLE_VERBS = frozenset({"run_station", "rig_check", "recipe_run", "recipe_feedback"})
+CONFIRMED_CMDS = frozenset({"START", "TRIGGER", "ARM"})   # bus commands that read operator_confirmed
 
 
 class ArgError(ValueError):
@@ -860,6 +868,18 @@ def _bool(a: dict, k: str, default: bool = False) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in ("1", "true", "yes", "on")
     return bool(v)
+
+
+def _confirmed(a: dict, k: str) -> bool:
+    """A human's confirmation (operator_confirmed, empty_confirmed, confirm): only a JSON
+    true confirms; absent / null / false do not, and anything else ("false", "yes", 1) is
+    refused rather than guessed."""
+    v = a.get(k)
+    if v is None or v is False:
+        return False
+    if v is True:
+        return True
+    raise ArgError(f"'{k}' must be a JSON boolean (true / false), got {type(v).__name__} {v!r}")
 
 
 def _num_list(a: dict, k: str, cast=float) -> Optional[list]:
@@ -1100,10 +1120,13 @@ class App:
         # buttons, keys, POST /api/cmd/*, hardware inputs) goes through its state machine
         from engine.control.commands import CommandBus, Handlers
         self.bus = CommandBus(Handlers(start=self._bus_start, abort=self._bus_abort,
-                                       home=self._bus_home, select=self._bus_select),
+                                       home=self._bus_home, select=self._bus_select,
+                                       pending=self._bus_pending),
                               require_confirmation=not self.mock)
-        self._bus_jobs: dict = {}               # job id -> "run" | "home"
-        self._home_args: dict = {}
+        # job id -> "run" | "home": registered under _cv BEFORE the job is queued (so the
+        # worker can never finish it unannounced), popped by _bus_notify. Lock order:
+        # bus._lock, then _cv - never the other way round.
+        self._bus_jobs: dict = {}
         self.library = Path(library) if library else None
         self.presets_dir = Path(presets_dir) if presets_dir else None
         self.preset_name = preset_name
@@ -1140,10 +1163,13 @@ class App:
         with self._cv:
             self._stop_live_locked("server shutting down")
             self._closing = True
-            for job in self._queue:
+            dropped = list(self._queue)
+            for job in dropped:
                 self._fail(job, "server shutting down", "Cancelled")
             self._queue.clear()
             self._cv.notify_all()
+        for job in dropped:                     # never ran: the bus still hears it ended
+            self._bus_notify(job)
         if self._thread.is_alive() and threading.current_thread() is not self._thread:
             self._thread.join(timeout)
 
@@ -1245,7 +1271,10 @@ class App:
         return c.value
 
     # ---------------------------------------------------------------- jobs
-    def submit(self, verb: str, args: Optional[dict] = None) -> Job:
+    def submit(self, verb: str, args: Optional[dict] = None,
+               bus_kind: Optional[str] = None) -> Job:
+        """Queue a job. bus_kind ('run' | 'home'): a job the command bus started; it is
+        registered before the worker can see it, so its end always reaches the bus."""
         if verb not in VERBS:
             raise HTTPError(400, f"unknown or not exposed verb {verb!r}; see GET /api/verbs")
         args = dict(args or {})
@@ -1270,6 +1299,8 @@ class App:
                 # view still waiting in the queue is dropped too)
                 if self._stop_live_locked(f"stopped so {verb} ({job.id}) could use the rig"):
                     job.note = "live view stopped so this job could use the rig"
+            if bus_kind is not None:
+                self._bus_jobs[job.id] = bus_kind
             self._jobs[job.id] = job
             self._queue.append(job)
             self._prune()
@@ -1297,6 +1328,7 @@ class App:
             return self._stop_live_locked(why)
 
     def cancel(self, job_id: str) -> Job:
+        dropped = None
         with self._cv:
             job = self._jobs.get(job_id)
             if job is None:
@@ -1304,6 +1336,7 @@ class App:
             if job.status == "queued":
                 self._queue.remove(job)
                 self._fail(job, "cancelled by the operator before it started", "Cancelled")
+                dropped = job
             elif job.status == "running" and job.verb == "live_view":
                 self.live.stopped_because = "stopped by the operator"
                 job.cancel.set()
@@ -1312,7 +1345,9 @@ class App:
                 job.note = "abort requested: stops before the next capture"
             elif job.status == "running":
                 raise HTTPError(409, "a running capture can't be interrupted mid-sequence")
-            return job
+        if dropped is not None:                 # never ran: the bus still hears it ended
+            self._bus_notify(dropped)
+        return job
 
     def _fail(self, job: Job, msg: str, etype: str):
         job.status, job.error, job.error_type = "error", msg, etype
@@ -1367,10 +1402,9 @@ class App:
 
     def _bus_start(self, workstate: str, confirmed: bool) -> str:
         self.clear_feedback("cleared: the next cycle started")
-        job = self.submit("run_station", {"config": workstate,
-                                          "operator_confirmed": bool(confirmed)})
-        self._bus_jobs[job.id] = "run"
-        return job.id
+        return self.submit("run_station", {"config": workstate,
+                                           "operator_confirmed": confirmed is True},
+                           bus_kind="run").id
 
     def _bus_select(self, workstate: str, preset: Optional[str]) -> Optional[str]:
         """SELECT_WORKSTATE accepted: load the work state's preset (its part recipe)."""
@@ -1383,37 +1417,77 @@ class App:
         return self.abort_runs("ABORT")
 
     def _bus_home(self) -> str:
+        """HOME accepted (now, or after the abort it was queued behind): the rig check with
+        that HOME request's options (bus.home_args: set_reference, tol_px, mock_shift_px)."""
         self.clear_feedback("cleared: HOME")
-        args, self._home_args = self._home_args, {}
-        job = self.submit("rig_check", args)
-        self._bus_jobs[job.id] = "home"
-        return job.id
+        args = dict(self.bus.home_args or {})
+        return self.submit("rig_check", args, bus_kind="home").id
+
+    def _bus_pending(self) -> bool:
+        """Is a job the bus started still going to report back? (Handlers.pending)"""
+        with self._cv:
+            return bool(self._bus_jobs)
+
+    def bus_jobs(self) -> dict:
+        with self._cv:
+            return dict(self._bus_jobs)
 
     def _bus_notify(self, job: Job) -> None:
-        kind = self._bus_jobs.pop(job.id, None)
-        if kind is None:
-            return
-        r = job.result if isinstance(job.result, dict) else {}
-        self.bus.job_finished(kind, r.get("result") if kind == "run" else r.get("status"),
-                              job.error if job.status == "error" else None)
+        """A bus job ended - ran, failed, or was cancelled / dropped before it ran: tell the
+        bus. The pop and job_finished happen under the bus lock, so bus_reconcile never sees
+        the gap between them as a lost job."""
+        with self.bus._lock:
+            with self._cv:
+                kind = self._bus_jobs.pop(job.id, None)
+            if kind is None:
+                return
+            r = job.result if isinstance(job.result, dict) else {}
+            error = job.error if job.status == "error" else None
+            if kind == "run":
+                result = r.get("result")
+                if error and job.error_type == "Cancelled":    # dropped before it ran: an
+                    result, error = "ABORTED", None             # abort, not a crash
+                self.bus.job_finished("run", result, error)
+            else:
+                self.bus.job_finished("home", r.get("status"), error)
+
+    def bus_reconcile(self) -> None:
+        """Recovery: a busy bus state (RUNNING / ABORTING / HOMING) with no job left that
+        will report back is settled (job_lost) instead of wedging the station."""
+        with self.bus._lock:
+            if self.bus.state in BUS_BUSY and not self._bus_pending():
+                self.bus.job_lost("no station job is running or queued any more")
+
+    def cmd_state(self) -> dict:
+        """The bus snapshot for /quick and a PLC gateway, plus the bus jobs, the loaded
+        preset (active_preset) and the preset START would run (run_preset: the work state's
+        own preset, else the loaded one - what _v_run_station uses)."""
+        self.bus_reconcile()
+        snap = self.bus.snapshot()
+        snap["jobs"] = self.bus_jobs()
+        p = self.session.preset
+        snap["active_preset"] = p.name if p is not None else None
+        snap["run_preset"] = snap.get("workstate_preset") or snap["active_preset"]
+        return snap
 
     def refresh_workstates(self) -> list:
+        """Re-read the station configs and hand them to the bus: every config in file-name
+        order (an invalid one keeps its number and is marked unusable, so a PLC's work-state
+        number never shifts because another config broke). The bus never switches the
+        selected work state on its own, and keeps the list as it is while ARMED or busy."""
         items = self.stations()
-        names = [i["config"] for i in items if not i.get("error")]
-        with self.bus._lock:
-            self.bus.workstate_presets = {i["config"]: i.get("preset") for i in items
-                                          if not i.get("error")}
-            self.bus.workstate_info = {i["config"]: {"recipe": i["recipe"],
-                                                     "result_codes": i.get("result_codes")}
-                                       for i in items if not i.get("error") and i.get("recipe")}
-            if self.bus.state in ("READY", "ARMED", "FAULT"):
-                self.bus.workstates = names
-                if self.bus.workstate not in names:
-                    self.bus.workstate = names[0] if names else None
+        ok = [i for i in items if not i.get("error")]
+        self.bus.update_workstates(
+            [i["config"] for i in items],
+            unusable={i["config"]: i["error"] for i in items if i.get("error")},
+            presets={i["config"]: i.get("preset") for i in ok},
+            info={i["config"]: {"recipe": i["recipe"], "result_codes": i.get("result_codes")}
+                  for i in ok if i.get("recipe")})
         return items
 
     def abort_runs(self, why: str = "aborted by the operator") -> list:
-        """ABORT: drop queued station runs and rig checks, abort the running one.
+        """ABORT (in any bus state): drop queued station / recipe runs, rig checks and
+        projected verdicts, abort the running one, stop the live view.
         -> ids of the jobs touched."""
         dropped = []
         with self._cv:
@@ -1428,7 +1502,8 @@ class App:
                 cur.cancel.set()
                 cur.note = "abort requested: stops before the next capture"
                 touched.append(cur.id)
-            self._stop_live_locked(why)
+            if self._stop_live_locked(why):
+                touched.append("live view")
         for j in dropped:                       # never ran: the bus still hears it ended
             self._bus_notify(j)
         return touched
@@ -1761,15 +1836,44 @@ class App:
                             "triangulation_angle_deg": rig.triangulation_angle_deg}}
 
     def save_preset(self, body: dict) -> dict:
+        """The Setup editor's Save: a USER preset in this library (<library>/presets/<name>/,
+        runtime data), never a file in the built-in presets folder (read-only, tracked in
+        the repo). Same path as the preset_add verb: a built-in name is refused, and
+        overwrite replaces an existing USER preset (the old one goes to the library trash).
+        body: {"preset": {...}, "base": the preset the editor opened, "overwrite": false,
+        "description": text}."""
+        usage = ("body must be {\"preset\": {...}, \"base\": \"<the preset it was edited from>\", "
+                 "\"overwrite\": false}")
         d = body.get("preset")
         if not isinstance(d, dict):
-            raise HTTPError(400, "body must be {\"preset\": {...}, \"overwrite\": false}")
-        overwrite = bool(body.get("overwrite", False))
+            raise HTTPError(400, usage)
+        name = d.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPError(400, "preset.name is required")
+        overwrite = body.get("overwrite", False)
+        if not isinstance(overwrite, bool):
+            raise HTTPError(400, "overwrite must be a JSON boolean (true / false)")
+        base = body.get("base")
+        if base is None and name in self.preset_names():
+            base = name                         # re-saving an existing preset under its name
+        if not isinstance(base, str) or not base:
+            raise HTTPError(400, "'base' (the preset this one was edited from) is required: "
+                                 + usage)
         try:
-            path = config.save_preset(d, presets_dir=self.presets_path, overwrite=overwrite)
+            self.check_preset_name(base)
+        except HTTPError as e:
+            raise HTTPError(400, f"base: {e.msg}") from None
+        geo = d.get("geometry_id")
+        overrides = {k: v for k, v in d.items() if k not in ("name", "geometry_id")}
+        try:
+            r = preset_lib.add(self.session.store, self.presets_path, name, base, overrides,
+                               geo, str(body.get("description") or ""), replace=overwrite)
         except Exception as e:          # noqa: BLE001 - validation errors go back verbatim
             raise HTTPError(400, f"{type(e).__name__}: {e}") from None
-        return {"saved": d["name"], "path": str(path), "overwrote": overwrite}
+        return {"saved": r["name"], "tier": "user", "path": str(r["path"]),
+                "overwrote": bool(r.get("replaced")),
+                "replaced": str(r["replaced"]) if r.get("replaced") else None,
+                "warnings": list(r.get("warnings") or []), "note": r.get("note")}
 
     # ================================================================ verbs
     # Each _v_<verb> runs ON THE WORKER. Returns result or (result, links).
@@ -1798,7 +1902,7 @@ class App:
                 "warnings": list(p.warnings)}
 
     def _v_preset_delete(self, a):
-        if not _bool(a, "confirm"):
+        if not _confirmed(a, "confirm"):
             raise ArgError("preset_delete needs confirm=true (the operator confirmed the delete)")
         name = self.check_preset_name_arg(_s(a, "name", required=True))
         p = self.session.preset
@@ -2006,7 +2110,7 @@ class App:
         return api.teach_presence(
             _s(a, "name", required=True), _at(a), _num(a, "diameter_mm"),
             _s(a, "method", "photoelectric"), self._preset(),
-            empty_confirmed=_bool(a, "empty_confirmed"),
+            empty_confirmed=_confirmed(a, "empty_confirmed"),
             **_kw(mm_per_dmd_px=_num(a, "mm_per_dmd_px"), threshold=_num(a, "threshold"),
                   min_height_mm=_num(a, "min_height_mm"), level=_num(a, "level", cast=int)))
 
@@ -2770,6 +2874,17 @@ class App:
             out.append(item)
         return out
 
+    @staticmethod
+    def _config_names_preset(f: Path) -> bool:
+        """Does the station config pin its own preset (directly, or through its recipe)?
+        An unreadable config counts as yes: the run then refuses it with its own error."""
+        from ui import run_job as RJ
+        try:
+            c = RJ.load_station_config(f)
+        except Exception:               # noqa: BLE001 - cmd_run reports the config's error
+            return True
+        return bool(c.preset) or c.job_type == "recipe"
+
     def _station_file(self, name) -> Path:
         if not isinstance(name, str) or not _NAME_RE.match(name) or not name.endswith(".json"):
             raise ArgError("config must be a station config file name from GET /api/stations")
@@ -2782,7 +2897,7 @@ class App:
         """`scan run <config>` in-process, on the server's own session and library."""
         from ui import cli
         f = self._station_file(a.get("config"))
-        confirmed = _bool(a, "operator_confirmed")
+        confirmed = _confirmed(a, "operator_confirmed")
         mock_part = _s(a, "mock_part")
         if mock_part is not None and not self.mock:
             raise ArgError("mock_part is MOCK ONLY")
@@ -2793,11 +2908,16 @@ class App:
         argv += (["--mock-part", mock_part] if mock_part else [])
         argv += ["run", str(f), "--no-feedback"] + (["--operator-confirmed"] if confirmed else [])
         args = cli.build_parser().parse_args(argv)
-        args.preset_given = False
+        args.preset_given = False               # the config's (or its recipe's) preset wins
         args.mock_part_given = mock_part is not None    # else the config's own mock_part
-        act = api.preset_active()               # no station preset: the selected one
-        if act:
-            args.preset = act
+        loaded = self.session.preset
+        if loaded is not None:
+            # a config naming no preset runs the LOADED one: what /quick shows (run_preset)
+            # and what the operator set up - never the CLI's default preset
+            args.preset = loaded.name
+        elif not self._config_names_preset(f):
+            raise ArgError("this station config names no preset and none is loaded: load one "
+                           "in Setup (or name one in the config)")
         ctx = cli.Ctx(args)
         ctx.session = self.session
         ctx._outputs_before = len(self.session.store.outputs())
@@ -2876,7 +2996,7 @@ class App:
         return api.recipe_select(self.check_recipe_name(_s(a, "name", required=True)))
 
     def _v_recipe_delete(self, a):
-        if not _bool(a, "confirm"):
+        if not _confirmed(a, "confirm"):
             raise ArgError("recipe_delete needs confirm=true (the operator confirmed the delete)")
         return api.recipe_delete(self.check_recipe_name(_s(a, "name", required=True)),
                                  _s(a, "reason", required=True), _bool(a, "force"),
@@ -3215,28 +3335,37 @@ class Handler(BaseHTTPRequestHandler):
                     "dir": str(self.app.stations_dir)})
 
     def r_cmd_state(self, q, body):
-        snap = self.app.bus.snapshot()
-        snap["jobs"] = dict(self.app._bus_jobs)
-        p = self.app.session.preset
-        snap["active_preset"] = p.name if p is not None else None
-        self._json(snap)
+        self._json(self.app.cmd_state())
 
     def r_cmd(self, q, body, name):
         """One command through the bus (page buttons, keys, a PLC / HMI gateway). 200 when
-        accepted, 409 when the state machine refused it (the reply says why).
-        body: operator_confirmed (start / trigger / arm on the real rig), workstate (a
-        config name or a 1-based index), home: set_reference, tol_px, mock_shift_px."""
+        accepted, 409 when the state machine refused it (the reply says why), 400 for a
+        malformed body. body: operator_confirmed (start / trigger / arm on the real rig: a
+        JSON boolean, only true confirms), workstate (workstate: the config name or 1-based
+        index to select; start / trigger / arm: the one the sender expects - refused when
+        another is selected), home: set_reference, tol_px, mock_shift_px."""
         app = self.app
         cmd = {"workstate": "SELECT_WORKSTATE"}.get(name, name.upper())
-        if cmd == "HOME":
-            app._home_args = {k: body[k] for k in ("set_reference", "tol_px", "mock_shift_px")
-                              if body.get(k) is not None}
+        confirmed = body.get("operator_confirmed")
+        # only the commands that start something read the confirmation: a malformed one is
+        # refused there; ABORT / DISARM / HOME / RESET ignore the field (never refused for it)
+        if cmd in CONFIRMED_CMDS and confirmed is not None and not isinstance(confirmed, bool):
+            raise HTTPError(400, "operator_confirmed must be a JSON boolean (true / false), got "
+                                 f"{type(confirmed).__name__} {confirmed!r}")
+        if cmd not in CONFIRMED_CMDS:
+            confirmed = None
+        if cmd == "HOME":           # the options travel with the request the bus accepts
+            arg = {k: body[k] for k in ("set_reference", "tol_px", "mock_shift_px")
+                   if body.get(k) is not None}
+        else:
+            arg = body.get("workstate")
         src = str(body.get("source") or "http")[:40]
-        r = app.bus.command(cmd, source=src, arg=body.get("workstate"),
-                            confirmed=bool(body.get("operator_confirmed")))
-        p = app.session.preset
-        out = {**r.to_dict(), "bus": app.bus.snapshot(),
-               "jobs": dict(app._bus_jobs), "active_preset": p.name if p is not None else None}
+        if cmd != "ABORT":          # ABORT settles a lost job itself (and wins over a queued HOME)
+            app.bus_reconcile()
+        r = app.bus.command(cmd, source=src, arg=arg, confirmed=confirmed is True)
+        st = app.cmd_state()
+        out = {**r.to_dict(), "bus": st, "jobs": st["jobs"],
+               "active_preset": st["active_preset"]}
         self._json(out, 200 if r.accepted else 409)
 
     def r_run_file(self, q, body, run_id, name):

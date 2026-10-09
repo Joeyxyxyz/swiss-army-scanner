@@ -19,8 +19,15 @@ States and rules:
     ABORTING  abort requested, run winding down    done -> READY (or HOMING if HOME pressed)
     HOMING    rig check                            OK -> READY, MOVED / error -> FAULT
     FAULT     rig check failed / a job crashed     HOME (re-check) or RESET -> READY
-ABORT always wins (it is never refused); HOME only when idle or after an abort;
-TRIGGER is ignored unless ARMED; the work state can't change while a job runs.
+ABORT always wins (it is never refused, and in every state it also asks the owner to stop
+whatever it runs outside the state machine: a projected verdict, a live view, jobs started
+directly); HOME only when idle or after an abort (a HOME pressed while aborting runs once the
+aborted job ends - a further ABORT cancels it - and is never kept for later); TRIGGER is
+ignored unless ARMED; the work state can't change while a job runs, and changing it while
+ARMED disarms (the operator's confirmation was for the old one). START / TRIGGER / ARM may
+name the work state the sender expects: refused when the selected one differs. A work state
+the owner marked unusable (its config is invalid or gone) is never started: refused, result
+INVALID. A cancelled or aborted cycle never re-arms.
 
 Outputs (stack-light style): READY / BUSY / PASS / FAIL / ALARM booleans, published to
 every OutputBackend on each change (the UI lamp reads the same signals), plus registers for
@@ -31,7 +38,8 @@ Work states: the station configs; a recipe work state (job.type recipe) pins its
 preset, and its result codes come from the recipe.
 
 Pure: no engine, no hardware. The owner (the web server) passes handlers that start /
-abort the actual jobs and calls job_finished() when they end.
+abort the actual jobs and calls job_finished() when they end (also for a job dropped before
+it ran); job_lost() settles a busy state whose job can no longer report back.
 """
 
 from __future__ import annotations
@@ -47,6 +55,7 @@ STATES = ("READY", "ARMED", "RUNNING", "ABORTING", "HOMING", "FAULT")
 COMMANDS = ("START", "ABORT", "HOME", "TRIGGER", "SELECT_WORKSTATE", "ARM", "DISARM", "RESET")
 SIGNALS = ("READY", "BUSY", "PASS", "FAIL", "ALARM")
 IDLE = ("READY", "ARMED")
+BUSY = ("RUNNING", "ABORTING", "HOMING")
 RESULT_CODES = {"PASS": 1, "FAIL": 2, "INVALID": 3, "ABORTED": 4}       # 0 = no result yet
 REGISTERS = ("result_code", "state_code", "workstate")
 
@@ -65,13 +74,17 @@ class Reply:
 @dataclass
 class Handlers:
     """What the bus asks its owner to do. start(workstate, confirmed) -> job id;
-    abort() and home() -> anything (ids, for the log)."""
+    abort() and home() -> anything (ids, for the log). home() reads the HOME request's
+    options from bus.home_args while it runs."""
     start: Callable = lambda ws, confirmed: None
     abort: Callable = lambda: None
     home: Callable = lambda: None
     # select(workstate, preset) after SELECT_WORKSTATE is accepted: the owner makes that
     # work state's preset (part recipe) the loaded one; None = the station names none
     select: Callable = lambda ws, preset: None
+    # pending() -> True while a job the bus started will still report back (job_finished),
+    # False when none will (it was dropped / lost), None = the owner doesn't track jobs
+    pending: Callable = lambda: None
 
 
 class CommandBus:
@@ -84,10 +97,13 @@ class CommandBus:
         self.workstate: Optional[str] = self.workstates[0] if self.workstates else None
         self.workstate_presets: dict = {}            # work state -> the preset it pins
         self.workstate_info: dict = {}               # work state -> {recipe, result_codes}
+        self.unusable: dict = {}                     # work state -> why it can't run (owner)
         self.armed_confirmed = False
         self.last_result: Optional[str] = None      # PASS | FAIL | INVALID | ABORTED
         self.fault: Optional[str] = None
-        self.home_after_abort = False
+        self.home_after_abort = False                # only ever True while ABORTING
+        self.home_args: dict = {}                    # the HOME request's options (owner reads)
+        self._busy_kind: Optional[str] = None        # 'run' | 'home': what the busy state awaits
         self._return_armed = False
         self.outputs: list = []
         self.history: list = []                      # (time, source, command, accepted, msg)
@@ -97,7 +113,7 @@ class CommandBus:
     def signals(self) -> dict:
         s = self.state
         return {"READY": s in IDLE and self.fault is None,
-                "BUSY": s in ("RUNNING", "ABORTING", "HOMING"),
+                "BUSY": s in BUSY,
                 "PASS": s in IDLE and self.last_result == "PASS",
                 "FAIL": s in IDLE and self.last_result == "FAIL",
                 "ALARM": s == "FAULT" or (s in IDLE and self.last_result == "INVALID")}
@@ -117,7 +133,8 @@ class CommandBus:
                     "workstate_recipe": (self.workstate_info.get(self.workstate) or {}).get(
                         "recipe"),
                     "registers": self.registers(),
-                    "workstates": list(self.workstates), "last_result": self.last_result,
+                    "workstates": list(self.workstates), "unusable": dict(self.unusable),
+                    "last_result": self.last_result,
                     "fault": self.fault, "signals": self.signals(),
                     "require_confirmation": self.require_confirmation,
                     "history": self.history[-20:]}
@@ -130,22 +147,31 @@ class CommandBus:
                 o.publish(sig)
                 o.publish_registers(regs)
             except Exception as e:          # noqa: BLE001 - an output must not stop the bus
-                self.history.append((_now(), "bus", "OUTPUT", False, f"{type(o).__name__}: {e}"))
+                self._log("bus", "OUTPUT", False, f"{type(o).__name__}: {e}")
+
+    def _log(self, source: str, name: str, accepted: bool, msg: str) -> None:
+        self.history.append((_now(), source, name, accepted, msg))
+        del self.history[:-200]
 
     def _go(self, state: str) -> None:
+        if state != "ABORTING" and self.home_after_abort:
+            # a HOME pressed while aborting lives only as long as that abort: it runs when
+            # the aborted job ends (job_finished), or it is forgotten - never fired later
+            self.home_after_abort = False
+            self.home_args = {}
         self.state = state
         self._publish()
 
     # ------------------------------------------------------------ commands
     def command(self, name: str, source: str = "api", arg=None, confirmed: bool = False) -> Reply:
+        """confirmed: only a real True counts (a "false" string from a gateway is not a yes)."""
         name = str(name).upper()
         with self._lock:
             if name not in COMMANDS:
                 r = Reply(False, name, self.state, f"unknown command (one of {', '.join(COMMANDS)})")
             else:
-                r = getattr(self, "_c_" + name.lower())(arg, bool(confirmed))
-            self.history.append((_now(), source, name, r.accepted, r.message))
-            del self.history[:-200]
+                r = getattr(self, "_c_" + name.lower())(arg, confirmed is True)
+            self._log(source, name, r.accepted, r.message)
             return r
 
     def _no(self, cmd, msg) -> Reply:
@@ -154,13 +180,44 @@ class CommandBus:
     def _ok(self, cmd, msg="") -> Reply:
         return Reply(True, cmd, self.state, msg)
 
-    def _begin(self, cmd: str, confirmed: bool) -> Reply:
+    def _unusable(self, ws: Optional[str]) -> Optional[str]:
+        """Why work state `ws` can't run (None = it can)."""
+        if self.unusable.get(ws):
+            return self.unusable[ws]
+        if ws not in self.workstates:
+            return "it is not one of the station configs any more"
+        return None
+
+    def _expect(self, cmd: str, arg) -> Optional[Reply]:
+        """START / TRIGGER / ARM naming the work state the sender expects (the work state the
+        operator page shows): refused when the selected one differs."""
+        if arg is None or arg == "":
+            return None
+        if self.resolve_workstate(arg) != self.workstate:
+            return self._no(cmd, f"the selected work state is {self.workstate}, not {arg!r}: "
+                                 "check the setup for the selected one first")
+        return None
+
+    def _begin(self, cmd: str, confirmed: bool, arg=None) -> Reply:
         if self.workstate is None:
             return self._no(cmd, "no work state selected")
+        refused = self._expect(cmd, arg)
+        if refused is not None:
+            return refused
+        why = self._unusable(self.workstate)
+        if why:                                 # never started: the cycle's result is INVALID
+            self.last_result = "INVALID"
+            if self.state == "ARMED":
+                self.armed_confirmed = False
+                self._go("READY")
+            else:
+                self._publish()
+            return self._no(cmd, f"work state {self.workstate} is not usable: {why}")
         if self.require_confirmation and not confirmed:
             return self._no(cmd, "the real rig needs the operator's confirmation of the setup")
         self._return_armed = self.state == "ARMED"
         self.last_result = None
+        self._busy_kind = "run"
         self._go("RUNNING")
         try:
             self.h.start(self.workstate, confirmed)
@@ -173,38 +230,76 @@ class CommandBus:
     def _c_start(self, arg, confirmed):
         if self.state not in IDLE:
             return self._no("START", f"not idle ({self.state})")
-        return self._begin("START", confirmed)
+        return self._begin("START", confirmed, arg)
 
     def _c_trigger(self, arg, confirmed):
         if self.state != "ARMED":
             return self._no("TRIGGER", f"ignored: not armed ({self.state})")
-        return self._begin("TRIGGER", confirmed or self.armed_confirmed)
+        return self._begin("TRIGGER", confirmed or self.armed_confirmed, arg)
+
+    def _owner_abort(self) -> str:
+        """h.abort() (stops what the owner runs: the bus's job, and also a projected verdict,
+        a live view, runs started directly); never raises: ABORT is never refused."""
+        try:
+            touched = self.h.abort()
+        except Exception as e:              # noqa: BLE001
+            return f"abort handler failed: {type(e).__name__}: {e}"
+        if isinstance(touched, (list, tuple)) and touched:
+            return "stopped " + ", ".join(str(t) for t in touched)
+        return ""
 
     def _c_abort(self, arg, confirmed):
-        """Never refused: it preempts whatever runs."""
+        """Never refused: it preempts whatever runs, in every state."""
         if self.state in ("RUNNING", "HOMING"):
             self._go("ABORTING")
-            self.h.abort()
-            return self._ok("ABORT", "abort requested: stops before the next capture")
-        if self.state == "ARMED":
+            note = self._owner_abort()
+            msg = "abort requested: stops before the next capture"
+        elif self.state == "ABORTING":
+            msg = "abort already requested: waiting for the job to stop"
+            if self.home_after_abort:           # ABORT wins over a HOME queued behind it
+                self.home_after_abort = False
+                self.home_args = {}
+                msg += "; the queued HOME is cancelled"
+            note = self._owner_abort()          # again: whatever was queued since
+        elif self.state == "ARMED":
             self.armed_confirmed = False
             self._go("READY")
-            return self._ok("ABORT", "disarmed")
-        return self._ok("ABORT", "nothing running")
+            note = self._owner_abort()
+            msg = "disarmed"
+        else:
+            note = self._owner_abort()
+            msg = "" if note else "nothing running"
+        if self.state == "ABORTING" and self.h.pending() is False:
+            # nothing left that will report back (a job dropped without a word): settle now
+            self.job_lost("aborted: no job left that could report back")
+            msg += f"; nothing left running ({self.state})"
+        return self._ok("ABORT", "; ".join(m for m in (msg, note) if m))
 
-    def _c_home(self, arg, confirmed):
-        if self.state == "ABORTING":
-            self.home_after_abort = True
-            return self._ok("HOME", "homing after the abort finishes")
-        if self.state in ("RUNNING", "HOMING"):
-            return self._no("HOME", f"refused while {self.state}: ABORT first")
-        self.armed_confirmed = False
+    def _start_home(self) -> bool:
+        """HOMING + h.home() (which reads home_args); a refused home is a FAULT."""
+        self._busy_kind = "home"
         self._go("HOMING")
         try:
             self.h.home()
         except Exception as e:              # noqa: BLE001
             self.fault = f"home failed: {type(e).__name__}: {e}"
             self._go("FAULT")
+            return False
+        finally:
+            self.home_args = {}
+        return True
+
+    def _c_home(self, arg, confirmed):
+        opts = dict(arg) if isinstance(arg, dict) else {}
+        if self.state == "ABORTING":
+            self.home_after_abort = True
+            self.home_args = opts
+            return self._ok("HOME", "homing after the abort finishes")
+        if self.state in ("RUNNING", "HOMING"):
+            return self._no("HOME", f"refused while {self.state}: ABORT first")
+        self.armed_confirmed = False
+        self.home_args = opts
+        if not self._start_home():
             return self._no("HOME", self.fault)
         return self._ok("HOME", "rig check running")
 
@@ -214,19 +309,36 @@ class CommandBus:
         ws = self.resolve_workstate(arg)
         if ws is None:
             return self._no("SELECT_WORKSTATE", f"no work state {arg!r}")
+        why = self.unusable.get(ws)
+        if why:
+            return self._no("SELECT_WORKSTATE", f"{ws} is not usable: {why}")
+        note = ""
+        if ws != self.workstate and self.state == "ARMED":
+            # the operator's confirmation (and the arm) was for the old work state
+            self.armed_confirmed = False
+            self.state = "READY"
+            note = " - disarmed: ARM again for this work state"
         self.workstate = ws
+        self._publish()
         preset = self.workstate_presets.get(ws)
         try:
             self.h.select(ws, preset)
         except Exception as e:              # noqa: BLE001 - selected, but its preset didn't load
-            return self._ok("SELECT_WORKSTATE", f"{ws} (preset {preset}: {type(e).__name__}: {e})")
-        return self._ok("SELECT_WORKSTATE", f"{ws} (preset {preset})" if preset else ws)
+            return self._ok("SELECT_WORKSTATE",
+                            f"{ws} (preset {preset}: {type(e).__name__}: {e}){note}")
+        return self._ok("SELECT_WORKSTATE", (f"{ws} (preset {preset})" if preset else ws) + note)
 
     def _c_arm(self, arg, confirmed):
         if self.state != "READY":
             return self._no("ARM", f"not READY ({self.state})")
         if self.workstate is None:
             return self._no("ARM", "no work state selected")
+        refused = self._expect("ARM", arg)
+        if refused is not None:
+            return refused
+        why = self._unusable(self.workstate)
+        if why:
+            return self._no("ARM", f"work state {self.workstate} is not usable: {why}")
         if self.require_confirmation and not confirmed:
             return self._no("ARM", "the real rig needs the operator's confirmation to arm")
         self.armed_confirmed = bool(confirmed)
@@ -249,12 +361,44 @@ class CommandBus:
 
     def resolve_workstate(self, arg) -> Optional[str]:
         """A work state name, or a 1-based index (keys 1-9, a PLC number)."""
-        if arg is None:
+        if arg is None or isinstance(arg, bool):
             return None
         if isinstance(arg, int) or (isinstance(arg, str) and arg.isdigit()):
             i = int(arg) - 1
             return self.workstates[i] if 0 <= i < len(self.workstates) else None
-        return arg if arg in self.workstates else None
+        return arg if isinstance(arg, str) and arg in self.workstates else None
+
+    def update_workstates(self, names: list, unusable: Optional[dict] = None,
+                          presets: Optional[dict] = None, info: Optional[dict] = None) -> None:
+        """The owner re-read its work states: `names` = every station config in a stable
+        order (usable or not, so a broken config never shifts the others' numbers),
+        `unusable` = name -> why it can't run. Never switches the selected work state (one
+        that broke or vanished stays selected and is refused). While ARMED or busy the list
+        and its numbers stay as they are and only the usability marks change; an ARMED bus
+        whose work state became unusable disarms."""
+        names = list(names)
+        bad = dict(unusable or {})
+        with self._lock:
+            before = (list(self.workstates), self.workstate)
+            if self.state in ("READY", "FAULT"):
+                self.workstates = names
+                self.workstate_presets = dict(presets or {})
+                self.workstate_info = dict(info or {})
+                if self.workstate is None:       # nothing selected yet: the first usable one
+                    self.workstate = next((n for n in names if n not in bad), None)
+            marks = {n: bad[n] for n in self.workstates if n in bad}
+            for n in [*self.workstates, self.workstate]:
+                if n is not None and n not in names:
+                    marks[n] = "its station config is gone"
+            self.unusable = marks
+            ws = self.workstate
+            why = self._unusable(ws) if ws is not None else None
+            if self.state == "ARMED" and why:
+                self.armed_confirmed = False
+                self._go("READY")
+                self._log("bus", "DISARM", True, f"work state {ws} is not usable: {why}")
+            elif (list(self.workstates), self.workstate) != before:
+                self._publish()                  # the workstate register may have moved
 
     # ------------------------------------------------------------ job events
     def job_finished(self, kind: str, result: Optional[str] = None,
@@ -262,31 +406,47 @@ class CommandBus:
         """kind 'run' (result PASS / FAIL / INVALID / ABORTED) or 'home' (result OK /
         MOVED / UNKNOWN / REFERENCE_SET); error = the job crashed."""
         with self._lock:
+            if self.state == "ABORTING" and self._busy_kind not in (None, kind):
+                return                          # not the job this abort waits for
             if kind == "run" and self.state in ("RUNNING", "ABORTING"):
                 aborted = self.state == "ABORTING"
                 self.last_result = "ABORTED" if aborted else (result or "INVALID")
                 if error and not aborted:
                     self.last_result = "INVALID"
                 if aborted and self.home_after_abort:
-                    self.home_after_abort = False
-                    self._go("HOMING")
-                    try:
-                        self.h.home()
-                    except Exception as e:  # noqa: BLE001
-                        self.fault = f"home failed: {type(e).__name__}: {e}"
-                        self._go("FAULT")
+                    self.home_after_abort = False   # consumed: the HOME pressed while aborting
+                    self._start_home()
                     return
-                keep = self._return_armed and not aborted
+                # an aborted / cancelled cycle disarms: the next part needs a new ARM
+                keep = self._return_armed and self.last_result != "ABORTED"
                 if not keep:
                     self.armed_confirmed = False
                 self._go("ARMED" if keep else "READY")
             elif kind == "home" and self.state in ("HOMING", "ABORTING"):
+                if self.state == "ABORTING" and self.home_after_abort:
+                    # HOME pressed again while this rig check was being aborted: run it now
+                    self.home_after_abort = False
+                    self._start_home()
+                    return
                 if error or result in ("MOVED", "UNKNOWN"):
                     self.fault = error or f"rig check {result}: re-home / recalibrate"
                     self._go("FAULT")
                 else:
                     self.fault = None
                     self._go("READY")
+
+    def job_lost(self, why: str = "the job ended without reporting back") -> None:
+        """The owner has no job left that will call job_finished (it was dropped or lost):
+        settle the busy state instead of waiting for ever. A run ends INVALID (ABORTED when it
+        was being aborted) and never re-arms; a rig check ends in FAULT; a HOME pressed while
+        aborting still runs."""
+        with self._lock:
+            if self.state not in BUSY:
+                return
+            self._return_armed = False
+            kind = self._busy_kind or ("home" if self.state == "HOMING" else "run")
+            self._log("bus", "JOB_LOST", False, why)
+            self.job_finished(kind, None, error=why)
 
 
 def _now() -> str:
@@ -327,9 +487,9 @@ class SimulatedInput(InputBackend):
 
 
 class CameraGpioInput(InputBackend):
-    """PLACEHOLDER: the machine-vision camera's opto-isolated GPIO lines as inputs
-    (e.g. Line0 = trigger / part present, Line2 = abort). Intended GenICam nodes (via the
-    camera SDK, never opened here): LineSelector = LineN, LineMode = Input,
+    """PLACEHOLDER: the machine-vision camera's GPIO input lines as inputs (e.g. Line0 =
+    trigger / part present, Line3 = abort; never Line1 / Line2, outputs). Intended GenICam
+    nodes (via the camera SDK, never opened here): LineSelector = LineN, LineMode = Input,
     LineInverter, LineStatus (polled) or an EventLine*RisingEdge event, LineDebouncerTime.
     Must share the camera handle with the capture session (one owner of the camera)."""
     name = "camera_gpio"

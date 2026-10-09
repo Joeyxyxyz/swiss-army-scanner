@@ -5,7 +5,7 @@
 
 const $ = (sel) => document.querySelector(sel);
 const state = { setupBusy: false, mode: null, stations: [], bus: null, runJobId: null, homeJobId: null,
-  shownRun: null, shownHome: null };
+  shownRun: null, shownHome: null, shownWorkstate: null, loadingStations: false };
 
 async function api(method, path, body) {
   const opt = { method, headers: {} };
@@ -37,13 +37,17 @@ function refreshButtons() {
   const b = state.bus || { state: 'READY' };
   const s = b.state;
   const idle = s === 'READY' || s === 'ARMED';
-  const st = state.stations.find((x) => x.config === $('#qStation').value);
-  const usable = st && !st.error;
+  const shown = $('#qStation').value;
+  const st = state.stations.find((x) => x.config === shown);
+  // usable = valid when listed, not marked unusable by the bus since, and the one the bus
+  // runs (START never runs anything but what this page shows)
+  const usable = st && !st.error && !(b.unusable && b.unusable[shown])
+    && (!state.bus || b.workstate === shown);
   $('#qConfirmRow').hidden = state.mode !== 'real';
   $('#qStart').disabled = !idle || !usable || !confirmed();
   $('#qAbort').disabled = false;                       // ABORT is never disabled
   $('#qHome').disabled = !(idle || s === 'FAULT' || s === 'ABORTING');
-  $('#qArm').disabled = !(s === 'READY' || s === 'ARMED') || !usable || (s === 'READY' && !confirmed());
+  $('#qArm').disabled = s === 'ARMED' ? false : (s !== 'READY' || !usable || !confirmed());   // DISARM: always
   $('#qArm').textContent = s === 'ARMED' ? 'DISARM' : 'ARM';
   $('#qArm').classList.toggle('on', s === 'ARMED');
   $('#qTrigger').disabled = s !== 'ARMED';
@@ -58,9 +62,13 @@ function refreshButtons() {
 }
 
 function showStation() {
-  const st = state.stations.find((s) => s.config === $('#qStation').value);
+  const shown = $('#qStation').value;
+  const st = state.stations.find((s) => s.config === shown);
+  const bad = state.bus && state.bus.unusable && state.bus.unusable[shown];
   let txt = '';
-  if (st && st.error) txt = `Not usable: ${st.error}`;
+  if (state.bus && state.bus.workstate && !st) txt = `Not usable: ${state.bus.workstate} is not in the station list`;
+  else if (st && st.error) txt = `Not usable: ${st.error}`;
+  else if (bad) txt = `Not usable: ${bad}`;
   else if (st && st.job_type === 'recipe') {
     // a recipe work state: zones + the checks recognised there; the recipe pins its preset
     txt = `recipe ${st.recipe}: zones ${(st.zones || []).join(', ')} (${(st.checks || []).join(', ')})`
@@ -76,33 +84,65 @@ function showStation() {
   refreshButtons();
 }
 
-async function loadStations() {
-  const d = await api('GET', '/api/stations');
-  state.mode = d.mode;
-  state.stations = d.stations || [];
-  const badge = $('#qMode');
-  badge.textContent = d.mode === 'mock' ? 'MOCK' : 'REAL RIG';
-  badge.className = `badge ${d.mode === 'mock' ? 'mock' : 'real'}`;
-  const sel = $('#qStation');
-  sel.textContent = '';
-  for (const s of state.stations) {
-    const o = document.createElement('option');
-    o.value = s.config;
-    o.textContent = s.error ? `${s.config} (invalid)` : `${s.station_id} - ${s.part_label}`;
-    sel.appendChild(o);
+async function fetchStations() {
+  // the work-state list (GET /api/stations also re-reads the configs on the server; the bus
+  // never switches its selected work state because of that)
+  state.loadingStations = true;
+  try {
+    const d = await api('GET', '/api/stations');
+    state.mode = d.mode;
+    state.stations = d.stations || [];
+    const badge = $('#qMode');
+    badge.textContent = d.mode === 'mock' ? 'MOCK' : 'REAL RIG';
+    badge.className = `badge ${d.mode === 'mock' ? 'mock' : 'real'}`;
+    const sel = $('#qStation');
+    sel.textContent = '';
+    state.stations.forEach((s, i) => {
+      const o = document.createElement('option');
+      o.value = s.config;
+      o.textContent = `${i + 1}: ` + (s.error ? `${s.config} (invalid)` : `${s.station_id} - ${s.part_label}`);
+      sel.appendChild(o);
+    });
+  } finally {
+    state.loadingStations = false;
   }
+}
+
+function stationListChanged(b) {
+  const names = state.stations.map((s) => s.config);
+  return JSON.stringify(b.workstates || []) !== JSON.stringify(names);
+}
+
+async function loadStations() {
+  await fetchStations();
   await pollOnce();
-  if (state.bus && state.bus.workstate) sel.value = state.bus.workstate;
-  showStation();
+}
+
+function syncWorkstate(b) {
+  // the selector always shows the bus's work state (a PLC, another page or a key may have
+  // changed it): what the operator confirms and what START runs are the same work state.
+  // A change of work state clears the confirmation (it was for the other one).
+  const sel = $('#qStation');
+  const ws = b.workstate || '';
+  if (sel.value !== ws) sel.value = ws;          // a work state missing from the list shows blank
+  if (ws !== state.shownWorkstate) {
+    if (state.shownWorkstate !== null) $('#qConfirm').checked = false;
+    state.shownWorkstate = ws;
+  }
+  showStation();                                 // its info, usability and the buttons
 }
 
 async function send(name, extra) {
   const body = { source: 'quick', ...(extra || {}) };
-  if (['start', 'trigger', 'arm'].includes(name)) body.operator_confirmed = confirmed();
+  if (['start', 'trigger', 'arm'].includes(name)) {
+    body.operator_confirmed = confirmed();
+    body.workstate = $('#qStation').value;       // refused if the bus has another selected
+  }
   try {
     const r = await api('POST', `/api/cmd/${name}`, body);
     state.bus = r.bus;
     trackJobs(r.jobs);
+    syncWorkstate(r.bus);
     if (!r.accepted) $('#qReason').textContent = `${r.command}: ${r.message}`;
     else if (name === 'start' || name === 'trigger') {
       lamp('RUNNING', 'running');
@@ -196,10 +236,22 @@ function showRig(job) {
   $('#qRigMsg').textContent = [r.message, ...(r.warnings || [])].filter(Boolean).join(' | ');
 }
 
+function showPreset(b) {
+  // the preset START runs: the work state's own, else the loaded one (run_preset)
+  const run = b.run_preset || b.active_preset;
+  $('#qPreset').textContent = run || 'none loaded';
+  $('#qPresetLoaded').textContent = run && b.active_preset && b.active_preset !== run
+    ? `(loaded now: ${b.active_preset}; the run loads ${run})` : '';
+}
+
 async function pollOnce() {
   const b = await api('GET', '/api/cmd/state');
   state.bus = b;
-  $('#qPreset').textContent = b.active_preset || 'none loaded';
+  if (!state.loadingStations && (b.state === 'READY' || b.state === 'FAULT') && stationListChanged(b)) {
+    await fetchStations();                         // configs added / removed / renamed
+  }
+  syncWorkstate(b);
+  showPreset(b);
   trackJobs(b.jobs);
   if (state.runJobId && state.shownRun !== state.runJobId) {
     const j = await api('GET', `/api/jobs/${state.runJobId}`);
@@ -292,6 +344,10 @@ async function signalCheck() {
   }
 }
 
+// Space / Enter activate a focused control (a button left focused by a click, a summary,
+// a link): never turn that into START, and never cancel the control's own action
+const ACTIVATABLE = 'button, summary, a[href], [role="button"], [tabindex]';
+
 function onKey(ev) {
   const t = ev.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA'
@@ -300,6 +356,7 @@ function onKey(ev) {
   }
   if (ev.ctrlKey || ev.altKey || ev.metaKey) return;
   const k = ev.key;
+  if ((k === ' ' || k === 'Enter') && t && t.closest && t.closest(ACTIVATABLE)) return;
   const s = state.bus ? state.bus.state : 'READY';
   let handled = true;
   if (k === ' ' || k === 'Enter') { if (!$('#qStart').disabled) send('start'); }
@@ -313,10 +370,16 @@ function onKey(ev) {
 }
 
 async function selectWorkstate(arg) {
-  const r = await api('POST', '/api/cmd/workstate', { workstate: arg, source: 'quick' });
-  state.bus = r.bus;
-  if (r.accepted) $('#qStation').value = r.bus.workstate;
-  else $('#qReason').textContent = `${r.command}: ${r.message}`;
+  try {
+    const r = await api('POST', '/api/cmd/workstate', { workstate: arg, source: 'quick' });
+    state.bus = r.bus;
+    $('#qReason').textContent = r.accepted ? (/disarmed/.test(r.message) ? r.message : '')
+      : `${r.command}: ${r.message}`;
+    syncWorkstate(r.bus);              // accepted or refused: show the bus's work state
+    showPreset(r.bus);
+  } catch (e) {
+    $('#qConn').hidden = false;
+  }
   showStation();
 }
 

@@ -52,7 +52,7 @@
 <!-- ============================================================ 1 SETUP -->
 <section id="tab-setup" class="tab">
   <div class="tabhead"><h2>Setup</h2>
-    <p>A preset holds every setting for one rig geometry. Edit a copy here, save it as a new preset, then load it to make it active.</p></div>
+    <p>A preset holds every setting for one rig geometry. Edit a copy here, save it as a user preset (in this library; built-in presets are never written), then load it to make it active.</p></div>
   <div class="card">
     <div class="row">
       <label class="f inline"><span>Preset</span><select id="presetSel"></select></label>
@@ -90,9 +90,9 @@
       <h3>Save</h3>
       <label class="f"><span>Preset name</span><input id="saveName" data-path="name" spellcheck="false"></label>
       <label class="f"><span>geometry_id</span><input id="saveGeo" data-path="geometry_id" spellcheck="false"></label>
-      <label class="chk"><input type="checkbox" id="saveOverwrite"> overwrite an existing preset of this name</label>
+      <label class="chk"><input type="checkbox" id="saveOverwrite"> replace an existing user preset of this name (the old one goes to the library trash)</label>
       <div class="row">
-        <button id="saveBtn">Save as new preset</button>
+        <button id="saveBtn">Save as user preset</button>
         <button id="saveLoadBtn" class="primary">Save &amp; load</button>
         <button id="revertBtn" class="ghost">Revert</button>
       </div>

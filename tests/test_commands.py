@@ -154,3 +154,149 @@ def test_bad_io_config_refused(tmp_path):
     f.write_text(json.dumps({"outputs": [{"kind": "laser", "map": {}}]}))
     with pytest.raises(ValueError, match="output kind"):
         C.load_io_config(f)
+
+
+# ------------------------------------------------------------ review regressions
+
+def _owner(confirm=False, workstates=("a.json", "b.json", "c.json")):
+    """A bus whose owner tracks its jobs: pending() says whether one will report back."""
+    calls, jobs = [], []
+    h = C.Handlers(start=lambda ws, ok: (calls.append(("start", ws, ok)), jobs.append("run")),
+                   abort=lambda: calls.append(("abort",)) or ["j1"],
+                   home=lambda: (calls.append(("home", dict(bus.home_args))), jobs.append("home")),
+                   pending=lambda: bool(jobs))
+    bus = C.CommandBus(h, list(workstates), require_confirmation=confirm)
+    return bus, calls, jobs
+
+
+def test_abort_with_no_job_left_settles_instead_of_wedging():
+    bus, calls, jobs = _owner()
+    bus.command("START")
+    jobs.clear()                                       # the run's report was lost
+    r = bus.command("ABORT")
+    assert r.accepted and bus.state == "READY" and bus.last_result == "ABORTED"
+    bus.command("HOME")
+    jobs.clear()
+    bus.command("ABORT")
+    assert bus.state == "FAULT" and "no job left" in bus.fault     # the rig check never ended
+    assert bus.command("RESET").accepted
+    bus.command("START")
+    jobs.clear()
+    bus.job_lost("gone")                               # what the owner's reconcile calls
+    assert bus.state == "READY" and bus.last_result == "INVALID"
+    bus2, calls2, _ = _owner()                         # an owner that doesn't track: no guess
+    bus2.h.pending = lambda: None
+    bus2.command("START")
+    bus2.command("ABORT")
+    assert bus2.state == "ABORTING"
+
+
+def test_abort_reaches_the_owner_in_every_state():
+    bus, calls, jobs = _owner()
+    r = bus.command("ABORT")                           # READY: a verdict / live view / direct job
+    assert r.accepted and calls == [("abort",)] and "j1" in r.message
+    bus.command("ARM")
+    r = bus.command("ABORT")
+    assert bus.state == "READY" and "disarmed" in r.message and calls[-1] == ("abort",)
+    bus.command("START")
+    bus.command("ABORT")
+    assert bus.state == "ABORTING"
+    n = len(calls)
+    assert bus.command("ABORT").accepted and len(calls) == n + 1    # again: re-issued
+    raising = C.CommandBus(C.Handlers(abort=lambda: 1 / 0), ["a.json"])
+    r = raising.command("ABORT")
+    assert r.accepted and "ZeroDivisionError" in r.message          # never refused
+
+
+def test_home_pressed_while_aborting_a_rig_check_runs_once_and_never_later():
+    bus, calls, jobs = _owner()
+    bus.command("HOME", arg={"tol_px": 0.4})
+    assert calls[-1] == ("home", {"tol_px": 0.4}) and bus.home_args == {}
+    bus.command("ABORT")
+    r = bus.command("HOME", arg={"set_reference": True})
+    assert r.accepted and bus.home_after_abort
+    jobs.clear()
+    bus.job_finished("home", None, error="Cancelled: aborted")
+    assert bus.state == "HOMING" and calls[-1] == ("home", {"set_reference": True})
+    assert not bus.home_after_abort and bus.home_args == {}
+    bus.job_finished("home", "OK")
+    assert bus.state == "READY"
+    homes = sum(1 for c in calls if c[0] == "home")
+    bus.command("START")
+    bus.command("ABORT")
+    bus.job_finished("run", "ABORTED")
+    assert bus.state == "READY" and sum(1 for c in calls if c[0] == "home") == homes
+    # queued behind an abort, then a further ABORT: cancelled with its options
+    bus.command("START")
+    bus.command("ABORT")
+    bus.command("HOME", arg={"set_reference": True})
+    r = bus.command("ABORT")
+    assert "HOME is cancelled" in r.message and not bus.home_after_abort and bus.home_args == {}
+    bus.job_finished("run", "ABORTED")
+    assert bus.state == "READY" and sum(1 for c in calls if c[0] == "home") == homes
+    # a refused HOME leaves nothing behind
+    bus.command("START")
+    assert not bus.command("HOME", arg={"set_reference": True}).accepted
+    assert bus.home_args == {} and not bus.home_after_abort
+
+
+def test_only_a_real_true_confirms():
+    bus, calls, _ = _owner(confirm=True)
+    for bad in ("false", "true", "0", 1, [1]):
+        assert not bus.command("ARM", confirmed=bad).accepted, bad
+        assert not bus.command("START", confirmed=bad).accepted, bad
+    assert calls == [] and not bus.armed_confirmed
+    assert bus.command("ARM", confirmed=True).accepted and bus.armed_confirmed
+
+
+def test_a_work_state_change_while_armed_disarms():
+    bus, calls, _ = _owner(confirm=True)
+    assert bus.command("ARM", confirmed=True).accepted
+    r = bus.command("SELECT_WORKSTATE", arg="a.json")             # the same one: stays armed
+    assert r.accepted and bus.state == "ARMED" and bus.armed_confirmed
+    r = bus.command("SELECT_WORKSTATE", arg="b.json")
+    assert r.accepted and "disarmed" in r.message
+    assert bus.state == "READY" and not bus.armed_confirmed
+    assert not bus.command("TRIGGER").accepted and calls == []
+    # START / TRIGGER / ARM naming the expected work state: refused on a mismatch
+    assert not bus.command("START", arg="a.json", confirmed=True).accepted
+    assert not bus.command("ARM", arg=1, confirmed=True).accepted and calls == []
+    assert bus.command("START", arg=2, confirmed=True).accepted
+    assert calls == [("start", "b.json", True)]
+
+
+def test_a_cancelled_triggered_cycle_does_not_rearm():
+    bus, calls, _ = _owner()
+    bus.command("ARM")
+    bus.command("TRIGGER")
+    bus.job_finished("run", "ABORTED")                 # cancelled from the job list
+    assert bus.state == "READY" and bus.last_result == "ABORTED"
+
+
+def test_work_state_updates_never_switch_the_selection_or_renumber_mid_cycle():
+    bus, calls, jobs = _owner(confirm=True)
+    out = C.SimulatedOutput()
+    bus.outputs.append(out)
+    bus.command("SELECT_WORKSTATE", arg=2)
+    bus.command("ARM", confirmed=True)
+    bus.update_workstates(["a.json", "b.json", "c.json"], unusable={"b.json": "bad JSON"})
+    assert bus.state == "READY" and bus.workstate == "b.json" and not bus.armed_confirmed
+    assert bus.history[-1][2] == "DISARM" and bus.registers()["workstate"] == 2
+    r = bus.command("START", confirmed=True)
+    assert not r.accepted and "bad JSON" in r.message and calls == []
+    assert bus.last_result == "INVALID" and out.current["ALARM"]
+    assert not bus.command("SELECT_WORKSTATE", arg=2).accepted
+    assert bus.command("SELECT_WORKSTATE", arg=3).accepted and bus.workstate == "c.json"
+    bus.update_workstates(["a.json", "b.json", "c.json"])
+    bus.command("START", confirmed=True)
+    bus.update_workstates(["b.json", "c.json", "d.json"])           # a.json removed mid-run
+    assert bus.workstates == ["a.json", "b.json", "c.json"] and bus.workstate == "c.json"
+    assert bus.unusable == {"a.json": "its station config is gone"}
+    bus.job_finished("run", "PASS")
+    bus.update_workstates(["b.json", "d.json"])                     # c.json gone while READY
+    assert bus.workstate == "c.json" and bus.workstates == ["b.json", "d.json"]
+    r = bus.command("START", confirmed=True)
+    assert not r.accepted and "gone" in r.message
+    fresh = C.CommandBus(workstates=[])                             # first list: first usable
+    fresh.update_workstates(["x.json", "y.json"], unusable={"x.json": "bad"})
+    assert fresh.workstate == "y.json"

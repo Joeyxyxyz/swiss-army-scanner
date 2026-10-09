@@ -77,7 +77,7 @@ of the scan (the fixture), the verdict projected for 5 s.
 | `part.frame.plane_band_mm` | the plane's inlier band (default 1.0 mm) |
 | `part.frame.origin_px` | `[x, y]`: the part frame's origin is the reference-plane point seen at this camera px (default: the optical axis) |
 | `part.mock_scene` | MOCK only: what the simulated human places (`scene:<name>[:<variant>]`) |
-| `golden.scan` | a good part's metric scan (id, label - newest wins - or `latest`) for `position` / `edge` position checks; `scan recipe-golden` makes it |
+| `golden.scan` | for `position` / `edge` position checks: a golden recorded by `scan recipe-golden` (its label - newest golden wins - or `latest` = the newest golden of THIS recipe at this geometry) or an exact metric scan id; never the scan being checked, never a plain metric scan with that label (an earlier run's test scan), never one made at other rig settings or with another stereo calibration (INVALID) |
 | `zones[]` | see below |
 | `feedback` | see below |
 | `outputs.runs_dir` | where run folders go (relative to the recipe file; default `$SCANNER_RUNS_DIR`, else `<library>/runs`) |
@@ -104,7 +104,15 @@ a reference-only zone (no checks: e.g. the plane for `part.frame.reference`);
 
 **Checks.** `{"type": "<check id>", "id": "<optional, unique in the zone>", "params": {...},
 "enabled": true}` - built-ins `presence`, `position`, `height`, `flatness`, `defect`, `edge`,
-`code`, plus plugins: [`docs/CHECKS.md`](../docs/CHECKS.md).
+`code`, plus plugins: [`docs/CHECKS.md`](../docs/CHECKS.md). Coverage is judged over the
+zone's whole extent in its own units (camera px, DMD px or part-frame mm), so whatever of a
+zone is off the image, occluded, in shadow or undecoded counts as unmeasured: `presence`
+(`min_points`) calls a part absent only when even its unseen extent, all counted as part,
+could not make it present; `defect` local (`min_valid_pct` 70, `max_gap_mm2`) and `flatness`
+(`min_valid_pct` 70) never pass a partly measured zone, and a `defect` gap that can hold the
+defect counts whether or not measured px enclose it. The run headline
+`deviation_mm` / `threshold_mm` comes from the failing check, as a deviation (height: from
+the band centre vs the half width).
 
 **Feedback** (`feedback.*`, what the projector paints after the verdict):
 
@@ -117,7 +125,7 @@ a reference-only zone (no checks: e.g. the plane for `part.frame.reference`);
 | `cross_px` | 24 | cross half-length at each fault point, DMD columns |
 | `text`, `text_px` | true, 28 | "FAIL right" next to the zones, camera px tall |
 | `hold_s` | 5 | seconds on the part (0..300); ABORT clears it, the web UI's next command too |
-| `max_fit_px` | 2.0 | camera -> DMD consistency limit (local affine residual, DMD px): a zone above it is not drawn |
+| `max_fit_px` | 2.0 | camera -> DMD consistency limit (local affine residual, DMD px): a zone above it is not drawn; a zone decoded too sparsely for the 16 px tile check (under half its px in checkable tiles) must pass the whole-zone fit instead; a FAIL / INVALID zone that cannot be drawn frames the whole DMD field in the verdict colour |
 | `photo` | true | photograph the projected verdict (`feedback_photo.png`) |
 
 The paint goes where the scan's own decoded correspondences say each camera px was lit
@@ -145,7 +153,7 @@ else PASS.
 | `ribbed_tube_alignment` | a ribbed tube | left / middle / right section: position and top-edge position vs the golden, 2 mm | `scene:tube` PASS, `:misaligned` FAIL (right section red) |
 
 ```bat
-scan.bat --mock --library library_mock calibrate-stereo --mock-poses 12
+scan.bat --mock --library library_mock --preset bench_9in_metric calibrate-stereo --mock-poses 12
 scan.bat --mock --library library_mock --mock-part scene:box_lid:ajar recipe-run box_lid
 scan.bat --mock --library library_mock recipe-golden ribbed_tube_alignment
 scan.bat --mock --library library_mock --mock-part scene:tube:misaligned recipe-run ribbed_tube_alignment

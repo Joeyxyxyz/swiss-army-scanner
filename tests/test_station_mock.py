@@ -2,7 +2,7 @@
 locate with a near neighbour, through the verbs.
 
 Synthetic station scans (tests/station_synth.py: two cells with their end faces toward the camera
-and a cooling tube (CT: a thin ribbon in a trapezoid wave, its front edge a few mm behind the
+and a ribbed tube (CT: a thin ribbon in a trapezoid wave, its front edge a few mm behind the
 faces) ray-cast by the mock bench's camera + projector, written as the library writes a metric
 scan, with a flood pair) cover station_measure (cell heights, Cj-Ci, spacing, CT band, wave,
 zones T1..Tn vs the truth), station_golden + station_check (PASS on a repeat, FAIL naming the
@@ -365,7 +365,7 @@ def _crop_cloud(rg, objs, c, margin_mm=34.0):
 
 
 def test_locate_face_with_a_thin_ribbon_3mm_behind():
-    """The station case: a cooling tube only 3 mm behind the face, touching its rim in the
+    """The station case: a ribbed tube only 3 mm behind the face, touching its rim in the
     image, merges with the face in depth (near band 12 mm). The old locate (no split) misfits
     that merged surface and then takes a sliver of it for the face (centre mm off) or finds
     none; the plane split (sequential RANSAC planes of the merged surface, rim = surface >=

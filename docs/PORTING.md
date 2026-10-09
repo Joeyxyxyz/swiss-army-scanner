@@ -61,11 +61,15 @@ uses the FLIR Spinnaker SDK (`RealCamera`); any **GenICam** camera (**GigE Visio
    geometry starts **uncalibrated** (nothing is copied).
 2. `scan signal`, `scan tune`: contrast, focus, exposure; fringes must vary across the
    projector-camera baseline (the orientation check says so).
-3. Stereo calibration: `scan charuco` (print at 100 %, caliper a square) -> `scan parity` ->
+3. Stereo calibration, with the new preset selected (`scan preset-select my_line`, or
+   `--preset my_line` on every step: the calibration is bound to its geometry):
+   `scan charuco` (print at 100 %, caliper a square) -> `scan parity` ->
    `scan calib-pose` x 12-20 (tilted up to +-30 deg, filling the measuring volume) ->
    `scan calibrate-stereo --square <measured mm>`: camera RMS < 0.3 px, projector < 0.5 px.
 4. `scan rig-check --set-reference` with the station empty: HOME then detects a nudged
-   camera or projector.
+   camera or projector (shift, roll and zoom; OK only when the projected pattern is matched;
+   a pattern that is not seen, or roll / zoom that cannot be determined, is UNKNOWN, never
+   OK; roll / zoom detection is tested on the mock bench only so far).
 
 Every mm the engine reports comes from the stereo calibration of the SAME geometry and
 fingerprint (rule 6); without one a recipe run is INVALID and says how to calibrate.
@@ -82,12 +86,16 @@ Start from the closest built-in (`scan recipe-list`) and copy it: `scan recipe-a
 - **Checks**: presence, position, height / step, flatness, defect, edge, code - or your own
   (`docs/CHECKS.md`). Tolerances are in mm / deg in the parameter names.
 - **Golden**: position and edge-position checks compare with a good part:
-  `scan recipe-golden my_part` on a known-good placement.
+  `scan recipe-golden my_part` on a known-good placement (recorded as the recipe's golden;
+  only recorded goldens or an exact scan id are used, never a run's own test scan).
 - **Feedback**: the verdict painted on the part (green outline PASS, red fill + a cross at
   the fault FAIL): set the hold to what the operator needs to act.
 
 `scan recipe-validate my_part` lists every problem before anything runs; `scan recipe-run
-my_part --scan <stored scan>` re-checks a stored scan offline while you tune tolerances.
+my_part --scan <stored scan> --no-feedback` re-checks a stored scan offline while you tune
+tolerances: nothing is captured or projected, so the real rig needs no operator confirmation
+for it. Without `--no-feedback` the verdict would be painted on whatever is in front of the
+projector now, so that form needs `--operator-confirmed` like a live run.
 
 ## 5. I/O
 
@@ -96,14 +104,18 @@ DISARM / RESET / work-state commands from every source (the operator page, keys,
 `POST /api/cmd/*`, hardware inputs) and publishes READY / BUSY / PASS / FAIL / ALARM plus three
 registers: `result_code` (the recipe's `outputs.result_codes`: PASS 1, FAIL 2, INVALID 3,
 ABORTED 4 by default; 0 = none yet), `state_code` (index of READY, ARMED, RUNNING, ABORTING,
-HOMING, FAULT) and `workstate` (1-based).
+HOMING, FAULT) and `workstate` (1-based): the position among ALL station configs in
+file-name order, invalid ones included (marked unusable, START / TRIGGER on them refused with
+result INVALID). The number never shifts because a config broke, and the list is frozen while
+ARMED or busy; adding or removing config files while idle does renumber, so keep the station
+config file names stable on a line driven by a PLC.
 
 Backends are config-driven (`stations/io_example.json`); the hardware ones are
 **placeholders** with the intended mapping in their docstrings and errors:
 
 | kind | in (PLC -> scanner) | out (scanner -> PLC) |
 |---|---|---|
-| `camera_gpio` | Line0 trigger, Line2 abort | Line1 busy |
+| `camera_gpio` | Line0 trigger, Line3 abort (camera inputs only: never Line2, the 3.3 V output) | Line1 busy |
 | `serial_io` | text tokens START / TRIG / STOP / HOME | - |
 | `digital_io` | DI0..DI15 rising edges | DO0..DO15 |
 | `modbus_tcp` | coils / discrete inputs -> commands, a holding register -> work state | coils <- signals, holding registers <- result / state / work state |
@@ -114,7 +126,11 @@ Implement `start(bus)` (deliver `bus.command(name, source=...)`) for an input an
 `publish(signals)` / `publish_registers(registers)` for an output with your site's stack,
 register the class under its kind, enable it in the I/O config. A typical handshake:
 PLC sets the work state -> ARM -> part in place -> TRIGGER -> BUSY -> PASS / FAIL + result
-code -> the PLC acts (and the operator sees red on the part where it failed).
+code -> the PLC acts (and the operator sees red on the part where it failed). START /
+TRIGGER / ARM may carry the work state the sender expects (`{"workstate": ...}` over HTTP):
+refused when another one is selected. Changing the work state while ARMED disarms (ARM
+again). Over HTTP, `operator_confirmed` must be a JSON boolean (only `true` confirms; any
+other type is a 400 on START / TRIGGER / ARM); ABORT, DISARM, HOME and RESET ignore it.
 
 ## 6. Validation: prove the numbers on your site
 

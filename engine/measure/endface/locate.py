@@ -15,7 +15,7 @@ Locate a circular end face in a metric scan (the bench prototype ring_check2, pr
   3. rim: contour points of the depth face whose outward neighbourhood (far_dilate_px) holds
      FAR surface (> the nearest depth + far_gap_mm): the true silhouette against the
      background, never the edge of an undecoded band or of the cell's own side wall.
-     PLANE SPLIT (neighbour_split): a neighbour only a few mm behind the face (a cooling
+     PLANE SPLIT (neighbour_split): a neighbour only a few mm behind the face (a ribbed
      tube, the next cell's body) falls inside near_band_mm and merges with the face into one
      component whose outline is not the face's. The component's planes are found by
      sequential RANSAC (a face and a parallel ribbon 3 mm behind it come out as two planes);

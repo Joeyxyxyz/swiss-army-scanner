@@ -1,7 +1,7 @@
 """Synthetic station scenes for the station tests (no rig, no capture path).
 
 Two cells lying with their circular END FACES toward the camera (tests/face_synth: EndFace +
-its cylindrical body) and a cooling tube (CT) between them: a thin metal ribbon (thickness
+its cylindrical body) and a ribbed tube (CT: its edge) between them: a thin metal ribbon (thickness
 CT_T) bent into a trapezoid wave in the face plane, seen edge-on, its front edge a few mm
 behind the faces (a chain of oriented Blocks, one per straight segment of the wave), in front
 of the wall; ray-cast by the mock bench's pinhole camera + projector (face_synth.render) and

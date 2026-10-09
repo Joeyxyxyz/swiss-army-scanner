@@ -1,9 +1,11 @@
 """Station strict cell gates (engine/measure/station/geometry.strict_gate): on a deep scene a
 bright disc on the background can pass the flat / proud checks and be taken for a cell. The
 synthetic station scan (tests/station_synth.py) gets such a disc painted into its flood + cloud
-(a flat patch ~55 mm behind the faces, partly measured, a ragged rim): it is set aside with its
-reasons and C1 / C2 are still the real cells; strict=False shows the gates are what catches it;
-too few cells left -> StationError naming the reasons. No rig."""
+(a flat patch ~55 mm behind the faces, partly measured, a rippled rim): it is set aside with its
+reasons and C1 / C2 are still the real cells (or, when its rim passes, the run is refused as
+ambiguous - never measured); strict=False shows the gates are what catches it; too few cells
+left -> StationError naming the reasons. The face-set selection on synthetic discs (order, rows,
+groups) and station_golden across the gate change (re-measured with the gates) too. No rig."""
 
 import json
 import shutil
@@ -15,6 +17,7 @@ import face_synth as S
 import station_synth as SS
 from engine import api
 from engine.measure.station import geometry as geo_mod
+from engine.measure.station import verbs as st_verbs
 
 DZ = -55.0          # the background patch, mm along the face normal (behind the faces)
 
@@ -33,15 +36,15 @@ def gate(tmp_path_factory):
     api._session = None
 
 
-def _fake(ctx, name, level=240.0, coverage=0.55, ripple=0.04, at=(72.0, 8.0), seed=0):
+def _fake(ctx, name, level=240.0, coverage=0.55, ripple=0.04, at=(72.0, 8.0), seed=0, dz=DZ):
     """Copy of the good scan with a background-like disc: flood `level` inside a rim of
-    relative ripple `ripple`, cloud a flat patch DZ mm behind the faces, `coverage` of it
-    measured, its surround undecoded."""
+    relative ripple `ripple`, cloud a flat patch `dz` mm along the face normal (default DZ:
+    behind the faces), `coverage` of it measured, its surround undecoded."""
     rg, sc = ctx["rg"], ctx["sc"]
     src = ctx["lib"] / "metric" / S.GEO / ctx["good"]
     d = src.parent / name
     d.mkdir()
-    Q = sc["O"] + at[0] * sc["e1"] + at[1] * sc["e2"] + DZ * sc["n"]
+    Q = sc["O"] + at[0] * sc["e1"] + at[1] * sc["e2"] + dz * sc["n"]
     cx, cy = rg.camera.project(Q)
     r = float(np.linalg.norm(np.subtract(rg.camera.project(Q + SS.R0 * sc["e1"]), (cx, cy))))
     with np.load(src / "cloud.npz") as z:
@@ -79,10 +82,12 @@ def test_background_disc_set_aside_and_real_cells_kept(gate):
     ref = api.station_measure(gate["good"], label="ref", params={"ct": False})
     assert [c["name"] for c in ref.cells] == ["C1", "C2"] and not ref.meta["set_aside"]
     name, (fx, fy) = _fake(gate, "20260101T050002_000000_bgdisc")
-    # 55 % measured and its rim circle not clean (rms ~0.39 mm > 0.3): not shown to be an end
-    # face, set aside on its own (the real faces' rims are ~0.06 mm)
+    # ~53 % measured and its rim circle not clean (rms ~0.39 mm > 0.3, the default; or no rim
+    # exception at all, the first gate): not shown to be an end face, set aside on its own (the
+    # real faces' rims are ~0.06 mm)
     for params, reason in (({"ct": False}, "% of the disc measured"),
-                           ({"ct": False, "strict_min_coverage": 0.7}, "% of the disc measured")):
+                           ({"ct": False, "strict_partial_outline_rms_mm": 0.0},
+                            "% of the disc measured")):
         m = api.station_measure(name, label="bg", params=params)
         assert len(m.cells) == 2
         for c, c0 in zip(m.cells, ref.cells):              # the same two real cells
@@ -93,6 +98,33 @@ def test_background_disc_set_aside_and_real_cells_kept(gate):
         assert aside, m.meta["set_aside"]
         assert reason in aside[0]["why"], aside
         assert any("set aside" in w for w in m.warnings)
+    # a station that allows a looser rim (0.6 mm) lets this disc pass on its own, but it sits
+    # ~55 mm behind the faces and is brighter than them - refused as ambiguous, never measured
+    # as an end face, never guessed away
+    with pytest.raises(geo_mod.StationError, match="ambiguous.*in height"):
+        api.station_measure(name, label="bg_loose_rim",
+                            params={"ct": False, "strict_partial_outline_rms_mm": 0.6})
+
+
+@pytest.mark.parametrize("dz,at", [(-3.0, (72.0, 8.0)), (-10.0, (-45.0, 30.0))])
+def test_a_partly_measured_disc_near_the_faces_never_replaces_one(gate, dz, at):
+    """Review case (the 0.6 mm rim allowance): a brighter disc a few mm behind the faces,
+    ~60 % measured with a rim of ~0.35-0.4 mm, passed the per-disc gate and silently took a
+    real face's place (C2-C1 read +-2.9 mm, nothing set aside); a golden built so PASSED a
+    defective part. By default (0.3 mm) it is set aside and the real faces measured; where a
+    looser rim is allowed, more discs than n_cells together are refused, never guessed."""
+    api._session = gate["s"]
+    ref = api.station_measure(gate["good"], label="ref_nd", params={"ct": False})
+    name, (fx, fy) = _fake(gate, f"20260101T0510{int(-dz):02d}_000000_neardisc", coverage=1.0,
+                           at=at, dz=dz, seed=5)            # ~55-65 % of it decodes
+    m = api.station_measure(name, label="nd", params={"ct": False})
+    for c, c0 in zip(m.cells, ref.cells):
+        assert np.hypot(*np.subtract(c["camera_px"], c0["camera_px"])) < 1.0
+    assert any(np.hypot(x["camera_px"][0] - fx, x["camera_px"][1] - fy) < 10
+               for x in m.meta["set_aside"]), m.meta["set_aside"]
+    with pytest.raises(geo_mod.StationError, match="ambiguous"):
+        api.station_measure(name, label="nd_loose", params={
+            "ct": False, "strict_partial_outline_rms_mm": 0.6})
 
 
 def test_gates_are_what_catches_it_and_too_few_cells_raise(gate):
@@ -100,8 +132,17 @@ def test_gates_are_what_catches_it_and_too_few_cells_raise(gate):
     name, (fx, fy) = _fake(gate, "20260101T050003_000000_bgdisc2", seed=1)
     loose = api.station_measure(name, label="loose", params={"ct": False, "strict": False})
     assert any(np.hypot(c["camera_px"][0] - fx, c["camera_px"][1] - fy) < 10 for c in loose.cells)
-    with pytest.raises(geo_mod.StationError, match="set aside:.*measured"):
+    # n_cells = 3: no set of three - refused, its reason named: the coverage gate by default
+    # (its rim is not clean), the pair gate (~55 mm behind the faces) when a looser rim is
+    # allowed below 70 %
+    with pytest.raises(geo_mod.StationError,
+                       match=r"found 2 face disc.*set aside: \(\d+, \d+\): only \d+ % of the disc "
+                             r"measured \(< 70 %\) and rim circle rms 0\.\d+ mm > 0\.3"):
         api.station_measure(name, label="three", n_cells=3, params={"ct": False})
+    with pytest.raises(geo_mod.StationError,
+                       match=r"found 2 face disc.*set aside: \(\d+, \d+\): -5\d\.\d mm in height"):
+        api.station_measure(name, label="three", n_cells=3,
+                            params={"ct": False, "strict_partial_outline_rms_mm": 0.6})
 
 
 def test_implausible_height_alone_is_rejected(gate):
@@ -140,7 +181,11 @@ def test_real_faces_cut_by_the_zone_edge_pass_the_default_coverage():
     coverage floor refused the whole measurement. Below 0.7 a disc now needs a clean rim
     circle instead: the background patches seen on the bench at 0.57-0.68 had none (or a
     0.8 mm one) and stay out - lowering the floor to 0.5 let them in (one measured as the
-    end face of a scene with no part)."""
+    end face of a scene with no part). 'Clean' stays <= 0.3 mm: a real face measured 0.699
+    on the decode-modulation flood (09-28 baseline scan) had a 0.49 mm rim and is refused
+    ('found 1 face disc(s)', fail closed), because a looser rim lets a partly measured
+    background disc near the faces' depth replace a real face (and one bench background
+    patch had 0.62); a station whose own bench data shows otherwise sets the key."""
     prm = geo_mod.StationParams.from_dict({})
     assert prm.strict_min_coverage == 0.7 and prm.strict_partial_outline_rms_mm == 0.3
     c1 = {"centre": np.zeros(3), "normal": np.array([0.0, 0.0, -1.0]), "coverage": 0.83,
@@ -149,10 +194,23 @@ def test_real_faces_cut_by_the_zone_edge_pass_the_default_coverage():
         c2 = dict(c1, centre=np.array([20.0, 0.5, 0.0]), coverage=cov, outline={"rms_mm": rim})
         assert geo_mod.strict_gate(c2, [c1], prm) == "", (cov, rim)
     for cov, outline in ((0.600, {"rms_mm": 0.84}),        # a rib patch of a tube, no part
+                         (0.592, {"rms_mm": 0.80}),
+                         (0.565, {"rms_mm": 0.621}),       # a wall patch ~45 mm behind
+                         (0.699, {"rms_mm": 0.488}),       # the decode-flood face: refused
                          (0.567, None), (0.675, None)):     # wall patches 85-117 mm behind
         why = geo_mod.strict_gate(dict(c1, coverage=cov, outline=outline), [], prm)
         assert "% of the disc measured" in why and "not shown to be an end face" in why, why
     assert geo_mod.strict_gate(dict(c1, coverage=0.75, outline=None), [], prm) == ""
+    loose = geo_mod.StationParams.from_dict({"strict_partial_outline_rms_mm": 0.6})
+    assert geo_mod.strict_gate(dict(c1, centre=np.array([20.0, 0.5, 0.0]), coverage=0.699,
+                                    outline={"rms_mm": 0.488}), [c1], loose) == ""
+    # a disc refused just under a limit never reads as being at it
+    why = geo_mod.strict_gate(dict(c1, coverage=0.6996, outline={"rms_mm": 0.3004}), [], prm)
+    assert "only 69 % of the disc measured (< 70 %)" in why and "0.3004 mm > 0.3" in why, why
+    why = geo_mod.strict_gate(dict(c1, coverage=0.69, outline={"rms_mm": 1.0004}), [], prm)
+    assert "rim circle rms 1.0004 mm > 1" in why and "only 69 %" in why, why
+    why = geo_mod.strict_gate(dict(c1, coverage=0.69, outline={"rms_mm": 0.3000000001}), [], prm)
+    assert "0.3000000001 mm > 0.3" in why, why
 
 
 def test_a_row_of_faces_longer_than_the_spacing_bound_is_accepted():
@@ -297,49 +355,184 @@ def test_selection_a_long_row_needs_neighbours_only():
     depth2 = {(x, y): 640.0 for x, y, _, _ in spec2}
     with pytest.raises(geo_mod.StationError, match="split into groups"):
         _select(spec2, depth2, 8)
-    got, _ = _select(spec2, depth2, 4)                               # one group is a set
-    assert len(got) == 4
+    # one group is a set - but the other, as bright and at the same depth, is one too: which is
+    # the part? refused, both named (it used to take whichever group sorted first)
+    with pytest.raises(geo_mod.StationError, match="ambiguous.*no face of the set within"):
+        _select(spec2, depth2, 4)
+    # the other group dimmer (still within 2 x): a group of its own all the same - the part
+    # may be either (a bright background row); refused, never the brighter one guessed
+    spec3 = [(x, y, r, lv if x > 400 else 150) for x, y, r, lv in spec2]
+    with pytest.raises(geo_mod.StationError, match="ambiguous"):
+        _select(spec3, depth2, 4)
+    # ... a dimmer LONE disc there is set aside: the brighter group is the set
+    lone = [d for d in spec3 if d[0] > 400] + [(60, 240, 20, 150)]
+    got, _ = _select(lone, {(x, y): 640.0 for x, y, _, _ in lone}, 4)
+    assert sorted(got) == sorted(k for k in depth2 if k[0] > 400)
+    # a row of 9 faces for n_cells = 8: which 8? refused, never the 8 brightest guessed
+    spec9 = [(60 + 100 * k, 240, 20, 200 + k) for k in range(9) if 60 + 100 * k < 880]
+    depth9 = {(x, y): 640.0 for x, y, _, _ in spec9}
+    assert len(spec9) == 9
+    with pytest.raises(geo_mod.StationError, match="ambiguous.*continues their row"):
+        _select(spec9, depth9, 8)
+
+
+def test_a_bright_disc_beyond_the_end_of_the_row_never_replaces_a_face():
+    """Review case (the neighbour rule's first version): three real faces in a row (1.9 D
+    pitch, z 640 mm) and a brighter, round, flat disc 5 mm deeper, 5.5 D beyond the last face
+    (7.4 D from the middle one): it went with the last face, and the set {R2, R3, disc} was
+    taken - R1 dropped silently, nothing set aside. Now a left-out disc that goes with every
+    face of the set but continues its row past the bound refuses the run, whichever is
+    brighter; so does a chain of bright discs stepping away from two real faces. Without the
+    disc the row is measured."""
+    D, mmpx = 21.0, 0.8
+    bx = 200 + int(round(5.5 * D / mmpx))
+    for lv_r in (180, 179, 140):                       # real faces as bright, or dimmer
+        real = [(100, 240, 20, lv_r), (150, 240, 20, lv_r), (200, 240, 20, lv_r)]
+        depth = {(100, 240): 640.0, (150, 240): 640.0, (200, 240): 640.0, (bx, 240): 645.0}
+        with pytest.raises(geo_mod.StationError, match="ambiguous.*continues their row"):
+            _select(real + [(bx, 240, 20, 230)], depth, 3)
+        got, _ = _select(real, depth, 3)
+        assert sorted(got) == [(100, 240), (150, 240), (200, 240)]
+    # a chain: two real faces + three bright discs stepping away ~5.7 D each, 10 mm deeper each
+    real = [(100, 240, 20, 160), (150, 240, 20, 160)]
+    chain = [(300, 240, 20, 230), (450, 240, 20, 225), (600, 240, 20, 220)]
+    depth = {(100, 240): 640.0, (150, 240): 640.0, (300, 240): 650.0, (450, 240): 660.0,
+             (600, 240): 670.0}
+    with pytest.raises(geo_mod.StationError, match="ambiguous"):
+        _select(real + chain, depth, 3)
+    # the chain starting 6.5 D from the two real faces (a gap past the bound, 5.7 D steps): the
+    # real pair is a group of its own - the part with a face missing? refused, not dropped
+    b1x = 150 + int(round(6.5 * D / mmpx))
+    chain = [(b1x, 240, 20, 230), (b1x + 150, 240, 20, 225), (b1x + 300, 240, 20, 220)]
+    depth = {(100, 240): 640.0, (150, 240): 640.0, (b1x, 240): 650.0,
+             (b1x + 150, 240): 660.0, (b1x + 300, 240): 670.0}
+    with pytest.raises(geo_mod.StationError, match="ambiguous.*a group of their own"):
+        _select(real + chain, depth, 3)
+    # a compact group (every disc within the bound of every other) of more discs than
+    # n_cells > 1: which are the part? refused (it took the brightest two: a bright disc
+    # beside the faces replaced a real face silently); one face is the brightest disc
+    pack = [(100, 240, 20, 200), (150, 240, 20, 190), (125, 285, 20, 180)]
+    dpack = {(100, 240): 640.0, (150, 240): 640.1, (125, 285): 640.2}
+    with pytest.raises(geo_mod.StationError, match="ambiguous.*more end-face discs together"):
+        _select(pack, dpack, 2)
+    got, _ = _select(pack, dpack, 1)
+    assert got == [(100, 240)]
+    got, _ = _select(pack[:2], dpack, 2)
+    assert sorted(got) == [(100, 240), (150, 240)]
+
+
+@pytest.mark.parametrize("levels,bright", [((114, 120, 120), 230), ((113, 116, 117), 230),
+                                           ((110, 180, 180), 230), ((120, 130, 130), 250),
+                                           ((100, 180, 180), 230), ((110, 200, 200), 250),
+                                           ((130, 120, 130), 250)])
+def test_a_bright_disc_never_pushes_a_face_out_by_brightness_alone(levels, bright):
+    """Review case (the row rule's first version): the real faces' levels straddle
+    min_brightness_frac x a bright same-depth disc 5.5 D past the end of the row - one of them
+    'dimmer than 0.5 x the brightest face' of the set {the others, the disc}, so it did not go
+    with every face, the row rule skipped it, and it was dropped silently (nothing set aside).
+    A left-out disc that the pair gates let continue the row, kept out by brightness alone,
+    refuses the run when it makes a full set with other discs: the real row is one."""
+    D, mmpx = 21.0, 0.8
+    bx = 200 + int(round(5.5 * D / mmpx))
+    real = [(100 + 50 * k, 240, 20, lv) for k, lv in enumerate(levels)]
+    depth = {(100, 240): 640.0, (150, 240): 640.0, (200, 240): 640.0, (bx, 240): 645.0}
+    with pytest.raises(geo_mod.StationError, match="ambiguous.*by brightness alone"):
+        _select(real + [(bx, 240, 20, bright)], depth, 3)
+    got, _ = _select(real, depth, 3)
+    assert sorted(got) == [(100, 240), (150, 240), (200, 240)]
+    # n_cells = 2: the same straddle with the first two faces
+    with pytest.raises(geo_mod.StationError, match="ambiguous"):
+        _select(real[:2] + [(150 + int(round(5.5 * D / mmpx)), 240, 20, bright)],
+                {(100, 240): 640.0, (150, 240): 640.0,
+                 (150 + int(round(5.5 * D / mmpx)), 240): 645.0}, 2)
+
+
+def test_a_dim_disc_continuing_the_row_is_no_face():
+    """A disc continuing the row that is dimmer than half of EVERY face (no full set with it)
+    is not a face of the same kind: set aside as before, the row is measured."""
+    D, mmpx = 21.0, 0.8
+    real = [(150, 240, 20, 200), (200, 240, 20, 200), (250, 240, 20, 200)]
+    dim = (250 + int(round(5.5 * D / mmpx)), 240, 20, 80)
+    depth = {(150, 240): 640.0, (200, 240): 640.0, (250, 240): 640.0, dim[:2]: 640.5}
+    got, _ = _select(real + [dim], depth, 3)
+    assert sorted(got) == [(150, 240), (200, 240), (250, 240)]
 
 
 # ------------------------------------------------------------ goldens across the gate change
 
-def _old_style(m, path, cells=None):
-    """m's .json as a measurement made before the strict gates existed (no strict keys)."""
+def _old_style(m, path, cells=None, keys=st_verbs.STRICT_KEYS, **top):
+    """m's .json as a measurement made before the strict gates existed (no strict keys; or
+    only `keys` dropped: an earlier version of the gates); cells / top-level fields edited."""
     rep = json.loads(m.files["json"].read_text(encoding="utf-8"))
-    for k in ("strict", "max_outline_rms_mm", "strict_min_coverage", "max_pair_dz_diam",
-              "max_pair_spacing_diam", "min_pair_spacing_diam"):
+    for k in keys:
         rep["params"].pop(k)
     if cells:
         for c in rep["cells"]:
             c.update(cells.get(c["name"], {}))
+    rep.update(top)
     path.write_text(json.dumps(rep), encoding="utf-8")
     return path
 
 
-def test_golden_combines_a_measurement_older_than_the_gates_when_it_passes_them(gate, tmp_path):
+def test_golden_combines_a_measurement_older_than_the_gates_when_the_gates_measure_it_alike(
+        gate, tmp_path):
     """The review case: a measurement .json from before the strict gates (its params lack the
-    new keys) and a new one were refused as 'different station parameters'. Now its stored end
-    faces are re-checked against the gates: pass -> combined (warned, the golden checks with
-    the gates); fail -> refused; a new strict=False measurement goes with an old one as is;
-    different gate settings or other parameters are still refused."""
+    new keys) and a new one were refused as 'different station parameters'. Its scan is now
+    measured AGAIN with the gates - the whole selection, not only the faces it stored (a
+    re-check of those passed an ungated measurement that had taken a background disc, whose
+    scan the gates refuse as ambiguous): the same end faces -> the re-measurement stands in
+    (warned, the golden checks with the gates); the gates refuse its scan, find other end
+    faces, or it cannot be measured again -> refused. Two measurements without the gates go
+    together as they are; different gate settings or other parameters are still refused."""
     api._session = gate["s"]
     new = api.station_measure(gate["good"], label="g_new", params={"ct": False})
     old = _old_style(api.station_measure(gate["good"], label="g_old", params={"ct": False}),
                      tmp_path / "old_station.json")
     g = api.station_golden([str(old), new], "mixed")
     assert g.params["strict"] is True and g.params["strict_min_coverage"] == 0.7
-    assert any("re-checked" in w and "pass" in w for w in g.warnings), g.warnings
+    assert any("re-measured with them" in w and "the same end faces" in w for w in g.warnings), \
+        g.warnings
+    gj = json.loads((g.path / "golden.json").read_text(encoding="utf-8"))
+    assert gj["measurements"][0]["label"].startswith("g_old_gated")    # the re-measurement
+    assert gj["measurements"][0]["file"]
+    assert g.nominal["pairs"][0]["height_diff_mm"] == pytest.approx(
+        new.pairs[0]["height_diff_mm"], abs=1e-4)
     g = api.station_golden([new, str(old)], "mixed2")                  # either order
     assert g.params["strict"] is True
-    bad = _old_style(api.station_measure(gate["good"], label="g_bad", params={"ct": False}),
-                     tmp_path / "old_bad_station.json", {"C2": {"outline_rms_mm": 1.6}})
-    with pytest.raises(ValueError, match="does not pass them.*ragged outline"):
+    # made by an earlier version of the gates (a gate setting not stored): measured again too
+    early = _old_style(new, tmp_path / "early_station.json",
+                       keys=("strict_partial_outline_rms_mm",))
+    g = api.station_golden([new, str(early)], "early")
+    assert any("re-measured with them" in w for w in g.warnings), g.warnings
+    # an ungated measurement that took a background disc for an end face (round, fully
+    # measured, brighter than the faces): the gates refuse its scan (ambiguous) -> refused,
+    # whatever its stored faces look like
+    name, (fx, fy) = _fake(gate, "20260101T050005_000000_bgdisc4", seed=4, level=250.0,
+                           coverage=1.0, ripple=0.0)
+    took = api.station_measure(name, label="g_took", params={"ct": False, "strict": False})
+    assert any(np.hypot(c["camera_px"][0] - fx, c["camera_px"][1] - fy) < 10 for c in took.cells)
+    bad = _old_style(took, tmp_path / "old_bad_station.json")
+    with pytest.raises(ValueError, match="without the strict end-face gates.*refused.*ambiguous"):
         api.station_golden([new, str(bad)], "nope")
-    with pytest.raises(ValueError, match="does not pass them"):
+    with pytest.raises(ValueError, match="without the strict end-face gates"):
         api.station_golden([str(old), str(bad), new], "nope")
+    # its stored faces are not the ones the gates measure on its scan -> refused
+    moved = _old_style(new, tmp_path / "old_moved_station.json", cells={"C2": {"centre_mm": [
+        v + d for v, d in zip(new.cells[1]["centre_mm"], (30.0, 0.0, 0.0))]}})
+    with pytest.raises(ValueError, match="find other end faces.*C2"):
+        api.station_golden([new, str(moved)], "nope")
+    # it cannot be measured again (its flood was given as an array) -> refused
+    arr = _old_style(new, tmp_path / "old_array_station.json", flood_source="array")
+    with pytest.raises(ValueError, match="cannot be measured again"):
+        api.station_golden([new, str(arr)], "nope")
+    # no gates on either side: together as they are (no re-measurement) ...
     loose = api.station_measure(gate["good"], label="g_loose", params={"ct": False, "strict": False})
-    g = api.station_golden([str(bad), loose], "loose_pair")            # no gates on either side
-    assert not any("re-checked" in w for w in g.warnings)
+    g = api.station_golden([str(old), loose], "loose_pair")
+    assert not any("re-measured" in w for w in g.warnings)
+    # ... but an end face found somewhere else in one of them is never averaged in
+    with pytest.raises(ValueError, match="end face C[12] of measurement .* mm from the "
+                                         "measurements' mean position"):
+        api.station_golden([str(bad), loose], "nope")
     other = api.station_measure(gate["good"], label="g_cov",
                                 params={"ct": False, "strict_min_coverage": 0.6})
     with pytest.raises(ValueError, match="different strict end-face gate settings"):
@@ -348,6 +541,66 @@ def test_golden_combines_a_measurement_older_than_the_gates_when_it_passes_them(
                                  params={"ct": False, "face_shrink_px": 4.0})
     with pytest.raises(ValueError, match="different station parameters"):
         api.station_golden([str(old), shrink], "nope")
+
+
+def test_golden_never_averages_in_an_ungated_background_pair(gate, tmp_path):
+    """Review case: a clean background PAIR painted 55 mm behind the faces (brighter, fully
+    measured). Without the gates it is taken for C1 / C2; that measurement, saved as an older
+    .json, used to pass the stored-face re-check and move the golden's C2-C1 nominal - with 4
+    good measurements beside it the averaged face positions even stayed within tolerance and a
+    defective part PASSED. Its scan measured again with the gates is ambiguous: refused, with
+    one good measurement or four."""
+    api._session = gate["s"]
+    name = "20260101T050077_000000_bgpair"
+    _fake_pair(gate, name, [(72.0, 8.0), (72.0, -24.0)])
+    with pytest.raises(geo_mod.StationError, match="ambiguous"):
+        api.station_measure(name, label="p_gated", params={"ct": False})
+    loose = api.station_measure(name, label="p_loose", params={"ct": False, "strict": False})
+    old = _old_style(loose, tmp_path / "p_old.json")
+    goods = [api.station_measure(gate["good"], label=f"p_good{i}", params={"ct": False})
+             for i in range(4)]
+    for ms in (goods[:1], goods):
+        with pytest.raises(ValueError, match="without the strict end-face gates.*ambiguous"):
+            api.station_golden(ms + [str(old)], "p_mixed")
+    # two ungated measurements, one of them the background pair: never averaged
+    loose_good = api.station_measure(gate["good"], label="p_loose_good",
+                                     params={"ct": False, "strict": False})
+    with pytest.raises(ValueError, match="mean position"):
+        api.station_golden([loose_good, str(old)], "p_loose_mixed")
+
+
+def _fake_pair(ctx, name, ats, level=250.0, seed=3):
+    """Copy of the good scan with clean, fully measured background discs (DZ behind the faces,
+    brighter than them) at each (s, v) of the face frame."""
+    rg, sc = ctx["rg"], ctx["sc"]
+    src = ctx["lib"] / "metric" / S.GEO / ctx["good"]
+    d = src.parent / name
+    d.mkdir()
+    with np.load(src / "cloud.npz") as z:
+        xyz = z["xyz"].copy()
+    with np.load(src / "flood.npz") as z:
+        w, b = z["white"].copy(), z["black"].copy()
+    yy, xx = np.mgrid[0:S.CAM[0], 0:S.CAM[1]]
+    ray = xyz / np.linalg.norm(xyz, axis=-1, keepdims=True)
+    rng = np.random.default_rng(seed)
+    for at in ats:
+        Q = sc["O"] + at[0] * sc["e1"] + at[1] * sc["e2"] + DZ * sc["n"]
+        cx, cy = rg.camera.project(Q)
+        r = float(np.linalg.norm(np.subtract(rg.camera.project(Q + SS.R0 * sc["e1"]), (cx, cy))))
+        rho = np.hypot(xx - cx, yy - cy)
+        disc, ring = rho < r, (rho >= r) & (rho < 1.7 * r)
+        t = (Q @ sc["n"]) / (ray @ sc["n"])
+        P = ray * t[..., None] + ray * rng.normal(0, 0.02, t.shape)[..., None]
+        xyz[ring] = np.nan
+        xyz[disc] = P[disc]
+        w[disc] = level
+    np.savez_compressed(d / "cloud.npz", xyz=xyz, mask=np.all(np.isfinite(xyz), -1))
+    np.savez_compressed(d / "flood.npz", white=w, black=b)
+    shutil.copy2(src / "field.npz", d / "field.npz")
+    meta = json.loads((src / "meta.json").read_text())
+    meta.update(id=name, label=name)
+    (d / "meta.json").write_text(json.dumps(meta))
+    return name
 
 
 def _part_absent(ctx, name, ref, coverage=0.6, level=240.0, at=(72.0, 8.0), seed=0):

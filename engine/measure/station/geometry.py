@@ -91,18 +91,23 @@ class StationParams:
     # happened to be accepted first (a bright background disc must not set aside the real
     # faces): the face set is chosen among the discs that pass every per-disc check, and a
     # validated disc left out of that set that conflicts with it in depth (or is brighter than
-    # its faces) makes the result ambiguous: refused, both named, never guessed
+    # its faces, continues their row past max_pair_spacing_diam, or forms a group of its own)
+    # makes the result ambiguous: refused, both named, never guessed
     strict: bool = True
     max_outline_rms_mm: float = 1.0     # flood rim circle rms on the face plane (good faces ~0.1-0.7)
     strict_min_coverage: float = 0.7    # measured fraction of the disc; below it (down to
                                         # min_face_coverage) only with a clean rim circle:
     strict_partial_outline_rms_mm: float = 0.3   # real faces measured 0.5-0.7 on the bench
                                         # (glint, zone edge) had rim rms 0.09-0.13 mm (one at
-                                        # 0.699: 0.49); background patches there measured
-                                        # 0.57-0.68 with no rim circle or a 0.8 mm one
+                                        # 0.699 on the decode-modulation flood: 0.49, refused);
+                                        # background patches there measured 0.57-0.68 with no
+                                        # rim circle or a 0.8 mm one (a tube rib), and one at
+                                        # 0.565 had 0.62: a looser rim lets partly measured
+                                        # background discs near the faces' depth in
     max_pair_dz_diam: float = 2.0       # |height difference| between any two faces, x diameter
     max_pair_spacing_diam: float = 6.0  # 3D centre spacing to the NEAREST other face, x diameter
-                                        # (a row of faces may span more; each needs a neighbour)
+                                        # (a row of faces may span more; each needs a neighbour,
+                                        # and a disc that would continue the row is ambiguous)
     min_pair_spacing_diam: float = 0.9  # ... and to every other face at least this (no overlap)
 
     def to_dict(self) -> dict:
@@ -379,12 +384,22 @@ def _select_cells(cands: list, g: np.ndarray, d: np.ndarray, prm: StationParams,
     pair(a, b) -> (why, near, depth_conflict), no two overlap, none is dimmer than
     min_brightness_frac x the set's brightest, and each face has a near neighbour - so no
     single disc (e.g. a bright background disc) is the reference the others are judged by.
-    Fail closed: a validated disc left out of the chosen set that is incompatible with it and
-    at least as bright as the set's dimmest face, or that conflicts with it in depth and
-    either goes with another left-out disc there (a partial set: the part with a face
-    missing?) or makes a full set of its own, makes the result ambiguous: StationError naming
-    both. A dimmer lone disc at another depth is set aside (named in `rejected`). ->
-    (faces, rejected), faces shorter than n_cells when no set passes."""
+    Fail closed: a validated disc left out of the chosen set that is incompatible with it (or
+    has no face of it within max_pair_spacing_diam x D: a separate group) and is at least as
+    bright as the set's dimmest face, or that conflicts with it in depth and either goes with
+    another left-out disc there (a partial set: the part with a face missing?) or makes a full
+    set of its own, makes the result ambiguous: StationError naming both. So does a disc that
+    the pair gates let go with every face of the set but continues its row: within the bound
+    of one face, past it of another - the set + it span more than one face set, and
+    brightness alone (a bright background disc beyond the end of the row) must not decide
+    which faces are the part: refused when it goes with every face, and when only the
+    brightness rule keeps it out but it makes a full set with other discs; with n_cells > 1
+    the same within the bound among the faces (a compact group of more discs than n_cells;
+    n_cells = 1 takes the brightest disc of such a group). So does a disc at
+    the set's depth with no face of it within the bound that goes with another such disc (a
+    group of its own, partial or full). A dimmer lone disc is set aside (named in
+    `rejected`, pair-gate conflicts first). -> (faces, rejected), faces shorter than n_cells
+    when no set passes."""
     n = prm.n_cells
     hint = bool(prm.cell_px_hint)
     examined = []                                # [(cell, ok, why)] brightest first
@@ -400,26 +415,33 @@ def _select_cells(cands: list, g: np.ndarray, d: np.ndarray, prm: StationParams,
     rel_cache = {}
 
     def rel(i, j, V):
-        """(why from V[i]'s side vs V[j], near, depth conflict) for two validated discs; the
-        depth conflict is the pair gate's whatever their brightness (a much brighter or much
-        dimmer disc at another depth still makes the choice ambiguous)."""
+        """(why from V[i]'s side vs V[j], near, depth conflict, the pair gate's own why) for
+        two validated discs; the depth conflict is the pair gate's whatever their brightness
+        (a much brighter or much dimmer disc at another depth still makes the choice
+        ambiguous); `why` adds the brightness rule to the pair gate's."""
         if (i, j) not in rel_cache:
             a, b = V[i], V[j]
             if _overlap(a, b):
-                rel_cache[(i, j)] = ("overlaps a brighter disc" if j < i else "", True, False)
+                w = "overlaps a brighter disc" if j < i else ""
+                rel_cache[(i, j)] = (w, True, False, w)
             else:
                 why, near, depth = pair(a, b)
+                gwhy = why
                 if not why and not hint:
                     if a["flood_level"] <= prm.min_brightness_frac * b["flood_level"]:
                         why = f"dimmer than {prm.min_brightness_frac:g} x the brightest face"
                     elif b["flood_level"] <= prm.min_brightness_frac * a["flood_level"]:
                         why = (f"over {1 / max(prm.min_brightness_frac, 1e-9):.3g} x as bright "
                                "as the faces")
-                rel_cache[(i, j)] = (why, near, depth)
+                rel_cache[(i, j)] = (why, near, depth, gwhy)
         return rel_cache[(i, j)]
 
     def compatible(i, j, V):
         return not _overlap(V[i], V[j]) and not rel(i, j, V)[0] and not rel(j, i, V)[0]
+
+    def fits_with(i, j, V):
+        """compatible but for the brightness rule: the pair gates pass, no overlap."""
+        return not _overlap(V[i], V[j]) and not rel(i, j, V)[3] and not rel(j, i, V)[3]
 
     def connected(sel, V):
         if len(sel) < 2:
@@ -490,23 +512,72 @@ def _select_cells(cands: list, g: np.ndarray, d: np.ndarray, prm: StationParams,
         out_ = [v for v in range(len(V))
                 if v not in chosen and not any(_overlap(V[v], V[c]) for c in chosen)]
         deep = [v for v in out_ if any(rel(v, c, V)[2] for c in chosen)]
+        D = prm.face_diameter_mm
+        bound = (f"{prm.max_pair_spacing_diam:g} x the diameter "
+                 f"({prm.max_pair_spacing_diam * D:.0f} mm)")
+        # left-out discs that the pair gates let go with every face of the set but that have
+        # no face of it within the bound: elsewhere, at the set's depth
+        aloof = [v for v in out_
+                 if all(fits_with(v, c, V) and not rel(v, c, V)[1] for c in chosen)]
         for v in out_:
             depth = [c for c in chosen if rel(v, c, V)[2]]
             other = [c for c in chosen if not compatible(v, c, V)]
+            near = [c for c in chosen if rel(v, c, V)[1]]
+            far = [c for c in chosen if not rel(v, c, V)[1]]
             bright = V[v]["flood_level"] >= lo_set and not hint
+            if near and (far or n > 1) and all(fits_with(v, c, V) for c in chosen):
+                # it goes with the set: it continues its row (within the bound of one face,
+                # past it of another), or - n_cells > 1 - sits within the bound among its
+                # faces. The set and it hold more than n_cells faces that go together, and
+                # only brightness chose among them (a bright background disc beyond the end of
+                # the row, or beside the faces, must not push a real face out silently). One
+                # face (n_cells = 1) is the brightest disc of a compact group, as documented.
+                where = (f"continues their row (within {bound} of the face at {at(near[:1])}, "
+                         f"not of the one at {at(far[:1])})" if far else
+                         f"goes with them, within {bound} of the face at {at(near[:1])}")
+                if not other:
+                    raise StationError(
+                        f"ambiguous end faces: the discs at camera px {at(chosen)} pass every "
+                        f"check, and so does the disc at {at([v])}, which {where}: more "
+                        f"end-face discs together than n_cells = {n} - which are the part? Pass "
+                        "cell_px_hint, or scan a zone that leaves the background out")
+                # ... and only the brightness rule keeps it out (dimmer than half of one face
+                # of the set, or the reverse): when it makes a full set with other discs, that
+                # set is as plausible - brightness relative to one disc (a bright background
+                # disc) must not decide which faces are the part
+                alt = search(V, forced=v)[0]
+                if alt is not None:
+                    c = other[0]
+                    dim = rel(v, c, V)[0] or rel(c, v, V)[0]
+                    raise StationError(
+                        f"ambiguous end faces: the discs at camera px {at(chosen)} and those at "
+                        f"{at(alt)} each pass every check; the disc at {at([v])} {where} and is "
+                        f"kept out of the first by brightness alone ({dim}, the disc at "
+                        f"{at([c])}): which are the part? Pass cell_px_hint, or scan a zone that "
+                        "leaves the background out")
             # a validated disc left out that goes with another left-out disc at its depth (a
             # partial set there: the part with a face missing?)
             group = depth and any(w != v and compatible(v, w, V) for w in deep)
-            if not ((depth and (bright or group)) or (other and bright)):
+            # ... or, at the set's depth but with no face of it within the bound, goes with
+            # another such disc within the bound (a partial set elsewhere: the same question)
+            mates = ([w for w in aloof if w != v and compatible(v, w, V) and rel(v, w, V)[1]]
+                     if v in aloof else [])
+            # no face of the set within the bound of it: a separate group (judged as a disc
+            # that does not go with the set)
+            apart = not other and not near
+            if not ((depth and (bright or group)) or ((other or apart) and bright) or mates):
                 alt = search(V, forced=v)[0] if depth else None
                 if alt is None:
                     continue                     # dimmer, alone, no full set of its own
             else:
                 alt = search(V, forced=v)[0]
-            c = (depth or other)[0]
-            why = rel(v, c, V)[0] or rel(c, v, V)[0]
+            c = (depth or other or far)[0]
+            why = (rel(v, c, V)[0] or rel(c, v, V)[0]
+                   or f"no face of the set within {bound} of the disc at {at([v])}")
             what = (f"the discs at camera px {at(chosen)} and those at {at(alt)} each pass "
                     "every check" if alt is not None else
+                    f"the discs at camera px {at(chosen)} pass every check, and so do the "
+                    f"discs at {at([v] + mates)}, a group of their own" if mates else
                     f"the discs at camera px {at(chosen)} pass every check, and so does the "
                     f"disc at {at([v])}")
             raise StationError(
@@ -516,7 +587,7 @@ def _select_cells(cands: list, g: np.ndarray, d: np.ndarray, prm: StationParams,
     sel = chosen if chosen is not None else partial
     faces = [V[i] for i in sel]
     lo = min((c["flood_level"] for c in faces), default=np.inf)
-    rejected = []
+    rejected, unfit = [], []                     # pair-gate conflicts first: they decide
     for c, ok, why in examined:
         if ok:
             i = next(k for k, v in enumerate(V) if v is c)
@@ -539,8 +610,8 @@ def _select_cells(cands: list, g: np.ndarray, d: np.ndarray, prm: StationParams,
             if chosen is not None and not hint and (c["flood_level"] < lo
                                                     or any(_overlap(c, f) for f in faces)):
                 continue                                 # never needed / a face's duplicate
-            rejected.append({"hough_px": c["hough_px"], "why": why})
-    return faces, rejected
+            unfit.append({"hough_px": c["hough_px"], "why": why})
+    return faces, rejected + unfit
 
 
 def find_cells(d: np.ndarray, prm: StationParams, r_exp_px: Optional[float] = None,
@@ -609,6 +680,8 @@ def find_cells(d: np.ndarray, prm: StationParams, r_exp_px: Optional[float] = No
     if len(out) < prm.n_cells:
         why = "; ".join(f"({x['hough_px'][0]:.0f}, {x['hough_px'][1]:.0f}): {x['why']}"
                         for x in rejected[:5])
+        if len(rejected) > 5:
+            why += f"; and {len(rejected) - 5} more"
         raise StationError(f"found {len(out)} face disc(s), expected {prm.n_cells} (radius "
                            f"{rmin}..{rmax} px){'; set aside: ' + why if why else ''} - pass "
                            "cell_px_hint or r_px_range, or check the flood")
@@ -683,6 +756,21 @@ def surround_same_frac(X: np.ndarray, cell: dict, f: dict, band=(1.2, 1.6),
     return float(np.sum(np.isfinite(h) & (np.abs(h) < tol_mm)) / ring.sum())
 
 
+def _pct(frac: float) -> int:
+    """A measured fraction as whole percent, rounded DOWN: a disc refused just below a limit
+    never reads as being at it ('70 % (< 70 %)')."""
+    return int(np.floor(100.0 * float(frac) + 1e-9))
+
+
+def _over(v: float, lim: float) -> str:
+    """v (> lim) with as many decimals as it takes not to read as lim ('0.30 > 0.3'); the
+    exact value when no rounding does."""
+    for nd in range(2, 10):
+        if float(f"{v:.{nd}f}") > lim:
+            return f"{v:.{nd}f}"
+    return repr(float(v))
+
+
 def strict_disc_gate(f: dict, prm: StationParams) -> list:
     """The strict per-disc reasons of a fitted face f ([] = passes): its flood outline is
     ragged, or too little of it is measured - a disc measured below strict_min_coverage passes
@@ -691,13 +779,15 @@ def strict_disc_gate(f: dict, prm: StationParams) -> list:
     why = []
     rms = (f.get("outline") or {}).get("rms_mm")
     if rms is not None and rms > prm.max_outline_rms_mm:
-        why.append(f"ragged outline (rim circle rms {rms:.2f} mm > {prm.max_outline_rms_mm:g})")
+        why.append(f"ragged outline (rim circle rms {_over(rms, prm.max_outline_rms_mm)} mm > "
+                   f"{prm.max_outline_rms_mm:g})")
     if f["coverage"] < prm.strict_min_coverage and (
             rms is None or rms > prm.strict_partial_outline_rms_mm):
         rim = ("no rim circle" if rms is None else
-               f"rim circle rms {rms:.2f} mm > {prm.strict_partial_outline_rms_mm:g}")
-        why.append(f"only {100 * f['coverage']:.0f} % of the disc measured "
-                   f"(< {100 * prm.strict_min_coverage:.0f} %) and {rim}: not shown to be an "
+               f"rim circle rms {_over(rms, prm.strict_partial_outline_rms_mm)} mm > "
+               f"{prm.strict_partial_outline_rms_mm:g}")
+        why.append(f"only {_pct(f['coverage'])} % of the disc measured "
+                   f"(< {100 * prm.strict_min_coverage:g} %) and {rim}: not shown to be an "
                    "end face")
     return why
 
@@ -1067,7 +1157,7 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
         except StationError as e:
             return False, str(e)
         if f["coverage"] < prm.min_face_coverage:
-            return False, f"only {100 * f['coverage']:.0f} % of the disc measured"
+            return False, f"only {_pct(f['coverage'])} % of the disc measured"
         if f["flat_rms_mm"] > prm.max_face_rms_mm:
             return False, f"not a flat face (plane rms {f['flat_rms_mm']:.2f} mm)"
         same = surround_same_frac(X, c, f)
@@ -1099,7 +1189,7 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
         f["height_mm"] = float((f["centre"] - O) @ n)
         f["tilt_vs_common_deg"] = angle_deg(f["normal"], n)
         if f["coverage"] < 0.7:
-            warnings.append(f"{c['name']}: only {100 * f['coverage']:.0f} % of its face disc is "
+            warnings.append(f"{c['name']}: only {_pct(f['coverage'])} % of its face disc is "
                             "measured")
         # a face cut by the zone edge (its flood dark past the cut) or a poor outline moves the
         # centre sideways: the height is unaffected (the centre stays on the face plane), the

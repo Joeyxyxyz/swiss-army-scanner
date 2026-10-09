@@ -262,3 +262,230 @@ def test_quick_page_shows_active_preset_and_workstate_selects_it(web):
         assert status == 409
     finally:
         app.bus.state = "READY"
+
+
+# ------------------------------------------------------------------ review regressions
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1e999", "nan", "inf"])
+def test_non_finite_override_refused(eng, value):
+    """A NaN / Infinity FAIL trigger never FAILs anything: refused at preset-add."""
+    with pytest.raises(ConfigError, match="finite"):
+        api.preset_add("tol_bad", BUILTIN, {"tolerance.ch_fail_mm": value})
+    with pytest.raises(ConfigError, match="finite"):
+        api.preset_add("tol_bad", BUILTIN, {"tolerance.ch_fail_mm": float(value)})
+    assert "tol_bad" not in api.list_presets()
+
+
+def test_non_finite_preset_file_refused():
+    raw = json.loads((FIXTURE_PRESETS / f"{BUILTIN}.json").read_text())
+    for key, val in (("ch_fail_mm", float("nan")), ("ch_fail_mm", float("inf")),
+                     ("dent_fail_um", float("nan")), ("ch_fail_mm", True)):
+        bad = {**raw, "tolerance": {**raw["tolerance"], key: val}}
+        with pytest.raises(ConfigError, match=key):
+            config.preset_from_dict(bad)
+    bad = {**raw, "calibration": {**(raw.get("calibration") or {}), "mm_per_px": float("nan")}}
+    with pytest.raises(ConfigError, match="mm_per_px"):
+        config.preset_from_dict(bad)
+
+
+def test_name_differing_from_a_builtin_only_by_case_refused(eng):
+    with pytest.raises(ConfigError, match="only by case"):
+        api.preset_add(BUILTIN.upper(), BUILTIN, {"camera.exposure_us": 8000})
+    api.preset_add("Part_A", BUILTIN)
+    with pytest.raises(ConfigError, match="only by case"):
+        api.preset_add("part_a", BUILTIN)
+    # names resolve exactly, on every platform: never the built-in file by case folding
+    with pytest.raises(ConfigError, match="not found"):
+        api.load_preset(BUILTIN.upper())
+    assert api.load_preset("Part_A").name == "Part_A"
+
+
+def test_a_builtin_added_later_never_silently_replaces_a_user_preset(tmp_path):
+    """A repo update adds a built-in with EXACTLY the name of an existing user preset: the
+    built-in used to win silently (loaded in the user preset's place, and the user one could
+    not be deleted by name). Both are refused by name now, and preset-delete takes the user
+    copy (built-ins are never deleted), after which the built-in loads."""
+    from engine.capture.mock_bench import MockBench
+    presets = tmp_path / "presets"
+    presets.mkdir()
+    for p in FIXTURE_PRESETS.glob("*.json"):
+        (presets / p.name).write_bytes(p.read_bytes())
+    api.configure(tmp_path / "library", mock=True, bench=MockBench(seed=1), presets_dir=presets)
+    api.preset_add("part_x", BUILTIN, {"camera.exposure_us": 8000})
+    raw = json.loads((presets / f"{BUILTIN}.json").read_text(encoding="utf-8"))
+    (presets / "part_x.json").write_text(json.dumps({**raw, "name": "part_x"}), encoding="utf-8")
+    with pytest.raises(ConfigError, match="both a built-in"):
+        api.load_preset("part_x")
+    with pytest.raises(ConfigError, match="both a built-in"):
+        api.preset_select("part_x")
+    row = [r for r in api.preset_list() if r["name"] == "part_x"]
+    assert row and all(not r["valid"] and "both a built-in" in r["error"] for r in row)
+    r = api.preset_delete("part_x", reason="shadowed by a new built-in")
+    assert r["name"] == "part_x" and (presets / "part_x.json").is_file()   # built-in untouched
+    assert api.load_preset("part_x").name == "part_x"
+    with pytest.raises(ConfigError, match="read-only"):
+        api.preset_delete("part_x", reason="x")
+
+
+@pytest.mark.parametrize("name", ["CON", "nul", "COM1", "lpt9", "con.txt", "foo.", "...",
+                                  "a\x00b", "x.json", "y.YAML", "bad\n", ".", ".."])
+def test_unportable_or_file_like_names_refused(eng, name):
+    """Windows strips trailing dots, CON / NUL / COMn are devices, a .json name reads as a
+    file: each is refused up front (ConfigError, exit 2), never a half-made folder."""
+    with pytest.raises(ConfigError):
+        api.preset_add(name, BUILTIN)
+    folder = eng.store.root / "presets"
+    assert not folder.exists() or list(folder.iterdir()) == []
+
+
+def test_cli_unportable_name_exit_2(tmp_path, capsys):
+    lib = str(tmp_path / "lib")
+    for name in ("CON", "foo.", "NUL", "..."):
+        assert cli.main(["--mock", "--library", lib, "preset-add", name, "--from", PRESET]) == \
+            cli.EXIT_REFUSED
+        assert "unexpected" not in capsys.readouterr().err
+
+
+def test_preset_names_never_resolve_against_the_cwd(eng, tmp_path, monkeypatch):
+    """A user preset named like a folder (or a device) in the current folder loads the user
+    preset, never that path."""
+    api.preset_add("docs", BUILTIN, {"camera.exposure_us": 8000})
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "other").write_text("{}")
+    monkeypatch.chdir(tmp_path)
+    assert api.load_preset("docs").camera.exposure_us == 8000
+    with pytest.raises(ConfigError, match="not found"):
+        api.load_preset("other")                    # a file in the CWD is not a preset name
+    with pytest.raises(ConfigError):
+        api.load_preset("CON")                      # never opens the console device
+    p = tmp_path / "mine.json"                      # an explicit .json path is still a file
+    p.write_text((FIXTURE_PRESETS / f"{BUILTIN}.json").read_text())
+    assert config.load_preset(str(p), mock=True).name == BUILTIN
+
+
+def test_replace_keeps_the_geometry_reuse_rule(eng):
+    """--replace with a geometry-bound change under the same geometry_id is refused (as a
+    new name is): the old calibration would be reused at another geometry."""
+    api.preset_add("p", BUILTIN, geometry_id="g1")
+    api.preset_add("p", "p", {"calibration.mm_per_px": "0.05"}, replace=True)
+    with pytest.raises(ConfigError, match="geometry_id g1"):
+        api.preset_add("p2", "p", {"projection.rotate90": "true"})
+    with pytest.raises(ConfigError, match="geometry_id g1"):
+        api.preset_add("p", "p", {"projection.rotate90": "true"}, replace=True)
+    raw = json.loads((eng.store.root / "presets" / "p" / "preset.json").read_text())
+    assert raw["projection"]["rotate90"] is False and raw["calibration"]["mm_per_px"] == 0.05
+    # with a new geometry_id the change is fine, and the calibration starts empty
+    r = api.preset_add("p", "p", {"projection.rotate90": "true"}, geometry_id="g2",
+                       replace=True)
+    raw = json.loads(r["path"].read_text())
+    assert raw["geometry_id"] == "g2" and raw["calibration"]["mm_per_px"] is None
+
+
+def test_failed_replace_keeps_the_old_preset(eng, monkeypatch):
+    """The replacement is written before the old one is trashed; a failure puts it back."""
+    from engine.library.store import LibraryStore
+    api.preset_add("line_a", BUILTIN, {"camera.exposure_us": 33333})
+    api.preset_select("line_a")
+
+    def full(path, obj):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(LibraryStore, "write_json", staticmethod(full))
+    with pytest.raises(OSError):
+        api.preset_add("line_a", BUILTIN, {"camera.exposure_us": 16667}, replace=True)
+    monkeypatch.undo()
+    assert api.preset_active() == "line_a"
+    assert api.load_preset("line_a").camera.exposure_us == 33333
+    assert [p.name for p in (eng.store.root / "presets").iterdir() if p.name[0] == "~"] == []
+
+
+def test_delete_refuses_a_preset_pinned_by_recipes(eng, tmp_path):
+    stations = tmp_path / "stations"
+    stations.mkdir()
+    api.preset_add("pa", BUILTIN)
+    api.preset_add("pb", BUILTIN)
+    api.recipe_add("ra", "flat_plate", {"preset": "pa"})
+    api.recipe_add("rb", "flat_plate", {"preset": "pb"})
+    api.recipe_select("ra")
+    (stations / "line_b.json").write_text(json.dumps(
+        {"station_id": "lb", "job": {"type": "recipe", "recipe": "rb"}}))
+    with pytest.raises(ConfigError, match="selected recipe 'ra'"):
+        api.preset_delete("pa", "x", stations_dir=stations)
+    with pytest.raises(ConfigError, match="selected recipe"):
+        api.preset_delete("pa", "x", force=True, stations_dir=stations)
+    with pytest.raises(ConfigError, match="rb.*line_b.json"):
+        api.preset_delete("pb", "x", stations_dir=stations)
+    assert api.recipe_validate("ra")["valid"] and api.recipe_validate("rb")["valid"]
+    r = api.preset_delete("pb", "x", force=True, stations_dir=stations)
+    assert r["forced"] and r["recipes"] == ["rb"] and r["recipe_stations"] == ["line_b.json"]
+
+
+def test_delete_sees_a_recipe_file_named_with_an_env_var(eng, tmp_path, monkeypatch):
+    """A station config's job.recipe '$VAR/rf.json' is expanded by the run job (run_job): the
+    delete check resolved it literally, missed the pin and deleted the preset the station
+    runs."""
+    stations, elsewhere = tmp_path / "st", tmp_path / "elsewhere"
+    stations.mkdir()
+    elsewhere.mkdir()
+    api.preset_add("pa", BUILTIN)
+    doc = json.loads((ROOT / "recipes" / "flat_plate.json").read_text(encoding="utf-8"))
+    doc.update(name="rf", preset="pa")
+    (elsewhere / "rf.json").write_text(json.dumps(doc), encoding="utf-8")
+    monkeypatch.setenv("SAS_TEST_RECIPES", str(elsewhere))
+    (stations / "line.json").write_text(json.dumps(
+        {"station_id": "line", "job": {"type": "recipe", "recipe": "$SAS_TEST_RECIPES/rf.json"}}))
+    with pytest.raises(ConfigError, match="line.json"):
+        api.preset_delete("pa", "x", stations_dir=stations)
+
+
+def test_unreadable_selection_lines_are_skipped(tmp_path, capsys):
+    """A non-UTF-8 byte (or a UTF-16 BOM) in active.jsonl never stops the CLI: the line is
+    skipped with a warning, and preset-select can still append a good one."""
+    lib = tmp_path / "lib"
+    run = lambda *a: (cli.main(["--mock", "--library", str(lib), *a]), capsys.readouterr())
+    assert run("preset-select", BUILTIN)[0] == 0
+    with open(lib / "presets" / "active.jsonl", "ab") as fh:
+        fh.write(b'{"name": "Jos\xe9"}\n\xff\xfe{\x00}\x00')
+    code, (out, err) = run("--json", "presets")
+    assert code == 0 and json.loads(out)["selected"] == BUILTIN, err
+    code, (out, err) = run("presets")
+    assert code == 0 and "unreadable" in out
+    assert run("paths")[0] == 0
+    assert run("preset-select", PRESET)[0] == 0
+    code, (out, err) = run("--json", "presets")
+    assert json.loads(out)["selected"] == PRESET
+
+
+def test_selected_preset_gone_is_a_clear_error_not_the_default(tmp_path, capsys):
+    import shutil
+    lib = tmp_path / "lib"
+    run = lambda *a: (cli.main(["--mock", "--average", "1", "--library", str(lib), *a]),
+                      capsys.readouterr())
+    assert run("preset-add", "line_a", "--from", PRESET)[0] == 0
+    assert run("preset-select", "line_a")[0] == 0
+    shutil.rmtree(lib / "presets" / "line_a")               # gone behind the library's back
+    code, (out, err) = run("signal")
+    assert code == cli.EXIT_REFUSED and "line_a" in err and "no longer exists" in err
+    code, (out, err) = run("--json", "presets")             # the listing works, and says so
+    doc = json.loads(out)
+    assert code == 0 and doc["selected_missing"] == "line_a" and doc["selected"] is None
+    assert run("--preset", PRESET, "signal")[0] == 0        # an explicit preset still works
+    assert run("preset-select", PRESET)[0] == 0             # and the operator can repair it
+    assert run("signal")[0] == 0
+
+
+@pytest.mark.parametrize("spelling", [["--pres", BUILTIN], ["--pre=" + BUILTIN],
+                                      ["--prese", BUILTIN]])
+def test_abbreviated_preset_is_refused_not_ignored(tmp_path, capsys, spelling):
+    """argparse would take --pres for --preset while main() only sees --preset: refused."""
+    lib = str(tmp_path / "lib")
+    assert cli.main(["--mock", "--library", lib, "preset-add", "part_a", "--from", PRESET]) == 0
+    assert cli.main(["--mock", "--library", lib, "preset-select", "part_a"]) == 0
+    capsys.readouterr()
+    assert cli.main(["--mock", "--library", lib, *spelling, "--json", "presets"]) == \
+        cli.EXIT_REFUSED
+    assert cli.main(["--mock", "--library", lib, "presets", *spelling]) == cli.EXIT_REFUSED
+    assert cli.main(["--mock", "--library", lib, "--mock-p", "none", "presets"]) == \
+        cli.EXIT_REFUSED
+    capsys.readouterr()
+    assert cli.main(["--mock", "--library", lib, "--preset", BUILTIN, "--json", "presets"]) == 0
+    assert json.loads(capsys.readouterr().out)["active"] == BUILTIN

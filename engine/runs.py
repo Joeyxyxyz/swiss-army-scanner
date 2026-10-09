@@ -12,7 +12,8 @@ INVALID means the numbers cannot be trusted and must never be reported as a pass
 
 Schema 0.2 (extends 0.1, every 0.1 key kept): `recipe` (the recipe a recipe job ran, else
 null), `zones` (per zone: id, verdict, checks; [] for other jobs) and `feedback` (what the
-projector showed after the verdict, else null).
+projector showed after the verdict, else null). `deviation_mm` also carries `n_defects` and
+`largest_defect` (metric jobs: the out-of-tolerance clusters; null for the other jobs).
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 def new_run(runs_dir, name: str, now: Optional[datetime] = None) -> tuple:
     """(run_id, run_dir): a fresh folder under runs_dir, never an existing one."""
-    if not RUN_ID.match(str(name)):
+    if not RUN_ID.fullmatch(str(name)):
         raise ValueError(f"run name {name!r}: letters, digits, _ . - only (max 64)")
     now = now or datetime.now(timezone.utc)
     root = Path(runs_dir)
@@ -107,8 +108,9 @@ def empty_result(*, run_id: str, run_folder: str, mock: bool, operator_confirmed
                     "exposure_us": None, "average": None, "zone": zone},
         "part": {"role": part.get("role", "test"), "label": part.get("label", "part"),
                  "scan_id": None},
+        # n_defects / largest_defect: metric jobs (out-of-tolerance clusters), else null
         "deviation_mm": {"max": None, "mean": None, "rms": None, "method": None,
-                         "n_points": None},
+                         "n_points": None, "n_defects": None, "largest_defect": None},
         "deviation_units": None,
         "threshold_mm": threshold_mm,
         "result": "INVALID",

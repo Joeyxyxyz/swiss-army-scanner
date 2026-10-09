@@ -17,7 +17,10 @@
     "average": null,
     "measure": "plane",
     "roi": null,
-    "golden": null
+    "golden": null,
+    "min_defect_px": 5,
+    "min_valid_pct": 30,
+    "plane_range_mm": null
   },
   "part": {
     "role": "test",

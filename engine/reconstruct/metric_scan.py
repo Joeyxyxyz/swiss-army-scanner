@@ -191,7 +191,11 @@ def compare_metric(s, scan: MetricScan, golden: MetricScan, max_dist_mm: float =
                    n_sigma: float = 4.0, min_depth_mm: float = 0.05, min_area_mm2: float = 0.5,
                    foreground_only: bool = True):
     """ICP-align scan onto golden (point-to-plane), then the signed deviation map
-    (mm, negative = below the golden surface) and its negative blobs."""
+    (mm, negative = below the golden surface) and its negative blobs. Informational, no
+    verdict: with foreground_only only each scan's LARGEST foreground blob is kept, and only
+    the test -> golden direction is measured (points beyond max_dist_mm are NaN), so missing
+    material and a second part or component are not reported. A verdict comes from a station
+    metric job with measure: "golden" (every component, both directions)."""
     from scipy import ndimage
     check_cal(s, scan, "compare_metric")
     check_cal(s, golden, "compare_metric (golden)")

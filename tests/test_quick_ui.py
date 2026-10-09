@@ -141,6 +141,24 @@ def test_start_runs_the_station_to_pass(quick):
     assert c.request("GET", "/runs/not_a_run/result.json")[0] == 404
 
 
+def test_a_crashed_run_reports_the_exit_code_its_log_records(quick, monkeypatch):
+    """run_station answered exit_code 2 (refused) for every exception, while run.log.jsonl's
+    run_end (and `scan run`) record 4 for a crash."""
+    from ui import cli
+    c, app = quick
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated crash in the measurement")
+    monkeypatch.setattr(cli, "_run_metric", boom)
+    j = c.job("run_station", {"config": "flat_check.json"})
+    assert j["status"] == "done", j
+    res = j["result"]
+    assert res["result"] == "INVALID" and res["exit_code"] == cli.EXIT_ERROR, res
+    st, raw, _ = c.request("GET", j["links"]["log"])
+    end = [json.loads(x) for x in raw.decode("utf-8").splitlines() if '"run_end"' in x]
+    assert st == 200 and end and end[-1]["exit_code"] == res["exit_code"], end
+
+
 def test_abort_mid_run_is_recorded_and_wins(quick):
     c, app = quick
     _, r = c.post("/api/cmd/start", {})

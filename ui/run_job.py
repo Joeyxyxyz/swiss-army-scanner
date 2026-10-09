@@ -35,6 +35,7 @@ engine.api verbs (ui/cli.py cmd_run), so every engine rule still applies.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -49,6 +50,11 @@ from engine.runs import write_result  # noqa: F401  (re-exported: callers use ru
 JOB_TYPES = ("inspect", "compare", "metric", "recipe")
 METRIC_SCANS = ("fast", "metric")           # api.scan_fast | api.scan_metric
 METRIC_MEASURES = ("plane", "golden")
+# metric verdicts: an out-of-tolerance cluster of fewer camera px than this is an isolated
+# outlier (a stray triangulated point) and is dropped; every larger cluster FAILs
+METRIC_MIN_DEFECT_PX = 5
+METRIC_MIN_VALID_PCT = 30.0     # plane: decoded share of the roi below this -> INVALID
+METRIC_MIN_COVERAGE_PCT = 95.0  # golden: surface agreeing within threshold, each direction
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,6 +89,10 @@ class StationConfig:
     periods: Optional[list] = None
     measure: str = "plane"                  # plane | golden
     roi: Optional[list] = None              # [x0, y0, x1, y1] camera px; None = whole field
+    min_defect_px: int = METRIC_MIN_DEFECT_PX
+    min_valid_pct: float = METRIC_MIN_VALID_PCT
+    min_coverage_pct: float = METRIC_MIN_COVERAGE_PCT
+    plane_range_mm: Optional[list] = None   # plane: [near, far] plane-to-camera distance, mm
     # recipe jobs: a recipe name (built-in recipes/ or the library) or a recipe file
     recipe: Optional[str] = None
     feedback: Optional[bool] = None         # None: the recipe's feedback.enabled
@@ -110,6 +120,26 @@ def _read_doc(path: Path) -> dict:
     return doc
 
 
+def _number(v) -> bool:
+    """A real, finite number: not a bool (True would read as 1), not NaN / Infinity."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _flag(doc: dict, key: str, default: bool) -> bool:
+    """A true / false switch: only a real boolean (null = the default). A quoted "false"
+    or 'no' is refused, never read as true."""
+    v = doc.get(key)
+    if v is None:
+        return default
+    if not isinstance(v, bool):
+        raise StationConfigError(f"{key} must be true or false (unquoted), got {v!r}")
+    return v
+
+
 def _rel(base_dir: Path, value) -> Optional[Path]:
     """Config paths are relative to the config file, after env expansion."""
     if value in (None, ""):
@@ -125,7 +155,7 @@ def load_station_config(path) -> StationConfig:
     doc = _read_doc(path)
     base_dir = path.resolve().parent
     sid = str(doc.get("station_id") or "").strip()
-    if not _ID.match(sid):
+    if not _ID.fullmatch(sid):
         raise StationConfigError("station_id is required: letters, digits, _ . - "
                                  "(max 64 chars), e.g. example_cell_station")
     job = doc.get("job") or {}
@@ -144,16 +174,24 @@ def load_station_config(path) -> StationConfig:
     if role not in ("golden", "test"):
         raise StationConfigError(f"part.role {role!r} must be 'golden' or 'test'")
     label = str(part.get("label", "part"))
-    if not _ID.match(label):
+    if not _ID.fullmatch(label):
         raise StationConfigError(f"part.label {label!r}: letters, digits, _ . - only")
-    metric = _metric_keys(job, jt)
+    if jt == "compare":
+        _golden_ref(job.get("golden"), label)
+    metric = _metric_keys(job, jt, label)
     rec = _recipe_keys(job, jt, base_dir)
     thr = doc.get("threshold_mm")
-    if thr is not None and (not isinstance(thr, (int, float)) or thr <= 0):
-        raise StationConfigError("threshold_mm must be a positive number (mm) or null")
+    if thr is not None and (not _number(thr) or thr <= 0):
+        raise StationConfigError("threshold_mm must be a positive, finite number (mm) or null")
     avg = job.get("average")
-    if avg is not None and (not isinstance(avg, int) or avg < 1):
+    if avg is not None and (not _count(avg) or avg < 1):
         raise StationConfigError("job.average must be a positive integer or null")
+    n_sigma = job.get("n_sigma", 6.0)
+    if not _number(n_sigma) or n_sigma <= 0:
+        raise StationConfigError("job.n_sigma must be a positive, finite number")
+    min_area = job.get("min_area_px", 50)
+    if not _count(min_area) or min_area < 1:
+        raise StationConfigError("job.min_area_px must be a positive integer")
     runs_env = os.environ.get("SCANNER_RUNS_DIR")
     return StationConfig(
         station_id=sid,
@@ -166,10 +204,10 @@ def load_station_config(path) -> StationConfig:
         golden=job.get("golden") or None,
         part_role=role, part_label=label,
         threshold_mm=float(thr) if thr is not None else None,
-        require_mm=bool(doc.get("require_mm", True)),
-        n_sigma=float(job.get("n_sigma", 6.0)),
-        min_area_px=int(job.get("min_area_px", 50)),
-        operator_confirmed=bool(doc.get("operator_confirmed", False)),
+        require_mm=_flag(doc, "require_mm", True),
+        n_sigma=float(n_sigma),
+        min_area_px=int(min_area),
+        operator_confirmed=_flag(doc, "operator_confirmed", False),
         mock_part=_mock_part(doc.get("mock_part")),
         source=path.resolve(), raw=doc, **metric, **rec)
 
@@ -202,8 +240,24 @@ def _recipe_keys(job: dict, jt: str, base_dir: Path) -> dict:
     return {"recipe": r, "feedback": fb}
 
 
-def _metric_keys(job: dict, jt: str) -> dict:
-    """job.scan / axis / steps / periods / measure / roi / golden for metric jobs."""
+def _golden_ref(golden, part_label: str, what: str = "scan") -> str:
+    """job.golden: the id or label of a golden scan. Every run saves its own test scan under
+    part.label, so 'latest' / 'last' or that label would compare each part with the previous
+    part, not with a golden: refused."""
+    if not isinstance(golden, str) or not golden.strip():
+        raise StationConfigError(f"job.golden must be the id or label of a golden {what} (a GOOD "
+                                 "part scanned once)")
+    g = golden.strip()
+    if g.lower() in ("latest", "last") or g == part_label:
+        raise StationConfigError(f"job.golden {golden!r}: name the golden {what} by its id or "
+                                 "label; 'latest' and this station's part.label are the previous "
+                                 "run's own test scan, not a golden")
+    return g
+
+
+def _metric_keys(job: dict, jt: str, part_label: str) -> dict:
+    """job.scan / axis / steps / periods / measure / roi / golden / min_defect_px /
+    min_valid_pct / min_coverage_pct / plane_range_mm for metric jobs."""
     if jt != "metric":
         return {}
     scan = str(job.get("scan", "fast"))
@@ -216,26 +270,42 @@ def _metric_keys(job: dict, jt: str) -> dict:
     if measure not in METRIC_MEASURES:
         raise StationConfigError(f"job.measure {measure!r} must be one of "
                                  f"{', '.join(METRIC_MEASURES)}")
-    if measure == "golden" and not job.get("golden"):
-        raise StationConfigError("job.measure golden needs job.golden (a golden metric scan "
-                                 "id / label, or 'latest')")
+    if measure == "golden":
+        _golden_ref(job.get("golden"), part_label, "metric scan")
     steps = job.get("steps")
-    if steps is not None and (not isinstance(steps, int) or steps < 3):
+    if steps is not None and (not _count(steps) or steps < 3):
         raise StationConfigError("job.steps must be an integer >= 3 or null")
     periods = job.get("periods")
     if periods is not None and (not isinstance(periods, list) or not periods or not all(
-            isinstance(v, (int, float)) and v > 0 for v in periods)):
+            _number(v) and v > 0 for v in periods)):
         raise StationConfigError("job.periods must be a list of positive numbers (DMD px) or null")
     roi = job.get("roi")
     if roi is not None:
         if (not isinstance(roi, list) or len(roi) != 4
-                or not all(isinstance(v, int) and v >= 0 for v in roi)
+                or not all(_count(v) and v >= 0 for v in roi)
                 or roi[2] <= roi[0] or roi[3] <= roi[1]):
             raise StationConfigError("job.roi must be [x0, y0, x1, y1] camera px (x1 > x0, "
                                      "y1 > y0) or null")
+    min_px = job.get("min_defect_px", METRIC_MIN_DEFECT_PX)
+    if not _count(min_px) or min_px < 1:
+        raise StationConfigError("job.min_defect_px must be an integer >= 1 (camera px)")
+    pct = {}
+    for key, dflt in (("min_valid_pct", METRIC_MIN_VALID_PCT),
+                      ("min_coverage_pct", METRIC_MIN_COVERAGE_PCT)):
+        v = job.get(key, dflt)
+        if not _number(v) or not 0 <= v <= 100:
+            raise StationConfigError(f"job.{key} must be a number 0..100 (%)")
+        pct[key] = float(v)
+    rng = job.get("plane_range_mm")
+    if rng is not None and (not isinstance(rng, list) or len(rng) != 2
+                            or not all(_number(v) and v > 0 for v in rng) or rng[1] <= rng[0]):
+        raise StationConfigError("job.plane_range_mm must be [near, far] mm (0 < near < far) or "
+                                 "null")
     return {"scan": scan, "axis": axis, "steps": steps,
             "periods": [float(v) for v in periods] if periods else None,
-            "measure": measure, "roi": list(roi) if roi else None}
+            "measure": measure, "roi": list(roi) if roi else None,
+            "min_defect_px": int(min_px), **pct,
+            "plane_range_mm": [float(v) for v in rng] if rng is not None else None}
 
 
 # ------------------------------------------------------------ run folder + log

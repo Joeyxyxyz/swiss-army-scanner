@@ -17,7 +17,10 @@ job:
   average: null            # null: 2 (fast)
   measure: plane           # plane: flatness in roi | golden: vs a golden metric scan
   roi: null                # [x0, y0, x1, y1] camera px; null = whole field
-  golden: null             # golden: a metric scan id / label, or latest
+  golden: null             # golden: the golden metric scan's id / label (never latest)
+  min_defect_px: 5         # out-of-tolerance clusters this big (camera px) FAIL; smaller = stray
+  min_valid_pct: 30        # plane: INVALID when less of the roi decoded
+  plane_range_mm: null     # plane: [near, far] mm from the camera, or INVALID (part absent?)
 part:
   role: test
   label: flat_panel

@@ -297,9 +297,18 @@ def preset_show(name: str) -> dict:
 
 
 def preset_active() -> Optional[str]:
-    """The library's selected preset (used when no preset is named), or None."""
+    """The library's selected preset (used when no preset is named), or None (never selected,
+    or it no longer exists: preset_selection() tells the two apart)."""
     s = _engine()
     return preset_lib.active(s.store, _builtin_dir())
+
+
+def preset_selection() -> dict:
+    """{name: the last selected preset or None, exists: it still resolves, skipped:
+    unreadable history lines}: 'never selected' vs 'selected but gone' (deleted, renamed),
+    which must stop a scan rather than fall back to a default."""
+    s = _engine()
+    return preset_lib.selection(s.store, _builtin_dir())
 
 
 @_verb
@@ -326,11 +335,13 @@ def preset_select(name: str) -> dict:
 @_verb
 def preset_delete(name: str, reason: str, force: bool = False,
                   stations_dir: Union[str, Path, None] = None) -> dict:
-    """Move a USER preset to trash/presets/ (recoverable). Refuses built-ins, the
-    active preset, and one a station config references (unless force=True)."""
+    """Move a USER preset to trash/presets/ (recoverable). Refuses built-ins, the active
+    preset, a preset pinned by the selected recipe (always), and one a station config or a
+    recipe / recipe station config references (unless force=True)."""
     s = _engine()
     return preset_lib.delete(s.store, _builtin_dir(), name, reason,
-                             Path(stations_dir) if stations_dir else STATIONS_DIR, force)
+                             Path(stations_dir) if stations_dir else STATIONS_DIR, force,
+                             recipes_dir=_recipes_dir())
 
 
 # ------------------------------------------------------- recipes (work-state checks)
@@ -1507,7 +1518,9 @@ def cylinder_deviation(scan, radius_mm: Optional[float] = None, n_sigma: float =
 @_verb
 def compare_metric(scan, golden, max_dist_mm: float = 5.0, n_sigma: float = 4.0) -> dict:
     """Point-to-plane ICP of a metric scan onto a golden metric scan, then the signed
-    deviation (mm) and its below-surface blobs -> output/comparisons."""
+    deviation (mm) and its below-surface blobs -> output/comparisons. Informational: the
+    largest foreground blob of each scan, test -> golden only (missing material and a second
+    component are not reported); a verdict is a station metric job's measure: "golden"."""
     from .reconstruct import metric_scan
     rep, _ = metric_scan.compare_metric(_engine(), scan, golden, max_dist_mm, n_sigma)
     return rep

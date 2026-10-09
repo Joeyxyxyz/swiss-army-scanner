@@ -1156,6 +1156,12 @@ class App:
         self.session = api.configure(self.library, mock=self.mock, presets_dir=self.presets_dir)
         self.root = self.session.store.root.resolve()
         names = self.preset_names()
+        sel = api.preset_selection() if not self.preset_name else {"name": None}
+        if sel.get("name") and not sel.get("exists"):
+            # selected but gone (deleted, renamed): say so, never a silent default
+            self.startup_warnings.append(
+                f"the selected preset {sel['name']!r} no longer exists: loading the default "
+                "instead - select a preset in Setup before measuring")
         name = self.preset_name or api.preset_active() or (
             DEFAULT_PRESET if DEFAULT_PRESET in names else (names[0] if names else None))
         if name:
@@ -2803,7 +2809,8 @@ class App:
             if res is None:
                 raise
             run_dir = Path(e.run_dir)
-            code = cli.EXIT_REFUSED
+            # the code run.log.jsonl's run_end records: 2 refused, 4 crashed, ...
+            code = getattr(e, "run_exit_code", cli.EXIT_REFUSED)
             res = {**res, "error": f"{type(e).__name__}: {e}"}
         self._runs[res["run_id"]] = run_dir
         fb = res.get("feedback") or {}

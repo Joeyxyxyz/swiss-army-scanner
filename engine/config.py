@@ -14,6 +14,8 @@ mixed with real ones (rules 5/6).
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -45,9 +47,27 @@ def frame_locked(exposure_us, frame_us: float = VIDEO_FRAME_US) -> bool:
     return n >= 1 and abs(float(exposure_us) - n * frame_us) <= FRAME_LOCK_TOL * frame_us
 
 
+# Windows device names: a file or folder called CON, NUL, COM1 ... (any extension, any case)
+# opens the device, not a file - so they are never a library name on any platform
+_WIN_RESERVED = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                           *(f"LPT{i}" for i in range(1, 10))})
+
+
+def portable_name(s) -> bool:
+    """A name that is the SAME file / folder name on every platform: no trailing dot or space
+    and not made only of dots (Windows strips them: 'foo.' becomes 'foo'), no control
+    characters (NUL), not a Windows device name (CON, NUL, COM1 ..., also as 'con.txt')."""
+    if not isinstance(s, str) or not s or s != s.rstrip(". ") or not s.strip("."):
+        return False
+    if any(ord(c) < 32 for c in s):
+        return False
+    return s.split(".", 1)[0].rstrip(" ").upper() not in _WIN_RESERVED
+
+
 def valid_id(s) -> bool:
-    """A preset name / geometry_id: one path-safe segment, never '.' or '..'."""
-    return isinstance(s, str) and bool(_ID_RE.match(s)) and s not in (".", "..")
+    """A preset name / geometry_id: one path-safe, portable segment (portable_name), never
+    '.' or '..'."""
+    return isinstance(s, str) and bool(_ID_RE.fullmatch(s)) and portable_name(s)
 
 
 class ConfigError(ValueError):
@@ -167,9 +187,16 @@ def _section(cls, raw, section: str):
     return cls(**raw)
 
 
+def _finite(v) -> bool:
+    """A real, finite number: not a bool, not NaN / Infinity (NaN fails every comparison,
+    so a NaN tolerance would never FAIL anything)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def _positive(v, what, allow_zero=False):
-    if not isinstance(v, (int, float)) or v < 0 or (v == 0 and not allow_zero):
-        raise ConfigError(f"{what} must be {'>= 0' if allow_zero else '> 0'}, got {v!r}")
+    if not _finite(v) or v < 0 or (v == 0 and not allow_zero):
+        raise ConfigError(f"{what} must be a finite number {'>= 0' if allow_zero else '> 0'}, "
+                          f"got {v!r}")
 
 
 def preset_from_dict(d: dict, *, mock: bool = False,
@@ -202,10 +229,10 @@ def preset_from_dict(d: dict, *, mock: bool = False,
     if not isinstance(cam.gain_db, (int, float)) or isinstance(cam.gain_db, bool) or \
             not (0 <= cam.gain_db <= GAIN_DB_MAX):
         raise ConfigError(f"camera.gain_db must be 0..{GAIN_DB_MAX:g} dB, got {cam.gain_db!r}")
-    if not isinstance(cam.average, int) or cam.average < 1:
+    if not isinstance(cam.average, int) or isinstance(cam.average, bool) or cam.average < 1:
         raise ConfigError("camera.average must be an int >= 1")
     _positive(proj.gamma, "projection.gamma")
-    if not (0 < proj.duty <= 1):
+    if not _finite(proj.duty) or not (0 < proj.duty <= 1):
         raise ConfigError("projection.duty must be in (0, 1]")
     _positive(proj.settle_s, "projection.settle_s", allow_zero=True)
     _positive(proj.min_hold_s, "projection.min_hold_s", allow_zero=True)
@@ -224,6 +251,9 @@ def preset_from_dict(d: dict, *, mock: bool = False,
     _positive(dec.contrast_min, "decode.contrast_min", allow_zero=True)
     _positive(tol.ch_fail_mm, "tolerance.ch_fail_mm")
     _positive(tol.dent_fail_um, "tolerance.dent_fail_um")
+    if not isinstance(tol.min_defect_px, int) or isinstance(tol.min_defect_px, bool) \
+            or tol.min_defect_px < 1:
+        raise ConfigError(f"tolerance.min_defect_px must be an int >= 1, got {tol.min_defect_px!r}")
 
     bases = d.get("bases") or []
     if not bases:
@@ -253,6 +283,9 @@ def preset_from_dict(d: dict, *, mock: bool = False,
     extra = set(cal_raw) - {"id", "mm_per_px", "intercept_mm", "lateral_px_per_mm"}
     if extra:
         raise ConfigError(f"calibration: unknown keys {sorted(extra)}")
+    for k in ("mm_per_px", "intercept_mm", "lateral_px_per_mm"):
+        if cal_raw.get(k) is not None and not _finite(cal_raw[k]):
+            raise ConfigError(f"calibration.{k} must be a finite number or null, got {cal_raw[k]!r}")
 
     rig_geo = d["geometry_id"]
     geo = MOCK_PREFIX + rig_geo if mock else rig_geo
@@ -391,7 +424,12 @@ def _refuse_geometry_reuse(new: Preset, folder: Path, files: Optional[list] = No
 
 
 def list_presets(presets_dir: Optional[Path] = None) -> list[str]:
-    return sorted(p.stem for p in Path(presets_dir or PRESETS_DIR).glob("*.json"))
+    """Built-in preset names: the *.json stems, exactly as written on disk."""
+    d = Path(presets_dir or PRESETS_DIR)
+    if not d.is_dir():
+        return []
+    return sorted(n[:-5] for n in os.listdir(d)
+                  if n.endswith(".json") and (d / n).is_file())
 
 
 def user_presets_dir(library_root) -> Path:
@@ -400,19 +438,51 @@ def user_presets_dir(library_root) -> Path:
     return Path(library_root) / USER_PRESETS
 
 
+def is_preset_file(name) -> bool:
+    """A preset given as a FILE (a .json path, or anything with a folder separator) rather
+    than by name."""
+    s = str(name)
+    return s.lower().endswith(".json") or "/" in s or "\\" in s or os.sep in s
+
+
+def user_preset_names(user_dir: Optional[Path]) -> list:
+    """Folder names in user_dir holding a preset.json, exactly as written on disk (a
+    case-insensitive file system must not turn 'Part' into 'part')."""
+    d = Path(user_dir) if user_dir is not None else None
+    if d is None or not d.is_dir():
+        return []
+    return sorted(n for n in os.listdir(d)
+                  if valid_id(n) and (d / n / USER_PRESET_FILE).is_file())
+
+
 def resolve_preset_path(name: str, presets_dir: Optional[Path] = None,
                         user_dir: Optional[Path] = None) -> Path:
-    """A built-in preset by name, else a user preset of that name in
-    `user_dir` (built-in and user names never clash: preset_add refuses it)."""
-    p = Path(name)
-    if p.suffix == ".json" or p.exists():
-        return p
-    builtin = Path(presets_dir or PRESETS_DIR) / f"{name}.json"
-    if not builtin.exists() and user_dir is not None and valid_id(name):
-        user = Path(user_dir) / name / USER_PRESET_FILE
-        if user.exists():
-            return user
-    return builtin
+    """A preset NAME -> the built-in of exactly that name, else the user preset of exactly
+    that name in `user_dir` (names are case-sensitive on every platform). A name is never
+    looked up in the current folder. A preset FILE (is_preset_file: a .json path) is
+    returned as given."""
+    s = str(name)
+    if is_preset_file(s):
+        if Path(s).stem.split(".", 1)[0].upper() in _WIN_RESERVED:
+            raise ConfigError(f"preset file {s!r}: a Windows device name, not a file")
+        return Path(s)
+    if not valid_id(s):
+        raise ConfigError(f"preset {s!r} is not a preset name [A-Za-z0-9_.-] (nor a .json file)")
+    folder = Path(presets_dir or PRESETS_DIR)
+    if s in list_presets(folder):
+        if s in user_preset_names(user_dir):
+            # a built-in added (a repo update) after the user made a preset of that name:
+            # neither is ever loaded silently in the other's place
+            raise ConfigError(f"preset {s!r} is both a built-in ({folder / (s + '.json')}) and a "
+                              f"user preset ({Path(user_dir) / s}): `scan preset-delete {s} "
+                              "--reason ...` moves the USER one to trash (or rename its folder), "
+                              "then the built-in loads")
+        return folder / f"{s}.json"
+    if s in user_preset_names(user_dir):
+        return Path(user_dir) / s / USER_PRESET_FILE
+    raise ConfigError(f"preset not found: {s!r} (no built-in {s}.json in {folder}"
+                      + (f" and no user preset in {user_dir}" if user_dir is not None else "")
+                      + "; names are case-sensitive, see `scan presets`)")
 
 
 def load_preset(name: str, *, presets_dir: Optional[Path] = None, store=None,

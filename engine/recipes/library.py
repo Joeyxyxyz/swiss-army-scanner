@@ -18,10 +18,13 @@ import copy
 import getpass
 import json
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from ..config import ConfigError
+from ..library import presets as _presets
 from ..library.store import LibraryStore
 from . import schema
 from .schema import RecipeError
@@ -65,6 +68,9 @@ def user_names(store: LibraryStore) -> list:
 
 
 def tier_of(store: LibraryStore, builtin: Path, name: str) -> Optional[str]:
+    """'builtin' | 'user' | None, by EXACT name (a file path is never a library recipe)."""
+    if not isinstance(name, str):
+        return None
     if name in builtin_names(builtin):
         return "builtin"
     if name in user_names(store):
@@ -106,12 +112,11 @@ def resolve(store: LibraryStore, builtin: Path, ref) -> schema.Recipe:
 
 
 def _parse_value(v):
-    if not isinstance(v, str):
-        return v
+    """--set key=value: JSON when it parses, else text; NaN / Infinity are refused."""
     try:
-        return json.loads(v)
-    except ValueError:
-        return v
+        return _presets.require_finite(_presets._parse_value(v), "value")
+    except ConfigError as e:
+        raise RecipeError(str(e)) from None
 
 
 def apply_overrides(d: dict, overrides: Optional[dict]) -> dict:
@@ -170,13 +175,14 @@ def add(store: LibraryStore, builtin: Path, name: str, base=None, overrides: Opt
         recipe: Optional[dict] = None, preset_names: Optional[list] = None) -> dict:
     """A new USER recipe: a copy of `base` (a recipe name or file) or the mapping `recipe`,
     with fields overridden, validated like any recipe (+ its preset must exist)."""
-    if not isinstance(name, str) or not _ID.match(name):
+    if not isinstance(name, str) or not _ID.fullmatch(name):
         raise RecipeError("recipe name must be an id [A-Za-z0-9_.-] (max 64)")
-    if name == Path(ACTIVE_FILE).stem:
-        raise RecipeError(f"{name!r} is reserved")
-    if name in builtin_names(builtin):
-        raise RecipeError(f"{name!r} is a built-in recipe (read-only): pick another name")
-    exists = name in user_names(store)
+    users = user_names(store)
+    try:
+        _presets.check_new_name(name, builtin_names(builtin), users, "recipe", replace)
+    except ConfigError as e:
+        raise RecipeError(str(e)) from None
+    exists = name in users
     if exists and not replace:
         raise RecipeError(f"user recipe {name!r} exists: pick another name, or replace it (the "
                           "old one goes to trash/)")
@@ -200,44 +206,56 @@ def add(store: LibraryStore, builtin: Path, name: str, base=None, overrides: Opt
     folder = user_dir(store)
     folder.mkdir(parents=True, exist_ok=True)
     entry = folder / name
-    trashed = None
-    if exists:
-        trashed = store.trash(entry, reason=f"replaced by recipe_add {name}")
-    entry.mkdir()
+    if not exists and entry.exists():
+        raise RecipeError(f"{entry} exists but is not a complete user recipe: move it away first")
     meta = {"name": name, "created": datetime.now().isoformat(timespec="seconds"),
             "author": author if author is not None else _user(),
             "description": str(description or r.description or ""), "from": src_name,
             "from_tier": src_tier, "preset": r.preset, "overrides": overrides or {},
-            "replaced": str(trashed) if trashed else None}
-    with store.filling(entry):
-        with open(entry / RECIPE_FILE, "x", encoding="utf-8") as f:
+            "replaced": None}
+    # written under a temporary name (never an id, so never listed) BEFORE the old one is
+    # touched; the old one comes back if finishing the new one fails
+    tmp = folder / f"~{name}.{uuid.uuid4().hex[:8]}"
+    tmp.mkdir()
+    with store.filling(tmp):
+        with open(tmp / RECIPE_FILE, "x", encoding="utf-8") as f:
             json.dump(d, f, indent=2)
-        LibraryStore.write_json(entry / META_FILE, meta)     # meta last: a complete entry
+    trashed = store.trash(entry, reason=f"replaced by recipe_add {name}") if exists else None
+    meta["replaced"] = str(trashed) if trashed else None
+    try:
+        with store.filling(tmp):
+            LibraryStore.write_json(tmp / META_FILE, meta)   # meta last: a complete entry
+            tmp.rename(entry)
+    except BaseException:
+        if trashed is not None and not entry.exists():
+            try:
+                Path(trashed).rename(entry)
+            except OSError:
+                pass
+        raise
     return {"name": name, "tier": "user", "path": entry / RECIPE_FILE, "meta": meta,
             "replaced": trashed, "recipe": r.summary()}
 
 
 def select(store: LibraryStore, builtin: Path, name: str, by: str = "") -> dict:
+    tier = tier_of(store, builtin, name)
+    if tier is None:
+        raise RecipeError(f"no recipe named {name!r}: only a built-in or library recipe can be "
+                          "selected (see `scan recipe-list`); for a recipe file, add it first "
+                          "(scan recipe-add NAME --from <file>)")
     resolve(store, builtin, name)            # an invalid recipe can't become the selected one
     folder = user_dir(store)
     folder.mkdir(parents=True, exist_ok=True)
-    rec = {"name": name, "tier": tier_of(store, builtin, name),
+    rec = {"name": name, "tier": tier,
            "time": datetime.now().isoformat(timespec="seconds"), "by": by or _user()}
-    with open(folder / ACTIVE_FILE, "a", encoding="utf-8") as f:     # append-only history
-        f.write(json.dumps(rec) + "\n")
+    _presets.append_selection(folder / ACTIVE_FILE, rec)
     return rec
 
 
 def active(store: LibraryStore, builtin: Path) -> Optional[str]:
-    f = user_dir(store) / ACTIVE_FILE
-    if not f.is_file():
-        return None
-    name = None
-    for line in f.read_text(encoding="utf-8").splitlines():
-        try:
-            name = json.loads(line).get("name") or name
-        except (ValueError, AttributeError):
-            continue
+    """The selected recipe, or None (never selected, or it no longer exists). Unreadable
+    history lines are skipped (with a warning), never fatal."""
+    name, _skipped = _presets.last_selected(user_dir(store) / ACTIVE_FILE)
     return name if name and tier_of(store, builtin, name) else None
 
 

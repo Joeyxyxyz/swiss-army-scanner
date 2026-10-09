@@ -53,6 +53,8 @@ if str(_ROOT) not in sys.path:          # `python ui/cli.py` from anywhere
     sys.path.insert(0, str(_ROOT))
 
 from engine import api, config, rules  # noqa: E402
+from engine.library import presets as preset_lib  # noqa: E402
+from engine.capture.hwtrigger import TRIGGER_LINES  # noqa: E402
 
 DEFAULT_PRESET = "cell_wall_2p7ft_vstripe"   # fringes vertical in camera, projector right
 EXIT_OK, EXIT_NOT_OK, EXIT_REFUSED, EXIT_NOT_AVAILABLE = 0, 1, 2, 3
@@ -309,6 +311,7 @@ class Ctx:
         self.session = None
         self._preset = None
         self._outputs_before = 0
+        self.selection = None           # preset_lib.selection() when no --preset was given
 
     # -- output
     def say(self, *lines) -> None:
@@ -341,12 +344,30 @@ class Ctx:
         self.session = api.configure(lib, mock=self.mock)
         self._outputs_before = len(self.session.store.outputs())
         if not getattr(self.args, "preset_given", True):
-            act = api.preset_active()           # the library's selected preset (preset-select)
-            if act:
-                self.args.preset = act
+            self.use_selected_preset()
+
+    def use_selected_preset(self) -> None:
+        """No --preset: this session library's selected preset (preset-select), else
+        DEFAULT_PRESET when none was ever selected. A selection that no longer resolves
+        (deleted, renamed, a failed replace) is kept as the name, so loading it stops with a
+        clear error instead of silently scanning with the default."""
+        sel = preset_lib.selection(self.session.store,
+                                   Path(self.session.presets_dir or config.PRESETS_DIR))
+        self.selection = sel
+        self.args.preset = sel["name"] or DEFAULT_PRESET
+        if sel["skipped"]:
+            self.say(f"  ! {sel['skipped']} unreadable line(s) skipped in "
+                     f"{preset_lib.user_dir(self.session.store) / preset_lib.ACTIVE_FILE} "
+                     "(not UTF-8 JSON); `scan preset-select NAME` appends a good one")
 
     def preset(self):
         if self._preset is None:
+            sel = self.selection
+            if sel and sel["name"] and not sel["exists"] and self.args.preset == sel["name"]:
+                raise CLIError(f"the selected preset {sel['name']!r} no longer exists in this "
+                               f"library ({self.session.store.root}): select one with `scan "
+                               "preset-select NAME` (see `scan presets`), or name one with "
+                               "--preset")
             p = api.load_preset(self.args.preset)
             if self.args.average is not None:       # this run only; the file is untouched
                 p.camera.average = self.args.average
@@ -648,11 +669,17 @@ def cmd_presets(ctx):
                      "description": info.get("description", "")})
     ctx.say(f"Presets: built-in {ctx.session.presets_dir or config.PRESETS_DIR} (read-only), "
             f"user {config.user_presets_dir(ctx.session.store.root)}")
-    ctx.say(f"  (* = in use for this run: --preset NAME, else the selected preset "
-            f"{selected or '- none selected, the default'})")
+    sel = ctx.selection or {}
+    stale = sel.get("name") if sel.get("name") and not sel.get("exists") else None
+    shown = selected or (f"{stale} (GONE)" if stale else "- none selected, the default")
+    ctx.say(f"  (* = in use for this run: --preset NAME, else the selected preset {shown})")
     ctx.table(["", "name", "tier", "geometry", "projector", "DMD", "camera", "bases",
                "calibration", "stereo cal"], rows)
-    return EXIT_OK, {"presets": data, "active": ctx.args.preset, "selected": selected}
+    if stale:
+        ctx.say(f"  ! the selected preset {stale!r} no longer exists: commands that scan stop "
+                "until you `scan preset-select NAME` (or pass --preset)")
+    return EXIT_OK, {"presets": data, "active": ctx.args.preset, "selected": selected,
+                     "selected_missing": stale}
 
 
 def _parse_sets(items) -> dict:
@@ -691,7 +718,11 @@ def cmd_preset_delete(ctx):
                           stations_dir=Path(a.stations).resolve() if a.stations else None)
     ctx.say(f"User preset {r['name']} moved to {r['trashed']} (recoverable: move it back)")
     if r.get("forced"):
-        ctx.say(f"  ! still referenced by station config(s): {', '.join(r['stations'])}")
+        used = [f"station config(s) {', '.join(r['stations'])}"] if r.get("stations") else []
+        used += [f"recipe(s) {', '.join(r['recipes'])}"] if r.get("recipes") else []
+        used += ([f"recipe station config(s) {', '.join(r['recipe_stations'])}"]
+                 if r.get("recipe_stations") else [])
+        ctx.say(f"  ! still referenced by {'; '.join(used)}")
     return EXIT_OK, {"deleted": r}
 
 
@@ -2929,7 +2960,7 @@ def _run_inspect(ctx, cfg, p, base, log, res) -> None:
 
 
 def _run_compare(ctx, cfg, p, base, log, res) -> None:
-    golden = _find_scan(cfg.golden)
+    golden = _find_station_golden(cfg, "objects")
     scan = _run_capture(ctx, cfg, p, base, log, res)
     tol = None
     if cfg.threshold_mm is not None:
@@ -2953,11 +2984,14 @@ def _run_compare(ctx, cfg, p, base, log, res) -> None:
         res["invalid_reason"] = f"engine verdict {v.result}"
 
 
-CALIBRATE_STEREO_HOWTO = ("calibrate it first: `scan charuco` (print at 100 %, caliper a "
-                          "square), `scan calib-pose` per board pose (12-20, tilted +-30 deg), "
-                          "then `scan calibrate-stereo --square MM` (mock: `scan --mock "
-                          "calibrate-stereo --mock-poses 12`)")
-METRIC_MAX_PCT = 99.9           # 'max' deviation: robust to isolated triangulation outliers
+CALIBRATE_STEREO_HOWTO = ("calibrate it first, with the preset this run uses: `scan "
+                          "--preset {preset} charuco` (print at 100 %, caliper a square), `scan "
+                          "--preset {preset} calib-pose` per board pose (12-20, tilted +-30 "
+                          "deg), then `scan --preset {preset} calibrate-stereo --square MM` "
+                          "(mock: `scan --mock --preset {preset} calibrate-stereo --mock-poses "
+                          "12`)")
+METRIC_MATCH_MM = 5.0           # golden: ICP pairing radius (mm)
+_CONN8 = np.ones((3, 3), bool)  # out-of-tolerance clusters: 8-connected camera px
 
 
 def _mock_place_metric(ctx) -> None:
@@ -3000,6 +3034,141 @@ def _roi_mask(shape, roi) -> np.ndarray:
     return m
 
 
+def _tolerance_clusters(dev_abs: np.ndarray, thr: float, min_px: int,
+                        area: Optional[np.ndarray] = None, side: str = "test") -> dict:
+    """|deviation| map (H, W) mm, NaN = not measured -> its out-of-tolerance clusters:
+    8-connected camera px with |dev| > thr. A cluster of fewer than min_px px is an isolated
+    outlier (a stray triangulated point) and is dropped; every other cluster is a defect, and
+    the max over everything not dropped is the robust max. No statistic (percentile, mean)
+    can hide a defect of min_px px or more."""
+    from scipy import ndimage
+    ok = np.isfinite(dev_abs)
+    a = np.where(ok, dev_abs, 0.0)
+    lab, n = ndimage.label(ok & (a > thr), structure=_CONN8)
+    drop = np.zeros(n + 1, bool)
+    defects = []
+    if n:
+        sizes = np.bincount(lab.ravel(), minlength=n + 1)
+        for k, sl in enumerate(ndimage.find_objects(lab), 1):
+            if sizes[k] < min_px:
+                drop[k] = True
+                continue
+            b = lab[sl] == k
+            ar = float(np.nansum(area[sl][b])) if area is not None else None
+            defects.append({"side": side, "n_px": int(sizes[k]),
+                            "area_mm2": round(ar, 3) if ar is not None else None,
+                            "max_mm": round(float(a[sl][b].max()), 5),
+                            "bbox_px": [sl[1].start, sl[0].start, sl[1].stop, sl[0].stop]})
+    outlier = drop[lab]
+    kept = ok & ~outlier
+    return {"robust_max": float(a[kept].max()) if kept.any() else None, "defects": defects,
+            "outlier_px": int(outlier.sum()), "outlier_clusters": int(drop.sum())}
+
+
+def _defect_order(d: dict) -> tuple:
+    return (d["area_mm2"] if d["area_mm2"] is not None else -1.0, d["n_px"])
+
+
+def _foreground_all(cloud, min_height_mm: float = 2.0) -> np.ndarray:
+    """Every decoded px more than min_height_mm in front of the dominant (background) plane:
+    ALL parts and components, not only the largest blob (metric.foreground keeps one)."""
+    from engine.measure import metric
+    m = cloud.mask
+    if int(m.sum()) < 100:
+        return np.zeros_like(m)
+    bg, _ = metric.ransac_plane(cloud.xyz[m], 0.5)
+    h = np.full(m.shape, -np.inf)
+    h[m] = bg.distance(cloud.xyz[m])
+    return m & (h > min_height_mm)
+
+
+def _golden_compare(s, ms, golden, roi, thr: float, min_px: int) -> dict:
+    """Golden metric compare in BOTH directions, on every foreground component in the roi.
+
+    The test part (its foreground in the roi) is ICP-aligned onto the golden's foreground.
+    test -> golden: each test point's distance to the golden surface (point-to-plane at the
+    nearest golden point, or the straight distance to it, less the golden's own sample spacing,
+    whichever is larger), so deviating AND extra material count. golden -> test: the same for
+    each golden point against the aligned test part, so missing material counts. Both maps
+    go through the same out-of-tolerance clustering (_tolerance_clusters)."""
+    from scipy.spatial import cKDTree
+    from engine.library.store import json_safe
+    from engine.measure import metric
+    from engine.reconstruct import metric_scan
+    metric_scan.check_cal(s, ms, "compare_metric")
+    metric_scan.check_cal(s, golden, "compare_metric (golden)")
+    rules.require_same_geometry(ms.geometry_id, golden.geometry_id, "compare_metric")
+    a, g = ms.cloud, golden.cloud
+    fa, fg = _foreground_all(a), _foreground_all(g)
+    ra, rg = fa & _roi_mask(fa.shape, roi), fg & _roi_mask(fg.shape, roi)
+    out = {"n_test": int(ra.sum()), "n_golden": int(rg.sum()), "golden": golden.id}
+    if out["n_test"] < 100 or out["n_golden"] < 100:
+        return out
+    G = g.xyz[fg]
+    nG = metric.estimate_normals(G)
+    icp = metric.icp_point_to_plane(a.xyz[ra], G, nG, max_dist_mm=METRIC_MATCH_MM)
+    T = a.xyz[fa] @ icp.R.T + icp.t                      # the whole test part, aligned
+    tG, tT = cKDTree(G), cKDTree(T)
+    sG = tG.query(G, k=2)[0][:, 1]                       # each point's own sample spacing
+    sT = tT.query(T, k=2)[0][:, 1]
+    Ta = a.xyz[ra] @ icp.R.T + icp.t                     # test -> golden
+    e, j = tG.query(Ta)
+    pp = np.einsum("ij,ij->i", Ta - G[j], nG[j])
+    fwd = np.maximum(np.abs(pp), e - sG[j])
+    Gr = g.xyz[rg]                                       # golden -> test
+    gi = np.flatnonzero(rg[fg])
+    e2, k = tT.query(Gr)
+    pp2 = np.einsum("ij,ij->i", T[k] - Gr, nG[gi])
+    rev = np.maximum(np.abs(pp2), e2 - sT[k])
+    signed = np.full(ra.shape, np.nan)
+    signed[ra] = np.where(pp >= 0, 1.0, -1.0) * fwd
+    fwd_map = np.full(ra.shape, np.nan)
+    fwd_map[ra] = fwd
+    rev_map = np.full(rg.shape, np.nan)
+    rev_map[rg] = rev
+    area_a = metric.pixel_area_mm2(np.where(a.mask[..., None], a.xyz, np.nan))
+    area_g = metric.pixel_area_mm2(np.where(g.mask[..., None], g.xyz, np.nan))
+    ct = _tolerance_clusters(fwd_map, thr, min_px, area_a, "test")
+    cg = _tolerance_clusters(rev_map, thr, min_px, area_g, "golden")
+    maxes = [v for v in (ct["robust_max"], cg["robust_max"]) if v is not None]
+    out.update(icp={"rms_mm": icp.rms_mm, "fitness": icp.fitness, "iterations": icp.iterations,
+                    "converged": icp.converged},
+               signed=signed, fwd=fwd, robust_max=max(maxes) if maxes else None,
+               defects=sorted(ct["defects"] + cg["defects"], key=_defect_order, reverse=True),
+               outlier_px=ct["outlier_px"] + cg["outlier_px"],
+               test_matched_pct=round(100.0 * float(np.mean(fwd <= thr)), 2),
+               golden_found_pct=round(100.0 * float(np.mean(rev <= thr)), 2))
+    rep = {"scan": ms.id, "golden": golden.id, "units": "mm", "threshold_mm": thr, "roi": roi,
+           "min_defect_px": min_px, "n_test": out["n_test"], "n_golden": out["n_golden"],
+           "icp": {**out["icp"], "R": icp.R.tolist(), "t": icp.t.tolist()},
+           "test_matched_pct": out["test_matched_pct"],
+           "golden_found_pct": out["golden_found_pct"], "robust_max_mm": out["robust_max"],
+           "defects": out["defects"], "outlier_px": out["outlier_px"]}
+    f = s.store.output_path("comparisons", f"{ms.label}_vs_{golden.label}_metric", ".json")
+    s.store.write_json(f, json_safe(rep))
+    s.store.record_output("comparisons", f, label=ms.label, geometry_id=ms.geometry_id,
+                          source=ms.path)
+    out["report"] = str(f)
+    return out
+
+
+def _find_station_golden(cfg, kind: str = "metric"):
+    """job.golden -> the golden scan ('metric' scans for metric jobs, 'objects' for compare
+    jobs): an explicit id or label, never 'latest' (every run saves its own test scan, so that
+    is the previous part) and never this station's part.label (its test scans carry it)."""
+    key = str(cfg.golden or "").strip()
+    what, cmd_ = ("metric scan", "metric") if kind == "metric" else ("scan", "scans")
+    if key.lower() in ("latest", "last") or key == cfg.part_label:
+        raise CLIError(f"job.golden {key!r}: name the golden {what} by its id or label (a GOOD "
+                       "part scanned once), never 'latest' or this station's part.label (that "
+                       "would compare the part with an earlier test scan)")
+    golden = _pick(api.list_library(kind), key, what, cmd_, allow_latest=False)
+    if golden.label == cfg.part_label:
+        raise CLIError(f"job.golden {key!r} resolves to {golden.id}, labelled with this "
+                       f"station's part.label {cfg.part_label!r}: an earlier test scan, not a golden")
+    return golden
+
+
 def _deviation_png(run_dir: Path, dev: np.ndarray, scale_mm: float) -> Optional[str]:
     """Signed deviation map -> run_dir/deviation.png (red above, blue below, +-scale_mm)."""
     try:
@@ -3027,11 +3196,12 @@ def _deviation_png(run_dir: Path, dev: np.ndarray, scale_mm: float) -> Optional[
 
 def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     """metric job: scan_fast / scan_metric (stereo calibration, rule 6) -> mm, then a plane
-    fit in the roi or a golden metric compare; PASS / FAIL against threshold_mm only."""
+    fit in the roi or a golden metric compare (both directions); PASS / FAIL against
+    threshold_mm. The verdict comes from out-of-tolerance clusters (_tolerance_clusters):
+    only clusters smaller than job.min_defect_px are dropped, as isolated outliers."""
     from engine import config as cfgmod
     from engine.calibrate import stereo
     from engine.measure import metric
-    from engine.reconstruct import metric_scan
     s = api._engine()
     if cfg.threshold_mm is None:
         res["invalid_reason"] = ("metric jobs need threshold_mm (mm) in the station config: "
@@ -3042,18 +3212,19 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     if cal is None:
         res["calibration"]["same_geometry"] = False
         res["invalid_reason"] = (f"no stereo calibration for geometry {p.geometry_id} (these rig "
-                                 f"settings), so no mm (rule 6): {CALIBRATE_STEREO_HOWTO}")
+                                 f"settings), so no mm (rule 6): "
+                                 + CALIBRATE_STEREO_HOWTO.format(preset=p.name))
         log.event("refused", level="warning", reason=res["invalid_reason"])
         return
     res["calibration"].update(calibration_id=cal.id, same_geometry=True)
-    golden = _find_metric(cfg.golden) if cfg.measure == "golden" else None
+    golden = _find_station_golden(cfg, "metric") if cfg.measure == "golden" else None
     s.check_cancel()
     _mock_place_metric(ctx)
     if cfg.scan == "metric":
         ms = api.scan_metric(p, cfg.part_label, steps=cfg.steps, periods=cfg.periods,
                              zone=cfg.zone)
-    else:
-        avg = cfg.average if cfg.average is not None else (ctx.args.average or 2)
+    else:                                       # --average wins, else job.average (cmd_run)
+        avg = ctx.args.average if ctx.args.average is not None else (cfg.average or 2)
         ms = api.scan_fast(cfg.zone, p, cfg.part_label, cfg.steps or 4, cfg.periods, avg,
                            axis=cfg.axis)
     m = ms.meta or {}
@@ -3067,45 +3238,92 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
               n_points=m.get("n_points"), valid_pct=m.get("valid_pct"))
     s.check_cancel()
     cloud = ms.cloud
-    region = cloud.mask & _roi_mask(cloud.mask.shape, cfg.roi)
+    thr, min_px = cfg.threshold_mm, cfg.min_defect_px
+    roi = _roi_mask(cloud.mask.shape, cfg.roi)
+    incomplete = None
     if cfg.measure == "plane":
-        P = cloud.xyz[region]
         method = "plane_fit"
-        if len(P) < 100:
-            res["invalid_reason"] = (f"only {len(P)} points in the roi: nothing to fit a "
-                                     "plane to (check the roi, zone and exposure)")
-            log.event("measure", level="warning", method=method, n_points=int(len(P)))
+        region = cloud.mask & roi
+        P = cloud.xyz[region]
+        cov = 100.0 * len(P) / max(int(roi.sum()), 1)
+        extra = {"roi_valid_pct": round(cov, 2), "min_valid_pct": cfg.min_valid_pct}
+        if len(P) < 100 or cov < cfg.min_valid_pct:
+            res["invalid_reason"] = (f"only {len(P)} points ({cov:.1f} % of the roi) decoded, "
+                                     f"below job.min_valid_pct {cfg.min_valid_pct:g} %: too little "
+                                     "to measure (check the part, roi, zone and exposure)")
+            log.event("measure", level="warning", method=method, n_points=int(len(P)), **extra)
             return
         fit, _ = metric.ransac_plane(P, 0.5)
-        d = fit.distance(P)
+        dist = abs(float(fit.normal @ fit.point))       # plane to camera centre, mm
+        extra.update(plane_rms_inliers_mm=round(fit.rms, 5), plane_distance_mm=round(dist, 3))
+        if cfg.plane_range_mm is not None and not (
+                cfg.plane_range_mm[0] <= dist <= cfg.plane_range_mm[1]):
+            res["invalid_reason"] = (f"the fitted plane is {dist:.1f} mm from the camera, outside "
+                                     f"job.plane_range_mm {list(cfg.plane_range_mm)}: no part "
+                                     "surface where it should be (part absent or misplaced?)")
+            log.event("measure", level="warning", method=method, n_points=int(len(P)), **extra)
+            return
         dev = np.full(cloud.mask.shape, np.nan)
-        dev[region] = d
-        extra = {"plane_rms_inliers_mm": round(fit.rms, 5)}
+        dev[region] = fit.distance(P)
+        d = dev[region]
+        area = metric.pixel_area_mm2(np.where(cloud.mask[..., None], cloud.xyz, np.nan))
+        cl = _tolerance_clusters(np.abs(dev), thr, min_px, area, "test")
+        mx, outlier_px = cl["robust_max"], cl["outlier_px"]
+        defects = sorted(cl["defects"], key=_defect_order, reverse=True)
     else:
         method = "compare_metric_golden"
-        rep_, dev = metric_scan.compare_metric(s, ms, golden)
-        dev = np.where(_roi_mask(dev.shape, cfg.roi), dev, np.nan)
-        d = dev[np.isfinite(dev)]
-        extra = {"golden": golden.id, "icp_rms_mm": rep_["icp"]["rms_mm"],
-                 "icp_converged": rep_["icp"]["converged"], "blobs": len(rep_["blobs"])}
-        if not rep_["icp"]["converged"]:
-            res["warnings"].append("ICP onto the golden did not converge: check the placement")
-        if d.size < 100:
-            res["invalid_reason"] = (f"only {d.size} points overlap the golden {golden.id} "
-                                     "(in the roi): wrong part or placement?")
-            log.event("measure", level="warning", method=method, n_points=int(d.size), **extra)
+        gc = _golden_compare(s, ms, golden, cfg.roi, thr, min_px)
+        extra = {"golden": golden.id, "n_golden_points": gc["n_golden"]}
+        if "robust_max" not in gc:
+            res["invalid_reason"] = (f"only {gc['n_test']} test / {gc['n_golden']} golden "
+                                     f"foreground points in the roi (golden {golden.id}): wrong "
+                                     "part, placement or roi?")
+            log.event("measure", level="warning", method=method, n_points=gc["n_test"], **extra)
             return
-    mx = float(np.percentile(np.abs(d), METRIC_MAX_PCT))
+        extra.update(icp_rms_mm=gc["icp"]["rms_mm"], icp_fitness=gc["icp"]["fitness"],
+                     icp_converged=gc["icp"]["converged"],
+                     test_matched_pct=gc["test_matched_pct"],
+                     golden_found_pct=gc["golden_found_pct"],
+                     min_coverage_pct=cfg.min_coverage_pct, report=gc["report"])
+        res["outputs"]["report"] = gc["report"]
+        dev = gc["signed"]
+        d = dev[np.isfinite(dev)]
+        mx, defects, outlier_px = gc["robust_max"], gc["defects"], gc["outlier_px"]
+        if not gc["icp"]["converged"]:
+            incomplete = ("ICP onto the golden did not converge: the alignment, and so every "
+                          "deviation, can't be trusted (check the placement)")
+        elif min(gc["golden_found_pct"], gc["test_matched_pct"]) < cfg.min_coverage_pct:
+            incomplete = (f"only {gc['golden_found_pct']:g} % of the golden surface and "
+                          f"{gc['test_matched_pct']:g} % of the test surface agree within "
+                          f"{thr:g} mm (job.min_coverage_pct {cfg.min_coverage_pct:g} %) "
+                          "without one defect cluster: scattered or partial data, can't pass")
+    if mx is None:                              # every measured px was a dropped stray cluster
+        res["invalid_reason"] = ("nothing left to judge once the stray points (clusters under "
+                                 f"job.min_defect_px {min_px} px) are dropped")
+        log.event("measure", level="warning", method=method, n_points=int(d.size), **extra)
+        return
+    big = defects[0] if defects else None
     res["deviation_units"] = "mm"
     res["deviation_mm"].update(max=round(mx, 5), mean=round(float(np.mean(d)), 5),
                                rms=round(float(np.sqrt(np.mean(d * d))), 5), method=method,
-                               n_points=int(d.size))
-    res["outputs"]["deviation_map"] = _deviation_png(run_dir, dev, cfg.threshold_mm)
-    res["result"] = res["engine_verdict"] = "FAIL" if mx > cfg.threshold_mm else "PASS"
-    res["invalid_reason"] = None
-    log.event("measure", method=method, max_deviation_mm=res["deviation_mm"]["max"],
-              rms_mm=res["deviation_mm"]["rms"], n_points=int(d.size),
-              threshold_mm=cfg.threshold_mm, max_percentile=METRIC_MAX_PCT, **extra)
+                               n_points=int(d.size), n_defects=len(defects), largest_defect=big)
+    res["outputs"]["deviation_map"] = _deviation_png(run_dir, dev, thr)
+    if defects or mx > thr:                     # any defect cluster fails, whatever else
+        verdict = "FAIL"
+    elif incomplete:
+        verdict = None                          # INVALID: never a PASS on untrusted numbers
+    else:
+        verdict = "PASS"
+    if verdict is None:
+        res["invalid_reason"] = incomplete
+    else:
+        res["result"] = res["engine_verdict"] = verdict
+        res["invalid_reason"] = None
+    log.event("measure", level="info" if verdict else "warning", method=method,
+              max_deviation_mm=res["deviation_mm"]["max"], rms_mm=res["deviation_mm"]["rms"],
+              n_points=int(d.size), threshold_mm=thr, min_defect_px=min_px,
+              n_defects=len(defects), largest_defect=big, outliers_dropped_px=outlier_px,
+              **extra)
 
 
 def _run_capture(ctx, cfg, p, base, log, res):
@@ -3135,6 +3353,8 @@ def cmd_run(ctx):
     if lib is not None and not a.library:           # --library on the command line wins
         ctx.session = api.configure(lib.resolve(), mock=ctx.mock)
         ctx._outputs_before = len(ctx.session.store.outputs())
+        if not a.preset_given and ctx.selection is not None:
+            ctx.use_selected_preset()               # THIS library's selection, not the default's
     recipe = None
     if cfg.job_type == "recipe":                    # the recipe pins its preset
         try:
@@ -3207,13 +3427,13 @@ def cmd_run(ctx):
         return EXIT_NOT_OK, {"run_id": run_id, "run_dir": str(run_dir), "result": res}
     except (Exception, KeyboardInterrupt) as e:
         ecode, line = _classify_error(e, ctx.mode)
+        ecode = _exit_code_for(e, ecode, a)     # what main() exits with: a crash is 4, not 1
         res["result"] = "INVALID"
         res["invalid_reason"] = line
-        log.event("error", level="error", type=type(e).__name__, message=line,
-                  exit_code=EXIT_REFUSED if ecode == EXIT_REFUSED else EXIT_ERROR)
+        log.event("error", level="error", type=type(e).__name__, message=line, exit_code=ecode)
         RJ.write_result(run_dir, res)
         try:                                # callers in-process (the web UI) read the run back
-            e.run_result, e.run_dir = res, str(run_dir)
+            e.run_result, e.run_dir, e.run_exit_code = res, str(run_dir), ecode
         except AttributeError:
             pass
         log.event("run_end", result="INVALID", exit_code=ecode, result_json="result.json")
@@ -3493,18 +3713,20 @@ geometry, safety, config, rig busy, bad input) | 3 mode not available yet |
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # allow_abbrev=False everywhere: an abbreviated option (--pres for --preset) is refused
+    # instead of half-working (main() only sees the spelled-out --preset / --mock-part)
     ap = argparse.ArgumentParser(
         prog="scan", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Swiss Army Scanner: DMD structured-light scanner, command line.",
-        epilog=EPILOG)
+        epilog=EPILOG, allow_abbrev=False)
     _add_globals(ap, sub=False)
-    common = argparse.ArgumentParser(add_help=False)
+    common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     _add_globals(common, sub=True)
     sp = ap.add_subparsers(dest="command", metavar="<command>")
 
     def cmd(name, func, help_, mode=None):
         p = sp.add_parser(name, parents=[common], help=help_,
-                          description=help_.replace("%%", "%"))
+                          description=help_.replace("%%", "%"), allow_abbrev=False)
         p.set_defaults(func=func, mode=mode or name)
         return p
 
@@ -4268,6 +4490,15 @@ def _classify_error(e: BaseException, mode: str) -> tuple:
     return EXIT_NOT_OK, f"unexpected {type(e).__name__}: {msg} (run with --debug for details)"
 
 
+def _exit_code_for(e: BaseException, code: int, args) -> int:
+    """The process exit code for an error _classify_error rated `code`: for commands whose
+    exit 1 is a verdict (run, dent-detect, station-check ...) an unexpected error exits with
+    their unexpected_exit (4), never 1."""
+    if code == EXIT_NOT_OK and not isinstance(e, Abort):
+        return getattr(args, "unexpected_exit", code)
+    return code
+
+
 def _safe_streams() -> None:
     for s in (sys.stdout, sys.stderr):
         try:
@@ -4321,8 +4552,7 @@ def main(argv: Optional[list] = None) -> int:
         return code
     except (Exception, KeyboardInterrupt) as e:
         code, line = _classify_error(e, ctx.mode)
-        if code == EXIT_NOT_OK and not isinstance(e, Abort):
-            code = getattr(args, "unexpected_exit", code)       # a crash is not a verdict
+        code = _exit_code_for(e, code, args)                    # a crash is not a verdict
         if args.debug:
             traceback.print_exc()
         print(line.translate(_ASCII), file=sys.stderr)

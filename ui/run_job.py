@@ -50,9 +50,15 @@ from engine.runs import write_result  # noqa: F401  (re-exported: callers use ru
 JOB_TYPES = ("inspect", "compare", "metric", "recipe")
 METRIC_SCANS = ("fast", "metric")           # api.scan_fast | api.scan_metric
 METRIC_MEASURES = ("plane", "golden")
-# metric verdicts: an out-of-tolerance cluster of fewer camera px than this is an isolated
-# outlier (a stray triangulated point) and is dropped; every larger cluster FAILs
+# metric verdicts: an isolated out-of-tolerance cluster of fewer camera px than this is an
+# outlier (a stray triangulated point) and is dropped; every larger cluster FAILs. Capped: a
+# larger setting would quietly stop seeing real defects
 METRIC_MIN_DEFECT_PX = 5
+METRIC_MAX_MIN_DEFECT_PX = 50
+# dropped stray px beyond this share of the measured px -> INVALID (noisy data or a pitted
+# surface, never a PASS); capped, so the guard can't be switched off by a config
+METRIC_MAX_OUTLIER_PCT = 0.1
+METRIC_MAX_OUTLIER_PCT_CAP = 5.0
 METRIC_MIN_VALID_PCT = 30.0     # plane: decoded share of the roi below this -> INVALID
 METRIC_MIN_COVERAGE_PCT = 95.0  # golden: surface agreeing within threshold, each direction
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -90,6 +96,7 @@ class StationConfig:
     measure: str = "plane"                  # plane | golden
     roi: Optional[list] = None              # [x0, y0, x1, y1] camera px; None = whole field
     min_defect_px: int = METRIC_MIN_DEFECT_PX
+    max_outlier_pct: float = METRIC_MAX_OUTLIER_PCT
     min_valid_pct: float = METRIC_MIN_VALID_PCT
     min_coverage_pct: float = METRIC_MIN_COVERAGE_PCT
     plane_range_mm: Optional[list] = None   # plane: [near, far] plane-to-camera distance, mm
@@ -257,7 +264,7 @@ def _golden_ref(golden, part_label: str, what: str = "scan") -> str:
 
 def _metric_keys(job: dict, jt: str, part_label: str) -> dict:
     """job.scan / axis / steps / periods / measure / roi / golden / min_defect_px /
-    min_valid_pct / min_coverage_pct / plane_range_mm for metric jobs."""
+    max_outlier_pct / min_valid_pct / min_coverage_pct / plane_range_mm for metric jobs."""
     if jt != "metric":
         return {}
     scan = str(job.get("scan", "fast"))
@@ -287,8 +294,15 @@ def _metric_keys(job: dict, jt: str, part_label: str) -> dict:
             raise StationConfigError("job.roi must be [x0, y0, x1, y1] camera px (x1 > x0, "
                                      "y1 > y0) or null")
     min_px = job.get("min_defect_px", METRIC_MIN_DEFECT_PX)
-    if not _count(min_px) or min_px < 1:
-        raise StationConfigError("job.min_defect_px must be an integer >= 1 (camera px)")
+    if not _count(min_px) or not 1 <= min_px <= METRIC_MAX_MIN_DEFECT_PX:
+        raise StationConfigError(f"job.min_defect_px must be an integer 1.."
+                                 f"{METRIC_MAX_MIN_DEFECT_PX} (camera px): larger would drop "
+                                 "real defects as stray points")
+    max_out = job.get("max_outlier_pct", METRIC_MAX_OUTLIER_PCT)
+    if not _number(max_out) or not 0 <= max_out <= METRIC_MAX_OUTLIER_PCT_CAP:
+        raise StationConfigError(f"job.max_outlier_pct must be a number 0.."
+                                 f"{METRIC_MAX_OUTLIER_PCT_CAP:g} (% of the measured px that may "
+                                 "be dropped as stray points)")
     pct = {}
     for key, dflt in (("min_valid_pct", METRIC_MIN_VALID_PCT),
                       ("min_coverage_pct", METRIC_MIN_COVERAGE_PCT)):
@@ -304,7 +318,7 @@ def _metric_keys(job: dict, jt: str, part_label: str) -> dict:
     return {"scan": scan, "axis": axis, "steps": steps,
             "periods": [float(v) for v in periods] if periods else None,
             "measure": measure, "roi": list(roi) if roi else None,
-            "min_defect_px": int(min_px), **pct,
+            "min_defect_px": int(min_px), "max_outlier_pct": float(max_out), **pct,
             "plane_range_mm": [float(v) for v in rng] if rng is not None else None}
 
 

@@ -560,3 +560,335 @@ def test_run_uses_the_station_library_selection(tmp_path, monkeypatch):
     _cli(["--mock", "run", str(cfg)])
     res = _check_run(_only_run(tmp_path / "o" / "runs"), "sel2")
     assert res["capture"]["preset"] == cli.DEFAULT_PRESET
+
+
+# ------------------------------------------------------------ recheck regressions: metric
+
+@pytest.mark.parametrize("job, msg", [
+    ({"min_defect_px": 0}, "job.min_defect_px"),
+    ({"min_defect_px": RJ.METRIC_MAX_MIN_DEFECT_PX + 1}, "job.min_defect_px"),
+    ({"max_outlier_pct": -0.1}, "job.max_outlier_pct"),
+    ({"max_outlier_pct": RJ.METRIC_MAX_OUTLIER_PCT_CAP + 1}, "job.max_outlier_pct"),
+    ({"max_outlier_pct": "0.1"}, "job.max_outlier_pct"),
+    ({"max_outlier_pct": True}, "job.max_outlier_pct"),
+])
+def test_metric_detection_limits_are_bounded(tmp_path, job, msg):
+    """A large min_defect_px or max_outlier_pct would quietly switch defect detection off."""
+    with pytest.raises(RJ.StationConfigError, match=msg):
+        RJ.load_station_config(_metric_station(tmp_path, job=job))
+    cfg = RJ.load_station_config(METRIC)
+    assert cfg.min_defect_px == RJ.METRIC_MIN_DEFECT_PX
+    assert cfg.max_outlier_pct == RJ.METRIC_MAX_OUTLIER_PCT
+
+
+def test_tolerance_clusters_join_nearby_stray_px():
+    """Out-of-tolerance px close together are ONE cluster: a patch of pits, each smaller
+    than min_defect_px, is a defect; only isolated stray px are dropped, and counted."""
+    import numpy as np
+    dev = np.full((400, 400), 0.05)
+    for y in range(100, 130, 3):                      # 10 x 10 pits of 2 x 2 px, 1 px apart
+        for x in range(200, 230, 3):
+            dev[y:y + 2, x:x + 2] = 2.0
+    dev[10, 10] = 9.0                                 # isolated stray points
+    dev[390, 5:7] = 3.0
+    r = cli._tolerance_clusters(dev, 0.5, 5)
+    assert [d["n_px"] for d in r["defects"]] == [400]
+    assert r["outlier_px"] == 3 and r["outlier_clusters"] == 2 and r["n_measured"] == 160000
+    assert r["robust_max"] == pytest.approx(2.0)
+
+
+def _with_cloud(scan, xyz=None, mask=None):
+    """A copy of a canned metric scan with its cloud altered (the stored scan is untouched)."""
+    from dataclasses import replace
+    import numpy as np
+    c = scan.cloud
+    xyz = c.xyz.copy() if xyz is None else xyz
+    mask = c.mask.copy() if mask is None else mask
+    xyz[~mask] = np.nan
+    return replace(scan, _cloud=replace(c, xyz=xyz, mask=mask))
+
+
+@pytest.fixture(scope="module")
+def flat(canned):
+    """The canned block scan with the block cut out: the decoded wall alone (a flat part)."""
+    from scipy import ndimage
+    c = canned["full"].cloud
+    part = ndimage.binary_dilation(cli._foreground_all(c), iterations=8)
+    return _with_cloud(canned["full"], mask=c.mask & ~part)
+
+
+def _plane_run(tmp_path, stereo_lib, monkeypatch, scan, **job):
+    code, res, events, _ = _canned_run(tmp_path, stereo_lib, monkeypatch, scan,
+                                       station_id="plane", job=job)
+    return code, res, [e for e in events if e["event"] == "measure"][0]
+
+
+def test_metric_plane_reports_dropped_stray_points(tmp_path, stereo_lib, flat, monkeypatch):
+    """A few isolated stray points are dropped, PASS, and result.json says how many."""
+    import numpy as np
+    code, res, meas = _plane_run(tmp_path / "a", stereo_lib, monkeypatch, flat)
+    assert res["result"] == "PASS" and code == cli.EXIT_OK, res
+    dm = res["deviation_mm"]
+    assert dm["outlier_px"] == 0 and dm["outlier_pct"] == 0.0 and dm["outlier_clusters"] == 0
+    xyz = flat.cloud.xyz.copy()
+    ys, xs = np.nonzero(flat.cloud.mask)
+    pick = np.arange(0, len(ys), len(ys) // 30)[:30]
+    xyz[ys[pick], xs[pick], 2] -= 3.0                 # 30 single px, 3 mm off, far apart
+    code, res, meas = _plane_run(tmp_path / "b", stereo_lib, monkeypatch,
+                                 _with_cloud(flat, xyz=xyz))
+    assert res["result"] == "PASS" and code == cli.EXIT_OK, res
+    dm = res["deviation_mm"]
+    assert dm["outlier_px"] == 30 and dm["outlier_clusters"] == 30 and dm["max"] < 0.5
+    assert 0 < dm["outlier_pct"] < RJ.METRIC_MAX_OUTLIER_PCT and meas["outliers_dropped_px"] == 30
+
+
+def test_metric_plane_scattered_out_of_tolerance_data_never_passes(tmp_path, stereo_lib, flat,
+                                                                    monkeypatch):
+    """Dense small out-of-tolerance clusters used to be dropped one by one (PASS): pits
+    spread over the part, a pitted patch, per-px noise. Now INVALID or FAIL."""
+    import numpy as np
+    c = flat.cloud
+    pits = c.xyz.copy()                               # 2 x 2 px pits, 3 mm deep, 40 px apart
+    for y in range(40, c.mask.shape[0] - 40, 40):
+        for x in range(40, c.mask.shape[1] - 40, 40):
+            pits[y:y + 2, x:x + 2, 2] += 3.0
+    code, res, meas = _plane_run(tmp_path / "a", stereo_lib, monkeypatch,
+                                 _with_cloud(flat, xyz=pits))
+    assert res["result"] == "INVALID" and code == cli.EXIT_INVALID, res
+    assert "max_outlier_pct" in res["invalid_reason"]
+    assert res["deviation_mm"]["outlier_pct"] > RJ.METRIC_MAX_OUTLIER_PCT
+    code, res, _ = _plane_run(tmp_path / "b", stereo_lib, monkeypatch,
+                              _with_cloud(flat, xyz=pits), min_defect_px=1)
+    assert res["result"] == "FAIL" and code == cli.EXIT_NOT_OK, res
+    patch = c.xyz.copy()                              # one pitted patch: pits 1 px apart
+    y0, x0 = np.argwhere(c.mask)[len(np.argwhere(c.mask)) // 2]
+    for y in range(y0, y0 + 30, 3):
+        for x in range(x0, x0 + 30, 3):
+            patch[y:y + 2, x:x + 2, 2] += 3.0
+    code, res, _ = _plane_run(tmp_path / "c", stereo_lib, monkeypatch,
+                              _with_cloud(flat, xyz=patch))
+    assert res["result"] == "FAIL" and code == cli.EXIT_NOT_OK, res
+    assert res["deviation_mm"]["largest_defect"]["n_px"] >= 300
+    noisy = c.xyz.copy()
+    rng = np.random.default_rng(0)
+    noisy[..., 2] += rng.normal(0.0, 0.15, noisy.shape[:2])
+    code, res, _ = _plane_run(tmp_path / "d", stereo_lib, monkeypatch,
+                              _with_cloud(flat, xyz=noisy))
+    assert res["result"] in ("INVALID", "FAIL") and code != cli.EXIT_OK, res
+
+
+@pytest.fixture(scope="module")
+def placed(stereo_lib):
+    """Mock scans of GOOD parts placed again: canned["full"]'s 80 x 40 x 10 block shifted
+    1.0 / 0.5 mm and turned 2 deg on the wall, and two 40 x 30 x 10 blocks side by side (a
+    two-component part, its own golden); and two in-plane defects of them."""
+    import math
+    import numpy as np
+    from engine.capture.mock_stereo import Block
+    a = math.radians(2.0)
+    rz = np.array([[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0],
+                   [0.0, 0.0, 1.0]])
+    scenes = {"shifted": [Block(center=(1.0, 0.5, 818.0), half=(20.0, 40.0, 5.0))],
+              "turned": [Block(center=(0.0, 0.0, 818.0), half=(20.0, 40.0, 5.0), rot=rz.T)],
+              "pair": [Block(center=(x, 0.0, 818.0), half=(20.0, 15.0, 5.0))
+                       for x in (-30.0, 30.0)],
+              # in-plane defects: 1.5 mm longer at one end (no rigid placement brings both
+              # ends within 0.5 mm), and the pair's right block 2 mm off sideways
+              "long15": [Block(center=(0.0, 0.75, 818.0), half=(20.0, 40.75, 5.0))],
+              "pair_mv2": [Block(center=(-30.0, 0.0, 818.0), half=(20.0, 15.0, 5.0)),
+                           Block(center=(30.0, 2.0, 818.0), half=(20.0, 15.0, 5.0))]}
+    s = api.configure(stereo_lib, mock=True)
+    try:
+        p = api.load_preset(RJ.load_station_config(METRIC).preset)
+        out = {}
+        for key, shapes in scenes.items():
+            bench = api.mock_bench()
+            bench.clear()
+            bench.use_stereo()
+            for sh in shapes:
+                bench.place(sh)
+            out[key] = api.scan_fast(None, p, f"placed_{key}", 4, None, 1, axis="xy")
+            out[key].cloud
+        assert s.mock
+    finally:
+        api._session = None
+    return out
+
+
+def test_metric_golden_replaced_good_part_passes(tmp_path, stereo_lib, canned, placed,
+                                                 monkeypatch):
+    """The same good block placed 1.1 mm off or turned 2 deg: it used to FAIL (point-to-plane
+    ICP can't place a flat face along itself, the leftover offset read as edge strips of
+    extra / missing material). The part is now placed along the background plane."""
+    for key, move in (("shifted", "shift_mm"), ("turned", "turn_deg")):
+        code, res, events, _ = _golden_run(tmp_path / key, stereo_lib, monkeypatch, placed[key],
+                                           "canned_full")
+        assert res["result"] == "PASS" and code == cli.EXIT_OK, (key, res)
+        meas = [e for e in events if e["event"] == "measure"][0]
+        assert meas["placement"][move] > 0.7, meas
+        assert meas["icp_converged"] and res["deviation_mm"]["max"] < 0.5
+
+
+def test_metric_golden_one_component_offset_fails(tmp_path, stereo_lib, placed, monkeypatch):
+    """Two-component part, one component 0.8 mm proud or sunk (threshold 0.5): a best-fit
+    tilt of the whole part used to absorb it (PASS). The background plane is the datum, so
+    the offset stays in the deviation."""
+    import numpy as np
+    pair = placed["pair"]
+    c = pair.cloud
+    fg = cli._foreground_all(c)
+    x = np.nan_to_num(c.xyz[..., 0])
+    for tag, side, dz, want in (("proud", x > 0, -0.8, "FAIL"), ("sunk", x < 0, 0.8, "FAIL"),
+                                ("in_tol", x > 0, -0.3, "PASS")):
+        xyz = c.xyz.copy()
+        xyz[fg & side, 2] += dz                       # + z = away from the camera
+        code, res, events, _ = _golden_run(tmp_path / tag, stereo_lib, monkeypatch,
+                                           _with_cloud(pair, xyz=xyz), "placed_pair")
+        assert res["result"] == want, (tag, res)
+        if want == "FAIL":
+            assert code == cli.EXIT_NOT_OK and res["deviation_mm"]["max"] > 0.7
+            assert res["deviation_mm"]["largest_defect"]["n_px"] > 1000
+
+
+def test_metric_golden_thinner_part_fails(tmp_path, stereo_lib, canned, monkeypatch):
+    """The whole visible face 2 mm lower (a thinner part): no longer absorbed by the fit."""
+    c = canned["full"].cloud
+    xyz = c.xyz.copy()
+    xyz[cli._foreground_all(c), 2] += 2.0
+    code, res, _, _ = _golden_run(tmp_path, stereo_lib, monkeypatch,
+                                  _with_cloud(canned["full"], xyz=xyz), "canned_full")
+    assert res["result"] == "FAIL" and code == cli.EXIT_NOT_OK, res
+    assert res["deviation_mm"]["max"] == pytest.approx(2.0, abs=0.3)
+
+
+def test_metric_golden_moved_background_is_invalid(tmp_path, stereo_lib, canned, monkeypatch):
+    """The datum itself moved (the whole scene turned 3 deg): INVALID, never a verdict."""
+    import math
+    import numpy as np
+    a = math.radians(3.0)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, math.cos(a), -math.sin(a)],
+                   [0.0, math.sin(a), math.cos(a)]])
+    c = canned["full"].cloud
+    ctr = np.array([0.0, 0.0, 823.0])
+    xyz = (c.xyz - ctr) @ rx.T + ctr
+    code, res, _, _ = _golden_run(tmp_path, stereo_lib, monkeypatch,
+                                  _with_cloud(canned["full"], xyz=xyz), "canned_full")
+    assert res["result"] == "INVALID" and code == cli.EXIT_INVALID, res
+    assert "background plane" in res["invalid_reason"]
+
+
+def test_metric_golden_in_plane_size_errors_fail(tmp_path, stereo_lib, canned, placed,
+                                                 monkeypatch):
+    """Review case (the in-plane placement's first version): a block 1.5 mm too long, or one
+    component of a pair 2 mm off sideways, PASSED - the placement split the error and the
+    verdict took the golden's sample spacing (~0.4 mm) off every distance past its outline.
+    How far a point lies beyond the other part's outline is now measured in full."""
+    for key, golden in (("long15", "canned_full"), ("pair_mv2", "placed_pair")):
+        code, res, events, _ = _golden_run(tmp_path / key, stereo_lib, monkeypatch,
+                                           placed[key], golden)
+        assert res["result"] == "FAIL" and code == cli.EXIT_NOT_OK, (key, res)
+        assert res["deviation_mm"]["max"] > 0.6, (key, res["deviation_mm"])
+
+
+def _pitted(scan, mask, pitch, size=1, depth=1.5):
+    """scan's cloud with size x size px pits `depth` mm deep (along the view ray) every
+    `pitch` px inside `mask`."""
+    import numpy as np
+    c = scan.cloud
+    xyz = c.xyz.copy()
+    ys, xs = np.nonzero(mask)
+    y0, x0 = ys.min(), xs.min()
+    n = 0
+    for y in range(y0, ys.max() + 1, pitch):
+        for x in range(x0, xs.max() + 1, pitch):
+            if mask[y:y + size, x:x + size].all():
+                P = xyz[y:y + size, x:x + size]
+                away = 1.0 + depth / np.linalg.norm(P, axis=-1)
+                xyz[y:y + size, x:x + size] = P * away[..., None]
+                n += 1
+    return _with_cloud(scan, xyz=xyz), n
+
+
+def test_metric_golden_pits_never_pass(tmp_path, stereo_lib, canned, monkeypatch):
+    """Review cases: single-px pits 1.5 mm deep on a 7 px grid over the part used to be
+    dropped before the clustering (each pit tilted its own surface normal past 75 deg, so
+    it was 'not judged'): PASS with 0 stray px. And 2 x 2 px pits a few px apart were
+    stray clusters judged against BOTH sides' measured px (the golden's clean px halved
+    their share): PASS. Neither passes now."""
+    import numpy as np
+    from scipy import ndimage
+    c = canned["full"].cloud
+    part = ndimage.binary_erosion(cli._foreground_all(c), iterations=6)
+    scan, n = _pitted(canned["full"], part, 7)
+    assert n > 300
+    code, res, _, _ = _golden_run(tmp_path / "grid", stereo_lib, monkeypatch, scan,
+                                  "canned_full")
+    assert res["result"] != "PASS" and code != cli.EXIT_OK, res
+    patch = part.copy()
+    ys, xs = np.nonzero(part)
+    patch[:] = False
+    yc, xc = int(ys.mean()), int(xs.mean())
+    patch[yc - 12:yc + 12, xc - 12:xc + 12] = True
+    scan, n = _pitted(canned["full"], patch & part, 6, size=2)
+    assert n >= 9
+    code, res, _, _ = _golden_run(tmp_path / "patch", stereo_lib, monkeypatch, scan,
+                                  "canned_full")
+    assert res["result"] != "PASS" and code != cli.EXIT_OK, res
+
+
+def test_metric_plane_a_pitted_patch_never_passes(tmp_path, stereo_lib, flat, monkeypatch):
+    """Review case: 2 x 2 px pits 3 mm deep at a 5 px pitch in one ~30 mm patch - each pit
+    an isolated stray cluster, all of them under 0.1 % of the whole field: PASS. Dropped px
+    that are dense in one place are never stray points: INVALID."""
+    import numpy as np
+    from scipy import ndimage
+    c = flat.cloud
+    full = ndimage.uniform_filter(c.mask.astype(float), size=91) > 0.999     # all decoded
+    yc, xc = np.argwhere(full)[len(np.argwhere(full)) // 2]
+    patch = np.zeros_like(c.mask)
+    patch[yc - 45:yc + 45, xc - 45:xc + 45] = True
+    scan, n = _pitted(flat, patch & c.mask, 5, size=2, depth=3.0)
+    assert n > 200
+    code, res, meas = _plane_run(tmp_path, stereo_lib, monkeypatch, scan)
+    assert res["result"] == "INVALID" and code == cli.EXIT_INVALID, res
+    assert res["deviation_mm"]["outlier_pct"] < RJ.METRIC_MAX_OUTLIER_PCT
+    assert res["deviation_mm"]["dense_strays"] and "pits or a noisy patch" in res["invalid_reason"]
+
+
+def test_tolerance_clusters_name_dense_strays():
+    import numpy as np
+    dev = np.full((300, 300), 0.05)
+    for y in range(100, 160, 5):                      # 2 x 2 px pits, 3 px apart: each alone
+        for x in range(100, 160, 5):
+            dev[y:y + 2, x:x + 2] = 3.0
+    r = cli._tolerance_clusters(dev, 0.5, 5)
+    assert not r["defects"] and r["outlier_px"] == 576
+    assert r["dense"] and r["dense"]["n_px"] >= 5
+    sparse = np.full((300, 300), 0.05)
+    sparse[::40, ::40] = 3.0                          # single px far apart: strays, not dense
+    r = cli._tolerance_clusters(sparse, 0.5, 5)
+    assert r["outlier_px"] == 64 and r["dense"] is None
+
+
+def test_metric_golden_a_component_too_sparse_to_judge_is_invalid(tmp_path, stereo_lib,
+                                                                  placed, monkeypatch):
+    """Review case: a component decoded too sparsely in golden AND test (a saturating face)
+    was dropped from both sides by the 'well decoded' rule, the coverage counted judged px
+    only - a component 1.5 mm proud PASSED, looking like the good part. INVALID now."""
+    import numpy as np
+    pair = placed["pair"]
+    c = pair.cloud
+    fg = cli._foreground_all(c)
+    x = np.nan_to_num(c.xyz[..., 0])
+    rng = np.random.default_rng(0)
+    thin = fg & (x > 0) & (rng.random(fg.shape) > 0.08)          # keep ~8 % of the right block
+    golden = _with_cloud(pair, mask=c.mask & ~thin)
+    xyz = c.xyz.copy()
+    xyz[fg & (x > 0), 2] -= 1.5                                    # 1.5 mm proud
+    test = _with_cloud(pair, xyz=xyz, mask=c.mask & ~thin)
+    monkeypatch.setattr(cli, "_find_station_golden", lambda cfg, kind="metric": golden)
+    code, res, events, _ = _golden_run(tmp_path, stereo_lib, monkeypatch, test, "placed_pair")
+    assert res["result"] == "INVALID" and code == cli.EXIT_INVALID, res
+    assert "can't be compared" in res["invalid_reason"]
+    meas = [e for e in events if e["event"] == "measure"][0]
+    assert meas["unjudged"]

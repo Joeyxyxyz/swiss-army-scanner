@@ -377,10 +377,7 @@ class Ctx:
         if self._preset is None:
             sel = self.selection
             if sel and sel["name"] and not sel["exists"] and self.args.preset == sel["name"]:
-                raise CLIError(f"the selected preset {sel['name']!r} no longer exists in this "
-                               f"library ({self.session.store.root}): select one with `scan "
-                               "preset-select NAME` (see `scan presets`), or name one with "
-                               "--preset")
+                raise CLIError(_selection_gone(sel, self.session.store.root))
             p = api.load_preset(self.args.preset)
             if self.args.average is not None:       # this run only; the file is untouched
                 p.camera.average = self.args.average
@@ -413,6 +410,13 @@ class Ctx:
         if self._preset is not None:
             d.update(preset=self._preset.name, geometry_id=self._preset.geometry_id)
         return d
+
+
+def _selection_gone(sel: dict, root, extra: str = "",
+                    other: str = "name one with --preset") -> str:
+    return (f"the selected preset {sel['name']!r} no longer exists in this library ({root})"
+            f"{extra}: select one with `scan preset-select NAME` (see `scan presets`) or in the "
+            f"web UI's Setup, or {other}")
 
 
 # ------------------------------------------------------------ library lookup
@@ -3020,8 +3024,31 @@ CALIBRATE_STEREO_HOWTO = ("calibrate it first, with the preset this run uses: `s
                           "deg), then `scan --preset {preset} calibrate-stereo --square MM` "
                           "(mock: `scan --mock --preset {preset} calibrate-stereo --mock-poses "
                           "12`)")
-METRIC_MATCH_MM = 5.0           # golden: ICP pairing radius (mm)
+METRIC_MATCH_MM = 5.0           # golden: registration pairing radius (mm)
+# golden: the background (dominant) plane is the datum; a test scan whose background plane is
+# turned more than this from the golden's (or METRIC_MATCH_MM away) is INVALID: the rig or
+# the fixture moved, or it is another background
+METRIC_DATUM_MAX_DEG = 2.0
+# out-of-tolerance px this close (camera px, 8-neighbourhood distance) are one cluster: a
+# stray cluster is dropped only when it is isolated, never a patch of pits or spikes
+METRIC_ISOLATION_PX = 3
+# ... and dropped stray px are never dense: a METRIC_DENSE_WIN_PX square holding min_defect_px
+# or more of them, METRIC_DENSE_SHARE or more of its area (pits a few px apart, a noisy patch),
+# makes the run INVALID - never a PASS
+METRIC_DENSE_WIN_PX = 21
+METRIC_DENSE_SHARE = 0.02
+# golden: only px decoded with enough decoded neighbours (METRIC_MIN_SUPPORT of a
+# METRIC_SUPPORT_PX square) and seen within METRIC_MAX_INCIDENCE_DEG of face-on are judged
+METRIC_SUPPORT_PX = 5
+METRIC_MIN_SUPPORT = 0.5
+METRIC_MAX_INCIDENCE_DEG = 75.0
+# ... and a foreground region (decoded px joined across small gaps) of METRIC_REGION_MIN_PX or
+# more decoded px with under METRIC_MIN_JUDGED_SHARE of them judged (decoded too sparsely, a
+# saturating face) can't be compared: INVALID, never a component left out unseen
+METRIC_REGION_MIN_PX = 50
+METRIC_MIN_JUDGED_SHARE = 0.2
 _CONN8 = np.ones((3, 3), bool)  # out-of-tolerance clusters: 8-connected camera px
+_CONN4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
 
 
 def _mock_place_metric(ctx) -> None:
@@ -3067,60 +3094,285 @@ def _roi_mask(shape, roi) -> np.ndarray:
 def _tolerance_clusters(dev_abs: np.ndarray, thr: float, min_px: int,
                         area: Optional[np.ndarray] = None, side: str = "test") -> dict:
     """|deviation| map (H, W) mm, NaN = not measured -> its out-of-tolerance clusters:
-    8-connected camera px with |dev| > thr. A cluster of fewer than min_px px is an isolated
-    outlier (a stray triangulated point) and is dropped; every other cluster is a defect, and
-    the max over everything not dropped is the robust max. No statistic (percentile, mean)
-    can hide a defect of min_px px or more."""
+    camera px with |dev| > thr, joined when within METRIC_ISOLATION_PX px of each other (a
+    patch of small pits or spikes is ONE cluster). A cluster of fewer than min_px px is an
+    isolated outlier (a stray triangulated point) and is dropped; every other cluster is a
+    defect, and the max over everything not dropped is the robust max. No statistic
+    (percentile, mean) can hide a defect of min_px px or more. What was dropped is returned
+    (outlier_px, outlier_clusters, of n_measured px; `dense`: the densest METRIC_DENSE_WIN_PX
+    window where dropped px are min_px or more AND METRIC_DENSE_SHARE or more of its area -
+    pits a few px apart, a noisy patch - else None): the caller refuses a verdict when that is
+    more than a few stray points (job.max_outlier_pct) or dense anywhere."""
     from scipy import ndimage
     ok = np.isfinite(dev_abs)
     a = np.where(ok, dev_abs, 0.0)
-    lab, n = ndimage.label(ok & (a > thr), structure=_CONN8)
+    over = ok & (a > thr)
+    k = max(int(METRIC_ISOLATION_PX) - 1, 0) // 2      # joins px up to 2k+1 px apart
+    near = ndimage.binary_dilation(over, structure=np.ones((2 * k + 1,) * 2, bool)) if k else over
+    grp, n = ndimage.label(near, structure=_CONN8)
+    lab = np.where(over, grp, 0)
     drop = np.zeros(n + 1, bool)
     defects = []
     if n:
         sizes = np.bincount(lab.ravel(), minlength=n + 1)
-        for k, sl in enumerate(ndimage.find_objects(lab), 1):
-            if sizes[k] < min_px:
-                drop[k] = True
+        for i, sl in enumerate(ndimage.find_objects(lab), 1):
+            if sl is None:
                 continue
-            b = lab[sl] == k
+            if sizes[i] < min_px:
+                drop[i] = True
+                continue
+            b = lab[sl] == i
             ar = float(np.nansum(area[sl][b])) if area is not None else None
-            defects.append({"side": side, "n_px": int(sizes[k]),
+            defects.append({"side": side, "n_px": int(sizes[i]),
                             "area_mm2": round(ar, 3) if ar is not None else None,
                             "max_mm": round(float(a[sl][b].max()), 5),
                             "bbox_px": [sl[1].start, sl[0].start, sl[1].stop, sl[0].stop]})
     outlier = drop[lab]
     kept = ok & ~outlier
+    dense = None
+    if int(outlier.sum()) >= min_px:
+        w = int(METRIC_DENSE_WIN_PX)
+        cnt = ndimage.uniform_filter(outlier.astype(np.float64), size=w, mode="constant") * w * w
+        # of the window's AREA, not of its measured px: a few strays along an outline (a
+        # window mostly off the part) are not a dense patch
+        hot = cnt >= max(min_px, METRIC_DENSE_SHARE * w * w) - 1e-6
+        if hot.any():
+            i = int(np.argmax(np.where(hot, cnt, -1.0)))
+            y, x = divmod(i, cnt.shape[1])
+            dense = {"side": side, "n_px": int(round(cnt.flat[i])),
+                     "share_pct": round(100.0 * float(cnt.flat[i]) / (w * w), 2),
+                     "window_px": [x - w // 2, y - w // 2, x + w // 2 + 1, y + w // 2 + 1]}
     return {"robust_max": float(a[kept].max()) if kept.any() else None, "defects": defects,
-            "outlier_px": int(outlier.sum()), "outlier_clusters": int(drop.sum())}
+            "outlier_px": int(outlier.sum()), "outlier_clusters": int(drop.sum()),
+            "n_measured": int(ok.sum()), "dense": dense}
 
 
 def _defect_order(d: dict) -> tuple:
     return (d["area_mm2"] if d["area_mm2"] is not None else -1.0, d["n_px"])
 
 
-def _foreground_all(cloud, min_height_mm: float = 2.0) -> np.ndarray:
-    """Every decoded px more than min_height_mm in front of the dominant (background) plane:
-    ALL parts and components, not only the largest blob (metric.foreground keeps one)."""
+def _foreground_plane(cloud, min_height_mm: float = 2.0) -> tuple:
+    """(mask of every decoded px more than min_height_mm in front of the dominant (background)
+    plane: ALL parts and components, not only the largest blob (metric.foreground keeps one);
+    that plane, or None when too little is decoded)."""
     from engine.measure import metric
     m = cloud.mask
     if int(m.sum()) < 100:
-        return np.zeros_like(m)
+        return np.zeros_like(m), None
     bg, _ = metric.ransac_plane(cloud.xyz[m], 0.5)
     h = np.full(m.shape, -np.inf)
     h[m] = bg.distance(cloud.xyz[m])
-    return m & (h > min_height_mm)
+    return m & (h > min_height_mm), bg
+
+
+def _foreground_all(cloud, min_height_mm: float = 2.0) -> np.ndarray:
+    """Every decoded px more than min_height_mm in front of the dominant (background) plane:
+    ALL parts and components, not only the largest blob (metric.foreground keeps one)."""
+    return _foreground_plane(cloud, min_height_mm)[0]
+
+
+def _boundary_px(fg: np.ndarray, background: np.ndarray, region: np.ndarray) -> np.ndarray:
+    """The part's outline: fg px with a 4-neighbour in the well-decoded background (the
+    part's silhouette against the wall). Not the edges of undecoded holes and shadows (they
+    differ from scan to scan) and not the image or roi border (it does not move with the
+    part)."""
+    from scipy import ndimage
+    bg_next = ndimage.binary_dilation(background, structure=_CONN4)
+    keep = ndimage.binary_erosion(region, structure=_CONN8, border_value=0)
+    return fg & bg_next & keep
+
+
+def _well_decoded(mask: np.ndarray) -> np.ndarray:
+    """Decoded px with at least METRIC_MIN_SUPPORT of their METRIC_SUPPORT_PX square
+    neighbourhood decoded too: a px decoded alone in a shadow or a glint is a flying point,
+    different in every scan, never a surface to judge (golden compare)."""
+    from scipy import ndimage
+    share = ndimage.uniform_filter(mask.astype(np.float32), size=METRIC_SUPPORT_PX,
+                                   mode="constant")
+    return mask & (share >= METRIC_MIN_SUPPORT - 1e-6)
+
+
+def _judged(xyz: np.ndarray, fg: np.ndarray, k: int = 12) -> np.ndarray:
+    """fg px whose surface faces the camera within METRIC_MAX_INCIDENCE_DEG (golden compare):
+    a surface seen grazing (a side wall, a cylinder's silhouette) samples other points in
+    every placement, so it is not judged; it still serves as the reference surface. The
+    surface is that of the k points AROUND each px, not the px itself: a pit or a spike of a
+    px or a few is judged where it sits, never tilted out of the compare by its own offset."""
+    from scipy.spatial import cKDTree
+    out = np.zeros_like(fg)
+    if int(fg.sum()) < 12:
+        return out
+    P = xyz[fg]
+    _, nn = cKDTree(P).query(P, k=min(k + 1, len(P)))
+    Q = P[nn[:, 1:]]                            # the neighbours, not the px itself
+    Q = Q - Q.mean(1, keepdims=True)
+    nP = np.linalg.eigh(np.einsum("nki,nkj->nij", Q, Q))[1][:, :, 0]
+    cos_in = np.abs(np.einsum("ij,ij->i", nP, P)) / np.linalg.norm(P, axis=1)
+    out[fg] = cos_in >= math.cos(math.radians(METRIC_MAX_INCIDENCE_DEG))
+    return out
+
+
+def _outline_normals(xyz: np.ndarray, fg: np.ndarray, bnd: np.ndarray, n: np.ndarray,
+                     spacing: float, win: int = 7) -> np.ndarray:
+    """Outward unit normals ALONG the datum plane (normal n) of the outline px `bnd` of `fg`,
+    in raster order: away from the mean of the fg px around each one on its surface (within
+    2 mm). A zero row where the outline is too thin to tell its outside (fg on both sides)."""
+    ys, xs = np.nonzero(bnd)
+    P = xyz[ys, xs]
+    H, W = fg.shape
+    acc, cnt = np.zeros_like(P), np.zeros(len(P))
+    r = win // 2
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if not (dx or dy):
+                continue
+            yy, xx = ys + dy, xs + dx
+            inside = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+            yy, xx = np.clip(yy, 0, H - 1), np.clip(xx, 0, W - 1)
+            d = xyz[yy, xx] - P
+            ok = inside & fg[yy, xx] & (np.einsum("ij,ij->i", d, d) < 4.0)    # NaN: False
+            acc[ok] += d[ok]
+            cnt[ok] += 1
+    v = -acc / np.maximum(cnt, 1.0)[:, None]
+    v -= np.outer(v @ n, n)
+    nv = np.linalg.norm(v, axis=1)
+    out = np.zeros_like(v)
+    good = (cnt >= 3) & (nv > 0.5 * spacing)
+    out[good] = v[good] / nv[good, None]
+    return out
+
+
+def _unjudged_regions(dec: np.ndarray, judged: np.ndarray, roi: np.ndarray, side: str) -> list:
+    """Foreground regions in the roi (decoded fg px joined across gaps of a few px) with
+    METRIC_REGION_MIN_PX or more decoded px of which under METRIC_MIN_JUDGED_SHARE are judged:
+    a component decoded too sparsely (a saturating face, a dark one) that the compare can't
+    see -> [{side, n_px, n_judged, bbox_px}], largest first."""
+    from scipy import ndimage
+    m = dec & roi
+    if not m.any():
+        return []
+    lab, nl = ndimage.label(ndimage.binary_closing(m, structure=np.ones((5, 5), bool)) | m,
+                            structure=_CONN8)
+    n_dec = np.bincount(lab[m], minlength=nl + 1)
+    n_jud = np.bincount(lab[m & judged], minlength=nl + 1)
+    out = []
+    for i, sl in enumerate(ndimage.find_objects(lab), 1):
+        if sl is not None and n_dec[i] >= METRIC_REGION_MIN_PX and \
+                n_jud[i] < METRIC_MIN_JUDGED_SHARE * n_dec[i]:
+            out.append({"side": side, "n_px": int(n_dec[i]), "n_judged": int(n_jud[i]),
+                        "bbox_px": [sl[1].start, sl[0].start, sl[1].stop, sl[0].stop]})
+    return sorted(out, key=lambda r: -r["n_px"])
+
+
+def _rot_onto(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """The smallest rotation taking unit vector a onto unit vector b."""
+    from engine.measure import metric
+    v = np.cross(a, b)
+    sn = float(np.linalg.norm(v))
+    if sn < 1e-12:
+        return np.eye(3)
+    return metric._rodrigues(v / sn * math.atan2(sn, float(a @ b)))
+
+
+def _tukey_sqrt_w(r: np.ndarray, c: float) -> np.ndarray:
+    u = np.clip(np.abs(r) / c, 0.0, 1.0)
+    return 1.0 - u * u                          # sqrt of Tukey's biweight (1 - u^2)^2
+
+
+def _register_in_plane(A: np.ndarray, Ab: np.ndarray, G: np.ndarray, nG: np.ndarray,
+                       Gb: np.ndarray, n: np.ndarray, R: np.ndarray, t: np.ndarray, thr: float,
+                       max_iter: int = 100) -> dict:
+    """Place the test part (A, its edge px Ab) on the golden (G, normals nG, edge px Gb) by a
+    turn about the datum normal n and a shift along the datum plane ONLY: height and tilt are
+    the part's own, measured against the background (a cell 0.8 mm proud, a thinner part or a
+    tilted lid are never fitted away). Point-to-plane on the surface plus the edges (the
+    in-plane position a flat face can't give), Tukey-weighted with a scale annealed from
+    METRIC_MATCH_MM down to the tolerance (the edges: to no less than 3 sample spacings, their
+    own sampling noise), so a defect far out never drags the placement. A placement that
+    splits an in-plane size error between two ends is a legitimate best fit: the verdict
+    measures each end's offset past the other part's outline in full (_golden_compare)."""
+    from scipy.spatial import cKDTree
+    from engine.measure import metric
+    rng = np.random.default_rng(0)
+    if len(A) > 30000:
+        A = A[rng.choice(len(A), 30000, replace=False)]
+    if len(Ab) > 20000:
+        Ab = Ab[rng.choice(len(Ab), 20000, replace=False)]
+    e1 = np.cross(n, (1.0, 0.0, 0.0) if abs(n[0]) < 0.9 else (0.0, 1.0, 0.0))
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+    Pn = np.eye(3) - np.outer(n, n)             # onto the datum plane
+    tG = cKDTree(G)
+    tB = cKDTree(Gb) if len(Gb) >= 10 and len(Ab) >= 10 else None
+    probe = G[rng.choice(len(G), min(len(G), 3000), replace=False)]
+    sp = float(np.median(tG.query(probe, k=2)[0][:, 1]))      # golden sample spacing
+    c_end = max(thr, 3.0 * sp)
+    c, converged, it = METRIC_MATCH_MM, False, 0
+    r = rb = np.zeros(0)
+    for it in range(1, max_iter + 1):
+        p = A @ R.T + t
+        d, j = tG.query(p, distance_upper_bound=METRIC_MATCH_MM)
+        ok = np.isfinite(d)
+        p, q, m = p[ok], G[j[ok]], nG[j[ok]]
+        r = np.einsum("ij,ij->i", p - q, m)
+        sig = 1.4826 * float(np.median(np.abs(r))) if len(r) else 0.0
+        w = _tukey_sqrt_w(r, max(c, thr, 4.685 * sig))
+        rows = [np.c_[np.einsum("ij,ij->i", np.cross(n, p), m), m @ e1, m @ e2] * w[:, None]]
+        rhs = [-r * w]
+        rb = np.zeros(0)
+        if tB is not None:
+            pb = Ab @ R.T + t
+            db, jb = tB.query(pb, distance_upper_bound=METRIC_MATCH_MM)
+            okb = np.isfinite(db)
+            pb = pb[okb]
+            rv = (pb - Gb[jb[okb]]) @ Pn.T      # edge offset along the datum plane
+            rb = np.linalg.norm(rv, axis=1)
+            if len(pb):
+                wb = _tukey_sqrt_w(rb, max(c, c_end)) * math.sqrt(max(len(p), 1) / len(pb))
+                Jb = np.stack([np.cross(n, pb) @ Pn.T, np.broadcast_to(Pn @ e1, pb.shape),
+                               np.broadcast_to(Pn @ e2, pb.shape)], axis=2)
+                rows.append((Jb * wb[:, None, None]).reshape(-1, 3))
+                rhs.append((-rv * wb[:, None]).reshape(-1))
+        J, b = np.concatenate(rows), np.concatenate(rhs)
+        if len(b) < 6:
+            break
+        x = np.linalg.lstsq(J, b, rcond=None)[0]
+        dR = metric._rodrigues(n * x[0])        # a turn about n keeps the datum plane
+        R, t = dR @ R, dR @ t + x[1] * e1 + x[2] * e2
+        small = abs(x[0]) < 1e-5 and math.hypot(x[1], x[2]) < 1e-3     # um: far under noise
+        if small and c <= c_end:
+            converged = True
+            break
+        if small or it % 3 == 0:
+            c = max(c_end, c * 0.5)
+    score = (float(np.mean(np.abs(r) <= thr)) if len(r) else 0.0) * len(r) / max(len(A), 1)
+    score += (float(np.mean(rb <= c_end)) * len(rb) / max(len(Ab), 1)) if len(rb) else 0.0
+    return {"R": R, "t": t, "converged": converged, "iterations": it, "score": score,
+            "rms_mm": float(np.sqrt(np.mean(r * r))) if len(r) else float("nan"),
+            "fitness": float(len(r) / max(len(A), 1))}
 
 
 def _golden_compare(s, ms, golden, roi, thr: float, min_px: int) -> dict:
     """Golden metric compare in BOTH directions, on every foreground component in the roi.
 
-    The test part (its foreground in the roi) is ICP-aligned onto the golden's foreground.
-    test -> golden: each test point's distance to the golden surface (point-to-plane at the
-    nearest golden point, or the straight distance to it, less the golden's own sample spacing,
-    whichever is larger), so deviating AND extra material count. golden -> test: the same for
-    each golden point against the aligned test part, so missing material counts. Both maps
-    go through the same out-of-tolerance clustering (_tolerance_clusters)."""
+    The background (dominant) plane is the datum: the test scan's is brought onto the
+    golden's (beyond METRIC_DATUM_MAX_DEG / METRIC_MATCH_MM: refused, INVALID), and the test
+    part is then placed on the golden only by a turn and a shift ALONG that plane
+    (_register_in_plane): a re-placed good part is found again, while a height or tilt
+    change of the part or of any one component stays in the deviation.
+    Judged px (both scans, same rule): foreground, well decoded (_well_decoded) and not seen
+    grazing (_judged); every foreground px still serves as the surface the other scan is
+    measured against. A foreground region with too few judged px (decoded too sparsely) is
+    named in `unjudged`: the caller refuses a verdict, it is never left out unseen.
+    test -> golden: each test point's distance to the golden surface - the largest of the
+    point-to-plane distance at the nearest golden point, the straight distance to it less the
+    golden's own sample spacing (material far off the golden surface), and, when that nearest
+    point is on the golden's outline against the wall, how far the test point lies beyond
+    that outline along its outward normal in the datum plane (extra material or a component
+    moved sideways, measured in full: no sample spacing is taken off it). golden -> test: the
+    same for each golden point against the placed test part (missing material). Both maps go
+    through the same out-of-tolerance clustering (_tolerance_clusters); the stray share and
+    any dense strays are judged per side (outlier_*: the worse side)."""
     from scipy.spatial import cKDTree
     from engine.library.store import json_safe
     from engine.measure import metric
@@ -3129,29 +3381,71 @@ def _golden_compare(s, ms, golden, roi, thr: float, min_px: int) -> dict:
     metric_scan.check_cal(s, golden, "compare_metric (golden)")
     rules.require_same_geometry(ms.geometry_id, golden.geometry_id, "compare_metric")
     a, g = ms.cloud, golden.cloud
-    fa, fg = _foreground_all(a), _foreground_all(g)
-    ra, rg = fa & _roi_mask(fa.shape, roi), fg & _roi_mask(fg.shape, roi)
+    (fa, bga), (fg, bgg) = _foreground_plane(a), _foreground_plane(g)
+    wa, wg = _well_decoded(a.mask), _well_decoded(g.mask)
+    roim = _roi_mask(fa.shape, roi)
+    # judged px: well decoded and not seen grazing, by the same rule on both scans; every
+    # foreground px stays part of the surface the other scan is measured against
+    ra = _judged(a.xyz, fa & wa) & roim
+    rg = _judged(g.xyz, fg & wg) & roim
     out = {"n_test": int(ra.sum()), "n_golden": int(rg.sum()), "golden": golden.id}
     if out["n_test"] < 100 or out["n_golden"] < 100:
         return out
+    n = bgg.normal
+    R0 = _rot_onto(bga.normal, n)
+    off = float(n @ (bgg.point - R0 @ bga.point))
+    tilt = math.degrees(math.acos(float(np.clip(bga.normal @ n, -1.0, 1.0))))
+    out["datum"] = {"tilt_deg": round(tilt, 4), "offset_mm": round(off, 3)}
+    if tilt > METRIC_DATUM_MAX_DEG or abs(off) > METRIC_MATCH_MM:
+        out["refused"] = (f"the background plane (the datum) is {tilt:.2f} deg / {off:.2f} mm "
+                          f"off the golden {golden.id}'s (limits {METRIC_DATUM_MAX_DEG:g} deg / "
+                          f"{METRIC_MATCH_MM:g} mm): the rig or the fixture moved, or another "
+                          "background - check the rig (or scan a new golden)")
+        return out
     G = g.xyz[fg]
     nG = metric.estimate_normals(G)
-    icp = metric.icp_point_to_plane(a.xyz[ra], G, nG, max_dist_mm=METRIC_MATCH_MM)
-    T = a.xyz[fa] @ icp.R.T + icp.t                      # the whole test part, aligned
+    idx = np.full(fg.shape, -1)
+    idx[fg] = np.arange(len(G))
+    gbm = _boundary_px(fg, wg & ~fg, np.ones_like(fg))
+    Gb = G[idx[gbm]]
+    A, Ab = a.xyz[ra], a.xyz[_boundary_px(fa, wa & ~fa, roim)]
+    t0 = off * n
+    Pn = np.eye(3) - np.outer(n, n)
+    shift = Pn @ (g.xyz[rg].mean(0) - (A @ R0.T + t0).mean(0))
+    fits = [_register_in_plane(A, Ab, G, nG, Gb, n, R0, t0, thr)]
+    if float(np.linalg.norm(shift)) > 0.5:      # also from the centroids: the better wins
+        fits.append(_register_in_plane(A, Ab, G, nG, Gb, n, R0, t0 + shift, thr))
+    reg = max(fits, key=lambda f: f["score"])
+    R, t = reg["R"], reg["t"]
+    T = a.xyz[fa] @ R.T + t                              # the whole test part, placed
     tG, tT = cKDTree(G), cKDTree(T)
-    sG = tG.query(G, k=2)[0][:, 1]                       # each point's own sample spacing
-    sT = tT.query(T, k=2)[0][:, 1]
-    Ta = a.xyz[ra] @ icp.R.T + icp.t                     # test -> golden
+    # each point's own sample spacing: to its 4th nearest neighbour, so the spacing ACROSS a
+    # surface seen at a slant (a cylinder's flank, sampled coarsely across it) counts too; on
+    # a face-on surface (4 neighbours one px away) it is the px spacing
+    sG = tG.query(G, k=5)[0][:, 4]
+    sT = tT.query(T, k=5)[0][:, 4]
+    # outward normals of each part's outline against the wall, along the datum plane (zero
+    # elsewhere): how far a point lies beyond the other part's outline
+    oG = np.zeros_like(G)
+    oG[idx[gbm]] = _outline_normals(g.xyz, fg, gbm, n, float(np.median(sG)))
+    ia = np.full(fa.shape, -1)
+    ia[fa] = np.arange(len(T))
+    abm = _boundary_px(fa, wa & ~fa, np.ones_like(fa))
+    oT = np.zeros_like(T)
+    oT[ia[abm]] = _outline_normals(a.xyz, fa, abm, bga.normal, float(np.median(sT))) @ R.T
+    Ta = A @ R.T + t                                     # test -> golden (judged px)
     e, j = tG.query(Ta)
     pp = np.einsum("ij,ij->i", Ta - G[j], nG[j])
-    fwd = np.maximum(np.abs(pp), e - sG[j])
-    Gr = g.xyz[rg]                                       # golden -> test
-    gi = np.flatnonzero(rg[fg])
+    beyond = np.einsum("ij,ij->i", Ta - G[j], oG[j])     # past the golden's outline
+    fwd = np.maximum.reduce([np.abs(pp), e - sG[j], beyond])
+    Gr = g.xyz[rg]                                       # golden -> test (judged px)
+    gi = idx[rg]
     e2, k = tT.query(Gr)
     pp2 = np.einsum("ij,ij->i", T[k] - Gr, nG[gi])
-    rev = np.maximum(np.abs(pp2), e2 - sT[k])
+    beyond2 = np.einsum("ij,ij->i", Gr - T[k], oT[k])    # past the test part's outline
+    rev = np.maximum.reduce([np.abs(pp2), e2 - sT[k], beyond2])
     signed = np.full(ra.shape, np.nan)
-    signed[ra] = np.where(pp >= 0, 1.0, -1.0) * fwd
+    signed[ra] = np.where((pp >= 0) | (beyond > np.abs(pp)), 1.0, -1.0) * fwd
     fwd_map = np.full(ra.shape, np.nan)
     fwd_map[ra] = fwd
     rev_map = np.full(rg.shape, np.nan)
@@ -3161,19 +3455,37 @@ def _golden_compare(s, ms, golden, roi, thr: float, min_px: int) -> dict:
     ct = _tolerance_clusters(fwd_map, thr, min_px, area_a, "test")
     cg = _tolerance_clusters(rev_map, thr, min_px, area_g, "golden")
     maxes = [v for v in (ct["robust_max"], cg["robust_max"]) if v is not None]
-    out.update(icp={"rms_mm": icp.rms_mm, "fitness": icp.fitness, "iterations": icp.iterations,
-                    "converged": icp.converged},
+    turn = math.degrees(math.acos(float(np.clip((np.trace(R @ R0.T) - 1.0) / 2.0, -1.0, 1.0))))
+    # the stray share is judged per side: strays on the test part show in its map only, and
+    # the other side's clean px must not water them down
+    worse = max((ct, cg), key=lambda c: c["outlier_px"] / max(c["n_measured"], 1))
+    dense = [c["dense"] for c in (ct, cg) if c["dense"]]
+    unjudged = (_unjudged_regions(fa, ra, roim, "test")
+                + _unjudged_regions(fg, rg, roim, "golden"))
+    out.update(icp={"rms_mm": reg["rms_mm"], "fitness": reg["fitness"],
+                    "iterations": reg["iterations"], "converged": reg["converged"]},
+               placement={"shift_mm": round(float(np.linalg.norm(Pn @ (t - t0))), 3),
+                          "turn_deg": round(turn, 3)},
                signed=signed, fwd=fwd, robust_max=max(maxes) if maxes else None,
                defects=sorted(ct["defects"] + cg["defects"], key=_defect_order, reverse=True),
-               outlier_px=ct["outlier_px"] + cg["outlier_px"],
+               outlier_px=worse["outlier_px"], outlier_clusters=worse["outlier_clusters"],
+               n_measured=worse["n_measured"], outlier_side=("test" if worse is ct else "golden"),
+               outlier_all_pct=100.0 * (ct["outlier_px"] + cg["outlier_px"])
+               / max(ct["n_measured"] + cg["n_measured"], 1),
+               dense_strays=max(dense, key=lambda d: d["share_pct"]) if dense else None,
+               unjudged=unjudged,
                test_matched_pct=round(100.0 * float(np.mean(fwd <= thr)), 2),
                golden_found_pct=round(100.0 * float(np.mean(rev <= thr)), 2))
     rep = {"scan": ms.id, "golden": golden.id, "units": "mm", "threshold_mm": thr, "roi": roi,
            "min_defect_px": min_px, "n_test": out["n_test"], "n_golden": out["n_golden"],
-           "icp": {**out["icp"], "R": icp.R.tolist(), "t": icp.t.tolist()},
+           "datum": out["datum"], "placement": out["placement"],
+           "icp": {**out["icp"], "R": R.tolist(), "t": t.tolist()},
            "test_matched_pct": out["test_matched_pct"],
            "golden_found_pct": out["golden_found_pct"], "robust_max_mm": out["robust_max"],
-           "defects": out["defects"], "outlier_px": out["outlier_px"]}
+           "defects": out["defects"], "outlier_px": out["outlier_px"],
+           "outlier_clusters": out["outlier_clusters"], "n_measured": out["n_measured"],
+           "outlier_side": out["outlier_side"], "dense_strays": out["dense_strays"],
+           "unjudged": unjudged}
     f = s.store.output_path("comparisons", f"{ms.label}_vs_{golden.label}_metric", ".json")
     s.store.write_json(f, json_safe(rep))
     s.store.record_output("comparisons", f, label=ms.label, geometry_id=ms.geometry_id,
@@ -3228,7 +3540,11 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     """metric job: scan_fast / scan_metric (stereo calibration, rule 6) -> mm, then a plane
     fit in the roi or a golden metric compare (both directions); PASS / FAIL against
     threshold_mm. The verdict comes from out-of-tolerance clusters (_tolerance_clusters):
-    only clusters smaller than job.min_defect_px are dropped, as isolated outliers."""
+    only isolated clusters smaller than job.min_defect_px are dropped, as stray points, and
+    more of them than job.max_outlier_pct of the measured px (golden: of both scans together,
+    or of either scan's own once they are two defect clusters' worth), or dropped px dense
+    anywhere, or (golden) a foreground region too sparsely decoded to judge, is INVALID
+    (never a PASS)."""
     from engine import config as cfgmod
     from engine.calibrate import stereo
     from engine.measure import metric
@@ -3299,11 +3615,17 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
         area = metric.pixel_area_mm2(np.where(cloud.mask[..., None], cloud.xyz, np.nan))
         cl = _tolerance_clusters(np.abs(dev), thr, min_px, area, "test")
         mx, outlier_px = cl["robust_max"], cl["outlier_px"]
+        outlier_n, n_measured, dense = cl["outlier_clusters"], cl["n_measured"], cl["dense"]
         defects = sorted(cl["defects"], key=_defect_order, reverse=True)
     else:
         method = "compare_metric_golden"
         gc = _golden_compare(s, ms, golden, cfg.roi, thr, min_px)
-        extra = {"golden": golden.id, "n_golden_points": gc["n_golden"]}
+        extra = {"golden": golden.id, "n_golden_points": gc["n_golden"],
+                 "datum": gc.get("datum")}
+        if gc.get("refused"):
+            res["invalid_reason"] = gc["refused"]
+            log.event("measure", level="warning", method=method, n_points=gc["n_test"], **extra)
+            return
         if "robust_max" not in gc:
             res["invalid_reason"] = (f"only {gc['n_test']} test / {gc['n_golden']} golden "
                                      f"foreground points in the roi (golden {golden.id}): wrong "
@@ -3311,7 +3633,7 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
             log.event("measure", level="warning", method=method, n_points=gc["n_test"], **extra)
             return
         extra.update(icp_rms_mm=gc["icp"]["rms_mm"], icp_fitness=gc["icp"]["fitness"],
-                     icp_converged=gc["icp"]["converged"],
+                     icp_converged=gc["icp"]["converged"], placement=gc["placement"],
                      test_matched_pct=gc["test_matched_pct"],
                      golden_found_pct=gc["golden_found_pct"],
                      min_coverage_pct=cfg.min_coverage_pct, report=gc["report"])
@@ -3319,14 +3641,43 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
         dev = gc["signed"]
         d = dev[np.isfinite(dev)]
         mx, defects, outlier_px = gc["robust_max"], gc["defects"], gc["outlier_px"]
+        outlier_n, n_measured, dense = gc["outlier_clusters"], gc["n_measured"], gc["dense_strays"]
+        extra.update(outlier_side=gc["outlier_side"], unjudged=gc["unjudged"][:5])
         if not gc["icp"]["converged"]:
-            incomplete = ("ICP onto the golden did not converge: the alignment, and so every "
-                          "deviation, can't be trusted (check the placement)")
+            incomplete = ("placing the part on the golden (ICP along the background plane) did "
+                          "not converge: every deviation depends on it, can't be trusted "
+                          "(check the placement)")
         elif min(gc["golden_found_pct"], gc["test_matched_pct"]) < cfg.min_coverage_pct:
             incomplete = (f"only {gc['golden_found_pct']:g} % of the golden surface and "
                           f"{gc['test_matched_pct']:g} % of the test surface agree within "
                           f"{thr:g} mm (job.min_coverage_pct {cfg.min_coverage_pct:g} %) "
                           "without one defect cluster: scattered or partial data, can't pass")
+        elif gc["unjudged"]:
+            u = gc["unjudged"][0]
+            incomplete = (f"{len(gc['unjudged'])} foreground region(s) can't be compared: "
+                          f"e.g. {u['n_px']} decoded px of the {u['side']} scan at camera px "
+                          f"{u['bbox_px']} and only {u['n_judged']} of them well enough decoded "
+                          "to judge (decoded too sparsely: a saturating or dark surface?) - "
+                          "a component left out unseen can't pass")
+    outlier_pct = 100.0 * outlier_px / max(n_measured, 1)
+    over = outlier_pct > cfg.max_outlier_pct
+    if cfg.measure == "golden":
+        # either scan's own share (strays on the test part alone are never watered down by the
+        # golden's clean px) once they are two defect clusters' worth - a handful of stray px on
+        # a small part is not noisy data - or both scans together, as one scan's share
+        over = ((over and outlier_px >= 2 * min_px)
+                or gc["outlier_all_pct"] > cfg.max_outlier_pct)
+    if incomplete is None and over:
+        incomplete = (f"{outlier_px} px ({outlier_pct:.3g} % of {n_measured} measured) beyond "
+                      f"{thr:g} mm sit in {outlier_n} isolated stray cluster(s) under "
+                      f"job.min_defect_px {min_px} px, more than job.max_outlier_pct "
+                      f"{cfg.max_outlier_pct:g} %: noisy data or a pitted surface, can't pass")
+    if incomplete is None and dense:
+        incomplete = (f"{dense['n_px']} stray px ({dense['share_pct']:g} % of the measured px) "
+                      f"beyond {thr:g} mm within {METRIC_DENSE_WIN_PX} camera px of each other "
+                      f"at camera px {dense['window_px']} ({dense['side']} side), each under "
+                      f"job.min_defect_px {min_px} px: pits or a noisy patch, never stray "
+                      "points - can't pass")
     if mx is None:                              # every measured px was a dropped stray cluster
         res["invalid_reason"] = ("nothing left to judge once the stray points (clusters under "
                                  f"job.min_defect_px {min_px} px) are dropped")
@@ -3336,7 +3687,9 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     res["deviation_units"] = "mm"
     res["deviation_mm"].update(max=round(mx, 5), mean=round(float(np.mean(d)), 5),
                                rms=round(float(np.sqrt(np.mean(d * d))), 5), method=method,
-                               n_points=int(d.size), n_defects=len(defects), largest_defect=big)
+                               n_points=int(d.size), n_defects=len(defects), largest_defect=big,
+                               outlier_px=outlier_px, outlier_clusters=outlier_n,
+                               outlier_pct=round(outlier_pct, 4), dense_strays=dense)
     res["outputs"]["deviation_map"] = _deviation_png(run_dir, dev, thr)
     if defects or mx > thr:                     # any defect cluster fails, whatever else
         verdict = "FAIL"
@@ -3353,7 +3706,8 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
               max_deviation_mm=res["deviation_mm"]["max"], rms_mm=res["deviation_mm"]["rms"],
               n_points=int(d.size), threshold_mm=thr, min_defect_px=min_px,
               n_defects=len(defects), largest_defect=big, outliers_dropped_px=outlier_px,
-              **extra)
+              outlier_clusters=outlier_n, outlier_pct=round(outlier_pct, 4),
+              max_outlier_pct=cfg.max_outlier_pct, dense_strays=dense, **extra)
 
 
 def _run_capture(ctx, cfg, p, base, log, res):
@@ -3419,6 +3773,18 @@ def cmd_run(ctx):
             raise CLIError("the real rig needs a human to confirm the physical setup first "
                            "(part placed, rig untouched since the base): pass "
                            "--operator-confirmed, or set operator_confirmed in the station config")
+        if not a.preset_given and not cfg.preset and recipe is None:
+            # the config names no preset, so it runs the library's selection: one that no
+            # longer resolves stops the run, whatever preset is loaded in its place (the web
+            # server's station runs pass the loaded one, possibly its default)
+            sel = ctx.selection if ctx.selection is not None else api.preset_selection()
+            if sel.get("name") and not sel.get("exists"):
+                instead = (f", it would run {a.preset!r} instead"
+                           if a.preset and a.preset != sel["name"] else "")
+                raise CLIError(_selection_gone(
+                    sel, ctx.session.store.root,
+                    f" and station config {cfg.source.name} names no preset{instead}",
+                    "name one in the station config (or with --preset)"))
         ctx.header()
         p = ctx.preset()
         res["capture"].update(preset=p.name, geometry_id=p.geometry_id,
@@ -3782,7 +4148,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("--reason", required=True, help="why (recorded with the trashed preset)")
     p.add_argument("--force", action="store_true",
-                   help="delete even when a station config references it")
+                   help="delete even when a station config, a recipe (built-in or user) or a "
+                   "recipe station config uses it (never the selected recipe's preset)")
     p.add_argument("--stations", metavar="DIR", help="station configs folder checked for "
                    "references (default: the repo's stations/)")
     p = cmd("preset-show", cmd_preset_show, "show one preset (tier, calibration, JSON)",

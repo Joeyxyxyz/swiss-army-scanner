@@ -254,6 +254,10 @@ async function refreshStatus() {
   let st;
   try { st = await api('/api/status'); } catch (e) { $('#connBanner').hidden = false; return; }
   $('#connBanner').hidden = true;
+  // the server's own warnings (e.g. the selected preset no longer exists: nothing loaded)
+  const sw = st.warnings || [];
+  $('#statusWarn').hidden = !sw.length;
+  put($('#statusWarn'), ...(sw.length ? [h('b', null, 'Server warnings'), warningsList(sw)] : []));
   const prevGeo = S.geo;
   S.status = st;
   S.geo = st.geometry_id;

@@ -36,7 +36,6 @@ META_FILE = "meta.json"
 ACTIVE_FILE = "active.jsonl"
 EXTS = (".json", ".yaml", ".yml")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-_YAML_RECIPE = re.compile(r"^\s*recipe:\s*['\"]?([A-Za-z0-9_.\-]+)", re.M)
 
 
 def user_dir(store: LibraryStore) -> Path:
@@ -260,24 +259,27 @@ def active(store: LibraryStore, builtin: Path) -> Optional[str]:
 
 
 def station_refs(stations_dir: Optional[Path], name: str) -> list:
-    """Station configs (stations/*.json|yaml) whose job.recipe is `name`."""
+    """Station configs (stations/*.json|yaml) whose job.recipe is `name`, read as run_job
+    reads it (stripped); a YAML one that can't be parsed here (PyYAML is optional): whose
+    text mentions the name - never skipped, never guessed at by a pattern for its keys."""
     d = Path(stations_dir) if stations_dir else None
     if d is None or not d.is_dir():
         return []
     out = []
     for f in sorted(d.iterdir()):
-        if f.suffix.lower() == ".json":
-            try:
-                job = json.loads(f.read_text(encoding="utf-8")).get("job") or {}
-                r = job.get("recipe") if isinstance(job, dict) else None
-            except (ValueError, AttributeError, OSError):
-                continue
-        elif f.suffix.lower() in (".yaml", ".yml"):
-            m = _YAML_RECIPE.search(f.read_text(encoding="utf-8", errors="replace"))
-            r = m.group(1) if m else None
-        else:
+        if f.suffix.lower() not in EXTS:
             continue
-        if r == name:
+        try:
+            doc, text = _presets.read_or_text(f)
+        except Exception:                       # noqa: BLE001 - not a station config we can read
+            continue
+        if doc is None:
+            hit = _presets.mentions(text, name)
+        else:
+            job = doc.get("job")
+            r = job.get("recipe") if isinstance(job, dict) else None
+            hit = isinstance(r, str) and r.strip() == name      # as run_job reads job.recipe
+        if hit:
             out.append(f.name)
     return out
 

@@ -236,6 +236,13 @@ function showRig(job) {
   $('#qRigMsg').textContent = [r.message, ...(r.warnings || [])].filter(Boolean).join(' | ');
 }
 
+function showWarnings(b) {
+  // the server's own warnings (e.g. the selected preset no longer exists: nothing loaded)
+  const ws = b.warnings || [];
+  $('#qWarn').hidden = !ws.length;
+  $('#qWarn').textContent = ws.join(' | ');
+}
+
 function showPreset(b) {
   // the preset START runs: the work state's own, else the loaded one (run_preset)
   const run = b.run_preset || b.active_preset;
@@ -252,6 +259,7 @@ async function pollOnce() {
   }
   syncWorkstate(b);
   showPreset(b);
+  showWarnings(b);
   trackJobs(b.jobs);
   if (state.runJobId && state.shownRun !== state.runJobId) {
     const j = await api('GET', `/api/jobs/${state.runJobId}`);

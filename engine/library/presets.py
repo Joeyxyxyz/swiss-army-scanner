@@ -34,7 +34,14 @@ from .store import LibraryStore
 ACTIVE_FILE = "active.jsonl"
 META_FILE = "meta.json"
 FILE_SUFFIXES = (".json", ".yaml", ".yml")      # a name ending so reads as a file, not a name
-_YAML_PRESET = re.compile(r"^preset:\s*['\"]?([A-Za-z0-9_.\-]+)", re.M)
+# a YAML file that can't be parsed here (PyYAML is optional) is judged by what its text
+# mentions, never skipped and never guessed at by a pattern for its keys: the recipe-file
+# paths in it (quoted, plain or after a key, block or flow style) ...
+_FILE_REFS = (re.compile(r"""(['"])([^'"\r\n]+?\.(?:json|ya?ml))\1""", re.I),       # quoted
+              re.compile(r"""(?<![^\s'"{}\[\],:])([^\s'"{}\[\],#]+\.(?:json|ya?ml))"""
+                         r"""(?![A-Za-z0-9_])""", re.I),                          # a plain word
+              re.compile(r"""(?:^|:)[ \t]+([^'"#\r\n{}\[\],][^#\r\n{}\[\],]*?"""
+                         r"""\.(?:json|ya?ml))[ \t]*(?:#.*)?$""", re.I | re.M))  # after a key
 _log = logging.getLogger(__name__)
 
 
@@ -319,24 +326,64 @@ def active(store: LibraryStore, builtin: Path) -> Optional[str]:
     return sel["name"] if sel["exists"] else None
 
 
+def read_or_text(path: Path) -> tuple:
+    """A station config / recipe file -> (its mapping, None), read exactly; or (None, its text)
+    for a YAML file that can't be parsed here (PyYAML is optional, or not valid YAML): the
+    station may run where PyYAML is, so it is judged by what its text mentions (mentions(),
+    file_refs()) - an over-match only asks for --force, a miss would delete what it runs.
+    Raises for an unreadable or missing file, or a JSON file that is not a mapping."""
+    from ..recipes import schema
+    try:
+        return schema.read_doc(path), None
+    except schema.RecipeError:
+        if Path(path).suffix.lower() in (".yaml", ".yml") and Path(path).is_file():
+            return None, Path(path).read_text(encoding="utf-8", errors="replace")
+        raise
+
+
+def mentions(text: str, word: str) -> bool:
+    """`word` anywhere in text as a name of its own (not inside a longer identifier), any
+    case: a fail-closed reading of a YAML file that can't be parsed."""
+    return bool(word) and re.search(rf"(?<![A-Za-z0-9_]){re.escape(word)}(?![A-Za-z0-9_])",
+                                    text, re.I) is not None
+
+
+def file_refs(text: str, base_dir: Path) -> list:
+    """Every recipe-file path a YAML text mentions, resolved as run_job resolves job.recipe
+    ($VARS, ~, relative to the config's folder)."""
+    out = []
+    for rx in _FILE_REFS:
+        for m in rx.finditer(text):
+            v = m.group(m.lastindex).strip()
+            p = Path(os.path.expandvars(os.path.expanduser(v)))
+            p = p if p.is_absolute() else Path(base_dir) / p
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def _pins(path: Path, name: str) -> bool:
+    """The recipe file at `path` pins preset `name` (a YAML one that can't be parsed here:
+    when its text mentions the name)."""
+    doc, text = read_or_text(path)
+    return mentions(text, name) if doc is None else doc.get("preset") == name
+
+
 def station_refs(stations_dir: Optional[Path], name: str) -> list:
-    """Station configs (stations/*.json|yaml) whose preset is `name`."""
+    """Station configs (stations/*.json|yaml) whose preset is `name` (a YAML one that can't
+    be parsed here: whose text mentions it)."""
     d = Path(stations_dir) if stations_dir else None
     if d is None or not d.is_dir():
         return []
     out = []
     for f in sorted(d.iterdir()):
-        if f.suffix.lower() == ".json":
-            try:
-                p = json.loads(f.read_text(encoding="utf-8")).get("preset")
-            except (ValueError, AttributeError, OSError):
-                continue
-        elif f.suffix.lower() in (".yaml", ".yml"):
-            m = _YAML_PRESET.search(f.read_text(encoding="utf-8", errors="replace"))
-            p = m.group(1) if m else None
-        else:
+        if f.suffix.lower() not in FILE_SUFFIXES:
             continue
-        if p == name:
+        try:
+            doc, text = read_or_text(f)
+        except Exception:                       # noqa: BLE001 - not a station config we can read
+            continue
+        if (mentions(text, name) if doc is None else doc.get("preset") == name):
             out.append(f.name)
     return out
 
@@ -345,18 +392,20 @@ def recipe_refs(store: LibraryStore, name: str, recipes_dir: Optional[Path] = No
                 stations_dir: Optional[Path] = None) -> dict:
     """What pins preset `name` through a recipe: {"recipes": built-in + user recipes whose
     preset it is, "selected": the selected recipe if it is one of them, "stations": station
-    configs whose recipe job (job.recipe: a name or a recipe file) runs one of them}."""
+    configs whose recipe job (job.recipe: a name or a recipe file) runs one of them}.
+    job.recipe is read as run_job reads it (stripped; a file: $VARS, ~, relative to the
+    config). A YAML file that can't be parsed here is never skipped: a recipe pins `name`
+    when its text mentions it, a station runs one when its text mentions a pinning recipe's
+    name or a recipe file that pins it (its own preset is not trusted to a pattern)."""
     from ..recipes import library as recipe_lib
-    from ..recipes import schema
     builtin = Path(recipes_dir) if recipes_dir else recipe_lib.BUILTIN_DIR
     pinned = []
     for rname in recipe_lib.builtin_names(builtin) + recipe_lib.user_names(store):
         try:
-            doc, _tier, _path = recipe_lib.raw(store, builtin, rname)
+            if _pins(recipe_lib.path_of(store, builtin, rname), name):
+                pinned.append(rname)
         except Exception:                       # noqa: BLE001 - unreadable: listed as invalid
             continue
-        if isinstance(doc, dict) and doc.get("preset") == name:
-            pinned.append(rname)
     sel = recipe_lib.active(store, builtin)
     stations = []
     d = Path(stations_dir) if stations_dir else None
@@ -365,24 +414,33 @@ def recipe_refs(store: LibraryStore, name: str, recipes_dir: Optional[Path] = No
             if f.suffix.lower() not in (".json", ".yaml", ".yml"):
                 continue
             try:
-                doc = schema.read_doc(f)
+                doc, text = read_or_text(f)
             except Exception:                   # noqa: BLE001 - not a station config we can read
+                continue
+            if doc is None:                     # YAML that can't be parsed here: fail closed
+                if any(mentions(text, r) for r in pinned) or any(
+                        _pins_quietly(rp, name) for rp in file_refs(text, f.resolve().parent)):
+                    stations.append(f.name)
                 continue
             job = doc.get("job") if isinstance(doc, dict) else None
             ref = job.get("recipe") if isinstance(job, dict) else None
-            if doc.get("preset") or not isinstance(ref, str):
+            if doc.get("preset") or not isinstance(ref, str) or not ref.strip():
                 continue                        # the station's own preset wins over the recipe's
+            ref = ref.strip()                   # as run_job reads it
             if ref in pinned:
                 stations.append(f.name)
             elif ref.lower().endswith((".json", ".yaml", ".yml")):
-                try:                            # resolved as run_job does: $VARS, ~
-                    rp = Path(os.path.expandvars(os.path.expanduser(ref)))
-                    rp = rp if rp.is_absolute() else f.resolve().parent / rp
-                    if schema.read_doc(rp).get("preset") == name:
-                        stations.append(f.name)
-                except Exception:               # noqa: BLE001 - a missing recipe file pins nothing
-                    continue
+                rp = Path(os.path.expandvars(os.path.expanduser(ref)))   # as run_job does
+                if _pins_quietly(rp if rp.is_absolute() else f.resolve().parent / rp, name):
+                    stations.append(f.name)
     return {"recipes": pinned, "selected": sel if sel in pinned else None, "stations": stations}
+
+
+def _pins_quietly(path: Path, name: str) -> bool:
+    try:
+        return _pins(path, name)
+    except Exception:                           # noqa: BLE001 - a missing recipe file pins nothing
+        return False
 
 
 def delete(store: LibraryStore, builtin: Path, name: str, reason: str,

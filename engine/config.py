@@ -18,7 +18,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field, fields
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Optional
 
 from . import rules
@@ -47,10 +47,12 @@ def frame_locked(exposure_us, frame_us: float = VIDEO_FRAME_US) -> bool:
     return n >= 1 and abs(float(exposure_us) - n * frame_us) <= FRAME_LOCK_TOL * frame_us
 
 
-# Windows device names: a file or folder called CON, NUL, COM1 ... (any extension, any case)
-# opens the device, not a file - so they are never a library name on any platform
-_WIN_RESERVED = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
-                           *(f"LPT{i}" for i in range(1, 10))})
+# Windows device names: a file or folder called CON, NUL, COM1 ... (any extension, any case,
+# trailing spaces / dots) opens the device, not a file - so they are never a library name on
+# any platform. CONIN$ / CONOUT$ (the console) and CLOCK$ open devices too.
+_WIN_RESERVED = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$",
+                           *(f"{d}{i}" for d in ("COM", "LPT")
+                             for i in (*range(10), "¹", "²", "³"))})
 
 
 def portable_name(s) -> bool:
@@ -455,16 +457,37 @@ def user_preset_names(user_dir: Optional[Path]) -> list:
                   if valid_id(n) and (d / n / USER_PRESET_FILE).is_file())
 
 
+def device_path(s) -> Optional[str]:
+    """Why a path names a Windows device (or would open something other than the file it
+    names), else None. Checked on the text alone, before anything touches the file system:
+    a device opened as a preset file reads the console and hangs the command."""
+    s = str(s)
+    if any(ord(c) < 32 for c in s):
+        return "control characters (NUL)"
+    t = s.replace("\\", "/")
+    if t.startswith(("//./", "//?/", "/??/")) or t in ("//.", "//?"):
+        return "a Windows device / raw path (a \\\\.\\ or \\\\?\\ prefix)"
+    name = PureWindowsPath(s).name
+    if ":" in name:
+        return "a ':' in the file name (a device or an alternate data stream)"
+    if name != name.rstrip(". "):
+        return "a trailing dot or space (Windows drops it: another file would be read)"
+    if name.split(".", 1)[0].rstrip(" ").upper() in _WIN_RESERVED:
+        return "a Windows device name (CON, NUL, CONIN$, COM1 ...), not a file"
+    return None
+
+
 def resolve_preset_path(name: str, presets_dir: Optional[Path] = None,
                         user_dir: Optional[Path] = None) -> Path:
     """A preset NAME -> the built-in of exactly that name, else the user preset of exactly
     that name in `user_dir` (names are case-sensitive on every platform). A name is never
     looked up in the current folder. A preset FILE (is_preset_file: a .json path) is
-    returned as given."""
+    returned as given, unless it names a device (device_path)."""
     s = str(name)
     if is_preset_file(s):
-        if Path(s).stem.split(".", 1)[0].upper() in _WIN_RESERVED:
-            raise ConfigError(f"preset file {s!r}: a Windows device name, not a file")
+        why = device_path(s)
+        if why:
+            raise ConfigError(f"preset file {s!r}: {why}")
         return Path(s)
     if not valid_id(s):
         raise ConfigError(f"preset {s!r} is not a preset name [A-Za-z0-9_.-] (nor a .json file)")
@@ -490,10 +513,15 @@ def load_preset(name: str, *, presets_dir: Optional[Path] = None, store=None,
     if user_dir is None and store is not None:
         user_dir = user_presets_dir(store.root)
     path = resolve_preset_path(name, presets_dir, user_dir)
-    if not path.exists():
-        raise ConfigError(f"preset not found: {path}")
-    with open(path, encoding="utf-8") as f:
-        preset = preset_from_dict(json.load(f), mock=mock, source=path)
+    if not path.is_file():                     # a folder or a device is never read as a preset
+        raise ConfigError(f"preset not found: {path}"
+                          + (" (not a file)" if path.exists() else ""))
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except ValueError as e:                    # not UTF-8 JSON
+        raise ConfigError(f"preset file {path}: not valid JSON ({e})") from e
+    preset = preset_from_dict(d, mock=mock, source=path)
     if store is not None:
         cal = store.latest_calibration(preset.geometry_id,
                                        fingerprint=geometry_fingerprint(preset))

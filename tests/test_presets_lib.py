@@ -5,6 +5,7 @@ api, the CLI and the web server; work states pin their own preset."""
 import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -489,3 +490,328 @@ def test_abbreviated_preset_is_refused_not_ignored(tmp_path, capsys, spelling):
     capsys.readouterr()
     assert cli.main(["--mock", "--library", lib, "--preset", BUILTIN, "--json", "presets"]) == 0
     assert json.loads(capsys.readouterr().out)["active"] == BUILTIN
+
+
+# ------------------------------------------------------------------ recheck regressions
+
+_BS = chr(92)
+DEVICE_PATHS = ["./CON ", "./CONIN$", "./conout$", "//./CON", "./CON:", "./NUL ", "./con .json",
+                "./COM0.json", "./LPT" + "¹" + ".json", "./CLOCK$", "p/x.json.",
+                "x.json:stream", "a\x00.json", _BS * 2 + "." + _BS + "CON",
+                _BS * 2 + "?" + _BS + "C:" + _BS + "p.json"]
+
+
+@pytest.mark.parametrize("path", DEVICE_PATHS)
+def test_device_preset_paths_refused_before_any_file_access(path, tmp_path, monkeypatch):
+    """A preset FILE that names a Windows device (trailing space / dot, ':', CONIN$ /
+    CONOUT$, the \\\\.\\ and \\\\?\\ namespaces) is refused on its text alone: opening it
+    reads the console and hangs every command. Nothing is looked up or opened."""
+    monkeypatch.chdir(tmp_path)
+
+    class Touched(Exception):
+        pass
+
+    def no_fs(self, *a, **k):
+        raise Touched(str(self))
+    for call in (config.resolve_preset_path, lambda p: config.load_preset(p, mock=True)):
+        with monkeypatch.context() as m:
+            m.setattr(config.Path, "exists", no_fs)
+            m.setattr(config.Path, "is_file", no_fs)
+            try:
+                call(path)
+                outcome = "accepted"
+            except ConfigError:
+                outcome = "refused"
+            except Touched as e:
+                outcome = f"touched the file system at {e}"
+        assert outcome == "refused", (path, outcome)
+
+
+def test_preset_file_must_be_a_readable_file(tmp_path):
+    """A folder named like a preset file, or a file that is not JSON, is a ConfigError (exit
+    2), never PermissionError / JSONDecodeError (an unexpected crash)."""
+    (tmp_path / "folder.json").mkdir()
+    with pytest.raises(ConfigError, match="not a file"):
+        config.load_preset(str(tmp_path / "folder.json"))
+    (tmp_path / "bad.json").write_bytes(b"\xff\xfe not json")
+    with pytest.raises(ConfigError, match="not valid JSON"):
+        config.load_preset(str(tmp_path / "bad.json"))
+    (tmp_path / "docs").mkdir()
+    with pytest.raises(ConfigError):
+        config.load_preset(str(tmp_path / "docs") + "/")
+
+
+def test_cli_device_preset_path_exits_2_without_hanging(tmp_path):
+    """The reported hang, end to end in a child process (a regression would block on the
+    console, so the child is timed out instead of the test run)."""
+    import subprocess
+    import sys
+    for spec in ("./CONIN$", "./CON "):
+        p = subprocess.run([sys.executable, "-m", "ui.cli", "--mock", "--library",
+                            str(tmp_path / "lib"), "--preset", spec, "signal"],
+                           cwd=str(ROOT), capture_output=True, text=True, timeout=300,
+                           stdin=subprocess.DEVNULL)
+        assert p.returncode == cli.EXIT_REFUSED, (spec, p.stdout, p.stderr)
+        assert "unexpected" not in p.stderr
+
+
+def _recipe_file(folder, name, preset):
+    doc = json.loads((ROOT / "recipes" / "flat_plate.json").read_text(encoding="utf-8"))
+    doc.update(name=name, preset=preset)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_delete_reads_job_recipe_as_the_run_job_does(eng, tmp_path):
+    """run_job strips job.recipe ('recipes/rf.json ' runs rf.json): the delete check read the
+    raw value, missed the pin and deleted the preset that station runs."""
+    from ui import run_job as RJ
+    st = tmp_path / "st"
+    _recipe_file(st / "recipes", "rf", "pa")
+    api.preset_add("pa", BUILTIN)
+    (st / "line.json").write_text(json.dumps(
+        {"station_id": "line", "job": {"type": "recipe", "recipe": "recipes/rf.json "}}))
+    assert api.recipe_load(RJ.load_station_config(st / "line.json").recipe).preset == "pa"
+    with pytest.raises(ConfigError, match="line.json"):
+        api.preset_delete("pa", "x", stations_dir=st)
+    api.recipe_add("ra", "flat_plate", {"preset": "pa"})
+    (st / "pad.json").write_text(json.dumps(
+        {"station_id": "pad", "job": {"type": "recipe", "recipe": " ra "}}))
+    r = api.preset_delete("pa", "x", force=True, stations_dir=st)
+    assert r["forced"] and r["recipes"] == ["ra"]
+    assert r["recipe_stations"] == ["line.json", "pad.json"]
+
+
+@pytest.fixture
+def no_yaml(monkeypatch):
+    """PyYAML (optional) not installed."""
+    import sys
+    monkeypatch.setitem(sys.modules, "yaml", None)
+
+
+def test_delete_reads_yaml_recipe_stations_without_pyyaml(eng, tmp_path, no_yaml):
+    """A YAML station config (or recipe file) that can't be parsed (PyYAML missing) is never
+    skipped: the station would run where PyYAML is installed. It is judged by what its text
+    mentions - a pattern for its keys missed valid YAML (a value on the next line, quoted
+    keys, JSON written as YAML, `preset: false`, a 'recipe:' inside a text value) and the
+    delete went through. An over-match only asks for --force."""
+    st = tmp_path / "st"
+    _recipe_file(st / "recipes", "rf", "pa")
+    api.preset_add("pa", BUILTIN)
+    api.preset_add("pb", BUILTIN)
+    api.recipe_add("rb", "flat_plate", {"preset": "pb"})
+    (st / "line.yaml").write_text("station_id: line\npreset: null\n# recipe: other\njob:\n"
+                                  "  type: recipe\n  recipe: recipes/rf.json  # the file\n")
+    (st / "flow.yml").write_text("station_id: flow\njob: {type: recipe, recipe: 'rb'}\n")
+    (st / "own.yaml").write_text("station_id: own\npreset: pb\njob:\n  recipe: recipes/rf.json\n")
+    with pytest.raises(ConfigError, match="line.yaml"):
+        api.preset_delete("pa", "x", stations_dir=st)
+    with pytest.raises(ConfigError, match="flow.yml"):
+        api.preset_delete("pb", "x", stations_dir=st)
+    r = api.preset_delete("pa", "x", force=True, stations_dir=st)
+    # own.yaml runs its own preset where PyYAML parses it; read here, that is not trusted to
+    # a pattern: listed (an over-match), never a silent delete
+    assert r["recipe_stations"] == ["line.yaml", "own.yaml"]
+
+
+@pytest.mark.parametrize("text", [
+    "station_id: s\npreset:\n  pq\njob:\n  type: inspect\n",           # value on the next line
+    "station_id: s\n'preset': pq\n",                                      # quoted key
+    '{"station_id": "s", "preset": "pq"}\n',                               # JSON is valid YAML
+    "station_id: s\npreset : pq\n",
+])
+def test_preset_delete_yaml_station_own_preset_without_pyyaml(eng, tmp_path, no_yaml, text):
+    st = tmp_path / "st"
+    st.mkdir()
+    api.preset_add("pq", BUILTIN)
+    (st / "line.yaml").write_text(text)
+    with pytest.raises(ConfigError, match="line.yaml"):
+        api.preset_delete("pq", "x", stations_dir=st)
+
+
+@pytest.mark.parametrize("text", [
+    "station_id: s\njob:\n  type: recipe\n  recipe:\n    recipes/rf.json\n",
+    "station_id: s\njob:\n  type: recipe\n  'recipe': recipes/rf.json\n",
+    '{"station_id": "s", "job": {"type": "recipe", "recipe": "recipes/rf.json"}}\n',
+    "station_id: s\njob:\n  type: recipe\n  recipe : recipes/rf.json\n",
+    "station_id: s\npreset: false\njob:\n  type: recipe\n  recipe: recipes/rf.json\n",
+    "station_id: s\n_comment: \"was recipe: rb until the lid changed\"\njob: {type: recipe, "
+    "recipe: recipes/rf.json}\n",
+    "station_id: s\njob: {type: recipe, note: \"bay #2\", recipe: recipes/rf.json}\n",
+    "station_id: s\njob:\n  type: recipe\n  recipe: \"my recipes/rf.json\"\n",
+    "station_id: s\njob:\n  type: recipe\n  recipe: my recipes/rf.json   # spaces\n",
+])
+def test_preset_delete_yaml_recipe_station_without_pyyaml(eng, tmp_path, no_yaml, text):
+    """Every form a station can name a pinning recipe file in (run_job reads them all with
+    PyYAML): the delete is refused, the station named."""
+    st = tmp_path / "st"
+    _recipe_file(st / "recipes", "rf", "pa")
+    _recipe_file(st / "my recipes", "rf", "pa")
+    api.preset_add("pa", BUILTIN)
+    (st / "line.yaml").write_text(text)
+    with pytest.raises(ConfigError, match="recipe station config.*line.yaml"):
+        api.preset_delete("pa", "x", stations_dir=st)
+
+
+def test_preset_delete_yaml_recipe_file_without_pyyaml(eng, tmp_path, no_yaml):
+    """A YAML recipe file (here written in JSON syntax, valid YAML) pins the preset it
+    mentions; a station running it keeps the preset."""
+    st = tmp_path / "st"
+    (st / "recipes").mkdir(parents=True)
+    doc = json.loads((ROOT / "recipes" / "flat_plate.json").read_text(encoding="utf-8"))
+    doc.update(name="ry", preset="pa")
+    (st / "recipes" / "ry.yaml").write_text(json.dumps(doc), encoding="utf-8")
+    api.preset_add("pa", BUILTIN)
+    (st / "line.json").write_text(json.dumps(
+        {"station_id": "line", "job": {"type": "recipe", "recipe": "recipes/ry.yaml"}}))
+    with pytest.raises(ConfigError, match="recipe station config.*line.json"):
+        api.preset_delete("pa", "x", stations_dir=st)
+
+
+def test_recipe_delete_reads_job_recipe_as_the_run_job_does(eng, tmp_path):
+    from engine.recipes.schema import RecipeError
+    st = tmp_path / "st"
+    st.mkdir()
+    api.preset_add("pa", BUILTIN)
+    api.recipe_add("ra", "flat_plate", {"preset": "pa"})
+    (st / "pad.json").write_text(json.dumps(
+        {"station_id": "pad", "job": {"type": "recipe", "recipe": " ra "}}))
+    (st / "flow.yaml").write_text("station_id: flow\njob: {type: recipe, recipe: ra}\n")
+    with pytest.raises(RecipeError, match="pad.json, flow.yaml|flow.yaml, pad.json"):
+        api.recipe_delete("ra", "x", stations_dir=st)
+
+
+@pytest.mark.parametrize("text", [
+    "station_id: s\njob:\n  type: recipe\n  recipe:\n    ra\n",          # value on the next line
+    "station_id: s\n_comment: \"was recipe: rb until the lid changed\"\njob: {type: recipe, "
+    "recipe: ra}\n",
+    "station_id: s\ndescription: \"lid check, recipe: see job\"\njob:\n  recipe: ra\n",
+    '{"station_id": "s", "job": {"type": "recipe", "recipe": "ra"}}\n',
+])
+def test_recipe_delete_yaml_station_without_pyyaml(eng, tmp_path, no_yaml, text):
+    from engine.recipes.schema import RecipeError
+    st = tmp_path / "st"
+    st.mkdir()
+    api.preset_add("pa", BUILTIN)
+    api.recipe_add("ra", "flat_plate", {"preset": "pa"})
+    (st / "line.yaml").write_text(text)
+    with pytest.raises(RecipeError, match="line.yaml"):
+        api.recipe_delete("ra", "x", stations_dir=st)
+
+
+def test_preset_delete_force_help_names_recipes(capsys):
+    try:
+        cli.main(["--mock", "preset-delete", "--help"])
+    except SystemExit:
+        pass
+    out = capsys.readouterr().out
+    assert "recipe" in out.rsplit("--force", 1)[1].rsplit("--stations", 1)[0]
+
+
+def test_station_run_refuses_a_gone_selection_whatever_preset_is_loaded(tmp_path):
+    """The web server's station runs pass its LOADED preset (its default when the selection
+    is gone) and build the CLI context without start(): a config naming no preset must
+    still stop, naming the gone selection, never scan with the default."""
+    import shutil
+    lib = tmp_path / "lib"
+    assert cli.main(["--mock", "--library", str(lib), "preset-add", "line_a", "--from",
+                     PRESET]) == 0
+    assert cli.main(["--mock", "--library", str(lib), "preset-select", "line_a"]) == 0
+    shutil.rmtree(lib / "presets" / "line_a")
+    doc = json.loads((ROOT / "stations" / "example_metric_check.json").read_text())
+    doc.update(station_id="gone", preset=None, runs_dir=str(tmp_path / "runs"),
+               mock_library=None)
+    cfg = tmp_path / "gone.json"
+    cfg.write_text(json.dumps(doc))
+    args = cli.build_parser().parse_args(["--json", "--library", str(lib), "--mock", "run",
+                                          str(cfg), "--no-feedback"])
+    args.preset_given, args.mock_part_given = False, False
+    args.preset = cli.DEFAULT_PRESET                    # what the server had loaded
+    ctx = cli.Ctx(args)
+    ctx.session = api.configure(lib.resolve(), mock=True)
+    with pytest.raises(cli.CLIError, match="line_a.*no longer exists") as e:
+        cli.cmd_run(ctx)
+    assert cli.DEFAULT_PRESET in str(e.value)
+    res = json.loads(Path(e.value.run_dir, "result.json").read_text())
+    assert res["result"] == "INVALID" and "line_a" in res["invalid_reason"]
+    assert res["capture"]["preset"] is None             # nothing was scanned
+
+
+def _gone_selection_library(tmp_path):
+    """A library whose selected user preset was deleted behind its back, and a station config
+    naming no preset (a metric job: refused before any scan without a stereo calibration)."""
+    import shutil
+    lib = tmp_path / "lib"
+    assert cli.main(["--mock", "--library", str(lib), "preset-add", "line_a", "--from",
+                     PRESET]) == 0
+    assert cli.main(["--mock", "--library", str(lib), "preset-select", "line_a"]) == 0
+    api._session = None
+    shutil.rmtree(lib / "presets" / "line_a")
+    stations = tmp_path / "stations"
+    stations.mkdir()
+    doc = json.loads((ROOT / "stations" / "example_metric_check.json").read_text())
+    doc.update(station_id="nopreset", preset=None, runs_dir=str(tmp_path / "runs"),
+               mock_library=None)
+    (stations / "nopreset.json").write_text(json.dumps(doc))
+    return lib, stations
+
+
+def _server_run(app, args):
+    job = app.submit("run_station", args)
+    assert job.done.wait(600)
+    return job
+
+
+def test_server_with_a_gone_selection_loads_nothing(tmp_path):
+    """Review case: the server loaded its DEFAULT preset when the selection was gone, and a
+    station run naming no preset passes the LOADED one - so once the selection resolved
+    again (the operator followed the refusal's advice in another terminal, or the preset was
+    re-created) station runs scanned with that default, unwarned. Nothing is loaded now: the
+    runs are refused until a preset is selected in Setup, which loads it."""
+    from engine.library import presets as preset_lib
+    lib, stations = _gone_selection_library(tmp_path)
+    app = ui_server.App(mock=True, library=lib, stations_dir=stations).start()
+    try:
+        assert app.session.preset is None
+        st = app.cmd_state()
+        assert st["active_preset"] is None and st["run_preset"] is None
+        assert any("line_a" in w and "no preset loaded" in w for w in st["warnings"])
+        assert any("line_a" in w for w in app.status()["warnings"])
+        job = _server_run(app, {"config": "nopreset.json"})
+        assert job.status == "error" and "none is loaded" in job.error
+        # the selection resolves again behind the server's back: still nothing loaded here,
+        # still refused - never a default scanned with
+        preset_lib.select(app.session.store, Path(app.session.presets_dir or
+                                                  config.PRESETS_DIR), BUILTIN)
+        job = _server_run(app, {"config": "nopreset.json"})
+        assert job.status == "error" and "none is loaded" in job.error
+        # selected in Setup: loaded, and the run uses it
+        j = app.submit("preset_select", {"name": BUILTIN})
+        assert j.done.wait(120) and j.status == "done", j.error
+        job = _server_run(app, {"config": "nopreset.json"})
+        assert job.status == "done", job.error
+        assert job.result["capture"]["preset"] == BUILTIN
+    finally:
+        app.close()
+        api._session = None
+
+
+def test_server_started_with_a_preset_warns_of_a_gone_selection(tmp_path):
+    """A server started with an explicit preset loads it; a library selection that is gone
+    is still said at start (it stops station configs that name no preset), and the refusal
+    names Setup and the station config."""
+    lib, stations = _gone_selection_library(tmp_path)
+    app = ui_server.App(mock=True, library=lib, stations_dir=stations,
+                        preset_name=BUILTIN).start()
+    try:
+        assert app.session.preset.name == BUILTIN
+        assert any("line_a" in w and "refused" in w for w in app.cmd_state()["warnings"])
+        job = _server_run(app, {"config": "nopreset.json"})
+        assert job.status == "done", job.error
+        r = job.result
+        assert r["result"] == "INVALID" and r["exit_code"] == cli.EXIT_REFUSED
+        assert "line_a" in r["error"] and "Setup" in r["error"]
+        assert "station config" in r["error"] and r["capture"]["preset"] is None
+    finally:
+        app.close()
+        api._session = None

@@ -12,8 +12,10 @@ INVALID means the numbers cannot be trusted and must never be reported as a pass
 
 Schema 0.2 (extends 0.1, every 0.1 key kept): `recipe` (the recipe a recipe job ran, else
 null), `zones` (per zone: id, verdict, checks; [] for other jobs) and `feedback` (what the
-projector showed after the verdict, else null). `deviation_mm` also carries `n_defects` and
-`largest_defect` (metric jobs: the out-of-tolerance clusters; null for the other jobs).
+projector showed after the verdict, else null). `deviation_mm` also carries `n_defects`,
+`largest_defect`, `outlier_px` / `outlier_clusters` / `outlier_pct` and `dense_strays`
+(metric jobs: the out-of-tolerance clusters, the isolated stray px dropped - golden: the
+worse side - and where dropped px were dense, else null; null for the other jobs).
 """
 
 from __future__ import annotations
@@ -108,9 +110,12 @@ def empty_result(*, run_id: str, run_folder: str, mock: bool, operator_confirmed
                     "exposure_us": None, "average": None, "zone": zone},
         "part": {"role": part.get("role", "test"), "label": part.get("label", "part"),
                  "scan_id": None},
-        # n_defects / largest_defect: metric jobs (out-of-tolerance clusters), else null
+        # n_defects / largest_defect / outlier_* / dense_strays: metric jobs (out-of-tolerance
+        # clusters, the isolated stray px dropped, where they were dense), else null
         "deviation_mm": {"max": None, "mean": None, "rms": None, "method": None,
-                         "n_points": None, "n_defects": None, "largest_defect": None},
+                         "n_points": None, "n_defects": None, "largest_defect": None,
+                         "outlier_px": None, "outlier_clusters": None, "outlier_pct": None,
+                         "dense_strays": None},
         "deviation_units": None,
         "threshold_mm": threshold_mm,
         "result": "INVALID",

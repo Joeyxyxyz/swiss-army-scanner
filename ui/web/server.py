@@ -165,11 +165,14 @@ VERBS: dict = {
                       "uses the LOADED one). A station config's own preset still wins. Refused "
                       "while a station run is busy.", {"name": "preset name (GET /api/presets)"}),
     "preset_delete": ("Move a USER preset to the library trash (recoverable). Refused for "
-                      "built-ins, the active preset, and presets a station config uses (unless "
-                      "force). Needs confirm=true.",
+                      "built-ins, the active preset, the selected recipe's preset, and presets a "
+                      "station config, a recipe or a recipe station config uses (unless force). "
+                      "Needs confirm=true.",
                       {"name": "user preset name", "reason": "why (recorded)",
                        "confirm": "bool: must be true (the operator confirmed the delete)",
-                       "force": "bool: delete even when a station config references it"}),
+                       "force": "bool: delete even when a station config, a recipe (built-in "
+                                "or user) or a recipe station config uses it (never the "
+                                "selected recipe's preset)"}),
     "check_signal": ("Short live probe: gc_conf, valid %, focus ratio, coded-axis check.", {}),
     "capture_base": ("EMPTY scene -> base reference (the datum) for the active geometry. "
                      "zone: light only that grid zone (use the same zone as the zone scans).",
@@ -1191,22 +1194,33 @@ class App:
         self.session = api.configure(self.library, mock=self.mock, presets_dir=self.presets_dir)
         self.root = self.session.store.root.resolve()
         names = self.preset_names()
-        sel = api.preset_selection() if not self.preset_name else {"name": None}
-        if sel.get("name") and not sel.get("exists"):
-            # selected but gone (deleted, renamed): say so, never a silent default
+        sel = api.preset_selection()
+        gone = bool(sel.get("name")) and not sel.get("exists")
+        if gone and not self.preset_name:
+            # selected but gone (deleted, renamed): nothing is loaded in its place - a default
+            # loaded here would be what every station run naming no preset scans with, even
+            # once the selection resolves again
             self.startup_warnings.append(
-                f"the selected preset {sel['name']!r} no longer exists: loading the default "
-                "instead - select a preset in Setup before measuring")
-        name = self.preset_name or api.preset_active() or (
-            DEFAULT_PRESET if DEFAULT_PRESET in names else (names[0] if names else None))
+                f"the selected preset {sel['name']!r} no longer exists in this library: no "
+                "preset loaded - select one in Setup before measuring")
+        elif gone:
+            self.startup_warnings.append(
+                f"the library's selected preset {sel['name']!r} no longer exists: station "
+                f"configs that name no preset are refused (not run with {self.preset_name!r}) "
+                "until one is selected in Setup")
+        if gone and not self.preset_name:
+            name = None
+        else:
+            name = self.preset_name or api.preset_active() or (
+                DEFAULT_PRESET if DEFAULT_PRESET in names else (names[0] if names else None))
+            if not name:
+                self.startup_warnings.append(f"no presets in {self.presets_path}")
         if name:
             try:
                 api.load_preset(name)
             except Exception as e:      # noqa: BLE001 - reported in the UI, not fatal
                 self.startup_warnings.append(f"could not load preset {name!r}: "
                                              f"{type(e).__name__}: {e}")
-        else:
-            self.startup_warnings.append(f"no presets in {self.presets_path}")
         self._refresh_snapshot()
         self.refresh_workstates()
 
@@ -1477,6 +1491,7 @@ class App:
         p = self.session.preset
         snap["active_preset"] = p.name if p is not None else None
         snap["run_preset"] = snap.get("workstate_preset") or snap["active_preset"]
+        snap["warnings"] = list(self.startup_warnings)     # e.g. the selected preset is gone
         return snap
 
     def refresh_workstates(self) -> list:

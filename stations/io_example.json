@@ -4,7 +4,7 @@
     {"kind": "simulated", "enabled": true,
      "map": {"trigger": "TRIGGER", "abort": "ABORT", "start": "START", "home": "HOME"}},
     {"kind": "camera_gpio", "enabled": false,
-     "map": {"Line0": "TRIGGER", "Line2": "ABORT"}, "options": {"debounce_us": 1000}},
+     "map": {"Line0": "TRIGGER", "Line3": "ABORT"}, "options": {"debounce_us": 1000}},
     {"kind": "serial_io", "enabled": false,
      "map": {"START": "START", "TRIG": "TRIGGER", "STOP": "ABORT", "HOME": "HOME"},
      "options": {"port": "COM5", "baud": 115200}},

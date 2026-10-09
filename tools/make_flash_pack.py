@@ -174,16 +174,39 @@ def trigger_timing_errors(bitdepth: int, period_us: float, pattern_exposure_us: 
     return errs
 
 
+TRIGGERED_DEEP_EXPOSURE_GAP_US = 500     # default deep-pattern exposure: period - this ...
+
+
+def default_pattern_exposure_us(bitdepth: int, period_us: int) -> int:
+    """The pattern exposure used when none is given: 1-bit = the period; deeper
+    patterns = period - 500 us, but never below the bit depth's minimum, so every
+    period >= minimum + 230 us (8-bit: 8333 + 230 = 8563 us) is reachable."""
+    P = int(period_us)
+    if int(bitdepth) == 1:
+        return P
+    return max(MIN_EXPOSURE_US.get(int(bitdepth), 0), P - TRIGGERED_DEEP_EXPOSURE_GAP_US)
+
+
+def min_triggered_period_us(bitdepth: int) -> int:
+    """The shortest pattern period a deep (> 1-bit) triggered pattern can run at:
+    its minimum exposure + the DLPC350's 230 us gap (exposure == period would leave
+    the camera no time after the pattern)."""
+    return MIN_EXPOSURE_US[int(bitdepth)] + PERIOD_DIFFERENCE_MIN_US
+
+
 def triggered_timing(bitdepth: int, period_us: int, *, pattern_exposure_us: Optional[int] = None,
                      camera_exposure_us: Optional[float] = None, mode: str = "trigout",
                      n_patterns: int = 16, line: str = "Line0",
                      camera_fps: float = CAMERA_FULL_FPS) -> dict:
     """The manifest's hardware_trigger block for one pattern period; TimingError
-    (every DLPC350 and camera rule broken) when the combination is infeasible."""
+    (every DLPC350 and camera rule broken) when the combination is infeasible.
+    pattern_exposure_us None: default_pattern_exposure_us; camera_exposure_us None:
+    1-bit min(3000, X - 1000), deeper X + 100 (an explicit value is used as given)."""
     if mode not in TRIGGER_MODES[1:]:
         raise ValueError(f"trigger mode must be one of {TRIGGER_MODES[1:]}, got {mode!r}")
     P = int(period_us)
-    X = int(pattern_exposure_us) if pattern_exposure_us else (P if bitdepth == 1 else P - 500)
+    X = (int(pattern_exposure_us) if pattern_exposure_us
+         else default_pattern_exposure_us(bitdepth, P))
     if camera_exposure_us is None:
         E = (min(TRIGGERED_CAMERA_EXPOSURE_US, X - 1000) if bitdepth == 1 else X + 100)
         E = max(E, TRIGGERED_MIN_CAMERA_EXPOSURE_US)
@@ -192,10 +215,15 @@ def triggered_timing(bitdepth: int, period_us: int, *, pattern_exposure_us: Opti
     errs = timing_errors(bitdepth, X, P) + trigger_timing_errors(bitdepth, P, X, E,
                                                                  camera_fps=camera_fps)
     if errs:
+        hint = ""
+        if int(bitdepth) in MIN_EXPOSURE_US and bitdepth > 1 and (
+                P < min_triggered_period_us(bitdepth) or X < MIN_EXPOSURE_US[int(bitdepth)]):
+            hint = (f". {bitdepth}-bit patterns need a pattern exposure >= "
+                    f"{MIN_EXPOSURE_US[int(bitdepth)]} us and a period >= "
+                    f"{min_triggered_period_us(bitdepth)} us: use the 1-bit --fastscan pack for "
+                    "shorter periods")
         raise TimingError(f"{bitdepth}-bit, period {P} us, pattern exposure {X} us, camera "
-                          f"exposure {E:g} us is not feasible: " + "; ".join(errs)
-                          + (". 8-bit patterns need >= 8333 us: use the 1-bit --fastscan pack "
-                             "for shorter periods" if bitdepth > 1 and P < 8563 else ""))
+                          f"exposure {E:g} us is not feasible: " + "; ".join(errs) + hint)
     return {"mode": mode,
             "dlp_trigger": "internal" if mode == "trigout" else "external (TRIG_IN_1)",
             "trig_out_1": {"polarity": "normal (active high)", "rising_delay_us": 0,
@@ -521,7 +549,9 @@ def make_pack(preset_name: str = DEFAULT_PRESET, *, axes=("x",), video_port: boo
               exposure_us: Optional[int] = None, trigger_mode: str = "trigout",
               camera_exposure_us: Optional[float] = None) -> Path:
     """period_us / exposure_us: one uniform pattern period / exposure for the
-    flash sequence (default: suggest_timing's); trigger_mode 'trigout' (internal
+    flash sequence (default: suggest_timing's; with only period_us,
+    default_pattern_exposure_us); camera_exposure_us: the triggered camera's
+    (default: pattern exposure + 100 us); trigger_mode 'trigout' (internal
     timer, TRIG_OUT_1 -> camera) or 'external'. Infeasible DLPC350 or camera
     timing is refused (TimingError) before anything is written."""
     if trigger_mode == "freerun":
@@ -529,6 +559,9 @@ def make_pack(preset_name: str = DEFAULT_PRESET, *, axes=("x",), video_port: boo
                          "slices the PWM bit planes): use --fastscan for soft sync")
     if video_port and period_us is not None:
         raise ValueError("--period-us is for flash packs (video port: one VSYNC per frame)")
+    if video_port and camera_exposure_us is not None:
+        raise ValueError("--camera-exposure-us is for flash packs (video port: the camera "
+                         "exposure per frame comes from the VSYNC timing)")
     preset = config.load_preset(preset_name)
     patterns = build_patterns(preset, axes)
     mode = "video_port" if video_port else "flash"
@@ -554,11 +587,12 @@ def make_pack(preset_name: str = DEFAULT_PRESET, *, axes=("x",), video_port: boo
         u = timing["uniform"]
         P = int(period_us) if period_us is not None else int(u["period_us"])
         X = int(exposure_us) if exposure_us is not None else (
-            P - 500 if period_us is not None else int(u["exposure_us"]))
+            default_pattern_exposure_us(deep, P) if period_us is not None
+            else int(u["exposure_us"]))
         hw = triggered_timing(deep, P, pattern_exposure_us=X,
                               camera_exposure_us=camera_exposure_us, mode=trigger_mode,
                               n_patterns=len(seq))
-        if period_us is not None or exposure_us is not None:
+        if period_us is not None or exposure_us is not None or camera_exposure_us is not None:
             timing["uniform"] = {"exposure_us": X, "period_us": P,
                                  "camera_exposure_us": hw["camera"]["exposure_us"]}
             timing["use"] = "uniform"
@@ -1026,7 +1060,7 @@ def make_fastscan_pack(*, zone_rings=(), zone_masks=(), band_cam=None, band_fiel
                        out_root: Optional[Path] = None, library: Optional[Path] = None,
                        label: Optional[str] = None, geometry_id: Optional[str] = None,
                        led: Optional[dict] = None, period_us: int = FASTSCAN_PERIOD_US,
-                       camera_exposure_us: int = FASTSCAN_CAMERA_EXPOSURE_US,
+                       camera_exposure_us: Optional[float] = None,
                        camera_fps: float = FASTSCAN_CAMERA_FPS, loops: int = FASTSCAN_LOOPS,
                        singles: bool = False, trigger_mode: str = "freerun",
                        pattern_exposure_us: Optional[int] = None) -> Path:
@@ -1035,6 +1069,8 @@ def make_fastscan_pack(*, zone_rings=(), zone_masks=(), band_cam=None, band_fiel
     timer, TRIG_OUT_1 -> camera trigger, one frame per pattern) or 'external'
     (the DLPC350 steps on TRIG_IN_1; TRIG_OUT_1 -> camera); the triggered modes
     check the camera's full-frame rate instead of the soft-sync window.
+    camera_exposure_us None: the mode's default (free run FASTSCAN_CAMERA_EXPOSURE_US;
+    triggered min(3000, pattern exposure - 1000)); a given value is used as given.
     out_root: a plain folder for the pack; else the library output bin
     (library or the engine's default library)/output/flashpacks/, recorded
     in output/index.csv."""
@@ -1054,12 +1090,12 @@ def make_fastscan_pack(*, zone_rings=(), zone_masks=(), band_cam=None, band_fiel
         if pattern_exposure_us not in (None, period_us):
             raise ValueError("soft sync plays exposure == period; --pattern-exposure-us is for "
                              "the triggered modes")
-        timing = fastscan_timing(period_us, camera_exposure_us, camera_fps, loops)
+        timing = fastscan_timing(period_us, FASTSCAN_CAMERA_EXPOSURE_US
+                                 if camera_exposure_us is None else camera_exposure_us,
+                                 camera_fps, loops)
     else:
-        timing = fastscan_triggered_timing(
-            period_us, pattern_exposure_us,
-            None if camera_exposure_us == FASTSCAN_CAMERA_EXPOSURE_US else camera_exposure_us,
-            trigger_mode, loops)
+        timing = fastscan_triggered_timing(period_us, pattern_exposure_us, camera_exposure_us,
+                                           trigger_mode, loops)
     variants, per, images, seq = fastscan_layout(zone)
     rt = _check_round_trip(images, seq, per)
     for e in seq:
@@ -1361,7 +1397,7 @@ def main(argv=None) -> int:
     fs.add_argument("--zone-mask", action="append", default=[], metavar="NPY",
                     help="any DMD-shaped mask .npy to add to the zone")
     fs.add_argument("--zone-band-cam", default=None, metavar="NPY",
-                    help="camera-space band mask (e.g. the cooling-tube band)")
+                    help="camera-space band mask (e.g. the tube band)")
     fs.add_argument("--zone-band-field", default=None, metavar="NPZ",
                     help="field.npz with corr_x + corr_y mapping that band to the DMD")
     fs.add_argument("--zone-margin", type=int, default=FASTSCAN_ZONE_MARGIN_PX)
@@ -1377,11 +1413,16 @@ def main(argv=None) -> int:
                          "default: the suggested timing). Triggered at full frame: >= "
                          f"{CAMERA_FULLFRAME_PERIOD_US:.0f} us")
     fs.add_argument("--pattern-exposure-us", type=int, default=None,
-                    help="pattern exposure, us (default: = period for 1-bit, period - 500 8-bit)")
+                    help="pattern exposure, us (default: = period for 1-bit; 8-bit period - "
+                         f"500, at least {MIN_EXPOSURE_US[8]}: 8-bit periods >= "
+                         f"{min_triggered_period_us(8)} us)")
     fs.add_argument("--trigger-mode", choices=TRIGGER_MODES, default=None,
                     help="freerun (soft sync; fastscan default), trigout (internal timer, "
                          "TRIG_OUT_1 -> camera; 8-bit default) or external (TRIG_IN_1 steps)")
-    fs.add_argument("--camera-exposure-us", type=int, default=FASTSCAN_CAMERA_EXPOSURE_US)
+    fs.add_argument("--camera-exposure-us", type=int, default=None,
+                    help=f"camera exposure, us (default: free run {FASTSCAN_CAMERA_EXPOSURE_US}; "
+                         "triggered 1-bit min(3000, pattern exposure - 1000), 8-bit pattern "
+                         "exposure + 100)")
     fs.add_argument("--camera-fps", type=float, default=FASTSCAN_CAMERA_FPS)
     fs.add_argument("--loops", type=int, default=FASTSCAN_LOOPS)
     fs.add_argument("--geometry-id", default=None)
@@ -1419,7 +1460,8 @@ def main(argv=None) -> int:
     d = make_pack(a.preset, axes=axes, video_port=a.video_port,
                   out_root=Path(a.out) if a.out else DEFAULT_OUT, label=a.label,
                   period_us=a.period_us, exposure_us=a.pattern_exposure_us,
-                  trigger_mode=a.trigger_mode or "trigout")
+                  trigger_mode=a.trigger_mode or "trigout",
+                  camera_exposure_us=a.camera_exposure_us)
     print(d)
     print((d / "procedure.txt").read_text(encoding="utf-8"))
     return 0

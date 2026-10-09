@@ -30,7 +30,7 @@ The engine never sends a DLPC350 USB/HID command and never opens the HDMI projec
 scan scan-flash part --pack library\output\flashpacks\<ts>_<label> --variant zone --roi 500,300,940,780
 scan scan-flash --pack <pack dir> --dry-run          # the timing plan; opens nothing
 scan scan-flash part --pack <pack dir> --variant zone --fine-prefilter 1   # optional fine low-pass
-scan sort-flash library\output\flashscans\<ts>_cell.npz --decode   # offline re-sort
+scan sort-flash library\output\flashscans\<ts>_part.npz --decode   # offline re-sort
 ```
 
 ```python

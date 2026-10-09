@@ -1334,17 +1334,18 @@ def make_fastscan_pack(zone_rings: tuple = (), zone_masks: tuple = (),
     A human loads it and plays it in the 4500 MKII GUI (docs/FLASH_FASTSCAN_4500.md).
     period_us (default 10000) / pattern_exposure_us / trigger_mode 'freerun' (soft sync) |
     'trigout' | 'external' (hardware trigger, docs/TRIGGER_FULLSPEED_TEST.md); infeasible
-    timing is refused (TimingError)."""
+    timing is refused (TimingError). camera_exposure_us None = the mode's default (soft sync
+    3000 us; triggered min(3000, pattern exposure - 1000)); a given value is kept as given."""
     import sys as _sys
     root = str(Path(__file__).resolve().parents[1])
     if root not in _sys.path:
         _sys.path.insert(0, root)
-    from tools.make_flash_pack import make_fastscan_pack as _make, FASTSCAN_PERIOD_US, \
-        FASTSCAN_CAMERA_EXPOSURE_US
+    from tools.make_flash_pack import make_fastscan_pack as _make, FASTSCAN_PERIOD_US
     s = _engine()
     return _make(period_us=int(period_us or FASTSCAN_PERIOD_US), trigger_mode=trigger_mode,
                  pattern_exposure_us=pattern_exposure_us,
-                 camera_exposure_us=int(camera_exposure_us or FASTSCAN_CAMERA_EXPOSURE_US),zone_rings=tuple(zone_rings or ()), zone_masks=tuple(zone_masks or ()),
+                 camera_exposure_us=None if camera_exposure_us is None else int(camera_exposure_us),
+                 zone_rings=tuple(zone_rings or ()), zone_masks=tuple(zone_masks or ()),
                  band_cam=band_cam, band_field=band_field, margin_px=int(margin_px),
                  calibration=calibration, study=bool(study), label=label,
                  library=s.store.root,
@@ -1383,8 +1384,9 @@ def trigger_test(line: str = "Line0", seconds: float = 5.0,
     """EXPERIMENTAL hardware-trigger check, camera only (the projector is untouched: a
     HUMAN plays the pattern sequence with TRIG_OUT_1 in the 4500 MKII GUI). The camera
     is put in hardware trigger on `line` (FrameStart, RisingEdge, short exposure),
-    triggered frames are counted for `seconds` (timeouts count zero) -> count, rate,
-    period mean / std / min / max from camera timestamps, missed pulses vs
+    triggered frames are counted for `seconds` (timeouts and incomplete frames are counted;
+    a train that stops or starts late, or an incomplete frame, is RATE MISMATCH) -> count,
+    rate, period mean / std / min / max from camera timestamps, missed pulses vs
     expect_period_ms and the verdict NO PULSES | RATE MISMATCH | OK. TriggerMode is
     set back to Off at the end, always (docs/TRIGGER_FULLSPEED_TEST.md)."""
     from .reconstruct import trigger_scan
@@ -1400,7 +1402,8 @@ def scan_trigger(pack: str, variant: Optional[str] = None, label: str = "trigger
     """EXPERIMENTAL hardware-triggered metric scan of a flash pack (the 8-bit hybrid pack
     or the 1-bit --fastscan pack): TRIG_OUT_1 -> camera `line`, exactly one full frame
     per pattern, `repeats` loops (missing / extra frames, spacing +-50 % and the first
-    trigger checked), aligned (1-bit: the sync markers; 8-bit: trigger order), decoded
+    trigger checked), aligned (1-bit: the sync markers; 8-bit: on its white / black frames,
+    refused unless exactly one start fits and, repeats > 1, the loops agree), decoded
     by the existing decoders -> 'plane' triangulation -> a metric scan (meta mode
     'flash_trigger', capture timing). Refused (PatternModeRefused) unless acknowledge
     == patternmode.ACK_PHRASE: a HUMAN put the projector in pattern mode. Rule 6 before

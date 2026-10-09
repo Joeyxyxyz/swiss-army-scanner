@@ -24,7 +24,8 @@ pattern mode and wired the trigger. The camera must be a triggered camera
 running camera is refused.
 
 The PySpin trigger setup (`configure_pyspin_trigger`, `restore_free_run`,
-`PySpinTriggeredCamera`) is bench-only code, never run by tests.
+`PySpinTriggeredCamera`) is bench code; tests run it only against a fake
+PySpin module (tests/test_trigger_pyspin_mock.py), never a camera.
 """
 
 from __future__ import annotations
@@ -37,6 +38,11 @@ import numpy as np
 from .. import rules
 
 ACK_PHRASE = "projector is in pattern mode, set by a human in the TI GUI"
+# The camera lines a trigger may be wired to (docs/TRIGGER_FULLSPEED_TEST.md §5):
+# Line0 = opto-isolated input (GPIO pin 2), Line3 = non-isolated input (pin 1).
+# Line1 is the opto-isolated OUTPUT and Line2 the bidirectional line / 3.3 V
+# auxiliary output (pin 3): never a trigger input here.
+TRIGGER_INPUT_LINES = ("Line0", "Line3")
 
 
 class PatternModeRefused(rules.SafetyViolation):
@@ -45,6 +51,16 @@ class PatternModeRefused(rules.SafetyViolation):
 
 class MissingFrames(RuntimeError):
     """The camera did not deliver exactly one frame per pattern."""
+
+
+class IncompleteFrame(RuntimeError):
+    """A trigger arrived but its image did not (USB3 packet loss). frame_id /
+    timestamp_ns: the camera's, when it still reported them (else None)."""
+
+    def __init__(self, msg: str, frame_id: Optional[int] = None,
+                 timestamp_ns: Optional[int] = None):
+        super().__init__(msg)
+        self.frame_id, self.timestamp_ns = frame_id, timestamp_ns
 
 
 @dataclass
@@ -103,6 +119,8 @@ class TriggeredSequenceCapture:
                                     else max(1000, 10 * longest / 1000))
         self.gap_tolerance = float(gap_tolerance)
         self.allow_extra = bool(allow_extra)     # a repeating loop: frames keep coming
+        # after the N frames, wait this long for one more (a sequence left on repeat)
+        self.extra_probe_ms = int(max(250, 3 * longest / 1000))
 
     @staticmethod
     def _expected_periods_us(manifest: dict, seq: list) -> list:
@@ -126,6 +144,7 @@ class TriggeredSequenceCapture:
     def capture(self) -> TriggeredCapture:
         n = len(self.sequence)
         frames, ids, ts = [], [], []
+        extra = 0
         arm = getattr(self.camera, "arm", None)
         if callable(arm):
             arm(n)
@@ -138,21 +157,45 @@ class TriggeredSequenceCapture:
                     raise MissingFrames(
                         f"got {k} of {n} frames: no trigger within {timeout} ms "
                         f"(pattern {self.sequence[k]['name']}). Sequence not playing, "
-                        "TRIG_OUT_1 not wired to Line0, or the sequence stopped early") from e
+                        "TRIG_OUT_1 not wired to the trigger line, or the sequence stopped "
+                        "early") from e
+                except IncompleteFrame as e:
+                    raise MissingFrames(
+                        f"frame {k + 1} of {n} (pattern {self.sequence[k]['name']}) arrived "
+                        f"incomplete ({e}): image data lost on USB3 - use a USB3 port on its "
+                        "own controller, a shorter cable, or a longer pattern period") from e
                 frames.append(np.asarray(img, dtype=np.float32))
                 ids.append(int(fid))
                 ts.append(int(t))
+            if not self.allow_extra:
+                extra = self._extra_frames()     # while the camera still takes triggers
         finally:
             disarm = getattr(self.camera, "disarm", None)
             if callable(disarm):
                 disarm()
         report = self._check(ids, ts)
-        extra = getattr(self.camera, "pending", None)
-        if not self.allow_extra and callable(extra) and extra() > 0:
+        if extra:
             raise MissingFrames(
-                f"{extra()} extra frame(s) after the {n} expected: the sequence is set to "
+                f"{extra} extra frame(s) after the {n} expected: the sequence is set to "
                 "repeat, or the camera was triggered by something else — uncheck Repeat")
         return TriggeredCapture(frames, ids, ts, self.sequence, report)
+
+    def _extra_frames(self) -> int:
+        """Frames that keep coming after the N expected: the camera's own count
+        (pending(), when it has one), else one more grab within extra_probe_ms -
+        a frame (even an incomplete one) means the sequence did not stop."""
+        pending = getattr(self.camera, "pending", None)
+        if callable(pending):
+            k = int(pending())
+            if k > 0:
+                return k
+        try:
+            self.camera.grab_triggered(self.extra_probe_ms)
+        except TimeoutError:
+            return 0
+        except IncompleteFrame:
+            return 1
+        return 1
 
     def _check(self, ids: list, ts: list) -> dict:
         n = len(ids)
@@ -183,18 +226,40 @@ class TriggeredSequenceCapture:
                 "sequence_ms": round((ts[-1] - ts[0]) / 1e6, 3) if n > 1 else 0.0}
 
 
-# ============================================================ bench only
-# Nothing below runs in tests. PySpin is passed in (or imported lazily) so
-# importing this module never needs the camera SDK.
+# ============================================================ bench
+# PySpin is passed in (or imported lazily) so importing this module never needs
+# the camera SDK. Tests run this code only against a fake PySpin module.
+
+def require_input_line(cam, PySpin, line: str) -> None:
+    """The trigger line must be a camera INPUT: one of TRIGGER_INPUT_LINES,
+    selected, LineMode set to Input where the camera lets it be written (a
+    non-isolated line may have been left an output by another program), and
+    read back as Input - else PatternModeRefused before the trigger is wired
+    to it in software (a push-pull trigger output against a camera output
+    driver is contention)."""
+    if line not in TRIGGER_INPUT_LINES:
+        raise PatternModeRefused(
+            f"trigger line {line!r} is not a camera input: use one of {TRIGGER_INPUT_LINES} "
+            "(Line1 is the opto output, Line2 the 3.3 V auxiliary output / bidirectional pin "
+            "3; docs/TRIGGER_FULLSPEED_TEST.md)")
+    cam.LineSelector.SetValue(getattr(PySpin, f"LineSelector_{line}"))
+    if cam.LineMode.GetAccessMode() == PySpin.RW:
+        cam.LineMode.SetValue(PySpin.LineMode_Input)
+    if int(cam.LineMode.GetValue()) != int(PySpin.LineMode_Input):
+        raise PatternModeRefused(f"camera {line} does not read back as an input (LineMode "
+                                 f"{cam.LineMode.GetValue()!r}): not used as the trigger")
+
 
 def configure_pyspin_trigger(cam, PySpin=None, *, exposure_us: float,
                              source: str = "Line0", activation: str = "RisingEdge",
-                             buffers: int = 64) -> None:  # pragma: no cover - bench only
+                             buffers: int = 64) -> None:
     """Hardware-trigger a Blackfly S (acquisition must be stopped).
-    Order matters: TriggerMode Off before changing selector/source."""
+    Order matters: TriggerMode Off before changing selector/source; the
+    source line is checked to be an input first (require_input_line)."""
     if PySpin is None:
         import PySpin  # noqa: N813
     cam.TriggerMode.SetValue(PySpin.TriggerMode_Off)
+    require_input_line(cam, PySpin, source)
     cam.TriggerSelector.SetValue(PySpin.TriggerSelector_FrameStart)
     cam.TriggerSource.SetValue(getattr(PySpin, f"TriggerSource_{source}"))
     cam.TriggerActivation.SetValue(getattr(PySpin, f"TriggerActivation_{activation}"))
@@ -214,15 +279,28 @@ def configure_pyspin_trigger(cam, PySpin=None, *, exposure_us: float,
     cam.TriggerMode.SetValue(PySpin.TriggerMode_On)
 
 
-def restore_free_run(cam, PySpin=None) -> None:  # pragma: no cover - bench only
+def restore_free_run(cam, PySpin=None) -> None:
     if PySpin is None:
         import PySpin  # noqa: N813
     cam.TriggerMode.SetValue(PySpin.TriggerMode_Off)
     cam.TLStream.StreamBufferHandlingMode.SetValue(PySpin.StreamBufferHandlingMode_NewestOnly)
 
 
-class PySpinTriggeredCamera:  # pragma: no cover - bench only
-    """grab_triggered() over an already-open PySpin camera `cam`."""
+def _is_timeout(e: BaseException, PySpin) -> bool:
+    """A SpinnakerException that is GetNextImage's grab timeout (and nothing
+    else: a lost camera or a stopped stream is an error, not 'no pulse')."""
+    code = getattr(PySpin, "SPINNAKER_ERR_TIMEOUT", -1011)
+    got = getattr(e, "errorcode", None)
+    if got is not None:
+        return int(got) == int(code)
+    return f"[{int(code)}]" in str(e)      # Spinnaker messages end with "[<code>]"
+
+
+class PySpinTriggeredCamera:
+    """grab_triggered() over an already-open PySpin camera `cam`. The caller
+    closes the camera: disarm() (EndAcquisition, TriggerMode Off), then
+    release() (drops this object's camera reference: PySpin refuses to release
+    its system while one is alive), then DeInit and the system release."""
 
     def __init__(self, cam, PySpin=None, *, exposure_us: float, source: str = "Line0"):
         if PySpin is None:
@@ -240,19 +318,43 @@ class PySpinTriggeredCamera:  # pragma: no cover - bench only
         self.cam.BeginAcquisition()
 
     def grab_triggered(self, timeout_ms: int):
+        """-> (image, frame id, timestamp ns). TimeoutError only for the grab
+        timeout; IncompleteFrame (with the frame id / timestamp when the camera
+        still gives them) for an image lost on USB; other camera errors raise."""
         try:
             img = self.cam.GetNextImage(int(timeout_ms))
         except self.PySpin.SpinnakerException as e:
-            raise TimeoutError(str(e)) from e
+            if _is_timeout(e, self.PySpin):
+                raise TimeoutError(str(e)) from e
+            raise
         try:
             if img.IsIncomplete():
-                raise RuntimeError(f"incomplete frame (status {img.GetImageStatus()})")
+                fid = t = status = None
+                try:
+                    fid, t = int(img.GetFrameID()), int(img.GetTimeStamp())
+                except Exception:  # noqa: BLE001 - not reported for this frame
+                    fid = t = None
+                try:
+                    status = img.GetImageStatus()
+                except Exception:  # noqa: BLE001 - status is only for the message
+                    pass
+                raise IncompleteFrame(f"incomplete frame (status {status})", fid, t)
             return img.GetNDArray().copy(), img.GetFrameID(), img.GetTimeStamp()
         finally:
             img.Release()
 
     def disarm(self) -> None:
+        """EndAcquisition (guarded: it may have ended already), then TriggerMode
+        Off - every time; safe to call again. Raises only when TriggerMode Off
+        (or the free-run buffering) cannot be set."""
+        if self.cam is None:
+            return
         try:
             self.cam.EndAcquisition()
-        finally:
-            restore_free_run(self.cam, self.PySpin)
+        except Exception:  # noqa: BLE001 - not acquiring (disarmed already)
+            pass
+        restore_free_run(self.cam, self.PySpin)
+
+    def release(self) -> None:
+        """Drop the camera reference (after disarm, before the system release)."""
+        self.cam = None

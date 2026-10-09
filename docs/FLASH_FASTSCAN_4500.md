@@ -234,7 +234,7 @@ Constraints: 1-bit exposure ≥ 235 µs, and exposure = period, or period − ex
 | **10 ms (default)** | **160 ms** | **0.48 s** | 5.07 ms | 1.5 |
 | 12 ms | 192 ms | 0.58 s | 7.07 ms | 1.9 |
 
-Use `--period-us`, `--camera-exposure-us`, `--camera-fps` and `--loops` to change them. The tool refuses a combination that could miss a slot. With a region of interest around the faces and the band, the camera runs much faster than 226 fps, which allows shorter periods. Keep the period in the GUI and the pack the same: the sorter takes the pattern period from the manifest.
+Use `--period-us`, `--camera-exposure-us`, `--camera-fps` and `--loops` to change them. A given camera exposure is used as given (3000 µs included); without one, soft sync uses 3000 µs and the hardware-triggered modes (`--trigger-mode trigout|external`) min(3000, pattern exposure − 1000) µs. The tool refuses a combination that could miss a slot. With a region of interest around the faces and the band, the camera runs much faster than 226 fps, which allows shorter periods. Keep the period in the GUI and the pack the same: the sorter takes the pattern period from the manifest.
 
 ## 7. Troubleshooting
 

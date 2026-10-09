@@ -64,7 +64,9 @@ scan --preset <...> fastscan-pack --trigger-mode trigout --period-us 5000  --lab
 scan --preset <...> fastscan-pack --trigger-mode trigout --period-us 4500  --label trig4p5ms
 ```
 
-The same builds are available as `python tools/make_flash_pack.py --fastscan --trigger-mode trigout --period-us 5000` (add `--zone-ring …` for a zone image). The optional 8-bit hybrid pack runs at ≥ 8.6 ms only: `scan flash-pack --period-us 10000`.
+The same builds are available as `python tools/make_flash_pack.py --fastscan --trigger-mode trigout --period-us 5000` (add `--zone-ring …` for a zone image). The optional 8-bit hybrid pack runs at a period of **≥ 8563 µs** only (8333 µs exposure + the 230 µs gap): `scan flash-pack --period-us 10000`. With only `--period-us`, its pattern exposure is period − 500 µs but never below 8333 µs, so every period from 8563 µs up builds.
+
+An explicit camera exposure (`--camera-exposure-us` / `--camera-exposure`) is written as given, 3000 µs included. Without one, a triggered 1-bit pack uses min(3000, pattern exposure − 1000) µs.
 
 Each pack's `manifest.json` records `timing.hardware_trigger`:
 
@@ -143,6 +145,8 @@ Sources and confidence:
 
 **Never connect the trigger to pin 3 (Line2 / 3.3 V out) or pin 4 (Line1 output).** Leave unused wires insulated.
 
+The software agrees: `--line` accepts **Line0** and **Line3** only, and Line1 / Line2 are refused before the camera is opened. Before it enables the trigger, the camera code selects the line, sets LineMode = Input where the camera lets it be written (Line3 is bidirectional on some models and may have been left an output by SpinView or another program), and refuses if the line does not read back as an input.
+
 ### Projector side: LightCrafter 4500 EVM output trigger connector J14
 
 | J14 pin | Signal |
@@ -165,7 +169,7 @@ Sources and confidence:
 
 ## 6. Pulse check — SOFTWARE (camera only)
 
-The sequence must be playing (step 3, Repeat on) and the wiring done (step 5).
+The sequence must be playing (step 3, Repeat on) **before** the command starts, and the wiring done (step 5).
 
 ```
 scan trigger-test --line Line0 --seconds 5 --expect-period-ms 10
@@ -174,17 +178,17 @@ scan trigger-test --line Line0 --seconds 5 --expect-period-ms 10
 The command:
 
 1. Puts the camera in hardware trigger on the line (FrameStart, RisingEdge, 1 ms exposure).
-2. Counts the triggered frames for 5 s. Timeouts count as zero.
-3. Prints the count, the rate (Hz), the period mean / std / min / max from the **camera timestamps**, the estimated missed pulses and frame-id gaps, and a verdict.
-4. **Always** sets TriggerMode back to Off.
+2. Counts the triggered frames for 5 s. A timeout (no frame within max(1 s, 3 periods)) and an incomplete frame (the trigger arrived, the image was lost on USB) are counted and the count goes on. Any other camera error stops the test with that error.
+3. Prints the count, the rate (Hz), the period mean / std / min / max from the **camera timestamps**, the estimated missed pulses, frame-id gaps, timeouts and incomplete frames, and a verdict.
+4. **Always** sets TriggerMode back to Off, then de-initialises the camera and releases it.
 
 Exit codes: 0 = OK, 1 = NO PULSES or RATE MISMATCH.
 
 | Verdict | Meaning / what to do |
 |---|---|
-| **OK** | The rate matches the GUI period and nothing was missed. Go to step 7. |
+| **OK** | Pulses arrived through the whole window at the GUI period: none missed, no timeout, no incomplete frame, and (with `--expect-period-ms`) about seconds / period of them. Go to step 7. |
 | **NO PULSES** | No trigger reached the camera. Check that the sequence plays, the J14 pin 2/3 wiring, the camera pins (Line0 = pin 2 + opto GND pin 5), and the level (J13 at 3.3 V). Then try `--line Line3` (pins 1 / 6) or a level shifter. |
-| **RATE MISMATCH** | The pulse period differs from the expected period (the GUI period differs from the pack), pulses are missed (level near the threshold, or a period too short for the camera), pulses come in doubles (ringing: shorten the wires, use a common ground), or frame ids skip (USB). |
+| **RATE MISMATCH** | The pulse period differs from the expected period (the GUI period differs from the pack), pulses are missed (level near the threshold, or a period too short for the camera), pulses come in doubles (ringing: shorten the wires, use a common ground), frame ids skip or frames arrive incomplete (USB), or the train **stopped or started late** (timeouts while pulses were arriving, or fewer pulses than the window holds at the expected period: Repeat off, Play pressed after the command started, an intermittent contact). |
 
 ## 7. First triggered scan at 10 ms — SOFTWARE
 
@@ -208,6 +212,12 @@ Check:
 - [ ] Repeat 3×: point count and plane rms are stable.
 
 Refusals: exit 2 with the reason (e.g. "got k of N frames", "frame ids jump", "spacing", "no sync_code frame stands out").
+
+**The optional 8-bit hybrid pack** (`scan flash-pack --period-us 10000`) is a sequence of 16 patterns (white, black, 10 code planes, 4 fringes) with no sync markers. The camera may arm anywhere in it, so the triggered frames are aligned on white and black before the decode:
+
+- **`--repeats 1`: Repeat off (Play Once).** Start the command, then press Play. After the 16 frames the camera waits a few periods for one more trigger. If one arrives, the sequence is still repeating and the scan is refused ("extra frame(s) … uncheck Repeat"). This check works on the real camera too.
+- **`--repeats N` (N > 1): Repeat on.** The frames may start mid-sequence. The start is found from the content: at nearly every lit pixel (≥ 90 %), the white frame must be the brightest and the black frame the darkest, at the positions the pack puts them. Exactly one start may fit, and every loop must show the same images (loop-to-loop rms ≤ 10 % of the white − black range). Otherwise the scan is refused (exit 2) and nothing is decoded or saved. TRIG_OUT_2 (sequence start) is not used.
+- The scan's `trigger.decode.align` records the start found (`start_seq`), the agreement of the best and second-best start, and the loop rms.
 
 ## 8. Step down: 5 ms, then 4.5 ms — HUMAN + SOFTWARE
 
@@ -234,7 +244,7 @@ The 1-bit fine level reads a constant offset of about 0.04 column against HDMI 8
 4. Run a normal HDMI scan to confirm.
 5. **Rollback** (only if the unit misbehaves): [§5.9](FLASH_FASTSCAN_4500.md). Upload the backup `.bin`, then Apply Solution with the `.ini`.
 
-The camera needs nothing: every command sets TriggerMode back to Off when it exits. If a crash leaves it on, the next normal scan reopens the camera with the preset settings. SpinView can also set TriggerMode Off.
+The camera needs nothing: every command sets TriggerMode back to Off when it exits, then drops its camera reference, de-initialises the camera and releases the camera system, in that order, so the next command or the web UI can open it again. If setting TriggerMode Off fails, the command reports it as an error. If a crash leaves it on, the next normal scan reopens the camera with the preset settings. SpinView can also set TriggerMode Off.
 
 ## Troubleshooting
 
@@ -244,24 +254,32 @@ The camera needs nothing: every command sets TriggerMode back to Off when it exi
 | NO PULSES, no pulses at J14 | Sequence not playing, Trigger Out 1 disabled, or the wrong connector | Play; Trigger Controls; check J14 on the silkscreen |
 | Line0 never fires, Line3 works | Opto ground (pin 5) not connected to EVM GND | Connect pin 5 to J14 pin 3 |
 | RATE MISMATCH, period = 2× expected | GUI period ≠ pack period, or every other pulse missed | Match the GUI to the pack; check the level |
+| RATE MISMATCH with timeouts, or "only N pulse(s) … expected" | The train stopped or started late: Repeat off, Play pressed after the command started, an intermittent contact | Repeat on, Play first; check the connector and the ground |
+| RATE MISMATCH, "incomplete frame(s)" | Image data lost on USB3 at this rate | USB3 port on its own controller, shorter cable, close SpinView; longer period |
 | Double pulses (period ≪ expected) | Ringing, long wires, no common ground | Short twisted pair, common ground |
+| Refused: trigger line Line2 / Line1 | Not a camera input (pin 3 is the 3.3 V aux output, pin 4 the opto output) | Wire Line0 (pin 2) or Line3 (pin 1), `--line Line0` / `Line3` |
+| Refused: line "does not read back as an input" | The camera keeps the line as an output | Reset the line in SpinView (LineMode Input) or use Line0 |
 | scan-trigger: "frame ids jump" | Camera dropped frames (USB, buffers) or the period is at the camera's limit | Longer period; dedicated USB3 port |
 | scan-trigger: "spacing" | The GUI timing differs from the pack's manifest | Use the pack built for the period the GUI runs |
 | scan-trigger: "no sync_code frame stands out" | Not the fast-scan loop, or the trigger is not one frame per pattern | Check the sequence rows (procedure.txt), Trigger Out 1 polarity, plane check |
 | scan-trigger: black not darkest | Wrong plane order in the GUI | Plane check (FLASH_FASTSCAN_4500.md §5.4) |
+| scan-trigger (8-bit): "extra frame(s)" with `--repeats 1` | Repeat is on | Play Once, or use `--repeats 2` or more |
+| scan-trigger (8-bit): "no start … puts white brightest and black darkest" | Another sequence or row order in the GUI, Invert Pattern ticked, or not one frame per pattern | Enter the rows from `procedure.txt` in order, untick Invert Pattern; run trigger-test |
+| scan-trigger (8-bit): "starts of the sequence fit" | The camera sees too little of the pattern field to tell where the sequence starts | Point the camera at more of the projected field |
+| scan-trigger (8-bit): "loops do not show the same images" | The GUI sequence is not the pack's 16 patterns, or the scene moved | Match the GUI rows to the pack; keep the part still |
 | Refused: no stereo calibration | Rule 6 | `calibrate-stereo` at this geometry first |
 
 ## Not verified yet
 
-- Nothing in this document has run on the rig: not the PySpin trigger code path, the pulse levels, the opto drive current, or the 4.5 ms limit.
+- Nothing in this document has run on the rig: not the PySpin trigger code path, the pulse levels, the opto drive current, or the 4.5 ms limit. The PySpin code path (trigger setup, line-mode check, grab, cleanup order) is tested only against a fake PySpin module that enforces Spinnaker's ordering rules; the node names `LineSelector` / `LineMode` and the exception's `errorcode` attribute are from the installed wrapper, not yet exercised on the camera.
 - FLIR pin table: verified on the Blackfly S family page only. The cable wire colours are not checked against the actual cable.
 - TI J14 / J13 pinout: from DLPU011E. Its applicability to the 4500 MKII board revision is not checked.
 - The camera's full-frame rate under hardware trigger with TriggerOverlap = ReadOut (226 fps is FLIR's free-run figure).
 
 ## Code
 
-- `engine/capture/hwtrigger.py`: pulse statistics and verdict, pulse counting, 1-bit loop alignment, and the fake triggered camera.
-- `engine/reconstruct/trigger_scan.py`: `trigger_test`, `scan_trigger` (camera-only context manager; TriggerMode Off in `finally`).
-- `engine/capture/patternmode.py`: `TriggeredSequenceCapture` guards, the PySpin trigger setup.
-- `tools/make_flash_pack.py`: `triggered_timing`, `trigger_timing_errors`, `fastscan_triggered_timing`, `--trigger-mode`, `--period-us`.
-- Tests: `tests/test_trigger_fullspeed_mock.py`.
+- `engine/capture/hwtrigger.py`: pulse statistics and verdict, pulse counting, 1-bit loop alignment, 8-bit sequence alignment (`align_sequence`), and the fake triggered camera.
+- `engine/reconstruct/trigger_scan.py`: `trigger_test`, `scan_trigger` (camera-only context manager; in `finally`: TriggerMode Off, camera reference dropped, DeInit, system released, rig lock released).
+- `engine/capture/patternmode.py`: `TriggeredSequenceCapture` guards (including the extra-frame grab), the PySpin trigger setup (`require_input_line`, `configure_pyspin_trigger`, `PySpinTriggeredCamera`).
+- `tools/make_flash_pack.py`: `triggered_timing`, `trigger_timing_errors`, `fastscan_triggered_timing`, `default_pattern_exposure_us`, `--trigger-mode`, `--period-us`, `--camera-exposure-us`.
+- Tests: `tests/test_trigger_fullspeed_mock.py`, `tests/test_trigger_pyspin_mock.py` (the real-camera path against `tests/fake_pyspin.py`).

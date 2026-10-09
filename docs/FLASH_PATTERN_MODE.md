@@ -15,7 +15,7 @@ This is the separate, explicitly entered, guarded mode from ENGINE_ARCHITECTURE 
 | Per pattern | about 0.35 s hold plus averaging | 4.5 to 8.8 ms |
 | One axis (16 patterns) | about 15 s | about 0.14 s (flash, uniform timing) |
 
-The DMD can run 1-bit patterns at kHz rates, but the camera is the limit. A full-frame Blackfly S Mono8 tops out at about 226 fps, so the pattern period stays at 4.5 ms or more. In practice the rate is about 110 to 200 patterns per second. Averaging is gone: each pattern is one exposure. To get SNR back, repeat the sequence and average in software. That is not built yet.
+The DMD can run 1-bit patterns at kHz rates, but the camera is the limit. A full-frame Blackfly S Mono8 tops out at about 226 fps, so the pattern period stays at 4.5 ms or more. In practice the rate is about 110 to 200 patterns per second. Averaging is gone: each pattern is one exposure. To get SNR back, repeat the sequence and average in software: `scan-trigger --repeats N` (docs/TRIGGER_FULLSPEED_TEST.md) does this.
 
 ## Files
 
@@ -49,7 +49,7 @@ Timing rules are checked by `validate_timing` (DLPU010G §2.4.3.4.3):
 
 These are the suggested values:
 
-- **Flash, uniform timing:** exposure 8333 µs, period 8833 µs. Set the camera ExposureTime to 8433 µs. The extra 100 µs sits inside the dark gap, so the camera integrates the whole PWM sequence of an 8-bit fringe.
+- **Flash, uniform timing:** exposure 8333 µs, period 8833 µs. Set the camera ExposureTime to 8433 µs. The extra 100 µs sits inside the dark gap, so the camera integrates the whole PWM sequence of an 8-bit fringe. The shortest legal 8-bit period is 8563 µs (8333 + 230). With `--period-us` alone the exposure is period − 500 µs, never below 8333 µs.
 - **Flash, variable timing (Mode 3):** 1-bit patterns use 4000/4500 µs.
 - **Video port:** Mode 4 (VSYNC, variable exposure). Each frame carries at most 3 one-bit patterns (the camera is the limit) or 2 eight-bit patterns. That makes 6 frames, about 100 ms. The camera exposure is 150 µs shorter than the pattern exposure.
 
@@ -77,17 +77,18 @@ These are the suggested values:
 ## 3. Trigger wiring and camera
 
 - **Projector:** in Trigger Controls, set Trigger Out 1 to normal polarity (active high) with 0 delay. TRIG_OUT_1 is high for the length of each pattern's exposure.
-- **Wiring:** connect TRIG_OUT_1 to the camera's **Line0** (opto-isolated input on the GPIO cable) and connect the grounds. **Check the voltage levels before wiring.** This has not been verified on this rig. If the opto input does not register the EVM's trigger level, use a level shifter or the non-isolated Line3 (`source="Line3"`).
+- **Wiring:** connect TRIG_OUT_1 to the camera's **Line0** (opto-isolated input on the GPIO cable) and connect the grounds. **Check the voltage levels before wiring.** This has not been verified on this rig. If the opto input does not register the EVM's trigger level, use a level shifter or the non-isolated Line3 (`source="Line3"`). Only Line0 and Line3 are accepted: Line1 is the opto output and Line2 is GPIO pin 3, the 3.3 V auxiliary output (docs/TRIGGER_FULLSPEED_TEST.md §5).
 - **Camera:** set these nodes in SpinView, or with `patternmode.configure_pyspin_trigger(cam, exposure_us=...)`, in this order:
   1. TriggerMode Off
-  2. TriggerSelector FrameStart
-  3. TriggerSource Line0
-  4. TriggerActivation RisingEdge
-  5. TriggerOverlap ReadOut
-  6. ExposureMode Timed
-  7. ExposureTime
-  8. StreamBufferHandlingMode **OldestFirst**, with the buffer count at N+8 or more
-  9. TriggerMode On
+  2. LineSelector = the trigger line, LineMode **Input** (written where the camera allows it; the code refuses a line that does not read back as an input)
+  3. TriggerSelector FrameStart
+  4. TriggerSource Line0
+  5. TriggerActivation RisingEdge
+  6. TriggerOverlap ReadOut
+  7. ExposureMode Timed
+  8. ExposureTime
+  9. StreamBufferHandlingMode **OldestFirst**, with the buffer count at N+8 or more
+  10. TriggerMode On
 
   The free-run path uses NewestOnly. Here every frame counts, so the buffer must be OldestFirst.
 - **Start order:** arm the camera first (BeginAcquisition), then press Play in the GUI.
@@ -99,7 +100,11 @@ from engine.capture import patternmode as pm
 cam = pm.PySpinTriggeredCamera(pyspin_cam, exposure_us=manifest["timing"]["uniform"]["camera_exposure_us"])
 cap = pm.TriggeredSequenceCapture(cam, manifest, acknowledge=pm.ACK_PHRASE).capture()
 field = basis.decode(cap.frames_for("x"), geometry_id)
+cam.disarm()      # EndAcquisition (if still running) + TriggerMode Off; safe to repeat
+cam.release()     # drop the camera reference before DeInit and the system release
 ```
+
+`scan-trigger` (`engine/reconstruct/trigger_scan.py`) does all of this, closes the camera in that order (TriggerMode Off, reference dropped, DeInit, system released), and aligns the frames first (below).
 
 `TriggeredSequenceCapture` refuses to run in these cases:
 
@@ -110,16 +115,19 @@ field = basis.decode(cap.frames_for("x"), geometry_id)
 After capture it raises `MissingFrames` in these cases:
 
 - The first trigger does not arrive within 30 s, or a later one within about 10 periods.
+- A frame arrives incomplete (image data lost on USB3).
 - Frame IDs jump.
 - Trigger spacing is more than ±50 % off the manifest period.
-- Extra frames arrive, for example because the sequence was left on repeat.
+- Extra frames arrive, for example because the sequence was left on repeat. After the N frames the camera waits max(250 ms, 3 periods) for one more trigger, so this works on a camera that reports no pending-frame count (the real one).
 
-The frames go through the existing `HybridBasis.decode` unchanged. The mock test shows that the triggered decode is identical to the video-path decode.
+`TriggeredSequenceCapture` takes the frames in trigger order. With Repeat off and Play pressed after the camera is armed, that is the manifest order. When the sequence loops (Repeat on), the camera can arm anywhere in it: `scan-trigger` then finds the start from the white and black frames (`hwtrigger.align_sequence`: exactly one start must put white at the per-pixel maximum and black at the minimum, and every loop must show the same images) and refuses when it cannot prove it.
+
+The aligned frames go through the existing `HybridBasis.decode` unchanged. The mock test shows that the triggered decode is identical to the video-path decode.
 
 ## 5. Risks
 
 - **Changing the display mode is the blue-lines failure.** Switching Video to Pattern Sequence and back makes the DLPC350 re-acquire its input. With the marginal CVT-RB 912x1140 HDMI timing, it can drop to the internal test pattern, and so far only a power cycle recovers it. Read `docs/HDMI_TIMING_FIX.md` first. Fix the HDMI timing with standard CVT before trying the video-port variant. The flash variant does not need HDMI during the sequence, but switching back to video mode can still hit the same failure.
 - **Flashing can brick the EVM** if the upload is interrupted or the base `.bin` is wrong. Keep the backup.
-- **Polarity:** the HDMI path lands inverted (`invert: true`) and pattern mode may not. The decode measures polarity from white and black on every capture, so either works.
-- **Single exposure per pattern:** there is no averaging, so noise is about 2.8x the 8-average HDMI scan. Clipped-fringe handling (`sat_level`) still applies.
-- **Not yet built:** `api.py` has no verb for pattern mode, there is no LED-current handling in pattern mode, TRIG_OUT_2 (sequence start) is not used for alignment, and there is no software averaging over repeats.
+- **Polarity:** the HDMI path lands inverted (`invert: true`), while pattern mode shows the mirrors directly. The decode measures polarity from white and black on every capture, but the triggered scan's alignment needs white brighter than black: a sequence played with Invert Pattern ticked is refused.
+- **Single exposure per pattern:** without `--repeats`, noise is about 2.8x the 8-average HDMI scan. Clipped-fringe handling (`sat_level`) still applies.
+- **Not yet built:** there is no LED-current handling in pattern mode, and TRIG_OUT_2 (sequence start) is not used: the alignment uses the frames' content (white and black).

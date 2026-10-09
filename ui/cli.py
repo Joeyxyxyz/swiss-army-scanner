@@ -57,6 +57,9 @@ from engine.library import presets as preset_lib  # noqa: E402
 from engine.capture.hwtrigger import TRIGGER_LINES  # noqa: E402
 
 DEFAULT_PRESET = "cell_wall_2p7ft_vstripe"   # fringes vertical in camera, projector right
+TRIGGER_LINE_HELP = ("camera input the trigger is wired to: Line0 = opto-isolated "
+                     "input (GPIO pin 2), Line3 = non-isolated input (pin 1); never "
+                     "pin 3 (Line2, the 3.3 V auxiliary output)")
 EXIT_OK, EXIT_NOT_OK, EXIT_REFUSED, EXIT_NOT_AVAILABLE = 0, 1, 2, 3
 EXIT_ERROR = 4                  # an unexpected error, for commands whose exit 1 is a verdict
 VALIDATION_DIMS = "106.95,56.5,21.9"        # §11 object, H,W,L mm
@@ -2849,6 +2852,9 @@ def cmd_trigger_test(ctx):
             ["expected", f"{r['expect_period_ms']:g} ms" if r.get("expect_period_ms") else "-"],
             ["missed (est.)", "-" if r.get("missed_pulses") is None else str(r["missed_pulses"])],
             ["frame-id gaps", str(r["frame_id_gaps"])], ["timeouts", str(r["timeouts"])],
+            ["incomplete", str(r.get("incomplete_frames", 0))],
+            ["expected count", "-" if r.get("expected_count") is None
+             else str(r["expected_count"])],
             ["TriggerMode", f"{r['trigger_mode_restored']} (restored)"]])
     ctx.warn(r.get("notes"))
     return (EXIT_OK if r["verdict"] == "OK" else EXIT_NOT_OK), r
@@ -4295,7 +4301,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--axes", choices=("x", "y"), default="x", help="one axis per pack")
     p.add_argument("--video-port", action="store_true")
     p.add_argument("--label")
-    p.add_argument("--period-us", type=int, help="uniform pattern period, us (8-bit >= ~8563)")
+    p.add_argument("--period-us", type=int, help="uniform pattern period, us (8-bit >= 8563)")
     p.add_argument("--pattern-exposure-us", type=int, help="pattern exposure, us")
     p.add_argument("--trigger-mode", choices=("trigout", "external"),
                    help="DLPC350 timer + TRIG_OUT_1 (default) or external TRIG_IN_1")
@@ -4318,7 +4324,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--period-us", type=int, help="pattern period, us (default 10000; triggered "
                                                   "full frame >= 4425)")
     p.add_argument("--pattern-exposure-us", type=int, help="pattern exposure (default = period)")
-    p.add_argument("--camera-exposure", type=int, metavar="US", help="camera exposure, us")
+    p.add_argument("--camera-exposure", type=int, metavar="US",
+                   help="camera exposure, us (default: soft sync 3000; triggered min(3000, "
+                        "pattern exposure - 1000))")
     p.add_argument("--trigger-mode", choices=("freerun", "trigout", "external"),
                    help="freerun = soft sync (default); trigout / external = TRIG_OUT_1 -> "
                         "camera (docs/TRIGGER_FULLSPEED_TEST.md)")
@@ -4344,7 +4352,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "at a sharp projector; default off)")
     p = cmd("trigger-test", cmd_trigger_test, "EXPERIMENTAL: count hardware trigger pulses at "
                                               "the camera (camera only)", "the trigger test")
-    p.add_argument("--line", default="Line0", choices=("Line0", "Line2", "Line3"))
+    p.add_argument("--line", default="Line0", choices=TRIGGER_LINES,
+                   help=TRIGGER_LINE_HELP)
     p.add_argument("--seconds", type=float, default=5.0)
     p.add_argument("--expect-period-ms", type=float, help="the GUI's Pattern Period, ms")
     p.add_argument("--exposure", type=float, default=1000.0, metavar="US",
@@ -4355,7 +4364,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("label", nargs="?", default="trigger")
     p.add_argument("--pack", metavar="DIR", required=True, help="the pack the GUI plays")
     p.add_argument("--variant", choices=("full", "zone"), help="fast-scan pack image played")
-    p.add_argument("--line", default="Line0", choices=("Line0", "Line2", "Line3"))
+    p.add_argument("--line", default="Line0", choices=TRIGGER_LINES,
+                   help=TRIGGER_LINE_HELP)
     p.add_argument("--repeats", type=_positive_int, default=1, help="loops to average")
     p.add_argument("--exposure", type=float, metavar="US", help="camera exposure (default: "
                                                                "the pack's)")

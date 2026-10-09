@@ -11,8 +11,9 @@ one full frame per pattern.
                      stats, missed pulses, verdict NO PULSES | RATE MISMATCH | OK
     scan_trigger()   N triggered frames per loop (TriggeredSequenceCapture: missing /
                      extra frames, spacing +-50 %, first-trigger timeout) -> aligned
-                     (1-bit: sync markers; 8-bit: trigger order) -> the existing
-                     decoders -> 'plane' triangulation -> a metric scan
+                     (1-bit: sync markers; 8-bit: white / black, refused unless exactly
+                     one start fits) -> the existing decoders -> 'plane' triangulation
+                     -> a metric scan
 
 Rule 1: nothing here imports or sends a DLPC350 USB / HID command, and the HDMI
 projector window is never opened. Rule 6: the stereo calibration is checked
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import json
 import time
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -50,14 +52,43 @@ def _mfp():
     return make_flash_pack
 
 
+def _drop_frames(e: Optional[BaseException]) -> None:
+    """Clear the locals of the finished frames an exception (and its causes) holds:
+    a frame of the PySpin calls keeps the camera alive, and PySpin refuses to release
+    its system while a reference to the camera exists."""
+    seen = set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        traceback.clear_frames(e.__traceback__)
+        e = e.__cause__ or e.__context__
+
+
+def _deinit_camera(real) -> None:
+    """EndAcquisition and DeInit, each step on its own (as camera._release_driver
+    does): the triggered capture has ended acquisition already, and the seed driver's
+    close() runs both in ONE try, so its EndAcquisition would raise and skip DeInit.
+    The driver's close() then drops its camera and releases the system."""
+    drv = getattr(real, "_drv", None)
+    for step in ("EndAcquisition", "DeInit"):
+        try:
+            if getattr(drv, "_cam", None) is not None:
+                getattr(drv._cam, step)()
+        except Exception:                   # noqa: BLE001 - not acquiring / de-inited already
+            pass
+
+
 @contextmanager
 def triggered_camera(s, preset, *, line: str, exposure_us: float, mock_factory=None):
     """The hardware-triggered camera, and nothing else of the rig. mock: mock_factory()
     (or bench.trigger_sim, a dict of FakeTriggeredCamera fields: {"pulses": False},
     {"period_us": 5000}, ...). real: the rig lock, the Blackfly S opened by the engine's
-    RealCamera, PySpinTriggeredCamera on `line`; its disarm() puts TriggerMode Off back,
-    and the camera is closed in any case. The projector is never opened."""
+    RealCamera, PySpinTriggeredCamera on `line`. On the way out, always and in this
+    order: EndAcquisition + TriggerMode Off (disarm), every reference to the camera
+    dropped, DeInit, the camera's system released (RealCamera.close), the rig lock
+    released. A TriggerMode Off that fails is raised (noted on the error that is
+    already propagating). The projector is never opened."""
     rules.check_scan_path_usb_free()
+    hwtrigger.check_line(line)
     if s.mock:
         cam = mock_factory() if mock_factory is not None else hwtrigger.FakeTriggeredCamera(
             **(getattr(s.bench, "trigger_sim", None) or {}))
@@ -65,8 +96,7 @@ def triggered_camera(s, preset, *, line: str, exposure_us: float, mock_factory=N
             cam.configure_trigger(line, exposure_us)
             yield cam
         finally:
-            if cam.armed:
-                cam.disarm()
+            cam.disarm()                     # TriggerMode Off, always
         return
     from ..capture.camera import open_camera
     from ..capture.riglock import RigLock
@@ -83,12 +113,29 @@ def triggered_camera(s, preset, *, line: str, exposure_us: float, mock_factory=N
         primary = e
         raise
     finally:
+        off_error = None
         if tc is not None:
             try:
-                tc.disarm()                  # EndAcquisition + TriggerMode Off
-            except Exception:                # noqa: BLE001 - the close below resets it
-                pass
-        _release_rig(real, None, lock, primary)
+                tc.disarm()                  # EndAcquisition (guarded) + TriggerMode Off
+            except Exception as e:           # noqa: BLE001 - reported after the release
+                off_error = e
+            tc.release()                     # drop the camera reference
+        tc = None
+        _drop_frames(primary)
+        _drop_frames(off_error)
+        try:
+            _deinit_camera(real)
+            _release_rig(real, None, lock, primary if primary is not None else off_error)
+        finally:
+            real = None
+        if off_error is not None:
+            note = (f"camera TriggerMode Off failed: {type(off_error).__name__}: {off_error} - "
+                    "the next normal scan resets it, or set it in SpinView")
+            if primary is not None:
+                if hasattr(primary, "add_note"):
+                    primary.add_note(note)
+            else:
+                raise RuntimeError(note) from off_error
 
 
 # ---------------------------------------------------------------- trigger test
@@ -117,13 +164,15 @@ def trigger_test(s, preset, line: str = "Line0", seconds: float = 5.0,
                           mock_factory=factory) as cam:
         cam.arm(64)
         try:
-            ts, ids, timeouts = hwtrigger.count_pulses(cam, seconds, timeout_ms=timeout_ms)
+            ts, ids, timeouts, incomplete = hwtrigger.count_pulses(cam, seconds,
+                                                                   timeout_ms=timeout_ms)
         finally:
             cam.disarm()                     # TriggerMode Off, always
     r = hwtrigger.trigger_stats(ts, ids, seconds=seconds, expect_period_ms=expect_period_ms,
-                                timeouts=timeouts)
+                                timeouts=timeouts, incomplete=incomplete)
     r.update({"line": line, "exposure_us": float(exposure_us), "mock": s.mock,
-              "trigger_mode_restored": "Off", "wall_s": round(time.perf_counter() - t0, 3)})
+              "timeout_ms": timeout_ms, "trigger_mode_restored": "Off",
+              "wall_s": round(time.perf_counter() - t0, 3)})
     return r
 
 
@@ -201,9 +250,18 @@ def scan_trigger(s, preset, pack, variant: Optional[str] = None, label: str = "t
         if axes != ["x"]:
             raise ValueError(f"the pack codes axes {axes}: the plane triangulation needs the "
                              "column axis alone (make_flash_pack --axes x)")
-        names = [e["name"] for e in sorted(m["sequence"], key=lambda e: e["seq"])]
+        seq = sorted(m["sequence"], key=lambda e: e["seq"])
+        names = [e["name"] for e in seq]
         if variant is not None:
             raise ValueError("--variant is for fast-scan packs")
+        if sorted(int(e["basis_index"]) for e in seq) != list(range(len(seq))):
+            raise ValueError("the pack's basis indices are not 0..N-1 for one axis")
+        # HybridBasis order: basis index 0 = white, 1 = black
+        roles = [e.get("role") or {0: "white", 1: "black"}.get(int(e["basis_index"]))
+                 for e in seq]
+        if roles.count("white") != 1 or roles.count("black") != 1:
+            raise ValueError("the pack needs one white and one black pattern: the triggered "
+                             "frames are aligned on them")
     pack_geo = m.get("geometry_id")
     if pack_geo and pack_geo != preset.geometry_id:
         warnings.append(f"the pack was made for geometry {pack_geo!r}, the preset is "
@@ -227,10 +285,12 @@ def scan_trigger(s, preset, pack, variant: Optional[str] = None, label: str = "t
         seed = int(s.bench._rng.integers(0, 2**31 - 1))
 
         def factory():                       # the simulated human pressed Play
+            # a looping sequence (Repeat on) is caught anywhere in the loop; one pass
+            # (Repeat off) starts at its first pattern
             return hwtrigger.mock_scene_camera(s.bench, pats, P,
                                                exposure_us=tm["camera_exposure_us"],
-                                               repeat=onebit or repeats > 1,
-                                               start=None if onebit else 0, seed=seed)
+                                               repeat=onebit or repeats > 1, start=None,
+                                               seed=seed)
     t_all = time.perf_counter()
     with triggered_camera(s, preset, line=line, exposure_us=tm["camera_exposure_us"],
                           mock_factory=factory) as cam:
@@ -281,14 +341,16 @@ def scan_trigger(s, preset, pack, variant: Optional[str] = None, label: str = "t
                 warnings.append(f"pack preset {m['preset']!r} not found; decoding with "
                                 f"{preset.name!r}'s bases")
         basis = from_preset_bases(pr.bases, axis="x")
-        by_name = {e["name"]: e["basis_index"] for e in m["sequence"]}
-        acc = [np.zeros((H, W), np.float64) for _ in range(n)]
-        for k, f in enumerate(cap.frames):
-            acc[by_name[names[k % n]]] += f
-        frames = [(a / repeats).astype(np.float32) for a in acc]
+        # the camera may arm anywhere in a looping sequence: the start is proven from
+        # the content (white brightest, black darkest; loops identical) or refused
+        images, arep = hwtrigger.align_sequence(cap.frames, roles, repeats)
+        frames = [None] * n
+        for e, im in zip(seq, images):
+            frames[int(e["basis_index"])] = im
         fld = basis.decode(frames, preset.geometry_id, contrast_min=preset.decode.contrast_min,
                            conf_min=preset.decode.conf_min)
-        dec = {"basis": "hybrid (8-bit pack)", "order": "trigger order = manifest seq"}
+        dec = {"basis": "hybrid (8-bit pack)", "order": "aligned on white / black",
+               "align": arep}
         steps, periods, parity = None, None, None
     decode_s = round(time.perf_counter() - t0, 3)
     t0 = time.perf_counter()

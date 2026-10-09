@@ -11,18 +11,44 @@ its parameters, units and defaults.
 
 | type | what it measures | key parameters (units in the names) | reuses |
 |---|---|---|---|
-| `presence` | part present / absent: points at least `min_height_mm` above the reference plane cover `min_area_pct` of the zone | `expect` present / absent, `min_height_mm`, `min_area_pct`, `min_valid_pct` (an unseen zone is INVALID, never "absent") | the part frame |
+| `presence` | part present / absent: points at least `min_height_mm` above the reference plane cover `min_area_pct` of the zone's whole extent | `expect` present / absent, `min_height_mm`, `min_area_pct`, `min_valid_pct`, `min_points` (an unseen zone is INVALID, never "absent": see coverage below) | the part frame |
 | `position` | alignment vs the golden part: in-plane offset (centroid), rotation about the plane normal (principal axis), height offset | `tol_mm`, `tol_deg`, `tol_height_mm`, `min_height_mm` | the recipe's golden scan |
-| `height` | a statistic of the zone's heights vs the reference plane, or vs another zone (`ref: "zone:<id>"`: a step, the height difference of two faces) | `nominal_mm` + `tol_mm`, or `band_mm` [lo, hi]; `stat` median / mean / p95 / p5 / max / min | |
-| `flatness` | robust plane fit: peak-to-valley between the trimmed percentiles, RMS | `tol_mm`, `rms_tol_mm`, `trim_pct`, `min_height_mm` | `engine/measure/endface/profile.robust_plane` |
-| `defect` | local dents / bumps. `face` mode (circle zone = an end face): the MF-CFAR matched-filter detector, self-referenced; `local` mode: residual vs the zone's own smooth surface, connected blobs | `depth_mm`, `min_area_mm2`, `mode` auto / face / local, `sign`, `smooth_mm`, `z_thresh` | `engine/measure/endface/mfcfar.py` |
-| `edge` | the part's long edge: sub-pixel edge in the flood image (or the height map), robust line fit in the part frame; straightness, and position / angle vs the golden | `side` top / bottom / both, `straightness_tol_mm`, `position_tol_mm`, `angle_tol_deg` | the camber prototype's edge method |
+| `height` | a statistic of the zone's heights vs the reference plane, or vs another zone (`ref: "zone:<id>"`: a step, the height difference of two faces); headline `deviation_mm` = height - the band's centre, limit = the band's half width | `nominal_mm` + `tol_mm`, or `band_mm` [lo, hi]; `stat` median / mean / p95 / p5 / max / min | |
+| `flatness` | robust plane fit: peak-to-valley between the trimmed percentiles, RMS. "Flat" needs coverage (see below) | `tol_mm`, `rms_tol_mm`, `trim_pct`, `min_height_mm`, `min_valid_pct` | `engine/measure/endface/profile.robust_plane` |
+| `defect` | local dents / bumps. `face` mode (circle zone = an end face): the MF-CFAR matched-filter detector, self-referenced; `local` mode: residual vs the zone's own smooth surface, connected blobs. "No defect" needs coverage (see below) | `depth_mm`, `min_area_mm2`, `mode` auto / face / local, `sign`, `smooth_mm`, `z_thresh`, `min_valid_pct`, `max_gap_mm2` | `engine/measure/endface/mfcfar.py` |
+| `edge` | the part's long edge(s): sub-pixel edge in the flood image (or the height map), robust line fit in the part frame; straightness, and position / angle vs the golden (lines compared undirected) | `side` top / bottom / both (every side asked for must be measured, in the scan and the golden), `straightness_tol_mm`, `position_tol_mm`, `angle_tol_deg` | `engine/recipes/checks/builtin.py` `edge_points` (gradient-peak profiles across the part, parabolic sub-pixel) |
 | `code` | a barcode / QR / Data Matrix in the zone: the codes read under DMD light before the scan (`scan.codes: true`), else the zone of the flood image decoded | `expect`, `pattern` (regex), `kind`, `min_count` | `engine/sense/codes.py` |
 
-Verdict rules: a check that cannot measure (too few points, no golden, no image) answers
-**INVALID**; a check that raises is recorded as INVALID with its error (a bug is never a
-verdict). A zone is FAIL when any of its checks fails, else INVALID when any is invalid,
-else PASS; the run the same over its zones.
+Verdict rules: a check that cannot measure (too few points, too little of the zone measured,
+no golden, no image) answers **INVALID**; a check that raises, or answers anything but a
+`CheckResult` with PASS / FAIL / INVALID, is recorded as INVALID with its error (a bug is
+never a verdict). A zone is FAIL when any of its checks fails, else PASS when every check
+passed, else INVALID; the run the same over its zones.
+
+Coverage is judged over a zone's whole extent in its OWN units, as cells (`engine/recipes/
+geometry.Coverage`): camera px for camera_px; native DMD px, binned to the camera's sampling,
+for projector_px; part-frame (u, v) mm at half the camera's sampling for part_mm. A cell is
+seen when a measured camera px falls in it (its own px, its decoded DMD px, or its (u, v)).
+Whatever of the zone is off the camera image, occluded (a tall object outside the zone hides
+it), in shadow or undecoded (a dark part), at whatever depth, is a cell nothing falls in:
+unseen. An unmeasured part never enters a part_mm or projector_px zone's points, so only its
+unseen cells show that it may be there. `presence` calls a zone "not present" (absent, or a
+missing part) only when even every unseen cell counted as part would stay under
+`min_area_pct`, and at least `min_valid_pct` was measured; `defect` local calls a zone clean
+only when at least `min_valid_pct` (70 %) of its inspected extent (less what was measured
+below `min_height_mm`) was measured and no unseen region of the zone - enclosed by measured
+points or not: a dropout reaching the zone border, the part edge or a glint streak counts -
+can hold a round defect of `max_gap_mm2` (default `min_area_mm2`); a thin streak that cannot
+hold one does not stop a PASS. `flatness` calls a zone flat only with `min_valid_pct` (70 %)
+of that extent measured. Otherwise INVALID; a defect or a warp that was found stays a FAIL.
+So draw a defect zone inside the face it inspects: a zone reaching over a projector shadow
+beside a raised part is INVALID (the shadow could hide a defect).
+
+Golden (`golden.scan`, for `position` and the `edge` golden tolerances): a golden recorded
+by `scan recipe-golden` (by its label; `latest` = the newest golden of this recipe at this
+geometry) or a metric scan named by its exact id. Never the scan being checked, never a plain
+metric scan matched by label (an earlier run's test scan carries the part's label), never
+one made at other geometry-bound settings or with another stereo calibration: INVALID.
 
 ## The context a check reads
 
@@ -85,10 +111,15 @@ Rules of thumb:
 
 - **Units in every name**: values `..._mm`, `..._deg`, `..._mm2`, `..._pct`, `n_...`;
   parameters declare `unit=`. The result's `units` are derived from the names.
-- `key` + `limit` name the headline number: the run's `deviation_mm` / `threshold_mm` (and the
-  operator page's key number) is the mm value closest to, or furthest past, its limit.
-- `fault_points`: `{"px": [x, y]}` camera px or `{"xyz_mm": [x, y, z]}`; the projector draws a
-  cross at each one of a FAIL check, on the surface the camera saw there.
+- `key` + `limit` name the headline number, in deviation semantics: a deviation and its
+  tolerance (|value| > limit is out of tolerance; not an absolute height against a band
+  edge). The run's `deviation_mm` / `threshold_mm` (and the operator page's key number)
+  come from a FAILing check when there is one (the largest |value| / limit among them),
+  else from the mm value closest to its limit.
+- `fault_points`: `{"px": [x, y]}` camera px or `{"xyz_mm": [x, y, z]}` (camera frame, mm:
+  the runner projects it to camera px); the projector draws a cross at each one of a FAIL
+  check, on the surface the camera saw there. A point that cannot be placed is listed in the
+  check's warnings, never dropped silently.
 - Answer INVALID, never PASS, when the data cannot support a verdict.
 - `needs = ("golden",)` (or `needs_for()`) makes the validator demand `golden.scan`.
 - `check_params(cls, p)` (classmethod) for cross-parameter rules; `zone_refs()` returns the
@@ -105,4 +136,8 @@ max_height = "my_line_checks.height:MaxHeight"
 ```
 
 A plugin that fails to load is listed in `engine.recipes.checks.LOAD_ERRORS`, not fatal.
-A check id is registered once: another class under a taken id is refused.
+A check id is registered once: another class under a taken id is refused. The built-in ids
+(`engine.recipes.checks.BUILTIN_IDS`) are reserved, so a plugin can never take one, whatever
+the import order or thread; the first registry read loads the built-ins and checks they are
+all there (a failed import is retried whole). No lock is held while a module imports, so a
+plugin module must not read the registry (`get` / `available`) while it is being imported.

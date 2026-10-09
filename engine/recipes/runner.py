@@ -9,10 +9,19 @@ Recipe runner: preset -> scan -> zones -> checks -> verdict -> run folder -> pro
                   it), run_end in the log
     run_recipe()  the whole thing in a NEW run folder (api.recipe_run)
 
-Verdict: any check FAIL -> FAIL (a trusted measurement found a bad part); else any INVALID ->
-INVALID (never a pass: no stereo calibration at the preset's geometry, a scan made under
-another calibration, a zone with too few points, no golden scan, ...); else PASS. A check that
-raises is INVALID with its error (a bug is never a verdict).
+Verdict: any check FAIL -> FAIL (a trusted measurement found a bad part); else every check
+PASS -> PASS; anything else -> INVALID (never a pass: no stereo calibration at the preset's
+geometry, a scan made under another calibration or other rig settings, a zone with too few
+points, no golden scan, ...). A check that raises, or answers anything but a CheckResult
+with PASS / FAIL / INVALID, is INVALID with its error (a bug is never a verdict).
+
+Golden (the good part position / edge compare with): only a GOLDEN entry, made by
+scan_golden (`scan recipe-golden`, api.recipe_golden) and recorded in
+<library>/recipe_golden/<geometry_id>/, or a metric scan named by its exact id. golden.scan
+'latest' = the newest golden recorded for THIS recipe at this geometry; a label = the
+newest golden entry with that label. Never the scan being checked, never a plain metric scan
+picked by label or 'latest' (an earlier run's own test scan carries the same label), never
+one made at other geometry-bound settings or with another stereo calibration.
 
 result.json = the run schema (engine/runs.py) + `recipe` (name, preset, frame, result code),
 `zones` [{id, verdict, checks: [{id, type, verdict, values (units in the names), key, limit,
@@ -23,6 +32,7 @@ camera -> DMD fit residuals, crosses, text, image file).
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -31,24 +41,30 @@ import numpy as np
 from .. import config, rules
 from .. import runs as R
 from . import feedback as FB
+from .checks.base import VERDICTS, CheckResult
 from .context import CheckContext, GoldenView
 from .geometry import ScanView, ZoneError, frame_for, resolve_zone
 
-CALIBRATE_STEREO_HOWTO = ("calibrate it first: `scan charuco` (print at 100 %, caliper a "
-                          "square), `scan calib-pose` per board pose (12-20, tilted +-30 deg), "
-                          "then `scan calibrate-stereo --square MM` (mock: `scan --mock "
-                          "calibrate-stereo --mock-poses 12`)")
+CALIBRATE_STEREO_HOWTO = ("calibrate it first, with the preset this run uses: `scan "
+                          "--preset {preset} charuco` (print at 100 %, caliper a square), `scan "
+                          "--preset {preset} calib-pose` per board pose (12-20, tilted +-30 "
+                          "deg), then `scan --preset {preset} calibrate-stereo --square MM` "
+                          "(mock: `scan --mock --preset {preset} calibrate-stereo --mock-poses "
+                          "12`)")
 FEEDBACK_IMAGE = "feedback_dmd.png"
 FEEDBACK_PHOTO = "feedback_photo.png"
 OVERLAY_IMAGE = "overlay.png"
 ORDER = {"PASS": 0, "INVALID": 1, "FAIL": 2}
+GOLDEN_KIND = "recipe_golden"           # <library>/recipe_golden/<geometry_id>/<ts>_<recipe>/
 
 
 def aggregate(verdicts) -> str:
+    """FAIL if any is exactly FAIL; PASS only when every one is exactly PASS; anything else
+    (INVALID, nothing, an unknown or misspelt verdict) is INVALID: fail closed."""
     v = list(verdicts)
     if "FAIL" in v:
         return "FAIL"
-    if "INVALID" in v or not v:
+    if not v or any(x != "PASS" for x in v):
         return "INVALID"
     return "PASS"
 
@@ -74,6 +90,100 @@ def _find_metric(s, key: str, geometry_id: str):
         return hits[0]
     raise LookupError(f"no metric scan {k!r} at geometry {geometry_id}"
                       + (f" ({len(hits)} ids contain it: give more of the id)" if hits else ""))
+
+
+# ------------------------------------------------------------------ golden scans
+
+def record_golden(s, recipe, preset, ms) -> Path:
+    """Record the metric scan `ms` (a GOOD part) as a golden of `recipe`: an append-only
+    entry recipe_golden/<geometry_id>/<ts>_<recipe>/meta.json naming the scan, its label,
+    rig fingerprint and stereo calibration. Only recorded goldens (or an exact scan id) can
+    be a recipe's golden. -> the entry folder."""
+    from ..library.store import json_safe
+    rules.require_same_geometry(ms.geometry_id, preset.geometry_id, "recipe golden")
+    d = s.store.new_dir(GOLDEN_KIND, ms.geometry_id, label=recipe.name)
+    meta = {"kind": GOLDEN_KIND, "recipe": recipe.name, "scan_id": ms.id, "label": ms.label,
+            "geometry_id": ms.geometry_id,
+            "geometry_fp": (ms.meta or {}).get("geometry_fp"),
+            "calibration_id": ms.calibration_id, "preset": preset.name,
+            "created": datetime.now().isoformat(timespec="seconds")}
+    with s.store.filling(d):
+        s.store.write_json(d / "meta.json", json_safe(meta))
+    return d
+
+
+def scan_golden(s, recipe, preset, label: str):
+    """Scan a GOOD part with the recipe's scan settings and record it as the recipe's golden
+    (record_golden). -> MetricScan"""
+    ms = _scan(s, recipe, preset, label, None, {"capture": {"average": None}}, False)
+    record_golden(s, recipe, preset, ms)
+    return ms
+
+
+def list_goldens(store, geometry_id: str) -> list:
+    """The golden entries at this geometry, oldest first: [meta (+ "entry": folder)]."""
+    from ..library.store import read_meta
+    out = []
+    for d in store.entries(GOLDEN_KIND, geometry_id):
+        m = read_meta(d)
+        if m is None or m.get("kind") != GOLDEN_KIND or not m.get("scan_id"):
+            continue                        # unreadable / half-written: never a golden
+        out.append({**m, "entry": d})
+    return out
+
+
+def find_golden(s, recipe, geometry_id: str, key=None, exclude=()):
+    """The recipe's golden scan -> MetricScan, or LookupError saying why.
+
+    key (default golden.scan): 'latest' / 'last' = the newest golden recorded for this
+    recipe at this geometry; else the newest golden entry whose label (or scan id) is key;
+    else the metric scan whose id is exactly key. A golden entry whose scan was trashed is
+    skipped. Refused when the scan is one of `exclude` (the scan being checked: a part is
+    never compared with itself)."""
+    from ..reconstruct import metric_scan
+    key = (recipe.golden or {}).get("scan") if key is None else key
+    k = str(key or "").strip()
+    if not k:
+        raise LookupError("the recipe names no golden scan (golden.scan)")
+    scans = {x.id: x for x in metric_scan.list_metric(s.store, geometry_id)}
+    gold = [g for g in list_goldens(s.store, geometry_id) if g["scan_id"] in scans]
+    if k.lower() in ("latest", "last"):
+        hits = [g for g in gold if g.get("recipe") == recipe.name]
+        if not hits:
+            raise LookupError(f"no golden recorded for recipe {recipe.name} at geometry "
+                              f"{geometry_id}")
+        ms = scans[hits[-1]["scan_id"]]
+    else:
+        hits = [g for g in gold if g.get("label") == k or g["scan_id"] == k]
+        if hits:
+            ms = scans[hits[-1]["scan_id"]]
+        elif k in scans:
+            ms = scans[k]                   # an explicit scan id: the integrator's choice
+        else:
+            plain = [x for x in scans.values() if x.label == k]
+            raise LookupError(
+                f"no golden {k!r} at geometry {geometry_id}"
+                + (f" ({len(plain)} metric scan(s) carry that label, but none was recorded as "
+                   "a golden: a test scan is never a golden; name one by its full id)"
+                   if plain else ""))
+    if ms.id in set(exclude):
+        raise LookupError(f"the golden {ms.id} is the scan being checked: a part is never "
+                          "compared with itself")
+    return ms
+
+
+def _same_setup(ms, preset, fp, cal, what: str) -> None:
+    """A stored metric scan must come from THIS rig setup: the preset's geometry-bound
+    settings (fingerprint) and the run's stereo calibration (GeometryMismatch otherwise)."""
+    diffs = rules.fingerprint_diffs((ms.meta or {}).get("geometry_fp"), fp)
+    if diffs:
+        raise rules.GeometryMismatch(
+            f"{what}: scan {ms.id} was made at other rig settings than preset {preset.name} "
+            f"({'; '.join(diffs)}): re-scan it at these settings")
+    if ms.calibration_id != cal.id:
+        raise rules.GeometryMismatch(
+            f"{what}: scan {ms.id} was triangulated with stereo calibration "
+            f"{ms.calibration_id}, this run uses {cal.id}: re-scan it")
 
 
 def _scan(s, recipe, preset, label: str, log, res, pattern_mode_ack: bool):
@@ -124,7 +234,8 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
     if cal is None:
         res["calibration"]["same_geometry"] = False
         res["invalid_reason"] = (f"no stereo calibration for geometry {preset.geometry_id} (these "
-                                 f"rig settings), so no mm (rule 6): {CALIBRATE_STEREO_HOWTO}")
+                                 f"rig settings), so no mm (rule 6): "
+                                 + CALIBRATE_STEREO_HOWTO.format(preset=preset.name))
         log.event("refused", level="warning", reason=res["invalid_reason"])
         return state
     res["calibration"].update(calibration_id=cal.id, same_geometry=True)
@@ -155,6 +266,7 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
         metric_scan.check_cal(s, ms, "recipe_run")               # rule 6 at use time
         res["capture"]["patterns"] = f"stored metric scan ({(ms.meta or {}).get('method', '?')})"
         res["warnings"].append(f"offline: checks run on the stored scan {ms.id} (nothing captured)")
+    _same_setup(ms, preset, fp, cal, "recipe_run scan")      # this preset's settings + calibration
     res["part"]["scan_id"] = ms.id
     res["calibration"]["calibration_id"] = ms.calibration_id
     res["warnings"] += [str(w) for w in (ms.meta or {}).get("warnings") or []]
@@ -179,7 +291,7 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
             res["warnings"].append(f"zone {z.id}: {e}")
     golden, gerr = None, None
     if "golden" in recipe.needs:
-        golden, gerr = _golden(s, recipe, preset, cal)
+        golden, gerr = _golden(s, recipe, preset, cal, exclude=(ms.id,))
         if gerr:
             res["warnings"].append(f"golden: {gerr}")
     zres = []
@@ -239,24 +351,59 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
             info["refused"] = f"{type(e).__name__}: {e}"
         if info.get("refused"):
             res["warnings"].append(f"feedback not projected: {info['refused']}")
+        elif info.get("frame"):
+            res["warnings"].append(f"feedback: {info['frame']['why']}: the whole DMD field is "
+                                   f"framed {info['frame']['verdict']}")
     res["feedback"] = info
     log.event("verdict", result=verdict, zones={z["id"]: z["verdict"] for z in zres},
               feedback_rendered=info["rendered"])
     return state
 
 
+def _invalid_check(message: str) -> dict:
+    return {"verdict": "INVALID", "values": {}, "units": {}, "key": None, "limit": None,
+            "message": message, "fault_points": [], "warnings": [], "details": {}}
+
+
 def _run_check(c, ctx) -> dict:
     t0 = time.perf_counter()
     try:
         r = c.check.run(ctx)
+        if not isinstance(r, CheckResult):
+            raise TypeError(f"run() returned {type(r).__name__}, not a CheckResult")
         d = r.to_dict()
+        if d.get("verdict") not in VERDICTS:        # e.g. set after construction
+            raise ValueError(f"verdict {d.get('verdict')!r} is not one of {', '.join(VERDICTS)}")
+        d["fault_points"], warn = _fault_px(d.get("fault_points") or [], ctx)
+        d["warnings"] = list(d.get("warnings") or []) + warn
     except Exception as e:                  # noqa: BLE001 - a crashing check is never a verdict
-        d = {"verdict": "INVALID", "values": {}, "units": {}, "key": None, "limit": None,
-             "message": f"the check failed: {type(e).__name__}: {e}", "fault_points": [],
-             "warnings": [], "details": {}}
+        d = _invalid_check(f"the check failed: {type(e).__name__}: {e}")
     d = {"id": c.id, "type": c.type, **d, "params": dict(c.check.p),
          "duration_s": round(time.perf_counter() - t0, 3)}
     return _clean(d)
+
+
+def _fault_px(faults: list, ctx) -> tuple:
+    """Every fault point gets its camera px (the projector's cross and the overlay mark
+    need one): {"xyz_mm": [x, y, z]} (camera frame) is projected with the calibration's
+    intrinsics. -> (fault points, warnings for those that could not be placed)."""
+    out, warn = [], []
+    for fp in faults:
+        fp = dict(fp)
+        if fp.get("px") is None and fp.get("xyz_mm") is not None:
+            try:
+                px = ctx.px_of(fp["xyz_mm"])
+                if not all(np.isfinite(px)):
+                    raise ValueError("projects to no camera px")
+                fp["px"] = px
+            except (TypeError, ValueError) as e:
+                warn.append(f"fault point {fp.get('label', '')!r} at xyz_mm {fp['xyz_mm']}: "
+                            f"{e}: not marked")
+        elif fp.get("px") is None:
+            warn.append(f"fault point {fp.get('label', '')!r} has neither px nor xyz_mm: "
+                        "not marked")
+        out.append(fp)
+    return out, warn
 
 
 def _clean(o):
@@ -285,35 +432,53 @@ def _invalid_reason(zres: list) -> str:
 
 
 def _headline(res: dict, zres: list, ms) -> None:
-    """deviation_mm / threshold_mm: the mm value closest to (or furthest past) its limit."""
-    best = None
+    """deviation_mm / threshold_mm: a check's key value in deviation semantics (a deviation
+    and its tolerance: |value| > limit is out). A FAILing check always outranks a passing
+    one; among them the largest |value| / limit. A FAIL run whose failing checks carry no
+    mm value names the failing check with no number (never a passing check's)."""
+    best, failed = None, None
     for z in zres:
         for ch in z["checks"]:
+            if ch.get("verdict") not in ("PASS", "FAIL"):
+                continue
+            if ch["verdict"] == "FAIL" and failed is None:
+                failed = f"{z['id']}/{ch['id']}"
             k, lim = ch.get("key"), ch.get("limit")
             v = (ch.get("values") or {}).get(k) if k else None
-            if v is None or lim in (None, 0) or not str(k).endswith("_mm"):
+            if v is None or lim is None or not str(k).endswith("_mm"):
                 continue
-            ratio = abs(float(v)) / abs(float(lim))
-            if best is None or ratio > best[0]:
-                best = (ratio, float(v), float(lim), f"{z['id']}/{ch['id']} {k}")
+            try:
+                v, lim = float(v), float(lim)
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(v) and np.isfinite(lim)) or lim <= 0:
+                continue
+            rank = (ch["verdict"] == "FAIL", abs(v) / lim)
+            if best is None or rank > best[0]:
+                best = (rank, v, lim, f"{z['id']}/{ch['id']} {k}")
     res["deviation_units"] = "mm"
     n = int((ms.meta or {}).get("n_points") or 0) or None
-    if best is not None:
+    if best is not None and (failed is None or best[0][0]):
         res["deviation_mm"].update(max=round(best[1], 5), method=f"recipe {best[3]}", n_points=n)
         res["threshold_mm"] = best[2]
+    elif failed is not None:
+        res["deviation_mm"].update(method=f"recipe {failed} (FAIL, no mm value)", n_points=n)
     else:
         res["deviation_mm"].update(method="recipe (no mm check)", n_points=n)
 
 
-def _golden(s, recipe, preset, cal) -> tuple:
-    """-> (GoldenView, None) or (None, why)."""
+def _golden(s, recipe, preset, cal, exclude=()) -> tuple:
+    """-> (GoldenView, None) or (None, why). The golden: find_golden (never one of
+    `exclude`, the run's own scan), at this preset's geometry-bound settings and made with
+    the run's stereo calibration `cal`."""
     from ..reconstruct import metric_scan
     key = (recipe.golden or {}).get("scan")
     if not key:
         return None, "the recipe names no golden scan (golden.scan)"
     try:
-        g = _find_metric(s, key, preset.geometry_id)
+        g = find_golden(s, recipe, preset.geometry_id, key, exclude=exclude)
         metric_scan.check_cal(s, g, "recipe golden")
+        _same_setup(g, preset, config.geometry_fingerprint(preset), cal, "recipe golden")
     except (LookupError, rules.RuleViolation) as e:
         return None, (f"golden scan {key!r}: {e} - scan a GOOD part with `scan recipe-golden "
                       f"{recipe.name}`")
@@ -372,7 +537,9 @@ def run_recipe(s, recipe, preset, *, runs_dir, operator_confirmed: bool = False,
                run_name: Optional[str] = None, mock_place: Optional[Callable] = None,
                pattern_mode_ack: bool = False, label: Optional[str] = None,
                tier: Optional[str] = None) -> dict:
-    """One recipe run in a NEW run folder -> {run_id, run_dir, result, exit_code}."""
+    """One recipe run in a NEW run folder -> {run_id, run_dir, result, exit_code}. On the real
+    rig it needs operator_confirmed, except an offline re-check: a stored `scan` with no
+    projected feedback captures and projects nothing (the rig is never opened)."""
     run_id, run_dir = R.new_run(runs_dir, run_name or recipe.name)
     res = R.empty_result(run_id=run_id, run_folder=str(run_dir), mock=s.mock,
                          operator_confirmed=operator_confirmed, station=run_name or recipe.name,
@@ -386,9 +553,11 @@ def run_recipe(s, recipe, preset, *, runs_dir, operator_confirmed: bool = False,
     try:
         log.event("run_start", station=res["station"], mode=res["mode"], job="recipe",
                   recipe=recipe.name, preset=preset.name, operator_confirmed=operator_confirmed)
-        if not s.mock and not operator_confirmed:
+        offline = scan is not None and not project_feedback
+        if not s.mock and not operator_confirmed and not offline:
             raise rules.RuleViolation("the real rig needs a human to confirm the physical setup "
-                                      "first (part placed, rig untouched): operator_confirmed")
+                                      "first (part placed, rig untouched): operator_confirmed "
+                                      "(a stored scan re-checked without feedback needs none)")
         state = execute(s, recipe, preset, res=res, log=log, run_dir=run_dir, scan=scan,
                         mock_place=mock_place, pattern_mode_ack=pattern_mode_ack, label=label)
         if res.get("recipe") is not None and tier:

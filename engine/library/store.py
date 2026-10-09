@@ -15,6 +15,8 @@ Filesystem library (§5): timestamped, append-only. Nothing overwrites.
                                                     frames + meta.json naming the metric scans
     <root>/face_golden/<geometry_id>/<ts>_<label>/  golden end faces: golden.npz + meta.json
     <root>/station_golden/<geometry_id>/<ts>_<label>/  station goldens: golden.json + meta.json
+    <root>/recipe_golden/<geometry_id>/<ts>_<recipe>/  recipe goldens: meta.json naming the
+                                                    GOOD part's metric scan
     <root>/presets/<name>/                          user presets: preset.json + meta.json;
                                                     presets/active.jsonl = the selected one
     <root>/sessions/<ts>/                           log.jsonl
@@ -61,7 +63,7 @@ OUTPUT_KINDS = ("pointclouds", "defects", "measurements", "codes", "spectral", "
 INDEX_FIELDS = ["time", "kind", "label", "geometry_id", "file", "source"]
 ENTRY_KINDS = ("bases", "objects", "calibrations", "readings", "spectral", "banks", "maps",
                "sensors", "atlases", "calib_poses", "metric", "dentsets", "faces", "facescans",
-               "face_golden", "station_golden", "presets", "recipes")
+               "face_golden", "station_golden", "recipe_golden", "presets", "recipes")
 
 LIBRARY_README = """# Swiss Army Scanner library
 
@@ -78,7 +80,8 @@ Written by the engine. Nothing here is overwritten; "delete" moves entries to tr
 | faces/<geometry_id>/ | located end faces (locate_face): face plane, centre, rim circle, camera face mask, camera -> DMD affine + aim ring |
 | facescans/<geometry_id>/ | targeted end-face scans: the face DMD mask, polar pattern frames, meta.json names the repeat metric scans |
 | face_golden/<geometry_id>/ | golden end faces (face_golden): golden.npz (MF radial profile, reflectance FIR coefficients, golden + band maps) + meta.json (detector settings; bound to geometry, face diameter, stereo calibration) |
-| station_golden/<geometry_id>/ | station goldens (station_golden): golden.json (nominal cell height differences, spacings, cooling-tube zone heights, the zone model + numbering, user-set limits) + meta.json (bound to geometry, stereo calibration) |
+| station_golden/<geometry_id>/ | station goldens (station_golden): golden.json (nominal end-face positions and height differences, spacings, tube zone heights, the zone model + numbering, user-set limits) + meta.json (bound to geometry, stereo calibration) |
+| recipe_golden/<geometry_id>/ | recipe goldens (scan recipe-golden): meta.json names the GOOD part's metric scan, its label, recipe, rig fingerprint and stereo calibration; only these (or an exact scan id) can be a recipe's golden |
 | readings/ | barcode / QR reading frames + codes.json |
 | spectral/ | spectral captures (cube.npz R/G/B signal, meta.json), materials/<name>/<ts>.json signature versions, light/ direct-global separations |
 | output/ | THE OUTPUT BIN - every result by kind; output/index.csv lists them all |
@@ -369,7 +372,8 @@ def json_safe(o):
 _ENTRY_DEPTH = {"bases": 3, "objects": 2, "calibrations": 3, "readings": 2,
                 "spectral": 2, "banks": 3, "maps": 3, "sensors": 3, "atlases": 3,
                 "calib_poses": 3, "metric": 3, "dentsets": 3, "faces": 3, "facescans": 3,
-                "face_golden": 3, "station_golden": 3, "presets": 2, "recipes": 2}
+                "face_golden": 3, "station_golden": 3, "recipe_golden": 3, "presets": 2,
+                "recipes": 2}
 _SPECTRAL_SUBDIRS = ("materials", "light")      # spectral/<sub>/<entry>
 _ENTRY_MARKERS = {"bases": ("meta.json", "field.npz"),
                   "objects": ("meta.json", "field.npz", "relief.npz"),
@@ -382,6 +386,7 @@ _ENTRY_MARKERS = {"bases": ("meta.json", "field.npz"),
                   "facescans": ("meta.json", "masks.npz"),
                   "face_golden": ("meta.json", "golden.npz"),
                   "station_golden": ("meta.json", "golden.json"),
+                  "recipe_golden": ("meta.json",),
                   "presets": ("preset.json", "meta.json"),
                   "recipes": ("recipe.json", "meta.json"),
                   "readings": ("codes.json", "full_on.png"),

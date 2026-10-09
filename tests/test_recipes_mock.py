@@ -21,6 +21,7 @@ from engine import api, recipes
 from engine.recipes import schema
 from engine.recipes.checks.base import Check, CheckResult, Param
 from engine.recipes.context import CheckContext, GoldenView
+from engine.recipes import runner
 from engine.recipes.geometry import ScanView, part_frame, resolve_zone
 from engine.recipes.runner import aggregate
 
@@ -433,7 +434,8 @@ def lib(tmp_path_factory):
         p = api.load_preset("bench_9in_metric")
         scans = {k: RS.oracle_scan(s, p, f"scene:{k}", k.replace(":", "_"), seed=i).id
                  for i, k in enumerate(("box_lid", "box_lid:ajar", "tube:misaligned"))}
-        RS.oracle_scan(s, p, "scene:tube", "ribbed_tube_alignment_golden", seed=9)
+        g = RS.oracle_scan(s, p, "scene:tube", "ribbed_tube_alignment_golden", seed=9)
+        runner.record_golden(s, api.recipe_load("ribbed_tube_alignment"), p, g)   # recipe-golden
         scans["box_lid:x"] = RS.oracle_scan(s, p, "scene:box_lid", "box_x_only", axis="x").id
     finally:
         api._session = None
@@ -620,6 +622,37 @@ def test_real_rig_without_confirmation_is_refused(tmp_path):
     res = out["result"]
     assert res["mode"] == "REAL" and res["result"] == "INVALID" and out["exit_code"] == 2
     assert "confirm" in res["invalid_reason"]
+    assert "PySpin" not in sys.modules and "hid" not in sys.modules
+
+
+def test_real_rig_offline_recheck_of_a_stored_scan_needs_no_confirmation(tmp_path):
+    """docs/PORTING.md: `recipe-run NAME --scan ID --no-feedback` re-checks a stored scan
+    offline. On the real rig it was refused without --operator-confirmed (and with the flag
+    and feedback on, the stored scan's verdict was painted on whatever part is there now).
+    A stored scan with no feedback captures and projects nothing: no confirmation needed;
+    feedback still needs it. Nothing opens the camera or the projector."""
+    from engine import config as cfg
+    from ui import cli
+    s = api.configure(tmp_path / "lib", mock=True)              # build the scan offline
+    p = cfg.load_preset("bench_9in_metric", presets_dir=s.presets_dir, store=s.store,
+                        mock=False)                                # the REAL geometry id
+    RS.truth_calibration(s, p)
+    ms = RS.oracle_scan(s, p, "scene:box_lid", "stored_lid")
+    api._session = None
+    api.configure(tmp_path / "lib", mock=False)
+    out = api.recipe_run("box_lid", scan=ms.id, project_feedback=False,
+                         runs_dir=tmp_path / "runs")
+    res = out["result"]
+    assert res["mode"] == "REAL" and res["result"] == "PASS", res.get("invalid_reason")
+    out = api.recipe_run("box_lid", scan=ms.id, project_feedback=True, runs_dir=tmp_path / "runs")
+    assert out["exit_code"] == 2 and "confirm" in out["result"]["invalid_reason"]
+    api._session = None
+    argv = ["--library", str(tmp_path / "lib"), "--json", "recipe-run", "box_lid", "--scan",
+            ms.id, "--runs-dir", str(tmp_path / "runs")]
+    assert cli.main(argv + ["--no-feedback"]) == 0
+    api._session = None
+    assert cli.main(argv) == cli.EXIT_REFUSED                    # feedback on: confirm first
+    api._session = None
     assert "PySpin" not in sys.modules and "hid" not in sys.modules
 
 

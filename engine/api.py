@@ -477,7 +477,8 @@ def recipe_run(recipe, preset: Optional[Preset] = None, operator_confirmed: bool
     outline PASS, red fill + crosses FAIL; hold_s, default the recipe's; ABORT clears it).
     scan: a stored metric scan (id / label / latest / handle) to check offline instead of
     capturing. runs_dir default: $SCANNER_RUNS_DIR, the recipe's outputs.runs_dir, else
-    <library>/runs. The real rig needs operator_confirmed. mock_scene (MOCK only):
+    <library>/runs. The real rig needs operator_confirmed (not an offline re-check: a stored
+    scan with project_feedback False touches no rig). mock_scene (MOCK only):
     'scene:<name>[:<variant>]' placed first (engine/capture/mock_scenes.py).
     -> {run_id, run_dir, result (the result.json document), exit_code}"""
     from .recipes import library as recipe_lib
@@ -504,9 +505,12 @@ def recipe_run(recipe, preset: Optional[Preset] = None, operator_confirmed: bool
 @_verb
 def recipe_golden(recipe, preset: Optional[Preset] = None, label: Optional[str] = None,
                   mock_scene: Optional[str] = None):
-    """Scan a GOOD part with the recipe's scan settings as its golden reference: the metric
-    scan is labelled golden.scan (or `label`, default <recipe>_golden), so recipe_run finds it
-    by that label (newest wins). Refused without a stereo calibration (rule 6). -> MetricScan"""
+    """Scan a GOOD part with the recipe's scan settings and record it as the recipe's golden:
+    the metric scan is labelled golden.scan (or `label`, default <recipe>_golden) and recorded
+    as a golden of this recipe (recipe_golden/<geometry_id>/: its label, recipe, rig
+    fingerprint and stereo calibration). recipe_run finds it by that label (newest golden
+    wins) or by golden.scan 'latest' (the newest golden of THIS recipe), never a plain metric
+    scan with the same label. Refused without a stereo calibration (rule 6). -> MetricScan"""
     from .recipes import runner
     s = _engine()
     r = recipe_load(recipe)
@@ -519,7 +523,7 @@ def recipe_golden(recipe, preset: Optional[Preset] = None, label: Optional[str] 
             raise ValueError("mock_scene is MOCK ONLY: physical steps on the real rig are human")
         from .capture import mock_scenes
         mock_scenes.place(s.bench, mock_scene)
-    return runner._scan(s, r, p, lab, None, {"capture": {"average": None}}, False)
+    return runner.scan_golden(s, r, p, lab)
 
 
 @_verb
@@ -1939,6 +1943,7 @@ def list_library(kind: str = "bases", geometry_id: Optional[str] = None) -> list
     'dentsets' (dent-detector captures) | 'faces' (located end faces) |
     'facescans' (targeted end-face scans) | 'face_golden' (golden end faces) |
     'station_golden' (station goldens: cylinders + ribbed tube) |
+    'recipe_golden' (recipe goldens recorded by recipe_golden, oldest first) |
     'outputs' (the output bin index; the 2nd argument filters by output kind) |
     'incomplete' (half-written base/object entries the listings skip; move
     them to trash/ with delete(path))."""
@@ -1950,6 +1955,10 @@ def list_library(kind: str = "bases", geometry_id: Optional[str] = None) -> list
         raise ValueError(f"geometry_id must be one id [A-Za-z0-9_.-], got {geometry_id!r}")
     if kind == "incomplete":
         return s.store.incomplete_entries()
+    if kind == "recipe_golden":
+        from .recipes import runner
+        geos = [geometry_id] if geometry_id else s.store.geometry_ids(runner.GOLDEN_KIND)
+        return [g for geo in geos for g in runner.list_goldens(s.store, geo)]
     if kind == "materials":
         from .sense import spectral as m
         return m.list_materials(s)

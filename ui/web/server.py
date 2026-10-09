@@ -618,8 +618,10 @@ VERBS: dict = {
                     "project_feedback": "bool (default true)",
                     "hold_s": "feedback hold, s (default the recipe's)",
                     "mock_scene": "MOCK ONLY: scene:<name>[:<variant>] placed first"}),
-    "recipe_golden": ("Scan a GOOD part with a recipe's scan settings as its golden reference "
-                      "(labelled the recipe's golden.scan).",
+    "recipe_golden": ("Scan a GOOD part with a recipe's scan settings and record it as the "
+                      "recipe's golden (labelled the recipe's golden.scan; recipe_run uses only "
+                      "recorded goldens - newest wins, 'latest' = this recipe's newest - or an "
+                      "exact scan id).",
                       {"recipe": "recipe name", "mock_scene": "MOCK ONLY: scene:<name>[:<variant>]"}),
     "recipe_feedback": ("Paint a recipe run's verdict on the part again (its feedback_dmd.png) for "
                         "hold_s; cancel the job (or any station command) to clear it.",
@@ -3004,15 +3006,17 @@ class App:
 
     def _v_recipe_run(self, a):
         name = self.check_recipe_name(_s(a, "recipe", required=True))
-        confirmed = _bool(a, "operator_confirmed")
-        if not self.mock and not confirmed:
-            raise rules.RuleViolation("the real rig needs the operator's confirmation of the "
-                                      "physical setup (part placed, rig untouched)")
+        confirmed = _confirmed(a, "operator_confirmed")
         scan = _s(a, "scan_id")
+        fb = _bool(a, "project_feedback", True)
+        if not self.mock and not confirmed and not (scan is not None and not fb):
+            raise rules.RuleViolation("the real rig needs the operator's confirmation of the "
+                                      "physical setup (part placed, rig untouched); a stored "
+                                      "scan_id re-checked with project_feedback false needs none")
         if scan is not None:
             self._entry("metric", scan)
         out = api.recipe_run(name, operator_confirmed=confirmed,
-                             project_feedback=_bool(a, "project_feedback", True), scan=scan,
+                             project_feedback=fb, scan=scan,
                              hold_s=_num(a, "hold_s"), mock_scene=self._mock_scene(a))
         res, run_dir = out["result"], Path(out["run_dir"])
         self._runs[res["run_id"]] = run_dir

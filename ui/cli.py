@@ -850,13 +850,15 @@ def cmd_recipe_run(ctx):
     a = ctx.args
     r = _recipe_arg(ctx)
     preset = ctx.preset() if a.preset_given else None
-    if not ctx.mock and not a.operator_confirmed:
+    want_fb = r.feedback["enabled"] and not a.no_feedback
+    offline = bool(a.scan) and not want_fb          # a stored scan, nothing projected: no rig
+    if not ctx.mock and not a.operator_confirmed and not offline:
         raise CLIError("the real rig needs a human to confirm the physical setup first (part "
-                       "placed, rig untouched): pass --operator-confirmed")
+                       "placed, rig untouched): pass --operator-confirmed (a stored scan "
+                       "re-checked offline: --scan ID --no-feedback, no confirmation needed)")
     if a.pattern_mode_set_by_human and r.scan["kind"] != "trigger":
         raise CLIError("--pattern-mode-set-by-human is only for scan.kind trigger recipes")
     scene = None if a.scan else _recipe_mock_scene(ctx, r)
-    want_fb = r.feedback["enabled"] and not a.no_feedback
     if want_fb and not ctx.json:
         ctx.say(f"[{'MOCK' if ctx.mock else 'REAL RIG'}] recipe {r.name} (preset "
                 f"{preset.name if preset else r.preset}); the verdict is projected on the part "
@@ -3812,8 +3814,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pattern-mode-set-by-human", action="store_true",
                    help="scan.kind trigger only: a HUMAN put the projector in pattern mode")
     p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a FAIL verdict (1)
-    p = cmd("recipe-golden", cmd_recipe_golden, "scan a GOOD part with a recipe's scan settings "
-            "as its golden reference (labelled the recipe's golden.scan)", "the recipe golden")
+    p = cmd("recipe-golden", cmd_recipe_golden, "scan a GOOD part with a recipe's scan settings, "
+            "recorded as the recipe's golden (labelled the recipe's golden.scan; golden.scan "
+            "latest = the newest golden of this recipe)", "the recipe golden")
     p.add_argument("recipe", nargs="?", help="recipe name or file (default: the selected recipe)")
     p.add_argument("--label", help="scan label (default the recipe's golden.scan)")
     cmd("paths", cmd_paths, "where the library, output bin and presets live")

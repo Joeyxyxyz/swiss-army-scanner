@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 import re
 import warnings
+from typing import Optional
 
 import numpy as np
 
@@ -55,7 +56,12 @@ def _part(ctx, min_height_mm, zone=None, golden=False):
 @register
 class Presence(Check):
     """Part present (or absent): a point is 'part' when it stands at least min_height_mm
-    above the reference plane; PRESENT when part points cover min_area_pct of the zone."""
+    above the reference plane; PRESENT when part points cover min_area_pct of the zone's
+    whole extent (in the zone's own units: camera px, DMD px or part-frame mm; see
+    geometry.Coverage). NOT present is a verdict only when even the unseen extent (off the
+    image, occluded, shadowed or undecoded), all counted as part, could not make it present
+    (and at least min_valid_pct of the zone was measured): else INVALID, an unseen part is
+    not an absent one."""
     id = "presence"
     title = "Part present / absent in the zone"
     params = {
@@ -64,28 +70,60 @@ class Presence(Check):
         "min_height_mm": Param("number", 2.0, "mm", min=0, open_min=True,
                                doc="a point counts as part this far above the reference plane"),
         "min_area_pct": Param("number", 30.0, "pct", min=0, max=100, open_min=True,
-                              doc="part points as % of the zone's camera px for PRESENT"),
+                              doc="part as % of the zone's whole extent for PRESENT"),
         "min_valid_pct": Param("number", 10.0, "pct", min=0, max=100,
                                doc="an ABSENT reading needs at least this % of the zone measured "
                                    "(else INVALID: unseen is not absent)"),
+        "min_points": Param("int", 30, "count", min=1,
+                            doc="fewer measured points in the zone: INVALID"),
     }
 
     def run(self, ctx) -> CheckResult:
         p, z = self.p, ctx.zone
-        if z.n_px == 0:
-            return CheckResult.invalid(f"zone {z.id} covers no camera px in this scan")
+        cov = z.cover
         h = ctx.heights()
-        part = h >= p["min_height_mm"]
-        part_pct = 100.0 * float(part.sum()) / z.n_px
-        valid_pct = 100.0 * z.n_valid / z.n_px
+        ys, xs = ctx.index()
+        is_part = h >= p["min_height_mm"]
+        n_part = int(is_part.sum())
+        if cov is not None:                  # over the zone's whole extent, in its own units
+            n_cells = int(cov.zmask.sum())
+            if n_cells == 0:
+                return CheckResult.invalid(f"zone {z.id} has no extent on this scan")
+            sel = np.zeros(z.valid.shape, bool)
+            sel[ys[is_part], xs[is_part]] = True
+            part_pct = 100.0 * int(cov.hits(sel).sum()) / n_cells
+            cover = 100.0 * int(cov.seen.sum()) / n_cells
+            part_max_pct = min(part_pct + 100.0 - cover, 100.0)   # every unseen cell = part
+        else:
+            if z.n_px == 0:
+                return CheckResult.invalid(f"zone {z.id} covers no camera px in this scan")
+            part_pct = 100.0 * n_part / max(z.n_px, 1)
+            cover = part_max_pct = None
+        part_pct = min(part_pct, 100.0)
         present = part_pct >= p["min_area_pct"]
-        values = {"part_pct": round(part_pct, 2), "valid_pct": round(valid_pct, 2),
+        values = {"part_pct": round(part_pct, 2),
+                  "valid_pct": round(cover, 2) if cover is not None else None,
+                  "unseen_pct": round(100.0 - cover, 2) if cover is not None else None,
                   "height_p95_mm": round(float(np.percentile(h, 95)), 4) if h.size else None,
                   "n_points": int(h.size)}
-        if not present and valid_pct < p["min_valid_pct"]:
-            return CheckResult.invalid(
-                f"only {valid_pct:.1f} % of the zone measured (< {p['min_valid_pct']:g} %): an "
-                "unseen part is not an absent one", values=values)
+        if not present:
+            if cover is None:
+                return CheckResult.invalid(
+                    f"zone {z.id}: the camera's sampling of it is unknown, so is its coverage: "
+                    "an unseen part is not an absent one", values=values)
+            if cover < p["min_valid_pct"]:
+                return CheckResult.invalid(
+                    f"only {cover:.1f} % of the zone measured (< {p['min_valid_pct']:g} %): an "
+                    "unseen part is not an absent one", values=values)
+            if part_max_pct >= p["min_area_pct"]:
+                return CheckResult.invalid(
+                    f"part on {part_pct:.1f} % of the zone, but {100.0 - cover:.1f} % of it was "
+                    f"not measured: a part there could reach {part_max_pct:.1f} % (>= "
+                    f"{p['min_area_pct']:g} %); an unseen part is not an absent one",
+                    values=values)
+        if h.size < p["min_points"]:
+            return CheckResult.invalid(f"only {h.size} measured points in zone {z.id} (need "
+                                       f"{p['min_points']})", values=values)
         ok = present == (p["expect"] == "present")
         state = "present" if present else "absent"
         faults = []
@@ -181,8 +219,11 @@ class Position(Check):
             sel = np.nonzero(ka)[0]
             i = sel[int(np.argmax(dist))]
             faults = [{"px": [float(xs[i]), float(ys[i])], "label": "misaligned"}]
-        return CheckResult(verdict="FAIL" if why else "PASS", values=values, key="offset_mm",
-                           limit=p["tol_mm"], fault_points=faults, warnings=warn,
+        key, limit = "offset_mm", p["tol_mm"]                 # the mm value nearest its limit
+        if p["tol_height_mm"] is not None and abs(dh) / p["tol_height_mm"] > off / p["tol_mm"]:
+            key, limit = "dz_mm", p["tol_height_mm"]
+        return CheckResult(verdict="FAIL" if why else "PASS", values=values, key=key,
+                           limit=limit, fault_points=faults, warnings=warn,
                            message="; ".join(why) if why else
                            f"aligned: offset {off:.2f} mm" + (f", rotation {rot:+.2f} deg"
                                                               if rot is not None else ""))
@@ -242,9 +283,11 @@ class Height(Check):
         val = _stat(h, p["stat"]) - ref
         lo, hi = (p["band_mm"] if p["band_mm"] is not None
                   else (p["nominal_mm"] - p["tol_mm"], p["nominal_mm"] + p["tol_mm"]))
-        values = {"height_mm": round(val, 4), "ref_mm": round(ref, 4), "n_points": int(h.size)}
-        if p["nominal_mm"] is not None:
-            values["deviation_mm"] = round(val - p["nominal_mm"], 4)
+        # deviation from the band's centre (nominal_mm) vs its half width (tol_mm): the
+        # headline's deviation semantics (|deviation| > half width <=> outside the band)
+        centre, half = (lo + hi) / 2.0, (hi - lo) / 2.0
+        values = {"height_mm": round(val, 4), "ref_mm": round(ref, 4),
+                  "deviation_mm": round(val - centre, 4), "n_points": int(h.size)}
         bad = not lo <= val <= hi
         faults = []
         if bad:
@@ -252,9 +295,9 @@ class Height(Check):
             i = sel[int(np.argmax(h) if val > hi else np.argmin(h))]
             faults = [ctx.fault_px(int(i), "too high" if val > hi else "too low")]
         what = "above " + (p["ref"][5:] if p["ref"] != "plane" else "the reference plane")
-        return CheckResult(verdict="FAIL" if bad else "PASS", values=values, key="height_mm",
-                           limit=(hi if val > hi else lo) if bad else hi, fault_points=faults,
-                           details={"band_mm": [lo, hi]},
+        return CheckResult(verdict="FAIL" if bad else "PASS", values=values, key="deviation_mm",
+                           limit=half, fault_points=faults,
+                           details={"band_mm": [lo, hi], "centre_mm": centre},
                            message=f"{p['stat']} height {val:+.3f} mm {what} "
                                    f"({'outside' if bad else 'inside'} [{lo:g}, {hi:g}] mm)")
 
@@ -270,7 +313,9 @@ def _robust_plane_residual(P: np.ndarray, iters: int = 3, k: float = 3.0) -> np.
 @register
 class Flatness(Check):
     """Flatness of the zone: robust plane fit, flatness = peak-to-valley of the residuals
-    between the trim_pct and 100 - trim_pct percentiles (mm), plus RMS."""
+    between the trim_pct and 100 - trim_pct percentiles (mm), plus RMS. A flat reading needs
+    min_valid_pct of the zone's whole extent (less what was measured below min_height_mm)
+    measured: a few strips of a warped face can read flat."""
     id = "flatness"
     title = "Flatness (plane fit)"
     params = {
@@ -283,6 +328,9 @@ class Flatness(Check):
                                    "(the part's top face)"),
         "trim_pct": Param("number", 0.5, "pct", min=0, max=10,
                           doc="percent dropped at each tail (stray triangulated points)"),
+        "min_valid_pct": Param("number", 70.0, "pct", min=0, max=100,
+                               doc="a flat reading needs at least this % of the zone measured "
+                                   "(else INVALID)"),
         "min_points": Param("int", 100, "count", min=10, doc="fewer points: INVALID"),
     }
 
@@ -297,20 +345,36 @@ class Flatness(Check):
         lo, hi = np.percentile(r, [p["trim_pct"], 100 - p["trim_pct"]])
         flat = float(hi - lo)
         rms = float(np.sqrt(np.mean((r - np.median(r)) ** 2)))
+        ys, xs = ctx.index()
+        sel = np.zeros(ctx.zone.valid.shape, bool)
+        sel[ys[keep], xs[keep]] = True
+        cover = ctx.zone.coverage_pct(sel)
         values = {"flatness_mm": round(flat, 4), "rms_mm": round(rms, 4),
-                  "max_dev_mm": round(float(max(abs(lo), abs(hi))), 4), "n_points": int(len(P))}
+                  "max_dev_mm": round(float(max(abs(lo), abs(hi))), 4),
+                  "valid_pct": round(cover, 2) if cover is not None else None,
+                  "n_points": int(len(P))}
         why = []
         if flat > p["tol_mm"]:
             why.append(f"flatness {flat:.3f} mm > {p['tol_mm']:g} mm")
         if p["rms_tol_mm"] is not None and rms > p["rms_tol_mm"]:
             why.append(f"RMS {rms:.3f} mm > {p['rms_tol_mm']:g} mm")
+        if not why and (cover is None or cover < p["min_valid_pct"]):   # a found warp stands
+            return CheckResult.invalid(
+                f"only {cover:.0f} % of the zone measured (< {p['min_valid_pct']:g} %): a "
+                "partly measured face is never passed flat" if cover is not None else
+                f"zone {ctx.zone.id}: the camera's sampling of it is unknown, so is its "
+                "coverage: a partly measured face is never passed flat",
+                values=values)
         faults = []
         if why:
             inside = (r >= lo) & (r <= hi)
             j = int(np.argmax(np.where(inside, np.abs(r - np.median(r)), -1)))
             faults = [ctx.fault_px(int(np.nonzero(keep)[0][j]), "out of flat")]
-        return CheckResult(verdict="FAIL" if why else "PASS", values=values, key="flatness_mm",
-                           limit=p["tol_mm"], fault_points=faults,
+        key, limit = "flatness_mm", p["tol_mm"]               # the mm value nearest its limit
+        if p["rms_tol_mm"] is not None and rms / p["rms_tol_mm"] > flat / p["tol_mm"]:
+            key, limit = "rms_mm", p["rms_tol_mm"]
+        return CheckResult(verdict="FAIL" if why else "PASS", values=values, key=key,
+                           limit=limit, fault_points=faults,
                            message="; ".join(why) if why else f"flat: {flat:.3f} mm "
                                                                f"peak-to-valley, RMS {rms:.3f} mm")
 
@@ -334,7 +398,12 @@ class Defect(Check):
     self-referenced: the face's radial profile), triggers deeper than depth_mm FAIL.
     mode 'local' (any zone): heights above the reference plane minus their own smooth
     surface (Gaussian, smooth_mm), connected blobs with |residual| >= depth_mm over at least
-    min_area_mm2 FAIL. 'auto' = face on circle zones, local otherwise."""
+    min_area_mm2 FAIL; no blob is a PASS only when at least min_valid_pct of the zone's
+    inspected extent was measured (its whole extent less what was measured below
+    min_height_mm) and no unmeasured gap anywhere in the zone (enclosed or not: a dropout
+    reaching the zone border, the part edge or a glint streak counts) could hold a round
+    defect of max_gap_mm2 (default min_area_mm2): else INVALID. 'auto' = face on circle
+    zones, local otherwise."""
     id = "defect"
     title = "Dents / bumps (local depth and area)"
     params = {
@@ -355,6 +424,13 @@ class Defect(Check):
                           doc="face: MF-CFAR z threshold (5.5 ~ 1e-3 false triggers per face)"),
         "rim_margin_mm": Param("number", 0.8, "mm", min=0,
                                doc="face: the outer rim band not inspected (chamfer)"),
+        "min_valid_pct": Param("number", 70.0, "pct", min=0, max=100,
+                               doc="a clean reading needs at least this % measured (local: the "
+                                   "zone's inspected area; face: the face), else INVALID"),
+        "max_gap_mm2": Param("number", None, "mm2", min=0, open_min=True,
+                             doc="local: an unmeasured gap in the zone that can hold a disc this "
+                                 "large could hide a defect: INVALID unless a defect was found "
+                                 "(default min_area_mm2)"),
         "min_points": Param("int", 200, "count", min=20, doc="fewer points: INVALID"),
     }
 
@@ -375,8 +451,9 @@ class Defect(Check):
         m = z.valid.copy()
         if p["min_height_mm"] is not None:
             m &= np.nan_to_num(fr.uvh[..., 2], nan=-1e9) >= p["min_height_mm"]
-        if m.sum() < p["min_points"]:
-            return CheckResult.invalid(f"only {int(m.sum())} points in the zone")
+        n_m = int(m.sum())
+        if n_m < p["min_points"]:
+            return CheckResult.invalid(f"only {n_m} points in the zone")
         ys, xs = np.nonzero(m)
         y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
         H = np.where(m, fr.uvh[..., 2], np.nan)[y0:y1, x0:x1]
@@ -388,8 +465,9 @@ class Defect(Check):
         if k > 0:
             mm = cv2.erode(mm, np.ones((2 * k + 1, 2 * k + 1), np.uint8))
         res[mm == 0] = np.nan
-        sig = res if p["sign"] == "both" else -res
-        hit = np.nan_to_num(np.abs(sig) if p["sign"] == "both" else sig, nan=0) >= p["depth_mm"]
+        # the residual of the inspected sign, + = a defect (dent: depth below the surface)
+        sig = np.abs(res) if p["sign"] == "both" else -res
+        hit = np.nan_to_num(sig, nan=0) >= p["depth_mm"]
         area_px = pixel_area_mm2(np.where(m[..., None], sv.xyz, np.nan))[y0:y1, x0:x1]
         n, lab = cv2.connectedComponents(hit.astype(np.uint8), connectivity=8)
         found = []
@@ -403,19 +481,68 @@ class Defect(Check):
             found.append({"depth_mm": round(float(-res[yy, xx]), 4), "area_mm2": round(area, 3),
                           "px": [float(xx + x0), float(yy + y0)]})
         found.sort(key=lambda f: -abs(f["depth_mm"]))
-        worst = float(np.nanmax(np.abs(res))) if np.isfinite(res).any() else 0.0
-        values = {"max_residual_mm": round(worst, 4), "n_defects": len(found),
+        fin = np.isfinite(sig)
+        worst = max(float(np.nanmax(sig)), 0.0) if fin.any() else 0.0
+        # the headline: the deepest defect counted, else the deepest residual below depth_mm
+        # (blobs under min_area_mm2 are not counted either way)
+        below = fin & ~hit
+        depth = (abs(found[0]["depth_mm"]) if found else
+                 max(float(np.max(sig[below])), 0.0) if below.any() else 0.0)
+        cover = z.coverage_pct(m)
+        max_gap = p["max_gap_mm2"] if p["max_gap_mm2"] is not None else p["min_area_mm2"]
+        gap, holds = self._gaps(z, mpp, max_gap)
+        values = {"max_depth_mm": round(depth, 4), "max_residual_mm": round(worst, 4),
+                  "n_defects": len(found),
                   "worst_depth_mm": found[0]["depth_mm"] if found else None,
                   "worst_area_mm2": found[0]["area_mm2"] if found else None,
-                  "n_points": int(m.sum())}
+                  "valid_pct": round(cover, 2) if cover is not None else None,
+                  "largest_gap_mm2": round(gap, 3) if gap is not None else None,
+                  "n_points": n_m}
+        if not found:                       # a found defect stands; "clean" needs coverage
+            if cover is None or gap is None:
+                return CheckResult.invalid(f"zone {z.id}: the camera's sampling of it is "
+                                           "unknown, so is its coverage: an unmeasured part is "
+                                           "never passed", values=values)
+            if cover < p["min_valid_pct"]:
+                return CheckResult.invalid(f"only {cover:.0f} % of the zone's inspected area "
+                                           f"measured (< {p['min_valid_pct']:g} %): an "
+                                           "unmeasured area is never passed", values=values)
+            if holds:
+                return CheckResult.invalid(f"an unmeasured gap of {gap:.1f} mm2 in the zone "
+                                           f"can hold a {max_gap:g} mm2 defect: it could hide "
+                                           "one", values=values)
         faults = [{"px": f["px"], "label": f"{'dent' if f['depth_mm'] > 0 else 'bump'} "
                                          f"{abs(f['depth_mm']):.2f} mm"} for f in found[:10]]
         return CheckResult(
-            verdict="FAIL" if found else "PASS", values=values, key="max_residual_mm",
+            verdict="FAIL" if found else "PASS", values=values, key="max_depth_mm",
             limit=p["depth_mm"], fault_points=faults, details={"defects": found[:20]},
             message=(f"{len(found)} defect(s), worst {abs(found[0]['depth_mm']):.3f} mm over "
                      f"{found[0]['area_mm2']:.1f} mm2" if found else
-                     f"no defect >= {p['depth_mm']:g} mm (largest residual {worst:.3f} mm)"))
+                     f"no defect >= {p['depth_mm']:g} mm (largest residual {worst:.3f} mm, "
+                     f"{cover:.0f} % measured)"))
+
+    @staticmethod
+    def _gaps(z, mpp: float, max_gap_mm2: float) -> tuple:
+        """The zone's unmeasured gaps (its unseen extent, enclosed or not) -> (largest gap
+        mm2, True when one can hold a disc of max_gap_mm2: a defect could hide in it);
+        (None, None) when the coverage is unknown."""
+        import cv2
+        c = z.cover
+        if c is None:
+            return None, None
+        u = c.unseen.astype(np.uint8)
+        if not u.any():
+            return 0.0, False
+        cell_mm = c.cell if z.units == "part_mm" else c.px_per_cell * mpp
+        n, _lab, st, _ = cv2.connectedComponentsWithStats(u, connectivity=8)
+        largest = float(st[1:, cv2.CC_STAT_AREA].max()) * cell_mm * cell_mm if n > 1 else 0.0
+        r = math.sqrt(max_gap_mm2 / math.pi) / cell_mm            # the disc's radius, cells
+        if r < 1.0:                                             # finer than a cell: by area
+            return largest, largest >= max_gap_mm2
+        k = int(math.ceil(r))
+        disc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+        core = cv2.erode(u, disc, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+        return largest, bool(core.any())
 
     # ---- circular end face: MF-CFAR
     def _face(self, ctx) -> CheckResult:
@@ -473,14 +600,15 @@ class Defect(Check):
         for t in trig[:10]:
             X = C0 + t["u_mm"] * e1 + t["v_mm"] * e2
             faults.append({"px": ctx.px_of(X), "label": f"{t['kind']} {abs(t['depth_mm']):.2f} mm"})
-        worst = max((abs(t["depth_mm"]) for t in det["triggers"]), default=0.0)
+        worst = max((abs(t["depth_mm"]) for t in trig), default=0.0)     # the counted sign
         values = {"max_depth_mm": round(worst, 4), "n_defects": len(trig),
                   "max_z": det.get("max_z"), "coverage_pct": det.get("coverage_pct"),
                   "face_radius_mm": round(radius, 3), "n_points": int(good.sum())}
         cov = det.get("coverage_pct") or 0.0
-        if not trig and cov < 70.0:
-            return CheckResult.invalid(f"only {cov:.0f} % of the face measured (< 70 %): an "
-                                       "unmeasured face is never passed", values=values)
+        if not trig and cov < p["min_valid_pct"]:
+            return CheckResult.invalid(f"only {cov:.0f} % of the face measured (< "
+                                       f"{p['min_valid_pct']:g} %): an unmeasured face is never "
+                                       "passed", values=values)
         return CheckResult(
             verdict="FAIL" if trig else "PASS", values=values, key="max_depth_mm",
             limit=p["depth_mm"], fault_points=faults, details={"triggers": trig[:20],
@@ -514,10 +642,13 @@ def _blob(ctx, min_h, golden=False):
 
 
 def edge_points(img: np.ndarray, blob: np.ndarray, step_px: float = 2.0, search_px: float = 4.0,
-                trim: float = 0.05):
-    """Sub-pixel edges of the blob's two long sides in img (the camber prototype's method:
-    profiles across the part's axis every step_px, the gradient peak near the blob border,
-    parabolic sub-pixel) -> (side a (N, 2), side b (M, 2) camera px, axis, normal)."""
+                trim: float = 0.05, ref_axis=None):
+    """Sub-pixel edges of the blob's two long sides in img: intensity profiles across the
+    part's axis every step_px, the gradient peak within search_px of the blob border, a
+    parabolic sub-pixel fit of that peak -> (side a (N, 2), side b (M, 2) camera px, axis,
+    normal). The axis points along ref_axis (camera px) when given, so the sides are named
+    as on that part (the golden's); else along its dominant component (+x for a left-right
+    part, +y for a top-bottom one)."""
     import cv2
     ys, xs = np.nonzero(blob)
     (cx, cy), (w, h), ang = cv2.minAreaRect(np.c_[xs, ys].astype(np.float32))
@@ -525,7 +656,10 @@ def edge_points(img: np.ndarray, blob: np.ndarray, step_px: float = 2.0, search_
         w, h, ang = h, w, ang + 90.0
     t = math.radians(ang)
     ax = np.array([math.cos(t), math.sin(t)])
-    if ax[0] < 0 or (abs(ax[0]) < 1e-9 and ax[1] < 0):
+    if ref_axis is not None:
+        if float(ax @ np.asarray(ref_axis, float)) < 0:
+            ax = -ax
+    elif ax[int(np.argmax(np.abs(ax)))] < 0:
         ax = -ax
     nr = np.array([-ax[1], ax[0]])                       # side a = -nr (top of a left-right part)
     g = cv2.GaussianBlur(np.nan_to_num(img).astype(np.float32), (0, 0), 1.0)
@@ -583,11 +717,13 @@ def _edge_uv(pts_px: np.ndarray, blob: np.ndarray, sv, fr, nr, inward: float,
 
 
 def _line(uv: np.ndarray):
-    """Robust line through (u, v) points -> (point, direction, residuals (N,) mm, keep)."""
+    """Robust line through (u, v) points -> (point, direction, residuals (N,) mm, keep). The
+    direction's sign is the line's dominant component's (+u for a left-right edge, +v for a
+    top-bottom one); a line has no direction, so compare two with _line_angle."""
     from scipy.ndimage import median_filter
     c = uv.mean(0)
     _, _, vt = np.linalg.svd(uv - c, full_matrices=False)
-    d = vt[0] if vt[0][0] >= 0 else -vt[0]
+    d = vt[0] if vt[0][int(np.argmax(np.abs(vt[0])))] >= 0 else -vt[0]
     nrm = np.array([-d[1], d[0]])
     s = (uv - c) @ d
     o = np.argsort(s)
@@ -606,6 +742,14 @@ def _line(uv: np.ndarray):
     dirn = d + nrm * co[0]
     dirn /= np.linalg.norm(dirn)
     return c + nrm * co[1], dirn, res[inv], keep[inv]
+
+
+def _line_angle(ref: np.ndarray, d: np.ndarray) -> float:
+    """Angle (deg, (-90, 90]) that turns the LINE along ref onto the line along d: lines are
+    undirected, so a direction and its opposite are the same line (never ~180 deg)."""
+    a = math.degrees(math.atan2(ref[0] * d[1] - ref[1] * d[0], float(ref @ d)))
+    a = (a + 90.0) % 180.0 - 90.0
+    return 90.0 if a == -90.0 else a
 
 
 @register
@@ -647,7 +791,9 @@ class Edge(Check):
         return {"golden"} if (self.p["position_tol_mm"] is not None
                               or self.p["angle_tol_deg"] is not None) else set()
 
-    def _edges(self, ctx, golden: bool):
+    def _edges(self, ctx, golden: bool, ref_axis=None):
+        """-> ({side: edge}, None) or (None, why); out["_axis"] = the part's axis (camera
+        px), to name the scan's sides as the golden's (ref_axis)."""
         p = self.p
         blob, sv, fr = _blob(ctx, p["min_height_mm"], golden)
         if blob is None:
@@ -658,28 +804,31 @@ class Edge(Check):
             if src == "flood":
                 return None, "source flood but the scan kept no flood pair (scan.kind fast)"
             img = np.nan_to_num(fr.uvh[..., 2], nan=0.0)
-        a, b, ax, nr = edge_points(img, blob, trim=p["trim_pct"] / 100.0)
+        a, b, ax, nr = edge_points(img, blob, trim=p["trim_pct"] / 100.0, ref_axis=ref_axis)
         out = {}
         for side, pts, inward in (("top", a, 1.0), ("bottom", b, -1.0)):
-            if p["side"] not in ("both", side) or len(pts) < p["min_points"]:
+            if p["side"] not in ("both", side):
                 continue
+            # every side asked for must be measured: a missing side is never skipped silently
+            if len(pts) < p["min_points"]:
+                return None, (f"only {len(pts)} edge samples on the {side} edge (need "
+                              f"{p['min_points']})")
             uv = _edge_uv(pts, blob, sv, fr, nr, inward)
             ok = np.isfinite(uv).all(1)
             if ok.sum() < p["min_points"]:
-                continue
+                return None, (f"only {int(ok.sum())} {side}-edge samples map to the part frame "
+                              f"(need {p['min_points']})")
             c, d, res, keep = _line(uv[ok])
             out[side] = {"px": pts[ok], "uv": uv[ok], "point": c, "dir": d, "res": res,
                          "keep": keep}
         if not out:
             return None, f"fewer than {p['min_points']} edge samples on the {p['side']} edge(s)"
+        out["_axis"] = ax
         return out, None
 
     def run(self, ctx) -> CheckResult:
         p = self.p
-        cur, why = self._edges(ctx, False)
-        if cur is None:
-            return CheckResult.invalid(why)
-        gold = None
+        gold, ref = None, None
         if self.needs_for():
             try:
                 ctx.need_golden()
@@ -688,7 +837,13 @@ class Edge(Check):
             gold, gwhy = self._edges(ctx, True)
             if gold is None:
                 return CheckResult.invalid(f"golden: {gwhy}")
+            ref = gold.pop("_axis")             # the scan's sides named as the golden's
+        cur, why = self._edges(ctx, False, ref_axis=ref)
+        if cur is None:
+            return CheckResult.invalid(why)
+        cur.pop("_axis")
         values, fails, faults, ratios = {}, [], [], []
+        compared = 0                                   # tolerances actually compared
         for side, e in cur.items():
             st = float(np.max(np.abs(e["res"])))      # every sample (the trim only fits the line)
             values[f"{side}_straightness_mm"] = round(st, 4)
@@ -699,16 +854,20 @@ class Edge(Check):
                 faults.append({"px": [float(e["px"][i, 0]), float(e["px"][i, 1])],
                                "label": f"{side} edge {st:.2f} mm"})
             if p["straightness_tol_mm"] is not None:
+                compared += 1
                 ratios.append((st / p["straightness_tol_mm"], f"{side}_straightness_mm",
                                p["straightness_tol_mm"]))
-            if gold is not None and side in gold:
+            if gold is not None:
+                if side not in gold:
+                    return CheckResult.invalid(f"golden: no {side} edge to compare with",
+                                               values=values)
                 g = gold[side]
                 mid = e["uv"].mean(0)
                 gn = np.array([-g["dir"][1], g["dir"][0]])
                 off = float((e["point"] + e["dir"] * float((mid - e["point"]) @ e["dir"])
                              - g["point"]) @ gn)
-                ang = math.degrees(math.atan2(g["dir"][0] * e["dir"][1] - g["dir"][1] * e["dir"][0],
-                                              float(g["dir"] @ e["dir"])))
+                ang = _line_angle(g["dir"], e["dir"])      # lines: never ~180 deg
+                compared += (p["position_tol_mm"] is not None) + (p["angle_tol_deg"] is not None)
                 values[f"{side}_offset_mm"] = round(off, 4)
                 values[f"{side}_angle_deg"] = round(ang, 3)
                 bad = []
@@ -726,6 +885,8 @@ class Edge(Check):
                 if p["position_tol_mm"] is not None:
                     ratios.append((abs(off) / p["position_tol_mm"], f"{side}_offset_mm",
                                    p["position_tol_mm"]))
+        if not compared:                                # nothing was held to a tolerance
+            return CheckResult.invalid("no edge tolerance could be compared", values=values)
         _, key, limit = max(ratios) if ratios else (0, None, None)
         return CheckResult(verdict="FAIL" if fails else "PASS", values=values, key=key,
                            limit=limit, fault_points=faults,

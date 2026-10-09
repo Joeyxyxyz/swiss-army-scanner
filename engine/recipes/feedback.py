@@ -19,7 +19,12 @@ it each get their own light; no single plane is assumed):
            feedback.max_fit_px, else the decode there is not trusted and the zone is not
            drawn (refused, with the number); nothing is projected when no zone can be drawn.
            (Tiles across a depth step or a curved surface fit worse: the median, not the
-           worst tile, judges the decode.)
+           worst tile, judges the decode.) A zone decoded too sparsely for its tiles to hold
+           half its px is judged by the one affine over the whole zone instead (same
+           limit): sparse is never drawn unchecked.
+  frame    a FAIL / INVALID zone that cannot be drawn (refused, unresolved) never leaves a
+           green-only picture: a frame round the whole DMD field in the run's verdict
+           colour says the run is not a PASS.
   crosses  centred on the fault px's own decoded DMD point, arms drawn in camera space and
            mapped through the local affine at that point; text likewise (upright in the
            scene, whatever mirror / rotation the optics add, and the diamond DMD's 2:1 rows).
@@ -38,6 +43,8 @@ import numpy as np
 
 DMD_SHAPE = (1140, 912)                  # rows, cols
 MIN_FIT_PX = 12
+MIN_TILE_PCT = 50.0                      # decoded px in checkable tiles, else the whole-zone fit
+FRAME_PX = 24                            # the not-PASS frame round the DMD field, DMD px
 OVERLAY_W = 960                          # camera overlay width in the run folder, px
 
 
@@ -126,14 +133,14 @@ def local_fit(sv, mask: np.ndarray, centre, radius: int = 12) -> Optional[dict]:
 
 def zone_map(sv, mask: np.ndarray, tile: int = 16, max_tiles: int = 64) -> dict:
     """A zone's decoded px -> {dmd_mask (DMD rows x cols), local_p95_px (the median over
-    tiles of each tile's trimmed local-affine p95 residual), local_worst_px, n_tiles, n_px, fit
-    (one affine over the zone, for reference)}; dmd_mask None when fewer than MIN_FIT_PX px
-    decoded."""
+    tiles of each tile's trimmed local-affine p95 residual), local_worst_px, n_tiles, n_px,
+    tile_pct (% of the decoded px in a tile dense enough to be checked), fit (one affine
+    over the zone)}; dmd_mask None when fewer than MIN_FIT_PX px decoded."""
     cv2 = _cv()
     dec = _decoded(sv, mask)
     n = int(dec.sum())
     out = {"dmd_mask": None, "local_p95_px": None, "local_worst_px": None, "n_tiles": 0,
-           "n_px": n, "fit": None}
+           "n_px": n, "tile_pct": 0.0, "fit": None}
     if n < MIN_FIT_PX:
         return out
     ys, xs = np.nonzero(dec)
@@ -147,7 +154,8 @@ def zone_map(sv, mask: np.ndarray, tile: int = 16, max_tiles: int = 64) -> dict:
     key = (ys // tile) * 100000 + (xs // tile)
     order = np.argsort(key, kind="stable")
     uk, start, counts = np.unique(key[order], return_index=True, return_counts=True)
-    groups = [order[a:a + n] for a, n in zip(start, counts) if n >= MIN_FIT_PX * 2]
+    groups = [order[a:a + k] for a, k in zip(start, counts) if k >= MIN_FIT_PX * 2]
+    out["tile_pct"] = 100.0 * sum(len(g) for g in groups) / n
     if len(groups) > max_tiles:
         groups = [groups[i] for i in np.random.default_rng(0).choice(len(groups), max_tiles,
                                                                      replace=False)]
@@ -235,7 +243,9 @@ def colour_for(verdict: str, fb: dict) -> tuple:
 
 def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> tuple:
     """-> (DMD image (1140, 912, 3) uint8 BGR or None, info dict). zone_results: the
-    result's zones list (id, verdict, checks with fault_points in camera px)."""
+    result's zones list (id, verdict, checks with fault_points: camera px, or xyz_mm in the
+    camera frame, projected). A FAIL / INVALID zone that is not drawn frames the whole field
+    (info["frame"]); None (info["refused"]) when no zone can be drawn at all."""
     cv2 = _cv()
     img = np.zeros(DMD_SHAPE + (3,), np.uint8)
     info = {"verdict": verdict, "zones": [], "crosses": [], "text": None, "refused": None,
@@ -247,12 +257,19 @@ def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> 
         return None, info
     line, maxfit = int(fb["line_px"]), float(fb["max_fit_px"])
     usable, outline_cam = {}, []
+    undrawn = []                                             # FAIL / INVALID zones not drawn
     union = np.zeros(sv.shape, bool)
     order = sorted(zone_results, key=lambda r: {"PASS": 0, "INVALID": 1, "FAIL": 2}.get(
         r["verdict"], 1))                                    # FAIL drawn last (on top)
     for zr in order:
         zv = zone_views.get(zr["id"])
-        if zv is None or not zv.feedback or (zv.datum and not zr.get("checks")):
+        if zv is None:
+            if zr["verdict"] != "PASS" and zr.get("checks"):
+                undrawn.append(zr["id"])
+                info["warnings"].append(f"zone {zr['id']}: {zr['verdict']} but not resolved on "
+                                        "this scan: not drawn")
+            continue
+        if not zv.feedback or (zv.datum and not zr.get("checks")):
             continue
         col = colour_for(zr["verdict"], fb)
         fill = None
@@ -269,7 +286,9 @@ def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> 
                        else round(zm["local_p95_px"], 3),
                        local_worst_px=None if zm["local_worst_px"] is None
                        else round(zm["local_worst_px"], 3), n_tiles=zm["n_tiles"],
-                       n_px=zm["n_px"], fit=_fit_public(zm["fit"]))
+                       tile_pct=round(zm["tile_pct"], 1), n_px=zm["n_px"],
+                       fit=_fit_public(zm["fit"]))
+            whole = zm["fit"]["p95_px"] if zm["fit"] is not None else None
             if zm["dmd_mask"] is None:
                 rec["refused"] = (f"only {zm['n_px']} decoded px in the zone: no camera -> DMD "
                                   "mapping")
@@ -277,6 +296,17 @@ def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> 
                 rec["refused"] = (f"the zone's camera -> DMD map is not consistent: local affine "
                                   f"residual p95 {zm['local_p95_px']:.2f} DMD px > {maxfit:g} "
                                   "(feedback.max_fit_px) - not drawn")
+            elif zm["n_tiles"] == 0 or zm["tile_pct"] < MIN_TILE_PCT:
+                # too sparse for the tile check: the one affine over the zone must hold instead
+                if whole is None or whole > maxfit:
+                    rec["refused"] = (
+                        f"the zone decoded too sparsely for the tile check ({zm['tile_pct']:.0f} "
+                        f"% of its {zm['n_px']} px in checkable tiles) and its whole-zone "
+                        "camera -> DMD fit residual p95 "
+                        + (f"{whole:.2f} DMD px > {maxfit:g}" if whole is not None else "is "
+                           "unknown") + " (feedback.max_fit_px) - not drawn")
+                else:
+                    dm = zm["dmd_mask"]
             else:
                 dm = zm["dmd_mask"]
         if dm is not None and dm.any():
@@ -291,6 +321,8 @@ def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> 
             outline_cam += [np.asarray(p) for p in zv.outline_px]
         if rec["refused"]:
             info["warnings"].append(f"zone {zv.id}: {rec['refused']}")
+        if not rec["drawn"] and zr["verdict"] != "PASS":
+            undrawn.append(zv.id)
         info["zones"].append(rec)
     col = colour_for("FAIL", fb)
     for zr in zone_results:                                  # crosses on top of the fills
@@ -301,16 +333,19 @@ def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> 
             if ch["verdict"] != "FAIL":
                 continue
             for fp in ch.get("fault_points", []):
-                if fp.get("px") is None:
+                px = fault_px_of(sv, fp)
+                if px is None:
+                    info["warnings"].append(f"zone {zv.id}: fault point {fp} has no camera px: "
+                                            "no cross")
                     continue
-                c, f = fault_dmd(sv, fp["px"], zv.mask)
+                c, f = fault_dmd(sv, px, zv.mask)
                 if c is None:
-                    info["warnings"].append(f"zone {zv.id}: fault at {fp['px']} has no decoded "
+                    info["warnings"].append(f"zone {zv.id}: fault at {px} has no decoded "
                                             "px nearby: no cross")
                     continue
                 _cross_at(img, f, c, col, int(fb["cross_px"]), line)
                 info["crosses"].append({"zone": zr["id"], "check": ch["id"],
-                                        "px": [round(float(v), 2) for v in fp["px"]],
+                                        "px": [round(float(v), 2) for v in px],
                                         "dmd": [round(float(v), 2) for v in c],
                                         "label": fp.get("label", "")})
     if not usable:
@@ -327,7 +362,37 @@ def render(zone_views: dict, zone_results: list, sv, fb: dict, verdict: str) -> 
             txt = verdict + ((" " + ", ".join(fail_z[:3])) if fail_z else "")
             if _text(img, g["A"], anchor, txt, colour_for(verdict, fb), int(fb["text_px"])):
                 info["text"] = txt
+    bad_drawn = any(r["drawn"] and r["verdict"] != "PASS" for r in info["zones"])
+    if undrawn or (verdict != "PASS" and not bad_drawn):
+        # never a green-only picture of a run that is not a PASS
+        fv = verdict if verdict in ("FAIL", "INVALID") else "INVALID"
+        _frame(img, colour_for(fv, fb))
+        why = (f"zone(s) {', '.join(undrawn)} ({fv}) could not be drawn" if undrawn else
+               f"no {verdict} zone is drawn")
+        info["frame"] = {"verdict": fv, "px": FRAME_PX, "why": why}
+        info["warnings"].append(f"{why}: the whole DMD field is framed {fv}")
     return img, info
+
+
+def _frame(img, colour) -> None:
+    """A FRAME_PX band round the whole DMD field."""
+    k = FRAME_PX
+    img[:k], img[-k:], img[:, :k], img[:, -k:] = colour, colour, colour, colour
+
+
+def fault_px_of(sv, fp: dict) -> Optional[list]:
+    """A fault point's camera px: its "px", or its "xyz_mm" (camera frame) projected with the
+    scan's intrinsics; None when it has neither (or does not project)."""
+    if fp.get("px") is not None:
+        return [float(v) for v in fp["px"]]
+    if fp.get("xyz_mm") is not None:
+        try:
+            p = sv.project(np.asarray(fp["xyz_mm"], np.float64).reshape(1, 3))[0]
+        except (TypeError, ValueError):
+            return None
+        if np.isfinite(p).all():
+            return [float(p[0]), float(p[1])]
+    return None
 
 
 # ------------------------------------------------------------------ camera overlay (run folder)
@@ -364,8 +429,9 @@ def overlay(sv, frame, zone_views: dict, zone_results: list, fb: dict, verdict: 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2, cv2.LINE_AA)
         for ch in zr.get("checks", []):
             for fp in ch.get("fault_points", []) if ch["verdict"] == "FAIL" else []:
-                if fp.get("px") is not None:
-                    x, y = (int(round(v)) for v in fp["px"])
+                px = fault_px_of(sv, fp)
+                if px is not None:
+                    x, y = (int(round(v)) for v in px)
                     cv2.drawMarker(vis, (x, y), colour_for("FAIL", fb), cv2.MARKER_CROSS, 28, 2)
     cv2.putText(vis, verdict, (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2,
                 colour_for(verdict, fb), 3, cv2.LINE_AA)

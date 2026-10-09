@@ -10,7 +10,9 @@ A recipe is one work-state check, portable to any DMD projector + camera line:
                    projector (DMD) px or part-frame mm (units always said)
            -> checks   what is recognised there (presence, position, height, flatness,
                        defect, edge, code, or a plugin), with their tolerances in mm / deg
-      -> golden    optional reference scan (position / edge vs the good part)
+      -> golden    optional reference scan (position / edge vs the good part): a golden
+                   recorded by `scan recipe-golden` (by label, or 'latest' for this recipe)
+                   or an exact metric scan id; never the scan being checked
       -> feedback  what the projector paints after the verdict (green outline = PASS,
                    red fill + cross at the fault = FAIL)
       -> outputs   run folder, result codes for the I/O registers, overlay image
@@ -255,7 +257,8 @@ def validate(doc: dict, source: Optional[Path] = None) -> Recipe:
     if golden is not None:
         if not isinstance(golden, dict) or set(golden) - {"scan", "_comment"} \
                 or not isinstance(golden.get("scan"), str) or not golden["scan"].strip():
-            E.add("golden", "must be {\"scan\": \"<metric scan id | label | latest>\"} or null")
+            E.add("golden", "must be {\"scan\": \"<golden label | latest | exact metric scan "
+                  "id>\"} or null (`scan recipe-golden` records a golden)")
             golden = None
         else:
             golden = {"scan": golden["scan"].strip()}

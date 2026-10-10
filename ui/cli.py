@@ -1964,7 +1964,14 @@ def cmd_charuco(ctx):
 
 
 def cmd_parity(ctx):
-    r = api.row_parity(ctx.preset())
+    p = ctx.preset()
+    if ctx.mock:            # the diamond DMD model every metric command runs on, an empty wall
+        bench = api.mock_bench()
+        bench.clear()
+        bench.use_stereo()
+        ctx.say("[mock] stereo bench: the empty wall (the diamond DMD model the metric "
+                "commands use)")
+    r = api.row_parity(p)
     ctx.say(f"Diamond row parity: {r.get('parity')}  ({r.get('note')})")
     ctx.kv([["shift", _u(r.get("shift_cols"), "columns", 3)],
             ["camera px / column", _f(r.get("camera_px_per_column"), 3)],
@@ -1972,25 +1979,80 @@ def cmd_parity(ctx):
     return (EXIT_OK if r.get("ok") else EXIT_NOT_OK), r
 
 
+def _fixture_arg(path):
+    """--fixture SPEC: read and validated here, so a bad spec is refused before the rig."""
+    if not path:
+        return None
+    from engine.calibrate import fixture as fixture_mod
+    return fixture_mod.load(Path(path))
+
+
+def _mock_place_fixture(ctx, fxs: dict, set_label: str) -> None:
+    """Mock only: the simulated human sets the fixture down at the next placement of the
+    plan (left, right, centre, ... each turned differently)."""
+    from engine import config as cfg
+    from engine.capture.mock_stereo import fixture_placements, fixture_shapes
+    p = ctx.preset()
+    fp = cfg.geometry_fingerprint(p)
+    done = [x for x in api.list_library("calib_poses", p.geometry_id)
+            if x.get("set") == set_label and x.get("fixture")
+            and not rules.fingerprint_diffs(x.get("geometry_fp"), fp)]
+    R, t = fixture_placements(len(done) + 1)[len(done)]
+    bench = api.mock_bench()
+    bench.clear()
+    bench.use_stereo()
+    for shape in fixture_shapes(fxs, R, t):
+        bench.place(shape)
+    ctx.say(f"[mock] stereo bench: fixture placement {len(done) + 1} of the plan (stands in "
+            "for the human)")
+
+
 def cmd_calib_pose(ctx):
     a = ctx.args
-    r = api.capture_calib_pose(ctx.preset(), a.set, steps=a.steps, periods=_periods(a.periods))
-    ctx.say(f"Calibration pose {r['id']} (set {r['set']}): {r['corners_found']} ChArUco corners, "
+    fxs = _fixture_arg(a.fixture)
+    if ctx.mock and fxs is not None:
+        _mock_place_fixture(ctx, fxs, a.set)
+    r = api.capture_calib_pose(ctx.preset(), a.set, steps=a.steps, periods=_periods(a.periods),
+                               fixture=str(Path(a.fixture).resolve()) if fxs else None)
+    if fxs is None:
+        ctx.say(f"Calibration pose {r['id']} (set {r['set']}): {r['corners_found']} ChArUco "
+                f"corners, {r['valid_pct']:.1f}% decoded, parity {r['diamond_parity']} "
+                f"({r['parity_source']})")
+        ctx.warn(r.get("warnings"))
+        return (EXIT_OK if r["corners_found"] >= 6 else EXIT_NOT_OK), r
+    ff = r["fixture"]["faces_found"]
+    ctx.say(f"Fixture placement {r['id']} (set {r['set']}, fixture {r['fixture']['name']}): "
+            f"{len(r['faces_seen'])} of {len(ff)} faces, {r['corners_found']} ChArUco corners, "
             f"{r['valid_pct']:.1f}% decoded, parity {r['diamond_parity']} ({r['parity_source']})")
+    ctx.table(["face", "marker ids", "corners", "usable"],
+              [[f["face"], f"{f['id_range'][0]}-{f['id_range'][1]}", f["corners"],
+                "yes" if f["corners"] >= 6 else "no"] for f in ff])
+    ctx.say("  next: move the fixture (left / right / centre), turn it 20-45 deg about its own "
+            "axis, tip it a little, change the distance; 3 placements, then calibrate-stereo")
     ctx.warn(r.get("warnings"))
-    return (EXIT_OK if r["corners_found"] >= 6 else EXIT_NOT_OK), r
+    return (EXIT_OK if len(r["faces_seen"]) >= 2 else EXIT_NOT_OK), r
 
 
 def cmd_calibrate_stereo(ctx):
     a = ctx.args
     if a.mock_poses and not ctx.mock:
         raise ValueError("--mock-poses needs --mock (on the rig: calib-pose per board pose)")
+    if a.mock_fixture and not ctx.mock:
+        raise ValueError("--mock-fixture needs --mock (on the rig: calib-pose --fixture SPEC per "
+                         "placement)")
+    fxs = _fixture_arg(a.fixture)
     r = api.calibrate_stereo(ctx.preset(), a.set, a.square, mock_poses=a.mock_poses or 0,
                              steps=a.steps, periods=_periods(a.periods),
-                             projector_distortion=a.projector_distortion)
+                             projector_distortion=a.projector_distortion,
+                             fixture=str(Path(a.fixture).resolve()) if fxs else None,
+                             mock_fixture=a.mock_fixture or 0, rigid=not a.no_rigid)
     rms = r["rms"]
-    ctx.say(f"Stereo calibration {r['calibration_id']}  ({r['n_poses_used']} of "
-            f"{r['n_poses_captured']} poses, set {r['set']})")
+    if r.get("fixture"):
+        ctx.say(f"Stereo calibration {r['calibration_id']}  ({r['n_views']} face views from "
+                f"{r['n_placements']} fixture placements, set {r['set']})")
+    else:
+        ctx.say(f"Stereo calibration {r['calibration_id']}  ({r['n_poses_used']} of "
+                f"{r['n_poses_captured']} poses, set {r['set']})")
     ctx.kv([["camera RMS", _u(rms.get("camera_px"), "px", 4) + "  (target < 0.3)"],
             ["projector RMS u / v", f"{_f(rms.get('projector_u_px'), 4)} / "
                                     f"{_f(rms.get('projector_v_px'), 4)} px  (target < 0.5)"],
@@ -1998,6 +2060,13 @@ def cmd_calibrate_stereo(ctx):
             ["baseline", _u(r["baseline_mm"], "mm", 2)], ["angle", _u(r["angle_deg"], "deg", 2)],
             ["f_v / f_u (diamond ~2)", _f(r["fv_over_fu"], 4)],
             ["diamond parity", r["diamond_parity"]]])
+    if r.get("fixture"):
+        rg, fc = r["rigid"], r["face_check"]
+        ctx.kv([["rigid-fixture refinement",
+                 "used (face-to-face poses estimated, shared by all placements)" if rg["used"]
+                 else "not used: the independent per-face views"],
+                ["face-angle check", f"max |measured - spec| {_f(fc['max_abs_residual_deg'], 3)} "
+                                     f"deg ({fc['source']}; warn > {fc['warn_deg']:g})"]])
     if r.get("vs_truth"):
         t = r["vs_truth"]
         ctx.say(f"  [mock] vs truth: R {t['R_deg']:.4f} deg, t {t['t_mm']:.3f} mm, cam f "
@@ -2069,6 +2138,42 @@ def cmd_accuracy(ctx):
             ["repeatability sigma", _u(r["repeatability_sigma_mm"], "mm", 4)],
             ["mean measured", _u(r["mean_measured_mm"], "mm", 4)]])
     return (EXIT_OK if r["verdict"] == "GO" else EXIT_NOT_OK), r
+
+
+def _mock_place_block(ctx, spec: dict) -> None:
+    """Mock only: the simulated human sets the check block down facing the camera (the
+    simulated print is exactly its spec)."""
+    from engine.capture.mock_stereo import check_block_placement, check_block_shapes
+    bench = api.mock_bench()
+    bench.clear()
+    bench.use_stereo()
+    for shape in check_block_shapes(spec, *check_block_placement()):
+        bench.place(shape)
+    ctx.say(f"[mock] stereo bench: placed the check block {spec['name']} (printed exactly to "
+            "its spec)")
+
+
+def cmd_accuracy_block(ctx):
+    a = ctx.args
+    from engine.measure import checkblock
+    spec = checkblock.load(Path(a.block))                  # refused before the rig
+    meas = checkblock.load_measured(Path(a.measured), spec) if a.measured else None
+    scans = [_find_metric(k) for k in a.scans] if a.scans else None
+    p = ctx.preset()
+    if ctx.mock and scans is None:
+        _mock_place_block(ctx, spec)
+    r = api.accuracy_block(str(Path(a.block)), {"values": meas} if meas else None, scans,
+                           a.repeats, p, a.tol_height, a.tol_diameter, a.flatness_max, a.label)
+    ctx.say(f"Check block {r['block']} ({r['n_scans']} scan(s), calibration "
+            f"{r.get('calibration_id')}): {r['result']}")
+    ctx.say(f"  {checkblock.verdict_text(r)}")
+    ctx.table(["quantity", "scanned mm", "reference mm", "from", "error mm", "tol mm", "verdict"],
+              [[x["name"], _f(x.get("scanned_mm"), 4),
+                _f(x.get("reference_mm"), 4) if x.get("reference_mm") is not None else "-",
+                x.get("reference_source", "-"), _f(x.get("error_mm"), 4),
+                _f(x.get("tol_mm", x.get("limit_mm")), 3), x["verdict"]] for x in r["rows"]])
+    ctx.warn([f"{q['reason']}: {q['message']}" for q in r.get("pull_reasons") or []])
+    return D.exit_code(r), r
 
 
 def cmd_precision(ctx):
@@ -4094,12 +4199,17 @@ metric (mm from a stereo calibration of the same geometry; refused otherwise):
   scan parity                            diamond DMD row parity (bench step B3)
   scan calib-pose [--set NAME]           one board pose (repeat 12-20x, tilt +-30 deg)
   scan calibrate-stereo --square MM      camera + projector + stereo; RMS per pose / axis
+  scan calib-pose --fixture SPEC --set fx   one fixture placement = one view per face
+                                         (3 placements; docs/CALIBRATION_FIXTURE.md)
+  scan calibrate-stereo --set fx --fixture SPEC   + rigid-fixture refinement, face-angle check
+  scan accuracy-block --block SPEC --measured JSON   printed check block: exit 0 CONTINUE,
+                                         1 REJECT (recalibrate), 5 PULL
   scan scan-metric [label]               both-axis scan -> point cloud in mm (+ .ply)
   scan cyldev <metric>                   cylinder fit -> deviation map + dents (mm)
   scan accuracy cylinder --diameter 29.84 [--repeats 5]   exit 0 GO, 1 NO-GO
   scan precision --scan <metric>         predicted sigma_z before scanning
   scan metric-mesh <metric>              STL / OBJ in mm, open surface only
-  mock: scan --mock calibrate-stereo --mock-poses 12
+  mock: scan --mock calibrate-stereo --mock-poses 12   (or --mock-fixture 3)
 
 dents on shiny cylinders (needs a stereo calibration; the null calibration is the good part):
   scan --preset DARK dent-scan good1 --zone H9:I12 --short-preset SHORT   a KNOWN-GOOD part
@@ -4472,12 +4582,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--set", default="stereo", help="pose set name")
     p.add_argument("--steps", type=_positive_int)
     p.add_argument("--periods", help="T,T,T DMD px, fine -> coarse")
+    p.add_argument("--fixture", metavar="SPEC", help="calibration fixture spec JSON "
+                   "(tools/make_calib_fixture.py): one PLACEMENT of the fixture, every face "
+                   "detected on its own (3 placements in all)")
     p = cmd("calibrate-stereo", cmd_calibrate_stereo,
             "camera + projector + stereo calibration from a pose set", "stereo calibration")
     p.add_argument("--set", help="pose set (default: newest)")
-    p.add_argument("--square", type=float, metavar="MM", help="caliper-measured square, mm")
+    p.add_argument("--square", type=float, metavar="MM", help="caliper-measured square, mm "
+                   "(single board; a fixture takes its squares from its spec)")
     p.add_argument("--mock-poses", dest="mock_poses", type=int, default=0,
                    help="MOCK: place N board poses on the simulated bench")
+    p.add_argument("--fixture", metavar="SPEC", help="fixture set: the spec with each face's "
+                   "caliper-measured square (default: the spec stored with the placements)")
+    p.add_argument("--mock-fixture", dest="mock_fixture", type=int, default=0, metavar="N",
+                   help="MOCK: place the calibration fixture N times (3 recommended)")
+    p.add_argument("--no-rigid", dest="no_rigid", action="store_true",
+                   help="fixture set: skip the rigid-fixture refinement (independent face "
+                        "views only)")
     p.add_argument("--steps", type=_positive_int)
     p.add_argument("--periods", help="T,T,T DMD px")
     p.add_argument("--projector-distortion", dest="projector_distortion", action="store_true")
@@ -4506,6 +4627,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scans", nargs="*", help="existing metric scans instead of new ones")
     p.add_argument("--tol", type=float, default=0.1)
     p.add_argument("--repeat-tol", dest="repeat_tol", type=float, default=0.03)
+    p = cmd("accuracy-block", cmd_accuracy_block, "scan the printed check block: step heights, "
+            "flatness, bar and dome vs your caliper values (exit 0 CONTINUE, 1 REJECT, 5 PULL)",
+            "the check block")
+    p.add_argument("--block", required=True, metavar="SPEC", help="check block spec JSON "
+                   "(tools/make_calib_fixture.py)")
+    p.add_argument("--measured", metavar="JSON", help="the filled-in measured template "
+                   "(without it every verdict is a PULL: a print is never exactly its model)")
+    p.add_argument("--repeats", type=_positive_int, default=1)
+    p.add_argument("--scans", nargs="*", help="existing metric scans of the block instead of "
+                                              "new ones")
+    p.add_argument("--tol-height", dest="tol_height", type=float, metavar="MM",
+                   help="step / top heights (default: the spec's, 0.1)")
+    p.add_argument("--tol-diameter", dest="tol_diameter", type=float, metavar="MM",
+                   help="bar / dome diameters (default: the spec's, 0.15)")
+    p.add_argument("--flatness-max", dest="flatness_max", type=float, metavar="MM",
+                   help="reference face plane-fit RMS limit (default: the spec's, 0.1)")
+    p.add_argument("--label", default="block")
+    p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a REJECT verdict (1)
     p = cmd("precision", cmd_precision, "predicted depth noise sigma_z (mm)")
     p.add_argument("--z", type=float, metavar="MM")
     p.add_argument("--A", type=float, help="fringe offset, grey levels")

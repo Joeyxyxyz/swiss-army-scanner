@@ -1472,12 +1472,15 @@ def row_parity(preset: Optional[Preset] = None, label: str = "parity") -> dict:
 @_verb
 def capture_calib_pose(preset: Optional[Preset] = None, set_label: str = "stereo",
                        board: Optional[dict] = None, steps: Optional[int] = None,
-                       periods: Optional[list] = None, diamond_parity="auto") -> dict:
+                       periods: Optional[list] = None, diamond_parity="auto",
+                       fixture=None) -> dict:
     """One ChArUco board pose for calibrate_stereo: flood + both-axis multifreq decode.
-    The operator places / holds the board (12-20 poses, tilts +-30 deg, fill the volume)."""
+    The operator places / holds the board (12-20 poses, tilts +-30 deg, fill the volume).
+    fixture: a calibration-fixture spec (path / dict, tools/make_calib_fixture.py): one
+    PLACEMENT of the fixture, every face's board detected on its own (3 placements in all)."""
     from .calibrate import flow
     return flow.capture_pose(_engine(), _preset(preset), set_label, flow.board_spec(board),
-                             steps, periods, diamond_parity)
+                             steps, periods, diamond_parity, fixture=fixture)
 
 
 @_verb
@@ -1485,13 +1488,19 @@ def calibrate_stereo(preset: Optional[Preset] = None, set_label: Optional[str] =
                      square_mm: Optional[float] = None, board: Optional[dict] = None,
                      projector_distortion: bool = False, mock_poses: int = 0,
                      steps: Optional[int] = None, periods: Optional[list] = None,
-                     diamond_parity="auto") -> dict:
+                     diamond_parity="auto", fixture=None, mock_fixture: int = 0,
+                     rigid: bool = True) -> dict:
     """Camera + projector (inverse camera) + stereoCalibrate from the pose set; saved as a
-    geometry-bound calibration. mock_poses=N (mock only) places N board poses itself."""
+    geometry-bound calibration. mock_poses=N (mock only) places N board poses itself.
+    A fixture set (capture_calib_pose fixture=...): one view per detected face, then the
+    rigid-fixture refinement (rigid) and the face-angle check; fixture = the spec with the
+    caliper-measured squares; mock_fixture=N (mock only) places the fixture N times."""
     from .calibrate import flow
     cal, summary = flow.calibrate_stereo(_engine(), _preset(preset), set_label, square_mm,
                                          board, projector_distortion, int(mock_poses or 0),
-                                         steps, periods, diamond_parity)
+                                         steps, periods, diamond_parity,
+                                         fixture=fixture, mock_fixture=int(mock_fixture or 0),
+                                         rigid=bool(rigid))
     return {**summary, "calibration": cal}
 
 
@@ -1549,6 +1558,24 @@ def accuracy_check(kind: str, known: Optional[dict] = None, scans: Optional[list
     p = _preset(preset) if scans is None else (preset or _engine().preset)
     return metric_scan.accuracy_check(_engine(), p, kind, known or {}, scans, repeats, tol_mm,
                                       repeat_tol_mm, label, steps, periods)
+
+
+@_verb
+def accuracy_block(block, measured=None, scans: Optional[list] = None, repeats: int = 1,
+                   preset: Optional[Preset] = None, tol_height_mm: Optional[float] = None,
+                   tol_diameter_mm: Optional[float] = None,
+                   flatness_max_mm: Optional[float] = None, label: str = "block",
+                   steps: Optional[int] = None, periods: Optional[list] = None) -> dict:
+    """The known-geometry check block (spec path / dict, tools/make_calib_fixture.py) over
+    `repeats` new metric scans (or the given ones): reference flatness, step heights, bar
+    and dome diameter / height vs what the PRINTED block measures (measured: the filled-in
+    template). -> report with verdict PASS / FAIL / INVALID and disposition CONTINUE /
+    REJECT (out of tolerance: recalibrate) / PULL (doubt, e.g. nominal values only)."""
+    from .reconstruct import metric_scan
+    p = _preset(preset) if scans is None else (preset or _engine().preset)
+    return metric_scan.accuracy_block(_engine(), p, block, measured, scans, repeats,
+                                      tol_height_mm, tol_diameter_mm, flatness_max_mm, label,
+                                      steps, periods)
 
 
 @_verb

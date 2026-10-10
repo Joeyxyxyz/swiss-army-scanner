@@ -9,6 +9,11 @@ goes straight into every mm the scanner reports.
 
 Board coordinates: mm, origin at the top-left of the square grid, x right,
 y down, z = 0 (cv2.aruco's convention).
+
+first_id: the board's markers are ids first_id .. first_id + n_markers - 1 of
+the dictionary (0 = the standard board). Boards with DISJOINT id ranges can
+share one camera frame and are detected separately (the calibration fixture,
+calibrate/fixture.py: one capture = one planar view per face).
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ class BoardSpec:
     square_mm: float = 25.0
     marker_mm: float = 18.0
     dictionary: str = "DICT_5X5_100"
+    first_id: int = 0                   # markers first_id .. first_id + n_markers - 1
 
     def __post_init__(self):
         if self.squares_x < 3 or self.squares_y < 3:
@@ -39,6 +45,13 @@ class BoardSpec:
         if not 0 < self.marker_mm < self.square_mm:
             raise ValueError(f"marker_mm must be in (0, square_mm={self.square_mm}), "
                              f"got {self.marker_mm}")
+        if (isinstance(self.first_id, bool) or int(self.first_id) != self.first_id
+                or self.first_id < 0):
+            raise ValueError(f"first_id must be an integer >= 0, got {self.first_id!r}")
+        n = dictionary_size(self.dictionary)
+        if n is not None and self.first_id + self.n_markers > n:
+            raise ValueError(f"{self.dictionary} has {n} markers: ids {self.first_id}.."
+                             f"{self.first_id + self.n_markers - 1} do not fit")
 
     @property
     def board_size_mm(self) -> tuple:
@@ -48,8 +61,20 @@ class BoardSpec:
     def n_corners(self) -> int:
         return (self.squares_x - 1) * (self.squares_y - 1)
 
+    @property
+    def n_markers(self) -> int:
+        return (self.squares_x * self.squares_y) // 2
+
+    @property
+    def marker_ids(self) -> tuple:
+        """(first, last) marker id of this board, inclusive."""
+        return (int(self.first_id), int(self.first_id) + self.n_markers - 1)
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        if not d["first_id"]:
+            del d["first_id"]               # the standard board keeps its stored form
+        return d
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "BoardSpec":
@@ -59,14 +84,18 @@ class BoardSpec:
         """The same board with the caliper-measured square size."""
         k = float(square_mm) / self.square_mm
         return BoardSpec(self.squares_x, self.squares_y, float(square_mm),
-                         self.marker_mm * k, self.dictionary)
+                         self.marker_mm * k, self.dictionary, self.first_id)
 
     # -------------------------------------------------------------- cv2
     def board(self):
         import cv2
         d = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, self.dictionary))
+        if not self.first_id:
+            return cv2.aruco.CharucoBoard((self.squares_x, self.squares_y),
+                                          float(self.square_mm), float(self.marker_mm), d)
+        ids = np.arange(self.first_id, self.first_id + self.n_markers, dtype=np.int32)
         return cv2.aruco.CharucoBoard((self.squares_x, self.squares_y), float(self.square_mm),
-                                      float(self.marker_mm), d)
+                                      float(self.marker_mm), d, ids)
 
     def object_points(self) -> np.ndarray:
         """(n_corners, 3) chessboard corners in board mm, id order."""
@@ -78,6 +107,13 @@ class BoardSpec:
         m = int(round(margin_mm * px_per_mm))
         size = (int(round(w * px_per_mm)) + 2 * m, int(round(h * px_per_mm)) + 2 * m)
         return self.board().generateImage(size, marginSize=m, borderBits=1)
+
+
+def dictionary_size(name: str) -> Optional[int]:
+    """Markers in a predefined cv2.aruco dictionary (DICT_5X5_250 -> 250), None if the
+    name does not say (the AprilTag / original sets)."""
+    tail = str(name).rsplit("_", 1)[-1]
+    return int(tail) if tail.isdigit() else None
 
 
 def detect(image: np.ndarray, spec: BoardSpec, min_corners: int = 6):

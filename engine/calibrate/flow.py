@@ -13,6 +13,14 @@ so a moved rig can never be calibrated from old poses.
 
 In mock mode, `mock_poses=N` makes calibrate_stereo place N board poses on
 the simulated bench itself (standing in for the operator's hands).
+
+Calibration fixture (calibrate/fixture.py, MOCK-TESTED ONLY): capture_pose(fixture=spec)
+detects every face's board in the one capture (disjoint marker ids) and stores the
+placement once (one field, one flood) with all its boards; calibrate_stereo expands each
+stored placement into one planar view per detected face, runs the unchanged per-view
+calibration, then the rigid-fixture refinement (calibrate/rigid.py: the face-to-face poses
+are unknowns shared by every placement) and the face-angle check against the spec.
+`mock_fixture=N` places the fixture N times on the simulated bench.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ from .. import config, rules
 from ..library.store import json_safe, read_meta, safe_label
 from . import parity as parity_mod
 from . import stereo
+from . import fixture as fixture_mod
 from .charuco import BoardSpec, detect, write_pdf, write_png
 
 PARITY_FILE = "parity.json"
@@ -146,11 +155,14 @@ def multifreq_basis(preset, parity, steps=None, periods=None, axis="xy"):
 # ---------------------------------------------------------- board poses
 
 def capture_pose(s, preset, set_label: str = "stereo", spec: Optional[BoardSpec] = None,
-                 steps=None, periods=None, parity=AUTO) -> dict:
+                 steps=None, periods=None, parity=AUTO, fixture=None) -> dict:
     """One board pose: flood + both-axis multifreq, ChArUco detection, saved
-    under calib_poses/<geometry_id>/. The operator holds the board still."""
+    under calib_poses/<geometry_id>/. The operator holds the board still.
+    fixture: a calibration-fixture spec (path or dict): one placement of the fixture, every
+    face's board detected on its own (meta "boards" / "fixture"), stored once."""
     safe_label(set_label)
-    spec = spec or BoardSpec()
+    fxs = fixture_mod.load(fixture) if fixture is not None else None
+    boards = fixture_mod.boards(fxs) if fxs else [spec or BoardSpec()]
     par, src, warn = resolve_parity(s, preset, parity)
     basis = multifreq_basis(preset, par, steps, periods)
     t0 = time.perf_counter()
@@ -158,8 +170,11 @@ def capture_pose(s, preset, set_label: str = "stereo", spec: Optional[BoardSpec]
     fld = basis.decode(frames, preset.geometry_id, contrast_min=preset.decode.contrast_min,
                        conf_min=preset.decode.conf_min)
     flood = _flood_image(frames)
-    det = detect(flood, spec)
-    n = 0 if det is None else len(det[1])
+    found = []
+    for b in boards:
+        det = detect(flood, b)
+        found.append(0 if det is None else len(det[1]))
+    n = int(sum(found))
     fp = config.geometry_fingerprint(preset)
     d = s.store.new_dir("calib_poses", preset.geometry_id, label=set_label)
     with s.store.filling(d):
@@ -167,14 +182,32 @@ def capture_pose(s, preset, set_label: str = "stereo", spec: Optional[BoardSpec]
         s.store.write_preview(d / "flood.png", flood.astype(np.float64))
         s.store.write_npz(d / "flood.npz", image=flood)
         meta = {"id": d.name, "set": set_label, "geometry_id": preset.geometry_id,
-                "geometry_fp": fp, "preset": preset.name, "board": spec.to_dict(),
+                "geometry_fp": fp, "preset": preset.name,
+                "board": None if fxs else boards[0].to_dict(),
                 "corners_found": n, "diamond_parity": par, "parity_source": src,
                 "steps": basis.steps, "periods_px": basis.periods, "mock": s.mock,
                 "valid_pct": round(fld.valid_pct, 2), "decode": fld.meta,
                 "capture_s": round(time.perf_counter() - t0, 2),
                 "created": datetime.now().isoformat(timespec="seconds"), "warnings": warn}
+        if fxs:
+            meta["boards"] = [b.to_dict() for b in boards]
+            meta["fixture"] = {**fixture_mod.summary(fxs), "spec": fxs,
+                               "faces_found": [{"face": f["face"], "corners": c,
+                                                "id_range": f["id_range"]}
+                                               for f, c in zip(fxs["faces"], found)]}
+            meta["faces_seen"] = [f["face"] for f, c in zip(fxs["faces"], found) if c >= 6]
         s.store.write_json(d / "meta.json", json_safe(meta))
-    if n < 6:
+    if fxs:
+        seen = meta["faces_seen"]
+        miss = [f"face {f['face']} ({c} corners)" for f, c in zip(fxs["faces"], found) if c < 6]
+        meta["warnings"] = list(warn)
+        if miss:
+            meta["warnings"].append(f"not usable in this placement: {', '.join(miss)} (out of "
+                                    "view, too steep, in shadow or too dark)")
+        if len(seen) < 2:
+            meta["warnings"].append(f"only {len(seen)} face(s) seen: turn / move the fixture so "
+                                    "at least 2 (ideally all) faces show")
+    elif n < 6:
         meta["warnings"] = warn + [f"only {n} ChArUco corners found: this pose will not be used "
                                    "(board out of view, too steep, or too dark)"]
     return {**meta, "path": d}
@@ -204,10 +237,31 @@ def _load_pose(d: Path) -> dict:
 def calibrate_stereo(s, preset, set_label: Optional[str] = None, square_mm: Optional[float] = None,
                      board: Optional[dict] = None, projector_distortion: bool = False,
                      mock_poses: int = 0, steps=None, periods=None, parity=AUTO,
-                     seed: int = 0) -> tuple:
+                     seed: int = 0, fixture=None, mock_fixture: int = 0,
+                     rigid: bool = True) -> tuple:
     """-> (StereoCalibration, summary dict). Uses every pose of `set_label`
-    (default: the newest set) at this geometry + fingerprint."""
+    (default: the newest set) at this geometry + fingerprint.
+    fixture: the calibration-fixture spec (path / dict) of a fixture pose set, read for its
+    caliper-measured squares (default: the spec stored with the captures); mock_fixture=N
+    (mock only) places the fixture N times; rigid: the rigid-fixture refinement."""
     fp = config.geometry_fingerprint(preset)
+    if mock_fixture:
+        if not s.mock:
+            raise rules.RuleViolation("mock_fixture is mock-only: on the rig the operator places "
+                                      "the fixture and runs capture_calib_pose --fixture per "
+                                      "placement")
+        from ..capture.mock_stereo import fixture_placements, fixture_shapes
+        fxs = fixture_mod.load(fixture) if fixture is not None else fixture_mod.design()
+        fixture = fxs
+        set_label = set_label or f"mockfx{datetime.now().strftime('%H%M%S')}"
+        bench = s.bench
+        for R, t in fixture_placements(int(mock_fixture), seed=seed):
+            bench.clear()
+            bench.use_stereo()
+            for shape in fixture_shapes(fxs, R, t):
+                bench.place(shape)
+            capture_pose(s, preset, set_label, None, steps, periods, parity, fixture=fxs)
+        bench.clear()
     if mock_poses:
         if not s.mock:
             raise rules.RuleViolation("mock_poses is mock-only: on the rig the operator moves "
@@ -229,8 +283,15 @@ def calibrate_stereo(s, preset, set_label: Optional[str] = None, square_mm: Opti
     if set_label is None:
         set_label = poses[-1].get("set")
     poses = [p for p in poses if p.get("set") == set_label]
-    specs = {tuple(sorted(p["board"].items())) for p in poses}
     pars = {p.get("diamond_parity") for p in poses}
+    is_fx = {bool(p.get("fixture")) for p in poses}
+    if len(is_fx) != 1:
+        raise ValueError(f"pose set {set_label!r} mixes single-board poses and fixture "
+                         "placements; capture one consistent set")
+    if is_fx.pop():
+        return _calibrate_fixture(s, preset, poses, set_label, square_mm, projector_distortion,
+                                  fixture, rigid, fp, pars)
+    specs = {tuple(sorted(p["board"].items())) for p in poses}
     if len(specs) != 1 or len(pars) != 1:
         raise ValueError(f"pose set {set_label!r} mixes boards or diamond parities; "
                          "capture one consistent set")
@@ -239,22 +300,34 @@ def calibrate_stereo(s, preset, set_label: Optional[str] = None, square_mm: Opti
     data = [_load_pose(p["path"]) for p in poses]
     fit = stereo.calibrate(data, spec, cam_size=data[0]["image"].shape[::-1],
                            projector_distortion=projector_distortion)
-    truth = s.bench.stereo_truth() if s.mock and getattr(s.bench, "stereo_rig", None) is not None \
-        else None
+    truth = _mock_truth(s)
     cal = stereo.save(s.store, preset.geometry_id, fit, fingerprint=fp, spec=spec, parity=par,
                       created=datetime.now().isoformat(timespec="seconds"),
                       extra_report={"set": set_label, "poses": [p["id"] for p in poses],
                                     "square_mm_used": spec.square_mm},
                       truth=truth)
-    summary = {"calibration_id": cal.id, "geometry_id": cal.geometry_id, "set": set_label,
-               "n_poses_captured": len(poses), "n_poses_used": fit["n_poses"],
-               "rms": cal.rms, "baseline_mm": round(cal.baseline_mm, 3),
-               "angle_deg": round(cal.angle_deg, 3), "diamond_parity": par,
-               "fv_over_fu": round(fit["proj"]["fv_over_fu"], 4),
-               "camera_per_pose_rms": [round(x, 4) for x in fit["cam"]["per_pose_rms"]],
-               "path": cal.path, "units": "px (reprojection), mm (baseline)", "warnings": []}
+    summary = _summary(cal, fit, set_label, len(poses), par)
     if truth is not None:
         summary["vs_truth"] = stereo.compare_truth(cal, truth)
+    return _finish(s, preset, cal, fit, summary, set_label, par)
+
+
+def _mock_truth(s) -> Optional[dict]:
+    return s.bench.stereo_truth() if s.mock and getattr(s.bench, "stereo_rig", None) is not None \
+        else None
+
+
+def _summary(cal, fit: dict, set_label: str, n_captured: int, par) -> dict:
+    return {"calibration_id": cal.id, "geometry_id": cal.geometry_id, "set": set_label,
+            "n_poses_captured": n_captured, "n_poses_used": fit["n_poses"],
+            "rms": cal.rms, "baseline_mm": round(cal.baseline_mm, 3),
+            "angle_deg": round(cal.angle_deg, 3), "diamond_parity": par,
+            "fv_over_fu": round(fit["proj"]["fv_over_fu"], 4),
+            "camera_per_pose_rms": [round(x, 4) for x in fit["cam"]["per_pose_rms"]],
+            "path": cal.path, "units": "px (reprojection), mm (baseline)", "warnings": []}
+
+
+def _finish(s, preset, cal, fit: dict, summary: dict, set_label: str, par) -> tuple:
     if not fit["cam"]["ok"]:
         summary["warnings"].append(f"camera RMS {fit['cam']['rms']:.3f} px >= 0.3 px target")
     if not fit["proj"]["ok"]:
@@ -268,3 +341,139 @@ def calibrate_stereo(s, preset, set_label: Optional[str] = None, square_mm: Opti
     s.store.record_output("calibration", out, label=set_label, geometry_id=preset.geometry_id,
                           source=cal.path)
     return cal, summary
+
+
+# ------------------------------------------------------- calibration fixture
+
+RIGID_RMS_FACTOR, RIGID_RMS_SLACK_PX = 1.5, 0.05
+
+
+def _calibrate_fixture(s, preset, poses: list, set_label: str, square_mm, projector_distortion,
+                       fixture, rigid: bool, fp, pars) -> tuple:
+    """A fixture pose set: one planar view per detected face of every placement, the
+    unchanged per-view calibration, then the rigid-fixture refinement + face-angle check."""
+    import cv2
+    from . import rigid as rigid_mod
+    if square_mm is not None:
+        raise ValueError("square_mm is for the single board: a fixture set takes each face's "
+                         "caliper value from faces[k].square_mm_measured in the fixture spec; "
+                         "fill it in and pass the spec (calibrate-stereo --fixture SPEC)")
+    if len(pars) != 1:
+        raise ValueError(f"pose set {set_label!r} mixes diamond parities; capture one "
+                         "consistent set")
+    par = pars.pop()
+    fps = {p["fixture"].get("fingerprint") for p in poses}
+    if len(fps) != 1:
+        raise ValueError(f"pose set {set_label!r} mixes fixtures ({sorted(map(str, fps))}); "
+                         "capture one consistent set")
+    if fixture is not None:
+        fxs = fixture_mod.load(fixture)
+        if fixture_mod.fingerprint(fxs) != next(iter(fps)):
+            raise ValueError(f"fixture spec {fxs.get('name')!r} is not the fixture these "
+                             "placements were captured with (other boards or face poses)")
+    else:
+        fxs = fixture_mod.load(poses[0]["fixture"]["spec"])
+    boards = fixture_mod.boards(fxs)
+    views, where = [], []
+    for k, p in enumerate(poses):
+        dat = _load_pose(p["path"])
+        for f, b in zip(fxs["faces"], boards):
+            views.append({**dat, "spec": b, "view": f"{p['id']}/face{f['face']}"})
+            where.append((k, int(f["face"])))
+    fit = stereo.calibrate(views, boards[0], cam_size=views[0]["image"].shape[::-1],
+                           projector_distortion=projector_distortion)
+    warnings = []
+    indep = {"camera_rms_px": fit["cam"]["rms"], "projector_u_px": fit["proj"]["rms_u"],
+             "projector_v_px": fit["proj"]["rms_v"], "K_cam": fit["cam"]["K"].tolist(),
+             "dist_cam": np.ravel(fit["cam"]["dist"]).tolist(),
+             "K_proj": fit["proj"]["K"].tolist(),
+             "R": np.asarray(fit["R"]).tolist(), "t": np.ravel(fit["t"]).tolist()}
+    n_pl = len({where[o["view"]][0] for o in fit["observations"]})
+    rig = {"used": False, "independent": indep}
+    check_views = [{"placement": where[i][0], "face": where[i][1],
+                    "R": cv2.Rodrigues(np.asarray(rv, np.float64))[0]}
+                   for i, rv in zip(fit["used"], fit["cam"]["rvecs"])]
+    if rigid and n_pl >= 2:
+        obs = [{**o, "placement": where[o["view"]][0], "face": where[o["view"]][1]}
+               for o in fit["observations"]]
+        try:
+            r = rigid_mod.refine(obs, fit["cam"], fit["proj"], fit["R"], fit["t"],
+                                 {int(f["face"]): fixture_mod.face_pose(f) for f in fxs["faces"]},
+                                 projector_distortion)
+        except (ValueError, np.linalg.LinAlgError) as e:
+            r = None
+            warnings.append(f"rigid-fixture refinement failed ({e}): the independent per-face "
+                            "views are used")
+        if r is not None:
+            lim_c = max(RIGID_RMS_FACTOR * fit["cam"]["rms"],
+                        fit["cam"]["rms"] + RIGID_RMS_SLACK_PX)
+            lim_p = max(RIGID_RMS_FACTOR * fit["proj"]["rms"],
+                        fit["proj"]["rms"] + RIGID_RMS_SLACK_PX)
+            rig.update(rms_cam_px=r["rms_cam"], rms_proj_px=r["rms_proj"],
+                       converged=r["success"], nfev=r["nfev"], ref_face=r["ref_face"])
+            if r["success"] and r["rms_cam"] <= lim_c and r["rms_proj"] <= lim_p:
+                fit = _apply_rigid(fit, r)
+                rig["used"] = True
+                rig["face_poses"] = {str(f): {"R": np.asarray(R).tolist(),
+                                              "t": np.ravel(t).tolist()}
+                                     for f, (R, t) in sorted(r["faces"].items())}
+                check_views = [{"placement": 0, "face": f, "R": R}
+                               for f, (R, _) in sorted(r["faces"].items())]
+            else:
+                warnings.append(
+                    f"rigid-fixture refinement rejected: camera RMS {r['rms_cam']:.3f} px / "
+                    f"projector {r['rms_proj']:.3f} px vs {fit['cam']['rms']:.3f} / "
+                    f"{fit['proj']['rms']:.3f} px for the independent views - did the fixture "
+                    "move or flex between placements (a loose wedge, a lifting sticker)? The "
+                    "independent per-face views are used")
+    elif rigid:
+        warnings.append("one placement only: the rigid-fixture refinement needs >= 2 (3 "
+                        "recommended: left, right, centre, turned differently)")
+    check = fixture_mod.consistency(fxs, check_views)
+    check["source"] = "rigid estimate" if rig["used"] else "per placement, independent views"
+    warnings += check["warnings"]
+    truth = _mock_truth(s)
+    board_rec = {"fixture": fxs.get("name"), "fingerprint": fixture_mod.fingerprint(fxs),
+                 "faces": [b.to_dict() for b in boards]}
+    per_view = [{"view": views[i]["view"], "placement": where[i][0], "face": where[i][1]}
+                for i in fit["used"]]
+    cal = stereo.save(s.store, preset.geometry_id, fit, fingerprint=fp, spec=boards[0],
+                      parity=par, created=datetime.now().isoformat(timespec="seconds"),
+                      extra_report={"set": set_label, "poses": [p["id"] for p in poses],
+                                    "fixture": fixture_mod.summary(fxs), "views": per_view,
+                                    "squares_mm_used": [b.square_mm for b in boards],
+                                    "rigid": rig, "face_check": check},
+                      truth=truth, board=board_rec)
+    summary = _summary(cal, fit, set_label, len(poses), par)
+    summary.update(n_placements=len(poses), n_views=fit["n_poses"],
+                   fixture=fixture_mod.summary(fxs), rigid=rig, face_check=check)
+    summary["warnings"] += warnings
+    if truth is not None:
+        summary["vs_truth"] = stereo.compare_truth(cal, truth)
+        ind = stereo.StereoCalibration(id="independent", geometry_id=cal.geometry_id,
+                                       K_cam=np.asarray(indep["K_cam"]),
+                                       dist_cam=np.asarray(indep["dist_cam"]),
+                                       K_proj=np.asarray(indep["K_proj"]), dist_proj=cal.dist_proj,
+                                       R=np.asarray(indep["R"]), t=np.asarray(indep["t"]))
+        summary["vs_truth_independent"] = stereo.compare_truth(ind, truth)
+    return _finish(s, preset, cal, fit, summary, set_label, par)
+
+
+def _apply_rigid(fit: dict, r: dict) -> dict:
+    """The fit dict stereo.save expects, with the refined values (RMS recomputed by
+    refine over the same corners)."""
+    from .camera import CAMERA_RMS_TARGET_PX
+    from .projector import PROJECTOR_RMS_TARGET_PX
+    cam = {**fit["cam"], "K": r["cam"]["K"], "dist": r["cam"]["dist"], "rms": r["rms_cam"],
+           "per_pose_rms": r["per_view_cam_rms"], "ok": r["rms_cam"] < CAMERA_RMS_TARGET_PX}
+    pv = [x for x in r["per_view_proj_rms"] if x is not None]
+    proj = {**fit["proj"], "K": r["proj"]["K"], "dist": r["proj"]["dist"],
+            "rms": r["rms_proj"], "rms_u": r["rms_proj_u"], "rms_v": r["rms_proj_v"],
+            "per_pose_rms": pv, "fv_over_fu": float(r["proj"]["K"][1, 1] / r["proj"]["K"][0, 0]),
+            "ok": r["rms_proj_u"] < PROJECTOR_RMS_TARGET_PX
+            and r["rms_proj_v"] < PROJECTOR_RMS_TARGET_PX}
+    rms = float(np.sqrt((r["rms_cam"] ** 2 + r["rms_proj"] ** 2) / 2))
+    per_pose = [{**pp, "camera_rms_px": c}                       # same view order (used)
+                for pp, c in zip(fit["per_pose"], r["per_view_cam_rms"])]
+    return {**fit, "cam": cam, "proj": proj, "R": r["R"], "t": r["t"], "rms_stereo": rms,
+            "per_pose": per_pose, "rigid": True}

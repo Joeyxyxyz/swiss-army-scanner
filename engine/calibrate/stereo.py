@@ -91,27 +91,33 @@ class StereoCalibration:
 
 def calibrate(poses: list, spec: BoardSpec, cam_size=(1440, 1080), proj_size=(912, 1140),
               projector_distortion: bool = False, half_win: int = 18) -> dict:
-    """poses: [{"image": flood uint8, "corr_x", "corr_y"}] (one per board pose)
-    -> {"cam": ..., "proj": ..., "R", "t", "rms_stereo", "per_pose": [...]}"""
+    """poses: [{"image": flood uint8, "corr_x", "corr_y"}] (one per board view; a view may
+    carry its own "spec": one face of the calibration fixture, several views sharing one
+    capture) -> {"cam": ..., "proj": ..., "R", "t", "rms_stereo", "per_pose": [...],
+    "used": view indices in camera-view order}"""
     import cv2
-    det = [detect(p["image"], spec) for p in poses]
+    det = [detect(p["image"], p.get("spec") or spec) for p in poses]
     used = [i for i, d in enumerate(det) if d is not None]
     if len(used) < 3:
-        raise ValueError(f"only {len(used)} of {len(poses)} poses show the ChArUco board "
+        raise ValueError(f"only {len(used)} of {len(poses)} views show their ChArUco board "
                          f"({spec.squares_x}x{spec.squares_y}, {spec.dictionary}); need >= 3")
     cam = calibrate_camera([det[i] for i in used], cam_size)
     det, n_outliers = _drop_corner_outliers(det, used, cam)
     if n_outliers:
         cam = calibrate_camera([det[i] for i in used], cam_size)
     cam["corner_outliers_dropped"] = n_outliers
-    obj_v, cam_v, prj_v, per_pose = [], [], [], []
+    obj_v, cam_v, prj_v, per_pose, obs = [], [], [], [], []
     for k, i in enumerate(used):
         corners, ids, obj = det[i]
         pp, ok, hrms = corners_to_projector(corners, poses[i]["corr_x"], poses[i]["corr_y"],
                                             cam["K"], cam["dist"], half_win=half_win)
+        obs.append({"view": i, "obj": np.asarray(obj, float),
+                    "cam_px": np.asarray(corners, float),
+                    "proj_px": np.where(ok[:, None], pp, np.nan)})
         per_pose.append({"pose": i, "corners": int(len(ids)), "projector_corners": int(ok.sum()),
                          "camera_rms_px": cam["per_pose_rms"][k],
-                         "homography_rms_px": float(np.nanmedian(hrms)) if ok.any() else None})
+                         "homography_rms_px": float(np.nanmedian(hrms)) if ok.any() else None,
+                         **({"view": poses[i]["view"]} if "view" in poses[i] else {})})
         if ok.sum() >= 6:
             obj_v.append(obj[ok])
             cam_v.append(corners[ok])
@@ -125,6 +131,7 @@ def calibrate(poses: list, spec: BoardSpec, cam_size=(1440, 1080), proj_size=(91
         cam["K"], cam["dist"], proj["K"], proj["dist"], tuple(cam_size), flags=flags)
     return {"cam": cam, "proj": proj, "R": R, "t": T.reshape(3), "rms_stereo": float(rms),
             "per_pose": per_pose, "n_poses": len(obj_v), "n_detected": len(used),
+            "used": used, "observations": obs,
             "corner_outliers_dropped": cam["corner_outliers_dropped"]}
 
 
@@ -172,7 +179,9 @@ def compare_truth(cal: StereoCalibration, truth: dict) -> dict:
 
 def save(store, geometry_id: str, fit: dict, *, fingerprint: Optional[dict], spec: BoardSpec,
          parity: Optional[int], created: str, extra_report: Optional[dict] = None,
-         truth: Optional[dict] = None) -> StereoCalibration:
+         truth: Optional[dict] = None, board: Optional[dict] = None) -> StereoCalibration:
+    """board: what the calibration records as its target (default spec.to_dict(); the
+    calibration fixture records its faces)."""
     from ..library.store import json_safe
     d = store.new_dir("calibrations", geometry_id, label="stereo")
     cal = StereoCalibration(
@@ -185,7 +194,7 @@ def save(store, geometry_id: str, fit: dict, *, fingerprint: Optional[dict], spe
              "projector_u_px": fit["proj"]["rms_u"], "projector_v_px": fit["proj"]["rms_v"],
              "stereo_px": fit["rms_stereo"], "camera_ok": fit["cam"]["ok"],
              "projector_ok": fit["proj"]["ok"]},
-        board=spec.to_dict(), n_poses=fit["n_poses"], fingerprint=fingerprint, path=d,
+        board=board or spec.to_dict(), n_poses=fit["n_poses"], fingerprint=fingerprint, path=d,
         created=created)
     report = {"per_pose": fit["per_pose"], "camera_per_pose_rms": fit["cam"]["per_pose_rms"],
               "projector_per_pose_rms": fit["proj"]["per_pose_rms"],

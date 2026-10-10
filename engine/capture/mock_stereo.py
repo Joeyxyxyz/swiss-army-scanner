@@ -375,7 +375,8 @@ class Block(StereoShape):
 @dataclass
 class CharucoTarget(StereoShape):
     """A printed ChArUco board (calibrate/charuco.BoardSpec) at a pose:
-    X_world = R @ X_board + t (board mm, origin top-left, z = 0)."""
+    X_world = R @ X_board + t (board mm, origin top-left, z = 0). margin_mm: the white
+    border of a printed sticker around the squares (0 = the bare board)."""
     spec: object = None
     R: np.ndarray = field(default_factory=lambda: np.eye(3))
     t: np.ndarray = field(default_factory=lambda: np.array([-125.0, -87.5, 800.0]))
@@ -384,6 +385,7 @@ class CharucoTarget(StereoShape):
     light: float = 0.85
     blur_px: float = 1.3                # texture px: ~ the camera footprint
     albedo: float = 0.85
+    margin_mm: float = 0.0
     _tex: Optional[np.ndarray] = field(default=None, repr=False)
 
     def intersect(self, o, d):
@@ -396,14 +398,15 @@ class CharucoTarget(StereoShape):
         X = o2 + np.where(np.isfinite(tt), tt, 0)[:, None] * d
         b = (X - t) @ R
         w, h = self.spec.board_size_mm
-        inside = (b[:, 0] >= 0) & (b[:, 0] <= w) & (b[:, 1] >= 0) & (b[:, 1] <= h)
+        m = float(self.margin_mm)
+        inside = (b[:, 0] >= -m) & (b[:, 0] <= w + m) & (b[:, 1] >= -m) & (b[:, 1] <= h + m)
         tt = np.where(inside & (np.abs(den) > 1e-12) & (tt > 1e-6), tt, np.inf)
         return tt, np.broadcast_to(-n if n[2] > 0 else n, d.shape)
 
     def texture(self) -> np.ndarray:
         if self._tex is None:
             import cv2
-            img = self.spec.image(self.px_per_mm).astype(np.float32) / 255.0
+            img = self.spec.image(self.px_per_mm, self.margin_mm).astype(np.float32) / 255.0
             img = self.dark + (self.light - self.dark) * img
             self._tex = cv2.GaussianBlur(img, (0, 0), self.blur_px)
         return self._tex
@@ -411,8 +414,9 @@ class CharucoTarget(StereoShape):
     def albedo_at(self, X):
         from scipy.ndimage import map_coordinates
         b = (X - np.asarray(self.t, float)) @ np.asarray(self.R, float)
-        mx = b[:, 0] * self.px_per_mm - 0.5
-        my = b[:, 1] * self.px_per_mm - 0.5
+        off = round(float(self.margin_mm) * self.px_per_mm)       # the sticker's white border
+        mx = b[:, 0] * self.px_per_mm - 0.5 + off
+        my = b[:, 1] * self.px_per_mm - 0.5 + off
         out = map_coordinates(self.texture(), [my, mx], order=1, mode="nearest")
         return out.astype(np.float32)
 
@@ -483,7 +487,43 @@ class EndFace(StereoShape):
         return np.where(hit, t, np.inf), np.broadcast_to(n, d.shape)
 
 
-STEREO_SHAPES = (Plane, Sphere, MetricCylinder, Block, CharucoTarget, EndFace)
+@dataclass
+class ConvexSolid(StereoShape):
+    """A convex polyhedron: the points X with normals[i] . X <= offsets[i] for every
+    plane (normals outward, world mm). A printed wedge of the calibration fixture."""
+    normals: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
+    offsets: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    albedo: float = 0.8
+
+    @classmethod
+    def from_local(cls, normals, offsets, R, t, albedo: float = 0.8) -> "ConvexSolid":
+        """Planes given in a local frame placed by X_world = R @ x + t."""
+        R, t = np.asarray(R, float), np.asarray(t, float)
+        N = np.asarray(normals, float) @ R.T
+        return cls(N, np.asarray(offsets, float) + N @ t, albedo)
+
+    @classmethod
+    def box(cls, lo, hi, R=np.eye(3), t=np.zeros(3), albedo: float = 0.8) -> "ConvexSolid":
+        e = np.eye(3)
+        return cls.from_local(np.vstack([e, -e]), np.r_[np.asarray(hi, float),
+                                                       -np.asarray(lo, float)], R, t, albedo)
+
+    def intersect(self, o, d):
+        N, off = np.asarray(self.normals, float), np.asarray(self.offsets, float)
+        o2 = np.broadcast_to(o, d.shape)
+        den = d @ N.T
+        num = off[None, :] - o2 @ N.T
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s = num / den
+        enter = np.where(den < -1e-12, s, -np.inf)
+        leave = np.where(den > 1e-12, s, np.inf)
+        parallel_out = ((np.abs(den) <= 1e-12) & (num < 0)).any(axis=1)
+        s_in, s_out = enter.max(axis=1), leave.min(axis=1)
+        hit = (s_in <= s_out) & (s_in > 1e-6) & ~parallel_out
+        return np.where(hit, s_in, np.inf), N[np.argmax(enter, axis=1)]
+
+
+STEREO_SHAPES = (Plane, Sphere, MetricCylinder, Block, CharucoTarget, EndFace, ConvexSolid)
 
 
 # ----------------------------------------------------------------- the scene
@@ -616,3 +656,106 @@ def board_poses(spec, n: int = 12, seed: int = 0, standoff: float = 823.0) -> li
         t = np.array([cx, cy, z]) - R @ np.array([w / 2, h / 2, 0.0])
         out.append((R, t))
     return out
+
+
+# ------------------------------------------- the calibration fixture + check block
+
+def _rot_xyz(ax_deg: float, ay_deg: float, az_deg: float) -> np.ndarray:
+    ax, ay, az = (math.radians(v) for v in (ax_deg, ay_deg, az_deg))
+    Rx = np.array([[1, 0, 0], [0, math.cos(ax), -math.sin(ax)], [0, math.sin(ax), math.cos(ax)]])
+    Ry = np.array([[math.cos(ay), 0, math.sin(ay)], [0, 1, 0], [-math.sin(ay), 0, math.cos(ay)]])
+    Rz = np.array([[math.cos(az), -math.sin(az), 0], [math.sin(az), math.cos(az), 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+FACING_CAMERA = np.diag([1.0, -1.0, -1.0])     # part x -> camera x, part y up, part z -> camera
+
+
+def fixture_shapes(spec: dict, R: np.ndarray, t: np.ndarray, bodies: bool = True,
+                   albedo: float = 0.8) -> list:
+    """The printed calibration fixture (calibrate/fixture.py spec) placed by
+    X_world = R @ X_fixture + t: one ChArUco sticker per face (the caliper-measured
+    squares when the spec gives them: the 'true' print), plus the white wedges and base
+    plate behind them (bodies)."""
+    from ..calibrate import fixture as fx
+    R, t = np.asarray(R, float), np.asarray(t, float)
+    margin = float(spec["design"]["sticker_margin_mm"])
+    out = []
+    for f, b in zip(spec["faces"], fx.boards(spec)):
+        Rf, tf = fx.face_pose(f)
+        nom = fx.BoardSpec.from_dict(f["board"])
+        centre = tf + Rf @ np.array([*nom.board_size_mm, 0.0]) / 2
+        tb = centre - Rf @ np.array([*b.board_size_mm, 0.0]) / 2
+        out.append(CharucoTarget(spec=b, R=R @ Rf, t=R @ tb + t, margin_mm=margin))
+    if not bodies:
+        return out
+    for w in (p for p in spec["parts"] if p["kind"] == "wedge"):
+        Rw, tw = fx.wedge_to_fixture(w)
+        p0, n_w = fx.face_plane_w(w)
+        Lu, Lv = float(w["Lu"]), float(w["Lv"])
+        N = [[0, 0, -1], n_w, [-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0]]
+        off = [0.0, float(n_w @ p0), 0.0, Lu, Lv / 2, Lv / 2]
+        out.append(ConvexSolid.from_local(N, off, R @ Rw, R @ tw + t, albedo))
+    base = next(p for p in spec["parts"] if p["kind"] == "base")
+    W, Dd, T = float(base["W"]), float(base["D"]), float(base["base_mm"])
+    out.append(ConvexSolid.box([-W / 2, -Dd / 2, -T], [W / 2, Dd / 2, 0.0], R, t, albedo))
+    return out
+
+
+# what the operator is told to do (docs/CALIBRATION_FIXTURE.md): left, right, centre, each
+# time turned differently about its own axis (spin), tipped a little and at another distance
+# (cx, cy, mm in front of the wall, tilt about x, about y, spin; mm / deg)
+FIXTURE_PLAN = [(-90.0, 35.0, 88.0, 12.0, -10.0, 20.0), (90.0, -35.0, 58.0, -10.0, 12.0, -25.0),
+                (0.0, 0.0, 133.0, -12.0, -12.0, 45.0), (90.0, 40.0, 103.0, 10.0, 10.0, -60.0),
+                (-90.0, -40.0, 73.0, -10.0, 12.0, 70.0)]
+
+
+def fixture_placements(n: int = 3, seed: int = 0, standoff: float = 823.0) -> list:
+    """n placements (R, t: fixture -> world) of the fixture facing the camera, after
+    FIXTURE_PLAN (seed > 0 jitters them by a few mm / deg)."""
+    rng = np.random.default_rng(seed)
+    j = 0.0 if not seed else 1.0
+    out = []
+    for k in range(int(n)):
+        cx, cy, dz, ax, ay, az = FIXTURE_PLAN[k % len(FIXTURE_PLAN)]
+        R = _rot_xyz(ax + j * rng.uniform(-2, 2), ay + j * rng.uniform(-2, 2),
+                     az + j * rng.uniform(-3, 3)) @ FACING_CAMERA
+        t = np.array([cx + j * rng.uniform(-4, 4), cy + j * rng.uniform(-4, 4),
+                      standoff - dz + j * rng.uniform(-4, 4)])
+        out.append((R, t))
+    return out
+
+
+def check_block_shapes(spec: dict, R: np.ndarray, t: np.ndarray, albedo: float = 0.8) -> list:
+    """The printed check block (measure/checkblock.py spec) placed by
+    X_world = R @ X_block + t: slab, steps, the D-profile bar (pedestal + cylinder) and
+    the dome (a sphere centred on the reference face)."""
+    R, t = np.asarray(R, float), np.asarray(t, float)
+    sl = spec["slab"]
+    L, Dd, T = float(sl["L"]), float(sl["D"]), float(sl["T"])
+    out = [ConvexSolid.box([-L / 2, -Dd / 2, -T], [L / 2, Dd / 2, 0.0], R, t, albedo)]
+    for f in spec["features"]:
+        if f["kind"] == "step":
+            out.append(ConvexSolid.box([f["x"][0], f["y"][0], -1.0],
+                                       [f["x"][1], f["y"][1], f["height_mm"]], R, t, albedo))
+        elif f["kind"] == "cylinder":
+            r, p, xc = float(f["radius_mm"]), float(f["pedestal_mm"]), float(f["x_c"])
+            y0, y1 = (float(v) for v in f["y"])
+            if p > 0:
+                out.append(ConvexSolid.box([xc - r, y0, -1.0], [xc + r, y1, p], R, t, albedo))
+            out.append(MetricCylinder(center=tuple(R @ np.array([xc, (y0 + y1) / 2, p]) + t),
+                                      radius=r, height=y1 - y0, axis=tuple(R[:, 1]),
+                                      albedo=albedo))
+        elif f["kind"] == "dome":
+            c = np.array([f["centre"][0], f["centre"][1], 0.0])
+            out.append(Sphere(center=tuple(R @ c + t), radius=float(f["radius_mm"]),
+                              albedo=albedo))
+    return out
+
+
+def check_block_placement(standoff: float = 823.0, tilt=(5.0, -4.0, 3.0),
+                          centre=(0.0, 0.0)) -> tuple:
+    """(R, t) of the check block facing the camera, its reference face ~25 mm in front of
+    the wall, slightly turned (an operator never sets it down perfectly square)."""
+    R = _rot_xyz(*tilt) @ FACING_CAMERA
+    return R, np.array([float(centre[0]), float(centre[1]), standoff - 25.0])

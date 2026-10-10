@@ -394,15 +394,21 @@ VERBS: dict = {
                            {"set_label": "pose set name (default stereo)",
                             "steps": "phase steps (default 12)",
                             "periods": "[T, ...] DMD px, fine -> coarse (default 8, 80, 1280)",
-                            "diamond_parity": "auto | 0 | 1 | null (square grid)"}),
+                            "diamond_parity": "auto | 0 | 1 | null (square grid)",
+                            "fixture": "calibration fixture spec JSON path: one PLACEMENT of the "
+                                       "fixture, one view per face (3 placements in all)"}),
     "calibrate_stereo": ("Camera + projector (inverse camera) + stereoCalibrate from a pose set "
                          "-> geometry-bound stereo calibration (per-pose and per-axis RMS).",
                          {"set_label": "pose set (default: the newest)",
-                          "square_mm": "caliper-measured printed square, mm",
+                          "square_mm": "caliper-measured printed square, mm (single board)",
                           "projector_distortion": "bool: fit projector k1/k2 (default false)",
                           "mock_poses": "MOCK ONLY: N board poses placed by the simulator",
                           "steps": "phase steps (mock poses)", "periods": "[T, ...] DMD px",
-                          "diamond_parity": "auto | 0 | 1 | null"}),
+                          "diamond_parity": "auto | 0 | 1 | null",
+                          "fixture": "fixture set: the spec JSON path with the caliper-measured "
+                                     "squares (default: the spec stored with the placements)",
+                          "mock_fixture": "MOCK ONLY: N fixture placements by the simulator",
+                          "rigid": "bool: rigid-fixture refinement (default true)"}),
     "scan_metric": ("Both-axis multifreq scan -> point cloud in mm (+ .ply, per-pixel "
                     "consistency error). Refused without a stereo calibration (rule 6).",
                     {"label": "text", "method": "auto | plane | rays",
@@ -430,6 +436,17 @@ VERBS: dict = {
                         "metric_ids": "[ids] of existing metric scans (else new scans)",
                         "repeats": "new scans (default 3)", "tol_mm": "mean error (default 0.1)",
                         "repeat_tol_mm": "repeat sigma (default 0.03)", "label": "text"}),
+    "accuracy_block": ("Scan the printed known-geometry check block: reference flatness, step "
+                       "heights, bar / dome diameter and height vs the caliper values -> "
+                       "CONTINUE / REJECT (recalibrate) / PULL (doubt).",
+                       {"block": "check block spec JSON path", "measured": "filled-in measured "
+                        "template JSON path (without it: PULL)",
+                        "metric_ids": "[ids] of existing metric scans (else new scans)",
+                        "repeats": "new scans (default 1)",
+                        "tol_height_mm": "heights (default: the spec's)",
+                        "tol_diameter_mm": "diameters (default: the spec's)",
+                        "flatness_max_mm": "reference face RMS limit (default: the spec's)",
+                        "label": "text"}),
     "predict_precision": ("Predicted depth noise sigma_z in mm before scanning (Lv & Kemao).",
                           {"z_mm": "working distance (default: rig standoff)",
                            "A_dn": "fringe offset, grey levels", "B_dn": "modulation, grey levels",
@@ -2275,17 +2292,31 @@ class App:
         return api.capture_calib_pose(self._preset(), _s(a, "set_label", "stereo"),
                                       steps=_num(a, "steps", None, int),
                                       periods=_num_list(a, "periods"),
-                                      diamond_parity=self._parity_arg(a))
+                                      diamond_parity=self._parity_arg(a),
+                                      fixture=_s(a, "fixture"))
 
     def _v_calibrate_stereo(self, a):
         n = _num(a, "mock_poses", 0, int)
-        if n and not self.mock:
-            raise ArgError("mock_poses is mock-only")
+        nf = _num(a, "mock_fixture", 0, int)
+        if (n or nf) and not self.mock:
+            raise ArgError("mock_poses / mock_fixture are mock-only")
         return api.calibrate_stereo(self._preset(), _s(a, "set_label"), _num(a, "square_mm"),
                                     projector_distortion=_bool(a, "projector_distortion"),
                                     mock_poses=n, steps=_num(a, "steps", None, int),
                                     periods=_num_list(a, "periods"),
-                                    diamond_parity=self._parity_arg(a))
+                                    diamond_parity=self._parity_arg(a),
+                                    fixture=_s(a, "fixture"), mock_fixture=nf,
+                                    rigid=_bool(a, "rigid", True))
+
+    def _v_accuracy_block(self, a):
+        ids = a.get("metric_ids") or None
+        if ids is not None and not isinstance(ids, list):
+            raise ArgError("metric_ids must be a list of metric scan ids")
+        scans = [self._entry("metric", i) for i in ids] if ids else None
+        return api.accuracy_block(_s(a, "block", required=True), _s(a, "measured"), scans,
+                                  _num(a, "repeats", 1, int), self._preset(),
+                                  _num(a, "tol_height_mm"), _num(a, "tol_diameter_mm"),
+                                  _num(a, "flatness_max_mm"), _s(a, "label", "block"))
 
     def _v_scan_metric(self, a):
         method = _s(a, "method", "auto")

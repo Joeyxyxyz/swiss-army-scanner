@@ -260,6 +260,32 @@ def accuracy_check(s, preset, kind: str, known: dict, scans: Optional[list] = No
     return rep
 
 
+def accuracy_block(s, preset, block, measured=None, scans: Optional[list] = None,
+                   repeats: int = 1, tol_height_mm=None, tol_diameter_mm=None,
+                   flatness_max_mm=None, label: str = "block", steps=None, periods=None) -> dict:
+    """The check block (measure/checkblock.py) over new metric scans (or the given ones)
+    -> the report (rows, verdict, disposition) in output/measurements."""
+    from ..measure import checkblock
+    spec = checkblock.load(block)
+    meas = checkblock.load_measured(measured, spec)        # bad input refused before the rig
+    if scans is None:
+        if repeats < 1:
+            raise ValueError("repeats must be >= 1")
+        scans = [scan_metric(s, preset, f"{label}_{i + 1}", steps=steps, periods=periods)
+                 for i in range(int(repeats))]
+    for sc in scans:
+        check_cal(s, sc, "accuracy_block")
+    rep = checkblock.analyze([sc.cloud for sc in scans], spec, meas, tol_height_mm,
+                             tol_diameter_mm, flatness_max_mm)
+    rep.update(scans=[sc.id for sc in scans], geometry_id=scans[0].geometry_id,
+               calibration_id=scans[0].calibration_id, measured_given=sorted(meas))
+    out = s.store.output_path("measurements", f"{label}_checkblock", ".json")
+    s.store.write_json(out, json_safe(rep))
+    s.store.record_output("measurements", out, label=label, geometry_id=rep["geometry_id"])
+    rep["file"] = out
+    return rep
+
+
 def export_metric_mesh(s, scan: MetricScan, fmt: str = "stl", stride: int = 1,
                        max_edge_mm: Optional[float] = None, foreground_only: bool = False):
     from . import mesh as mesh_mod

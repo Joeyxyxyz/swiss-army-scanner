@@ -66,10 +66,19 @@ uses the FLIR Spinnaker SDK (`RealCamera`); any **GenICam** camera (**GigE Visio
    `scan charuco` (print at 100 %, caliper a square) -> `scan parity` ->
    `scan calib-pose` x 12-20 (tilted up to +-30 deg, filling the measuring volume) ->
    `scan calibrate-stereo --square <measured mm>`: camera RMS < 0.3 px, projector < 0.5 px.
+   Watch the **projector corners** each pose prints (corners with a projector position /
+   corners found): under 60 % the fringes are not resolved on the board (a printed board,
+   an opened lens, a longer distance) and the pose is captured again with coarser fringes
+   (16,160,1280, then 24,192,1280 DMD px; `--periods` sets them yourself). A pose set keeps
+   one period set. `calibrate-stereo` lists the poses that gave projector points and is
+   rejected with nothing saved when the fit is not a calibration (degenerate projector
+   intrinsics, stereo RMS > 2 px, too few poses with projector points).
 4. `scan rig-check --set-reference` with the station empty: HOME then detects a nudged
    camera or projector (shift, roll and zoom; OK only when the projected pattern is matched;
    a pattern that is not seen, or roll / zoom that cannot be determined, is UNKNOWN, never
-   OK; roll / zoom detection is tested on the mock bench only so far).
+   OK; roll / zoom detection is tested on the mock bench only so far). After a small camera
+   nudge `scan rig-check --rehome` writes a re-homed copy of the calibration (the camera's
+   rotation taken out, the original kept; rotation only, so recalibrate when you can).
 
 Every mm the engine reports comes from the stereo calibration of the SAME geometry and
 fingerprint (rule 6); without one a recipe run is INVALID and says how to calibrate.

@@ -23,6 +23,15 @@ the matched area (the fitted motion at its corners, or any tile's own shift).
 OK needs both channels matched and the pattern's roll / zoom determined (the
 pattern is the only channel that sees the projector): a channel that cannot be
 matched is never read as "in place".
+
+Re-home (rehome_fit): a small CAMERA rotation about its own centre moves the
+whole image by one homography, whatever the scene's depth. camera_rotation()
+fits it from the flood's tile shifts on undistorted coordinates about the
+principal point (shift -> pan / tilt, roll), and rehome_fit() says whether the
+motion is one a rotation-only correction of the stereo calibration can take
+out: camera-like (the pattern moves with the flood), small, well registered.
+A camera TRANSLATION looks the same on a flat scene and is not corrected: the
+absolute depth can keep a small offset; a full calibration is the reference.
 """
 
 from __future__ import annotations
@@ -44,6 +53,17 @@ MIN_TILE_ISOTROPY = 0.1       # structure-tensor eigenvalue ratio: below it a ti
 MIN_TILE_SPREAD = 0.25        # matched tile centres must lie this far apart (x the frame
                               # diagonal) for the roll / scale to be determined
 TEXTURE_MIN_CONTRAST = 0.05   # high-passed rms / mean level: a frame with less shows no texture
+REHOME_MAX_PX = 5.0           # re-home: a larger image motion is not a nudge - recalibrate
+REHOME_GRID = 5               # re-home: REHOME_GRID x REHOME_GRID tiles (the check's own
+                              # downsampling and high-pass: the same texture band)
+REHOME_TILE_UPSAMPLE = 50     # re-home: sub-pixel step of the tiles' shifts, 1/50 px
+REHOME_MIN_TILES = 6          # re-home: flood tiles matched, and agreeing on one rotation
+REHOME_MIN_PEAK = 0.5         # re-home: median match of the flood tiles used
+REHOME_INLIER_PX = 0.3        # re-home: a tile agrees when its shift is this close to the fit
+REHOME_MIN_AGREE = 0.6        # re-home: share of the matched tiles (and of their spread over
+                              # the frame) that must agree on the one rotation
+REHOME_AGREE_PX = 0.4         # re-home: pattern tiles vs the flood's rotation, rms (or
+REHOME_AGREE_FRACTION = 0.15  #          this fraction of the motion, whichever is larger)
 
 
 def random_block_pattern(shape=(1140, 912), block: int = PATTERN_BLOCK_PX,
@@ -204,7 +224,7 @@ def similarity_at(sim: dict, pts, centre) -> np.ndarray:
 
 
 def motion(ref: np.ndarray, img: np.ndarray, grid: int = TILE_GRID, upsample: int = 50,
-           max_side: int = 1024) -> dict:
+           max_side: int = 1024, tile_upsample: int = TILE_UPSAMPLE) -> dict:
     """How `img` moved relative to `ref`, over the whole frame -> the global phase_shift
     keys {"dx", "dy", "shift_px", "peak"} plus
       matched       the frames could be matched (the global peak, or the tile similarity)
@@ -237,7 +257,7 @@ def motion(ref: np.ndarray, img: np.ndarray, grid: int = TILE_GRID, upsample: in
         if min(y1 - y0, x1 - x0) < 16:
             continue
         ta, tb = _window(hr[y0:y1, x0:x1]), _window(hm[y0:y1, x0:x1])
-        t = _match(ta, tb, f, TILE_UPSAMPLE)
+        t = _match(ta, tb, f, int(tile_upsample))
         iso = min(_isotropy(ta), _isotropy(tb))
         wgt = ta * ta
         s = float(wgt.sum())
@@ -270,7 +290,7 @@ def motion(ref: np.ndarray, img: np.ndarray, grid: int = TILE_GRID, upsample: in
         cnr = similarity_at(sim, [[x0, y0], [x1, y0], [x0, y1], [x1, y1]], centre)
         cand.append(float(np.max(np.hypot(cnr[:, 0], cnr[:, 1]))))
     out = dict(g)
-    out.update({"matched": matched, "similarity": sim is not None,
+    out.update({"shape": [int(H), int(W)], "matched": matched, "similarity": sim is not None,
                 "rotation_deg": round(sim["rotation_deg"], 4) if sim else None,
                 "scale_pct": round(100.0 * (sim["scale"] - 1.0), 4) if sim else None,
                 "fit_rms_px": round(sim["rms_px"], 3) if sim else None,
@@ -284,6 +304,228 @@ def motion(ref: np.ndarray, img: np.ndarray, grid: int = TILE_GRID, upsample: in
 
 def _matched(s: Optional[dict]) -> bool:
     return s is not None and bool(s.get("matched", s["peak"] >= MIN_PEAK))
+
+
+# ------------------------------------------------------------ re-home (camera rotation)
+
+def _normalised(px, K, dist=None, iters: int = 25) -> np.ndarray:
+    """Distorted pixels (N, 2) -> ideal normalised camera coordinates (N, 2): the Brown
+    model (k1, k2, p1, p2, k3) inverted by fixed-point iteration, run to convergence."""
+    px = np.asarray(px, np.float64).reshape(-1, 2)
+    K = np.asarray(K, np.float64)
+    coef = np.zeros(5) if dist is None else np.ravel(np.asarray(dist, np.float64))
+    k1, k2, p1, p2, k3 = (list(coef) + [0.0] * 5)[:5]
+    xd = (px[:, 0] - K[0, 2]) / K[0, 0]
+    yd = (px[:, 1] - K[1, 2]) / K[1, 1]
+    x, y = xd.copy(), yd.copy()
+    if any((k1, k2, p1, p2, k3)):
+        for _ in range(iters):
+            r2 = x * x + y * y
+            rad = 1 + r2 * (k1 + r2 * (k2 + r2 * k3))
+            x, y = ((xd - (2 * p1 * x * y + p2 * (r2 + 2 * x * x))) / rad,
+                    (yd - (p1 * (r2 + 2 * y * y) + 2 * p2 * x * y)) / rad)
+    return np.stack([x, y], axis=1)
+
+
+def _rotvec(R: np.ndarray) -> np.ndarray:
+    """Rotation matrix -> rotation vector (axis x angle, rad)."""
+    v = 0.5 * np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    sn = float(np.linalg.norm(v))
+    ang = float(np.arctan2(sn, 0.5 * (np.trace(R) - 1.0)))
+    return v * (ang / sn) if sn > 1e-12 else np.zeros(3)
+
+
+def rotation_from_rotvec(w) -> np.ndarray:
+    """Rotation vector (rad) -> rotation matrix (Rodrigues)."""
+    w = np.asarray(w, np.float64).reshape(3)
+    ang = float(np.linalg.norm(w))
+    if ang < 1e-15:
+        return np.eye(3)
+    k = w / ang
+    Kx = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+    return np.eye(3) + np.sin(ang) * Kx + (1.0 - np.cos(ang)) * (Kx @ Kx)
+
+
+def camera_rotation(pts, shifts, K, dist=None, weights=None) -> Optional[dict]:
+    """The small camera rotation (about the camera's own centre) that explains local image
+    shifts: pts (N, 2) px in the reference image, shifts (N, 2) px = where that texture is
+    in the fresh image minus where it was. Fitted on UNDISTORTED coordinates about the
+    principal point: the similarity (shift + roll + scale) there gives the numbers a person
+    reads - pan = shift_x / fx, tilt = shift_y / fy, roll - and the rotation itself is the
+    least-squares rotation between the two sets of viewing rays (exact at any field
+    position; the similarity is its small-angle form).
+
+    Convention (locked by the mock test that turns the simulated camera): with a point at
+    X_old in the camera frame before the move and X_new after it,
+        X_new = R_new_from_old @ X_old          X_old = R @ X_new        (R = its transpose)
+    so a stereo calibration X_proj = R0 @ X_cam + t0 taken before the move becomes
+        R1 = R0 @ R,   t1 = t0                  (the projector did not move).
+    Image motion of a pure rotation w (rad, the rotation vector of R_new_from_old) at the
+    principal point: dx = fx * w_y, dy = -fy * w_x; roll (x towards y) = w_z.
+    -> {R, R_new_from_old, rvec_deg, rotation_deg, pan_deg, tilt_deg, roll_deg, shift_px,
+        scale_pct, similarity_rms_px, residual_px (rms of the shifts vs the fitted pure
+        rotation), residual_max_px, n}; None with fewer than 3 points."""
+    P = np.asarray(pts, np.float64).reshape(-1, 2)
+    D = np.asarray(shifts, np.float64).reshape(-1, 2)
+    if len(P) < 3 or len(P) != len(D):
+        return None
+    K = np.asarray(K, np.float64)
+    f = np.array([K[0, 0], K[1, 1]])
+    c = np.array([K[0, 2], K[1, 2]])
+    a, b = _normalised(P, K, dist), _normalised(P + D, K, dist)
+    ua, ub = a * f + c, b * f + c                         # undistorted px
+    w = np.ones(len(P)) if weights is None else np.maximum(np.asarray(weights, np.float64), 1e-9)
+    sim = fit_similarity(ua, ub - ua, c, w)
+    ra = np.c_[a, np.ones(len(a))]
+    rb = np.c_[b, np.ones(len(b))]
+    ra /= np.linalg.norm(ra, axis=1, keepdims=True)
+    rb /= np.linalg.norm(rb, axis=1, keepdims=True)
+    U, _, Vt = np.linalg.svd((ra * w[:, None]).T @ rb)    # rb ~ Rn ra (Kabsch)
+    d = 1.0 if np.linalg.det(Vt.T @ U.T) >= 0 else -1.0
+    Rn = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    pr = ra @ Rn.T
+    res = pr[:, :2] / pr[:, 2:3] * f + c - ub
+    err = np.hypot(res[:, 0], res[:, 1])
+    rv = _rotvec(Rn)
+    return {"R": Rn.T, "R_new_from_old": Rn,
+            "rvec_deg": [float(v) for v in np.degrees(rv)],
+            "rotation_deg": float(np.degrees(np.linalg.norm(rv))),
+            "pan_deg": float(np.degrees(rv[1])), "tilt_deg": float(np.degrees(-rv[0])),
+            "roll_deg": float(np.degrees(rv[2])),
+            "shift_px": [float(sim["tx"]), float(sim["ty"])],
+            "scale_pct": float(100.0 * (sim["scale"] - 1.0)),
+            "similarity_rms_px": float(sim["rms_px"]),
+            "residual_px": float(np.sqrt(np.average(err * err, weights=w))),
+            "residual_max_px": float(err.max()), "n": int(len(P))}
+
+
+def _used_tiles(m: Optional[dict]) -> tuple:
+    """(centres (N, 2), shifts (N, 2), peaks (N,)) of the tiles a motion() used."""
+    ts = [t for t in ((m or {}).get("tile_shifts") or []) if t.get("used")]
+    return (np.array([t["centre_px"] for t in ts], np.float64).reshape(-1, 2),
+            np.array([[t["dx"], t["dy"]] for t in ts], np.float64).reshape(-1, 2),
+            np.array([t["peak"] for t in ts], np.float64))
+
+
+def _rotation_errors(R_new_from_old, pts, shifts, K, dist=None) -> np.ndarray:
+    """|measured - predicted| (undistorted px) of image shifts under a pure camera rotation."""
+    K = np.asarray(K, np.float64)
+    f = np.array([K[0, 0], K[1, 1]])
+    c = np.array([K[0, 2], K[1, 2]])
+    P = np.asarray(pts, np.float64).reshape(-1, 2)
+    a = _normalised(P, K, dist)
+    ra = np.c_[a, np.ones(len(a))] @ np.asarray(R_new_from_old, np.float64).T
+    want = ra[:, :2] / ra[:, 2:3] * f + c
+    got = _normalised(P + np.asarray(shifts, np.float64).reshape(-1, 2), K, dist) * f + c
+    return np.hypot(*(got - want).T)
+
+
+def _robust_rotation(P, D, w, K, dist=None) -> tuple:
+    """camera_rotation on the tiles that agree on ONE rotation -> (fit or None, inliers).
+    A tile whose texture does not pin its shift (one soft edge, a nearly flat patch) can
+    match well at the wrong place; it must not drag the rotation, and it must not count as
+    agreement either. Start from the median shift (a pure pan / tilt), then refit on the
+    tiles within a shrinking distance of the fit, ending at REHOME_INLIER_PX."""
+    K = np.asarray(K, np.float64)
+    med = np.median(D, axis=0)
+    R = rotation_from_rotvec([-med[1] / K[1, 1], med[0] / K[0, 0], 0.0])
+    keep = np.ones(len(P), bool)
+    fit = None
+    for thr in (1.0, 0.6, 0.4, REHOME_INLIER_PX, REHOME_INLIER_PX):
+        keep = _rotation_errors(R, P, D, K, dist) <= thr
+        if keep.sum() < 3:
+            return None, keep
+        fit = camera_rotation(P[keep], D[keep], K, dist, w[keep])
+        R = fit["R_new_from_old"]
+    keep = _rotation_errors(R, P, D, K, dist) <= REHOME_INLIER_PX
+    return fit, keep
+
+
+def rehome_fit(flood: Optional[dict], pattern: Optional[dict], K, dist=None,
+               max_px: float = REHOME_MAX_PX) -> dict:
+    """Can this motion be re-homed (a rotation-only correction of the stereo calibration)?
+    flood / pattern: motion() of the reference vs the fresh frames (on a finer grid than the
+    check's: REHOME_GRID). -> {"applicable": bool, "why": the refusal (None when
+    applicable), "motion_px" (the fitted rotation's largest image motion over the frame),
+    "tiles_used", "tiles", "tiles_agree", "match", "pattern_rms_px", and the
+    camera_rotation() numbers}. Applicable only when ALL of these hold (fail closed):
+      - the flood is matched in >= REHOME_MIN_TILES tiles with a median match >=
+        REHOME_MIN_PEAK
+      - those tiles agree on ONE camera rotation: >= REHOME_MIN_TILES of them and >=
+        REHOME_MIN_AGREE of the matched ones lie within REHOME_INLIER_PX of it, spread over
+        the frame (a zoom, a refocus or a changed scene does not)
+      - the motion is small: <= max_px
+      - the pattern moves with the flood (the projector did not move): the pattern tiles'
+        shifts fit the SAME rotation within max(REHOME_AGREE_PX, REHOME_AGREE_FRACTION x
+        the motion), rms."""
+    out = {"applicable": False, "why": None, "motion_px": None,
+           "tiles_used": int((flood or {}).get("tiles_used") or 0),
+           "tiles": int((flood or {}).get("tiles") or 0), "tiles_agree": None, "match": None,
+           "pattern_rms_px": None, "max_px": float(max_px)}
+
+    def no(why: str) -> dict:
+        out["why"] = why
+        return out
+
+    if not _matched(flood) or not flood.get("similarity"):
+        return no("the flood (the scene's own texture) could not be registered over the frame "
+                  f"({out['tiles_used']} of {out['tiles']} tiles matched): no camera rotation "
+                  "can be fitted")
+    P, Dv, pk = _used_tiles(flood)
+    out["match"] = round(float(np.median(pk)), 3) if len(pk) else None
+    if len(P) < REHOME_MIN_TILES:
+        return no(f"the registration is poor: the flood matched in {len(P)} of {out['tiles']} "
+                  f"tiles, {REHOME_MIN_TILES} are needed")
+    if out["match"] < REHOME_MIN_PEAK:
+        return no(f"the registration is poor: flood match {out['match']:.2f} < "
+                  f"{REHOME_MIN_PEAK:g}")
+    rot, keep = _robust_rotation(P, Dv, pk, K, dist)
+    n_in = int(keep.sum())
+    out["tiles_agree"] = n_in
+    if rot is None:
+        return no(f"the registration is poor, or the motion is not a camera rotation: fewer "
+                  f"than 3 of the {len(P)} matched flood tiles agree on one rotation")
+    out.update(rot)
+    # the size of the move: the fitted rotation over the whole frame (not one tile's shift)
+    shape = flood.get("shape")
+    if shape:
+        H, W = int(shape[0]), int(shape[1])
+        box = np.array([[0, 0], [W - 1, 0], [0, H - 1], [W - 1, H - 1]], np.float64)
+    else:
+        box = np.array([P.min(0), P.max(0), [P[:, 0].min(), P[:, 1].max()],
+                        [P[:, 0].max(), P[:, 1].min()]])
+    Kc = np.asarray(K, np.float64)
+    pts = np.vstack([box, [[Kc[0, 2], Kc[1, 2]]]])
+    mv = float(_rotation_errors(rot["R_new_from_old"], pts, np.zeros_like(pts), K, dist).max())
+    out["motion_px"] = round(mv, 3)
+    if not mv <= max_px:
+        return no(f"the motion is too large for a re-home: {mv:.1f} px > {max_px:g} px - "
+                  "recalibrate")
+
+    def span(Q) -> float:
+        return float(np.hypot(*(Q.max(0) - Q.min(0)))) if len(Q) else 0.0
+
+    if (n_in < REHOME_MIN_TILES or n_in < REHOME_MIN_AGREE * len(P)
+            or span(P[keep]) < REHOME_MIN_AGREE * span(P)):
+        return no(f"the registration is poor, or the motion is not a camera rotation: only "
+                  f"{n_in} of the {len(P)} matched flood tiles agree on one rotation within "
+                  f"{REHOME_INLIER_PX:g} px (scale {rot['scale_pct']:+.3f} %; a zoom / "
+                  "refocus, a changed scene or weak texture)")
+    if not _matched(pattern) or not pattern.get("similarity"):
+        return no("the pattern could not be registered over the frame, so the projector is "
+                  "not known to be in place")
+    Pp, Dp, _ = _used_tiles(pattern)
+    if len(Pp) < 3:
+        return no("the pattern matched in too few tiles to compare it with the flood")
+    e = _rotation_errors(rot["R_new_from_old"], Pp, Dp, K, dist)
+    out["pattern_rms_px"] = round(float(np.sqrt(np.mean(e * e))), 3)
+    lim = max(REHOME_AGREE_PX, REHOME_AGREE_FRACTION * mv)
+    if not out["pattern_rms_px"] <= lim:
+        return no(f"the motion is not camera-like: the projected pattern does not move with "
+                  f"the scene ({out['pattern_rms_px']:.2f} px rms apart, limit {lim:.2f} px) - "
+                  "the projector moved: recalibrate")
+    out["applicable"] = True
+    return out
 
 
 def _motion_px(s: dict) -> float:

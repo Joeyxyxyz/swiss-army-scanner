@@ -63,6 +63,19 @@ def corners_to_projector(corners: np.ndarray, corr_x: np.ndarray, corr_y: np.nda
     return out, ok, rms
 
 
+def projector_corner_count(corners: np.ndarray, corr_x: np.ndarray, corr_y: np.ndarray,
+                           half_win: int = 18) -> int:
+    """How many of these board corners (camera px, (N, 2)) get a projector position from
+    this decode: the count calibrate_stereo will find. No camera calibration is needed for
+    the COUNT (the lens distortion is locally affine over the window, so the local
+    homography is fitted on raw pixels): a pose can be judged the moment it is captured."""
+    if corr_x is None or corr_y is None or len(corners) == 0:
+        return 0
+    _, ok, _ = corners_to_projector(np.asarray(corners, np.float64).reshape(-1, 2), corr_x,
+                                    corr_y, np.eye(3), np.zeros(5), half_win=half_win)
+    return int(ok.sum())
+
+
 def calibrate_projector(obj_views: list, proj_views: list, size=(912, 1140),
                         distortion: bool = False) -> dict:
     """obj_views / proj_views: per pose (N, 3) board mm and (N, 2) DMD px.

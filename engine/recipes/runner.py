@@ -257,7 +257,7 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
             D.add(res, "rig_check", res["invalid_reason"])
             return state
         if rc["status"] == "REFERENCE_SET":
-            res["warnings"].append("rig check: first check at this geometry, reference stored")
+            res["warnings"].append(f"rig check: {rc.get('message') or 'reference stored'}")
     codes = None
     if recipe.scan["codes"] and scan is None:
         rd = api.read_codes(preset, label=f"{label or recipe.name}_codes")

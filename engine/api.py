@@ -1473,14 +1473,24 @@ def row_parity(preset: Optional[Preset] = None, label: str = "parity") -> dict:
 def capture_calib_pose(preset: Optional[Preset] = None, set_label: str = "stereo",
                        board: Optional[dict] = None, steps: Optional[int] = None,
                        periods: Optional[list] = None, diamond_parity="auto",
-                       fixture=None) -> dict:
+                       fixture=None, auto_periods: bool = True) -> dict:
     """One ChArUco board pose for calibrate_stereo: flood + both-axis multifreq decode.
     The operator places / holds the board (12-20 poses, tilts +-30 deg, fill the volume).
     fixture: a calibration-fixture spec (path / dict, tools/make_calib_fixture.py): one
-    PLACEMENT of the fixture, every face's board detected on its own (3 placements in all)."""
+    PLACEMENT of the fixture, every face's board detected on its own (3 placements in all).
+
+    The result says how many of the corners found got a projector position
+    (projector_corners / corners_found, projector_corner_pct, accepted) and warns under
+    60 %. Fringe periods (DMD px, fine -> coarse), one set per pose set: `periods` when
+    given (refused when the set already uses others); else the periods of the set's first
+    accepted pose; else the preset's (default 8, 80, 1280) - and when those map under 60 %
+    of the corners the pose is captured again at 16,160,1280, then 24,192,1280
+    (auto_periods; `attempts` lists every try, `periods_px` / `periods_source` what was
+    stored)."""
     from .calibrate import flow
     return flow.capture_pose(_engine(), _preset(preset), set_label, flow.board_spec(board),
-                             steps, periods, diamond_parity, fixture=fixture)
+                             steps, periods, diamond_parity, fixture=fixture,
+                             auto_periods=bool(auto_periods))
 
 
 @_verb
@@ -1494,7 +1504,16 @@ def calibrate_stereo(preset: Optional[Preset] = None, set_label: Optional[str] =
     geometry-bound calibration. mock_poses=N (mock only) places N board poses itself.
     A fixture set (capture_calib_pose fixture=...): one view per detected face, then the
     rigid-fixture refinement (rigid) and the face-angle check; fixture = the spec with the
-    caliper-measured squares; mock_fixture=N (mock only) places the fixture N times."""
+    caliper-measured squares; mock_fixture=N (mock only) places the fixture N times.
+
+    Fails loudly, nothing saved (engine.calibrate.stereo.CalibrationRejected, a ValueError
+    with .reasons and .per_pose): fewer than 3 poses (or under half of those showing the
+    board) gave projector points, degenerate projector intrinsics (f <= 0 or absurd,
+    f_v / f_u far from both 2, a diamond DMD, and 1, square pixels), or a stereo RMS above
+    2 px. The result's `per_pose`
+    lists each pose's corners / projector corners / contributed; `diamond_parity_source`
+    says whether the parity was measured ("row_parity": also when it found no offset), set
+    ("preset" / "argument") or not measured ("none": the only case that warns)."""
     from .calibrate import flow
     cal, summary = flow.calibrate_stereo(_engine(), _preset(preset), set_label, square_mm,
                                          board, projector_distortion, int(mock_poses or 0),
@@ -1883,7 +1902,8 @@ def check_face(placement, golden=None, label: Optional[str] = None,
 # ------------------------------------------------------------------ rig check (HOME)
 @_verb
 def rig_check(preset: Optional[Preset] = None, set_reference: bool = False,
-              tol_px: float = 0.5, mock_shift_px=None, label: str = "rigref") -> dict:
+              tol_px: float = 0.5, mock_shift_px=None, label: str = "rigref",
+              rehome: bool = False) -> dict:
     """Has the camera or projector been nudged? A fresh flood + a seeded random block
     pattern (3 frames, the DMD ends black) vs the reference stored for this geometry
     (calibrations/<geometry>/<ts>_rigref) -> image motion over the frame (shift + roll +
@@ -1893,12 +1913,27 @@ def rig_check(preset: Optional[Preset] = None, set_reference: bool = False,
     matched motion <= tol_px) | MOVED (names camera / projector; also when the pattern is
     visible but no longer matches) | UNKNOWN (no pattern / no texture, roll / zoom not
     determined, or the flood shows texture but no longer matches) | REFERENCE_SET (first
-    check at this geometry, or set_reference=True). tol_px must be finite and >= 0
-    (ValueError). mock_shift_px (dx, dy[, roll_deg[, scale]]; mock only) moves the fresh
-    frames to simulate a nudged camera."""
+    check at this geometry, or set_reference=True; `message` / `reference_reason` say why:
+    the first one, a new calibration, on request) | REHOMED (rehome=True only). tol_px must
+    be finite and >= 0 (ValueError). mock_shift_px (dx, dy[, roll_deg[, scale]]; mock only)
+    moves the fresh frames to simulate a nudged camera.
+
+    rehome=True: when the check finds a small CAMERA move (MOVED, the flood and the
+    projected pattern moving together), fit the camera's rotation from the reference flood
+    vs the fresh one (undistorted coordinates about the principal point) and write a NEW
+    stereo calibration R1 = R0 @ Rd, t unchanged, flagged "re-homed (rotation only) from
+    <calibration id>"; the fresh frames become its reference -> status REHOMED,
+    result["rehome"] = the fit and the new calibration id. The original calibration is never
+    changed (delete the re-homed one to return to it). Refused - status stays MOVED /
+    UNKNOWN, rehome["why"] - when the motion is not camera-like (the projector moved), larger
+    than ~5 px, or badly registered; a ValueError before any capture when there is no stereo
+    calibration or no reference of that calibration. Rotation only: a camera translation is
+    not corrected, so the absolute depth may keep a small offset; a full calibration is the
+    reference. Goldens / nulls bound to the old calibration id must be recorded again.
+    A plain check that finds such a move says so (result["rehome"]["applicable"])."""
     from .calibrate import rigref
     return rigref.rig_check(_engine(), _preset(preset), bool(set_reference), float(tol_px),
-                            mock_shift_px, label)
+                            mock_shift_px, label, rehome=rehome is True)
 
 
 # ------------------------------------------------------------------ HDMI fast zone scan

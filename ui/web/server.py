@@ -393,12 +393,18 @@ VERBS: dict = {
                            "tilts +-30 deg).",
                            {"set_label": "pose set name (default stereo)",
                             "steps": "phase steps (default 12)",
-                            "periods": "[T, ...] DMD px, fine -> coarse (default 8, 80, 1280)",
+                            "periods": "[T, ...] DMD px, fine -> coarse (default: the pose "
+                                       "set's, else 8, 80, 1280 - captured again at 16,160,1280 "
+                                       "/ 24,192,1280 when under 60 % of the corners get a "
+                                       "projector position; given: used as they are)",
                             "diamond_parity": "auto | 0 | 1 | null (square grid)",
                             "fixture": "calibration fixture spec JSON path: one PLACEMENT of the "
                                        "fixture, one view per face (3 placements in all)"}),
     "calibrate_stereo": ("Camera + projector (inverse camera) + stereoCalibrate from a pose set "
-                         "-> geometry-bound stereo calibration (per-pose and per-axis RMS).",
+                         "-> geometry-bound stereo calibration (per-pose and per-axis RMS, the "
+                         "poses that gave projector points). An error, nothing saved, when the "
+                         "fit is not a calibration (degenerate projector intrinsics, stereo RMS "
+                         "> 2 px, too few poses with projector points).",
                          {"set_label": "pose set (default: the newest)",
                           "square_mm": "caliper-measured printed square, mm (single board)",
                           "projector_distortion": "bool: fit projector k1/k2 (default false)",

@@ -221,7 +221,11 @@ def test_delete_asks_then_moves_to_trash(shared, tmp_path, capsys, monkeypatch):
     lib = copy_of(shared, tmp_path)
     prompts = []
     answer(monkeypatch, {"trash": "n"}, prompts)
-    code, out, _ = cli_run(capsys, lib, "delete", "v")
+    # no --yes, no --interactive: refused at once, never a question (nothing waits for input)
+    code, out, err = cli_run(capsys, lib, "delete", "v")
+    assert code == 2 and "--yes" in err and "does not wait for input" in err and prompts == []
+    assert list((lib / "objects").iterdir())                          # still there
+    code, out, _ = cli_run(capsys, lib, "--interactive", "delete", "v")
     assert code == 1 and "Cancelled" in out and len(prompts) == 1
     assert list((lib / "objects").iterdir())                          # still there
     code, out, _ = cli_run(capsys, lib, "delete", "v", "--yes", "--reason", "test")
@@ -371,21 +375,32 @@ def test_spot_projects_and_measures(tmp_path, capsys):
 
 
 def test_presence_sensor_needs_the_empty_field_confirmed(tmp_path, capsys, monkeypatch):
-    """Clearing the field is human-only: without --empty-confirmed the CLI asks,
-    and a 'no' (or --json, which can't ask) teaches nothing."""
+    """Clearing the field is human-only: the operator's answer is an ARGUMENT
+    (--empty-confirmed / --field-empty). Without it the command is refused at once - it
+    never waits for an answer (it once sat on its y/N question for two days) - and only
+    --interactive asks; a 'no' (or --json, which can't ask) teaches nothing."""
     lib = tmp_path / "lib"
     prompts = []
     answer(monkeypatch, {"EMPTY": "n"}, prompts)
     teach = ["teach-presence", "pe", SPOT, "--diameter", "6.5"]
-    code, out, _ = cli_run(capsys, lib, *teach)
+    code, out, err = cli_run(capsys, lib, *teach)
+    assert code == 2 and prompts == [] and "--empty-confirmed" in err
+    assert "does not wait for input" in err and "Nothing was projected or taught" in err
+    assert "[mock] simulated bench cleared" not in out and not (lib / "sensors").exists()
+    code, out, _ = cli_run(capsys, lib, "--interactive", *teach)
     assert code == 1 and len(prompts) == 1 and "Not taught" in out
     code, out, _ = cli_run(capsys, lib, "--json", *teach)
     assert code == 2 and "--empty-confirmed" in json.loads(out)["error"]["message"]
     assert len(prompts) == 1 and not (lib / "sensors").exists()
     answer(monkeypatch, {"EMPTY": "y"}, prompts)
-    code, out, _ = cli_run(capsys, lib, *teach)
+    code, out, _ = cli_run(capsys, lib, "--interactive", *teach)
     assert code == 0 and len(prompts) == 2 and "Sensor 'pe' taught" in out
     assert "|change| > 25 % of the empty reference" in out
+    code, out, _ = cli_run(capsys, lib, "teach-presence", "pe2", SPOT, "--diameter", "6.5",
+                           "--field-empty", "yes")
+    assert code == 0 and len(prompts) == 2 and "Sensor 'pe2' taught" in out
+    code, out, err = cli_run(capsys, lib, *teach, "--empty-confirmed", "--field-empty", "no")
+    assert code == 2 and "contradict" in err
 
 
 def test_presence_sensor_exit_codes_and_trash(tmp_path, capsys):
@@ -526,7 +541,7 @@ def test_wizard_guides_base_part_measure_inspect_reconstruct(tmp_path, capsys, m
     answer(monkeypatch, {"Clear the scene": lambda: events.append("CLEAR") or "",
                          "Place the part": lambda: events.append("PLACE") or "",
                          "Part label": "widget", "Known dimensions": V_DIMS}, [])
-    code, out, _ = cli_run(capsys, tmp_path / "lib", "wizard")
+    code, out, _ = cli_run(capsys, tmp_path / "lib", "wizard", "--interactive")
     assert code == 0, out
     # physical steps are prompted BEFORE the verbs that depend on them
     assert events == ["CLEAR", "check_signal", "capture_base", "PLACE", "capture_object",
@@ -546,18 +561,195 @@ def test_wizard_refuses_bad_signal_unless_forced(tmp_path, capsys, monkeypatch):
     replies = iter(["", "q"])                      # Enter = re-check, then quit
     prompts = []
     answer(monkeypatch, {"NOT ok": lambda: next(replies)}, prompts)
-    code, out, err = cli_run(capsys, tmp_path / "lib", "wizard")
+    code, out, err = cli_run(capsys, tmp_path / "lib", "wizard", "--interactive")
     assert code == 1 and "stopped" in err
     assert len(calls) == 2 and api.list_library("bases") == []     # never captured
     assert any("Clear the scene (empty base), press Enter" in p for p in prompts)
 
     prompts.clear()
     answer(monkeypatch, {"NOT ok": "force", "Place the part": "q"}, prompts)
-    code, out, err = cli_run(capsys, tmp_path / "lib2", "wizard")
+    code, out, err = cli_run(capsys, tmp_path / "lib2", "wizard", "--interactive")
     assert code == 1 and "forced by the operator" in out
     assert len(api.list_library("bases")) == 1                     # base captured, then quit
     assert any("Place the part, do not touch camera/projector, press Enter" in p
                for p in prompts)
+
+
+# ------------------------------------------------------------ no command waits for input
+
+def _never_answers(monkeypatch, prompts: list):
+    """input() of a terminal nobody types into: it blocks (until the test releases it)."""
+    import threading
+    gate = threading.Event()
+
+    def fake(prompt=""):
+        prompts.append(prompt)
+        gate.wait(30)
+        return ""
+    monkeypatch.setattr("builtins.input", fake)
+    return gate
+
+
+def test_no_command_waits_for_input_without_interactive(shared, tmp_path, capsys, monkeypatch):
+    """teach-presence, delete and the wizard used to call input() on their own: run where
+    nobody answers (an agent, a detached terminal) they waited for ever. Without
+    --interactive none of them asks: refused (exit 2) with the argument to pass."""
+    lib = copy_of(shared, tmp_path)
+    prompts = []
+    gate = _never_answers(monkeypatch, prompts)
+    try:
+        for argv, want in ((["teach-presence", "pe", SPOT, "--diameter", "6.5"],
+                            "--empty-confirmed"),
+                           (["delete", "v"], "--yes"),
+                           (["wizard"], "--interactive")):
+            code, out, err = cli_run(capsys, lib, *argv)
+            assert code == 2 and want in err, (argv, err)
+        assert prompts == []                               # input() was never reached
+        assert list((lib / "objects").iterdir()) and not (lib / "sensors").exists()
+        assert api.list_library("bases") and len(api.list_library("bases")) == 1
+    finally:
+        gate.set()
+
+
+def test_an_interactive_prompt_gives_up_and_fails_closed(shared, tmp_path, capsys, monkeypatch):
+    """--interactive asks, but never for ever: no answer within --prompt-timeout -> the
+    command stops with nothing done (exit 1)."""
+    import time
+    lib = copy_of(shared, tmp_path)
+    prompts = []
+    gate = _never_answers(monkeypatch, prompts)
+    fast = ["--interactive", "--prompt-timeout", "0.3"]
+    try:
+        for argv in (["teach-presence", "pe", SPOT, "--diameter", "6.5"], ["delete", "v"],
+                     ["wizard"]):
+            t0 = time.monotonic()
+            code, out, err = cli_run(capsys, lib, *fast, *argv)
+            assert code == 1 and "no answer within 0.3 s" in err, (argv, err)
+            assert "nothing was done" in err and time.monotonic() - t0 < 20
+        assert len(prompts) == 3
+        assert list((lib / "objects").iterdir()) and not (lib / "sensors").exists()
+        assert len(api.list_library("bases")) == 1         # the wizard captured nothing
+    finally:
+        gate.set()
+    for bad in ("0", "-1", "nan", "inf", "7200", "soon"):
+        code, out, err = cli_run(capsys, lib, "--prompt-timeout", bad, "bases")
+        assert code == 2, bad
+
+
+def test_commands_return_with_stdin_held_open(tmp_path):
+    """The real thing, in a separate process whose stdin is a pipe that is never written to
+    and never closed (what a hung terminal or an agent's shell looks like): each command
+    must come back on its own. Before, teach-presence waited on its question for ever."""
+    lib = tmp_path / "lib"
+    env = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1",
+           "PYTHONIOENCODING": "utf-8"}
+    base = [sys.executable, "-m", "ui.cli", "--mock", "--average", "1", "--library", str(lib)]
+    cases = [(["teach-presence", "pe", SPOT, "--diameter", "6.5"], 2, "--empty-confirmed"),
+             (["delete", "nothing-here"], 2, ""),
+             (["wizard"], 2, "--interactive"),
+             (["--interactive", "--prompt-timeout", "1", "teach-presence", "pe", SPOT,
+               "--diameter", "6.5"], 1, "no answer within 1 s"),
+             (["teach-presence", "pe", SPOT, "--diameter", "6.5", "--empty-confirmed"], 0, ""),
+             (["--mock-part", "none", "check-presence", "pe"], 1, ""),
+             (["spot", SPOT, "--diameter", "6.5"], 0, "")]
+    for argv, want, text in cases:
+        proc = subprocess.Popen([*base, *argv], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env, cwd=str(tmp_path))
+        try:
+            out, err = _wait_open(proc, 180)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        assert proc.returncode == want, (argv, proc.returncode, err[-400:])
+        assert text in err, (argv, err[-400:])
+
+
+def _wait_open(proc, timeout: float) -> tuple:
+    """Wait for the process WITHOUT closing its stdin (communicate() would close it and hand
+    the command an EOF, which is exactly what a hung terminal never does)."""
+    import threading
+    chunks = {"out": b"", "err": b""}
+
+    def drain(name, pipe):
+        chunks[name] = pipe.read()
+    readers = [threading.Thread(target=drain, args=(n, p), daemon=True)
+               for n, p in (("out", proc.stdout), ("err", proc.stderr))]
+    for th in readers:
+        th.start()
+    try:
+        proc.wait(timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise AssertionError("the command did not return: it is waiting for input") from None
+    for th in readers:
+        th.join(10)
+    proc.stdin.close()
+    return chunks["out"].decode("utf-8", "replace"), chunks["err"].decode("utf-8", "replace")
+
+
+# ------------------------------------------------------------ delete: calibration data
+
+def test_delete_trashes_calibration_poses_and_calibration_entries(tmp_path, capsys):
+    """A bad calibration pose had to be moved to the library trash by hand: `delete` takes
+    calibration poses (by id), stereo calibrations, rig references and parity measurements.
+    Moved with the reason, never destroyed; a pose SET name is not an id."""
+    import numpy as np
+    from engine import config
+    from recipe_synth import truth_calibration
+    lib = tmp_path / "lib"
+    s = api.configure(lib, mock=True)
+    try:
+        p = api.load_preset(PRESET)
+        geo = p.geometry_id
+        fp = config.geometry_fingerprint(p)
+        poses = []
+        for k in range(3):
+            d = s.store.new_dir("calib_poses", geo, label="setA")
+            np.savez(d / "flood.npz", image=np.zeros((4, 4), np.uint8))
+            s.store.write_json(d / "meta.json", {
+                "id": d.name, "set": "setA", "geometry_id": geo, "geometry_fp": fp,
+                "corners_found": 50, "projector_corners": 4 if k == 1 else 48,
+                "projector_corner_pct": 8.0 if k == 1 else 96.0, "accepted": k != 1,
+                "periods_px": [8.0, 80.0, 1280.0], "created": "2026-01-01T00:00:00"})
+            poses.append(d)
+        cal = truth_calibration(s, p)
+        par = s.store.new_dir("calibrations", geo, label="parity")
+        s.store.write_json(par / "parity.json", {"parity": None, "ok": True, "geometry_fp": fp})
+        ref = s.store.new_dir("calibrations", geo, label="rigref")
+        s.store.write_json(ref / "rigref.json", {"kind": "rigref", "geometry_fp": fp})
+    finally:
+        api._session = None
+    bad = poses[1].name
+    code, out, _ = cli_run(capsys, lib, "calib-poses", "--set", "setA")
+    assert code == 0 and "Calibration poses (3) of set setA" in out and bad in out
+    assert "4 (8 %)" in out and "NO" in out and "8,80,1280" in out
+    code, out, err = cli_run(capsys, lib, "delete", "setA", "--yes")      # a set is not an id
+    assert code == 2 and "ambiguous" in err and all(d.is_dir() for d in poses)
+    code, out, err = cli_run(capsys, lib, "delete", bad)                  # no --yes: no wait
+    assert code == 2 and "--yes" in err and poses[1].is_dir()
+    code, out, _ = cli_run(capsys, lib, "delete", bad, "--yes", "--reason", "8 px fringes: "
+                           "4 of 50 projector corners")
+    assert code == 0 and f"Moved calibration pose {bad} to trash" in out
+    trashed = lib / "trash" / "calib_poses" / geo / bad
+    assert trashed.is_dir() and not poses[1].exists()                     # moved, not destroyed
+    assert (trashed / "meta.json").is_file() and (trashed / "flood.npz").is_file()
+    rec = json.loads((trashed / "TRASHED.json").read_text())
+    assert rec["reason"].startswith("8 px fringes") and rec["from"].endswith(bad)
+    code, out, _ = cli_run(capsys, lib, "--json", "calib-poses")
+    assert [m["id"] for m in json.loads(out)["calib_poses"]] == [poses[0].name, poses[2].name]
+    # the calibration entries: the stereo calibration, the parity measurement, the reference
+    for what, ident, folder in (("calibration", cal.id, cal.path),
+                                ("parity measurement", f"{geo}/{par.name}", par),
+                                ("rig reference", f"{geo}/{ref.name}", ref)):
+        code, out, _ = cli_run(capsys, lib, "--json", "delete", ident, "--yes", "--reason",
+                               "recalibrating")
+        doc = json.loads(out)
+        assert code == 0 and doc["deleted"]["kind"] == what, (what, doc)
+        assert not folder.exists() and (lib / "trash" / "calibrations" / geo / folder.name).is_dir()
+        assert json.loads((lib / "trash" / "calibrations" / geo / folder.name / "TRASHED.json")
+                          .read_text())["reason"] == "recalibrating"
+    code, out, _ = cli_run(capsys, lib, "--json", "calibrations")
+    assert json.loads(out)["calibrations"] == []
 
 
 # ------------------------------------------------------------ rule 1 + entry points

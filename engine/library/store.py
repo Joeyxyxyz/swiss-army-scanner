@@ -5,8 +5,9 @@ Filesystem library (§5): timestamped, append-only. Nothing overwrites.
     <root>/objects/<ts>_<label>/                    field.npz relief.npz preview.png
                                                     known_dims.json measured.json meta.json
     <root>/calibrations/<geometry_id>/<ts>/         depth_calibration.json lateral.json
-                                                    (or stereo_calibration.json, parity.json,
-                                                    dent_null.json)
+                                                    (or stereo_calibration.json - also the
+                                                    re-homed copies -, parity.json,
+                                                    dent_null.json, rigref.json)
     <root>/dentsets/<geometry_id>/<ts>_<label>/     dent-detector frames (two exposures) +
                                                     meta.json
     <root>/faces/<geometry_id>/<ts>_<label>/        located end faces: face.npz (camera mask,
@@ -73,8 +74,8 @@ Written by the engine. Nothing here is overwritten; "delete" moves entries to tr
 |---|---|
 | bases/<geometry_id>/ | BASE LIBRARY - empty-scene references, one folder per rig geometry |
 | objects/ | 3D scans: field.npz (correspondence), relief.npz (height vs base), preview.png, meta.json |
-| calibrations/<geometry_id>/ | depth (Z) + lateral (XY) calibration fits, stereo (camera + projector) calibrations, diamond row parity, dent-detector null calibrations (dent_null.json, per cell diameter + fixture) |
-| calib_poses/<geometry_id>/ | ChArUco board poses for calibrate_stereo: flood.png, field.npz (both axes), meta.json |
+| calibrations/<geometry_id>/ | depth (Z) + lateral (XY) calibration fits, stereo (camera + projector) calibrations and their re-homed copies (rig-check --rehome: a new entry, the original kept), diamond row parity, rig-check references (rigref), dent-detector null calibrations (dent_null.json, per cell diameter + fixture) |
+| calib_poses/<geometry_id>/ | ChArUco board poses for calibrate_stereo: flood.png, field.npz (both axes), meta.json (corners found, corners with a projector position, the fringe periods used) |
 | metric/<geometry_id>/ | metric scans: field.npz, cloud.npz (xyz mm + consistency), meta.json |
 | dentsets/<geometry_id>/ | dent-detector pattern frames of one pose (long + short exposure, cropped to the zone), meta.json names its metric scan |
 | faces/<geometry_id>/ | located end faces (locate_face): face plane, centre, rim circle, camera face mask, camera -> DMD affine + aim ring |
@@ -378,7 +379,7 @@ _SPECTRAL_SUBDIRS = ("materials", "light")      # spectral/<sub>/<entry>
 _ENTRY_MARKERS = {"bases": ("meta.json", "field.npz"),
                   "objects": ("meta.json", "field.npz", "relief.npz"),
                   "calibrations": ("depth_calibration.json", "stereo_calibration.json",
-                                   "parity.json", "dent_null.json"),
+                                   "parity.json", "dent_null.json", "rigref.json"),
                   "calib_poses": ("meta.json", "field.npz"),
                   "metric": ("meta.json", "cloud.npz"),
                   "dentsets": ("meta.json", "frames_long.npy", "frames_short.npy"),

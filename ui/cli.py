@@ -11,6 +11,14 @@ enforces also covers this CLI. Physical steps stay human-only: the
 wizard PROMPTS for them and waits. With --mock, the simulated bench
 stands in for the human.
 
+No command ever waits for input unless --interactive is given: a command
+that needs an answer (delete, teach-presence) takes it as an argument
+(--yes, --empty-confirmed) and is refused (exit 2) without it; the wizard,
+which is nothing but prompts, needs --interactive. With --interactive
+every prompt gives up after --prompt-timeout seconds and the command
+stops with nothing done (exit 1): a script, an agent or a detached
+terminal can never leave a command hanging on a question nobody sees.
+
 The zone workflow is the reason the grid exists. `grid` projects a lettered
 grid and photographs it, a person or an AI agent reads the photo, and
 `scan part --zone C4:D5` scans only the cells the part sits in.
@@ -330,6 +338,9 @@ class Ctx:
         self._preset = None
         self._outputs_before = 0
         self.selection = None           # preset_lib.selection() when no --preset was given
+        # prompts are OFF unless --interactive: no command waits for input by default
+        self.interactive = bool(getattr(args, "interactive", False))
+        self.prompt_timeout = getattr(args, "prompt_timeout", None)
 
     # -- output
     def say(self, *lines) -> None:
@@ -417,6 +428,60 @@ class Ctx:
         return d
 
 
+# ------------------------------------------------------------ prompts (only with --interactive)
+
+PROMPT_TIMEOUT_S = 60.0         # a y/N question (delete, teach-presence)
+WIZARD_TIMEOUT_S = 600.0        # a physical step of the wizard (clear the scene, place the part)
+PROMPT_TIMEOUT_MAX_S = 3600.0
+
+
+def _prompt_timeout(text: str) -> float:
+    """--prompt-timeout: seconds, finite, > 0, at most an hour (never 'wait for ever')."""
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected seconds, got {text!r}") from None
+    if not (math.isfinite(v) and 0 < v <= PROMPT_TIMEOUT_MAX_S):
+        raise argparse.ArgumentTypeError(
+            f"must be > 0 and <= {PROMPT_TIMEOUT_MAX_S:g} s (a prompt always gives up), got {text}")
+    return v
+
+
+def _timed_input(prompt: str, timeout_s: float) -> str:
+    """input() that gives up: the line typed, EOFError when stdin is closed, or Abort after
+    timeout_s with no answer (the reading thread is a daemon: it dies with the process)."""
+    import threading
+    box: dict = {}
+
+    def read() -> None:
+        try:
+            box["answer"] = input(prompt)
+        except EOFError:
+            box["eof"] = True
+        except BaseException as e:              # noqa: BLE001 - handed to the caller's thread
+            box["error"] = e
+
+    th = threading.Thread(target=read, name="cli-prompt", daemon=True)
+    th.start()
+    th.join(timeout_s)
+    if th.is_alive():
+        raise Abort(f"no answer within {timeout_s:g} s (--prompt-timeout): nothing was done")
+    if "error" in box:
+        raise box["error"]
+    if box.get("eof"):
+        raise EOFError
+    return box["answer"]
+
+
+def _prompt(ctx, prompt: str, default_timeout: float = PROMPT_TIMEOUT_S) -> str:
+    """One question to the operator. Only ever reached with --interactive (the callers refuse
+    before, with the argument that answers the question); never waits for ever."""
+    if not ctx.interactive:
+        raise CLIError("this command would ask a question, and no command waits for input "
+                       "unless --interactive is given")
+    return _timed_input(prompt, ctx.prompt_timeout or default_timeout)
+
+
 def _selection_gone(sel: dict, root, extra: str = "",
                     other: str = "name one with --preset") -> str:
     return (f"the selected preset {sel['name']!r} no longer exists in this library ({root})"
@@ -474,6 +539,17 @@ def _deletable(ctx) -> list:
             for x in api.list_library(kind)]
     out += [("calibration", c["id"], c["id"], P["calibrations"] / c["id"])
             for c in api.list_library("calibrations")]
+    # a calibration board pose: its id only (a set name names many poses, never one)
+    out += [("calibration pose", m["id"], m["id"], Path(m["path"]))
+            for m in api.list_library("calib_poses")]
+    # the other entries of calibrations/: rig references and row-parity measurements
+    store = ctx.session.store
+    for geo in store.geometry_ids("calibrations"):
+        for d in store.entries("calibrations", geo):
+            for marker, name in (("rigref.json", "rig reference"),
+                                 ("parity.json", "parity measurement")):
+                if (d / marker).is_file():
+                    out.append((name, f"{geo}/{d.name}", d.name, d))
     out += [("reading", r["id"], r["id"], Path(r["path"])) for r in api.list_library("readings")]
     # a sensor is named per geometry: its id is geometry/name, its label the name
     out += [("sensor", f"{s['geometry_id']}/{s['name']}", s["name"], Path(s["path"]))
@@ -1059,8 +1135,12 @@ def cmd_delete(ctx):
     if not a.yes:
         if ctx.json:
             raise CLIError("delete with --json needs --yes (no interactive prompt)")
+        if not ctx.interactive:             # never wait for an answer nobody may give
+            raise CLIError(f"delete moves {kind} {ident} to trash/ only with --yes (this "
+                           "command does not wait for input; --interactive asks [y/N] and "
+                           "gives up after --prompt-timeout s). Nothing moved")
         try:
-            ans = input(f"Move {kind} {ident} to trash/? It stays recoverable. [y/N] ")
+            ans = _prompt(ctx, f"Move {kind} {ident} to trash/? It stays recoverable. [y/N] ")
         except EOFError:
             ans = ""
         if ans.strip().lower() not in ("y", "yes"):
@@ -1525,17 +1605,35 @@ def _print_teach(ctx, t) -> None:
 def cmd_teach_presence(ctx):
     a = ctx.args
     at = parse_at(a.at)
-    ctx.header()
-    p = ctx.preset()
-    _mock_clear(ctx)
-    if not a.empty_confirmed:
-        # clearing the field is physical and human-only: the operator says it is done
+    # clearing the field is physical and human-only: the operator says it is done - as an
+    # argument (--empty-confirmed / --field-empty yes). Without it the command is refused at
+    # once: it never waits for an answer (seen on a rig: it sat on its y/N question for two
+    # days in a session nobody was typing into). --interactive asks, with a timeout.
+    if a.field_empty == "no":
+        if a.empty_confirmed:
+            raise CLIError("--empty-confirmed and --field-empty no contradict each other")
+        ctx.say("Not taught: the sensor's field is not empty (--field-empty no). Clear it, then "
+                "run again with --empty-confirmed.")
+        return EXIT_NOT_OK, {"sensor": None, "cancelled": True}
+    confirmed = bool(a.empty_confirmed or a.field_empty == "yes")
+    if not confirmed:
         if ctx.json:
             raise CLIError("teach-presence with --json needs --empty-confirmed (no interactive "
                            "prompt): the operator confirms the sensor's field is EMPTY")
+        if not ctx.interactive:
+            raise CLIError(
+                "teach-presence records the EMPTY reference: have a person clear the sensor's "
+                f"field (nothing in the light at {_at_text(at)}), then run it with "
+                "--empty-confirmed (or --field-empty yes). This command does not wait for "
+                "input; --interactive asks [y/N] and gives up after --prompt-timeout s. "
+                "Nothing was projected or taught")
+    ctx.header()
+    p = ctx.preset()
+    _mock_clear(ctx)
+    if not confirmed:
         try:
-            ans = input(f">> Is the sensor's field EMPTY (nothing in the light at "
-                        f"{_at_text(at)})? [y/N] ")
+            ans = _prompt(ctx, f">> Is the sensor's field EMPTY (nothing in the light at "
+                               f"{_at_text(at)})? [y/N] ")
         except EOFError:
             ans = ""
         if ans.strip().lower() not in ("y", "yes"):
@@ -1661,18 +1759,47 @@ def cmd_calibrations(ctx):
         in_use = cur.id if cur is not None else None
     except (config.ConfigError, rules.RuleViolation):
         pass                                    # listing still works without a preset
+
+    def note(c) -> str:
+        if c.get("id") == in_use:
+            return "<- in use for the preset"
+        if c.get("kind") == "stereo":       # a re-homed copy says where it came from
+            return "stereo" + (f": {c['rehomed'].get('note')}" if c.get("rehomed") else "")
+        return ""
     rows = [[c.get("id"), c.get("geometry_id"),
              _u(c.get("mm_per_px"), "mm/px", 5) if c.get("mm_per_px") is not None else "-",
              _u(c.get("lateral_px_per_mm"), "px/mm", 4)
              if c.get("lateral_px_per_mm") is not None else "-",
-             _f(c.get("r2"), 5), c.get("n_samples"),
-             "<- in use for the preset" if c.get("id") == in_use else ""] for c in cals]
+             _f(c.get("r2"), 5), c.get("n_samples"), note(c)] for c in cals]
     ctx.say(f"Calibrations ({len(cals)})" + (f" for geometry {ctx.args.geometry}"
                                               if ctx.args.geometry else ""))
     ctx.table(["id", "geometry", "Z", "XY", "R^2", "samples", ""], rows)
     if not cals:
         ctx.say("  none yet: scan a part with --known H,W,L, then  calibrate <label>")
     return EXIT_OK, {"calibrations": cals, "in_use": in_use}
+
+
+def cmd_calib_poses(ctx):
+    a = ctx.args
+    poses = [m for m in api.list_library("calib_poses", a.geometry)
+             if a.set is None or m.get("set") == a.set]
+    ctx.say(f"Calibration poses ({len(poses)})" + (f" of set {a.set}" if a.set else "")
+            + (f" for geometry {a.geometry}" if a.geometry else ""))
+    ctx.table(["id", "set", "geometry", "corners", "projector corners", "periods (px)",
+               "accepted", "captured"],
+              [[m.get("id"), m.get("set"), m.get("geometry_id"), m.get("corners_found"),
+                (f"{m['projector_corners']} ({m.get('projector_corner_pct', 0):.0f} %)"
+                 if m.get("projector_corners") is not None else "-"),
+                _periods_words(m.get("periods_px")),
+                {True: "yes", False: "NO"}.get(m.get("accepted"), "-"), m.get("created")]
+               for m in poses])
+    if not poses:
+        ctx.say("  none yet: calib-pose [--set NAME]  (12-20 board poses, then calibrate-stereo)")
+    else:
+        ctx.say("  delete <id> --reason WHY --yes  moves one pose to the library trash")
+    return EXIT_OK, {"calib_poses": [{k: v for k, v in m.items() if k not in ("decode", "fixture",
+                                                                              "boards")}
+                                     for m in poses]}
 
 
 def cmd_readings(ctx):
@@ -1762,22 +1889,31 @@ def cmd_outputs(ctx):
 
 # ------------------------------------------------------------ wizard
 
-def _ask(prompt: str) -> str:
-    """input() for a human step; q / EOF stop the wizard cleanly."""
-    try:
-        ans = input(prompt)
-    except EOFError:
-        raise Abort("no input (stdin closed); wizard stopped") from None
-    if ans.strip().lower() in ("q", "quit", "exit"):
-        raise Abort("stopped by the operator")
-    return ans
-
-
 def cmd_wizard(ctx):
     """base -> part -> measure -> inspect -> 3D, prompting for every
-    physical step. Always human-readable (the prompts need a person)."""
+    physical step. Always human-readable (the prompts need a person). Needs --interactive
+    (it is nothing but prompts); each prompt gives up after --prompt-timeout s (default
+    WIZARD_TIMEOUT_S) and the wizard stops."""
     ctx.json = False
     a = ctx.args
+    if not ctx.interactive:
+        raise CLIError("the wizard asks a person at every physical step, and no command waits "
+                       "for input unless --interactive is given: run  scan wizard "
+                       "--interactive  from a terminal (each prompt gives up after "
+                       f"--prompt-timeout s, default {WIZARD_TIMEOUT_S:g}). For scripts and "
+                       "agents use the single commands: signal, base, scan, measure, inspect, "
+                       "reconstruct")
+
+    def _ask(prompt: str) -> str:
+        """One human step; q / EOF / no answer in time stop the wizard cleanly."""
+        try:
+            ans = _prompt(ctx, prompt, WIZARD_TIMEOUT_S)
+        except EOFError:
+            raise Abort("no input (stdin closed); wizard stopped") from None
+        if ans.strip().lower() in ("q", "quit", "exit"):
+            raise Abort("stopped by the operator")
+        return ans
+
     p = ctx.preset()
     ctx.say("Scan wizard: empty base -> part -> measure -> inspect -> 3D point cloud")
     ctx.header()
@@ -1972,7 +2108,11 @@ def cmd_parity(ctx):
         ctx.say("[mock] stereo bench: the empty wall (the diamond DMD model the metric "
                 "commands use)")
     r = api.row_parity(p)
-    ctx.say(f"Diamond row parity: {r.get('parity')}  ({r.get('note')})")
+    if r.get("ok"):         # a result either way: "none" = measured, no half-column offset
+        ctx.say(f"Diamond row parity: {_parity_words(r.get('parity'), 'row_parity')}; stored "
+                "with the geometry: calib-pose and calibrate-stereo use it")
+    else:
+        ctx.say(f"Diamond row parity: NOT determined ({r.get('note')}); nothing stored")
     ctx.kv([["shift", _u(r.get("shift_cols"), "columns", 3)],
             ["camera px / column", _f(r.get("camera_px_per_column"), 3)],
             ["lines matched", r.get("n_lines", "-")]])
@@ -2014,23 +2154,63 @@ def cmd_calib_pose(ctx):
         _mock_place_fixture(ctx, fxs, a.set)
     r = api.capture_calib_pose(ctx.preset(), a.set, steps=a.steps, periods=_periods(a.periods),
                                fixture=str(Path(a.fixture).resolve()) if fxs else None)
+    parity = _parity_words(r["diamond_parity"], r["parity_source"])
     if fxs is None:
         ctx.say(f"Calibration pose {r['id']} (set {r['set']}): {r['corners_found']} ChArUco "
-                f"corners, {r['valid_pct']:.1f}% decoded, parity {r['diamond_parity']} "
-                f"({r['parity_source']})")
-        ctx.warn(r.get("warnings"))
-        return (EXIT_OK if r["corners_found"] >= 6 else EXIT_NOT_OK), r
-    ff = r["fixture"]["faces_found"]
-    ctx.say(f"Fixture placement {r['id']} (set {r['set']}, fixture {r['fixture']['name']}): "
-            f"{len(r['faces_seen'])} of {len(ff)} faces, {r['corners_found']} ChArUco corners, "
-            f"{r['valid_pct']:.1f}% decoded, parity {r['diamond_parity']} ({r['parity_source']})")
-    ctx.table(["face", "marker ids", "corners", "usable"],
-              [[f["face"], f"{f['id_range'][0]}-{f['id_range'][1]}", f["corners"],
-                "yes" if f["corners"] >= 6 else "no"] for f in ff])
-    ctx.say("  next: move the fixture (left / right / centre), turn it 20-45 deg about its own "
-            "axis, tip it a little, change the distance; 3 placements, then calibrate-stereo")
+                f"corners, {r['valid_pct']:.1f}% decoded, parity {parity}")
+    else:
+        ff = r["fixture"]["faces_found"]
+        ctx.say(f"Fixture placement {r['id']} (set {r['set']}, fixture {r['fixture']['name']}): "
+                f"{len(r['faces_seen'])} of {len(ff)} faces, {r['corners_found']} ChArUco "
+                f"corners, {r['valid_pct']:.1f}% decoded, parity {parity}")
+        ctx.table(["face", "marker ids", "corners", "projector corners", "usable"],
+                  [[f["face"], f"{f['id_range'][0]}-{f['id_range'][1]}", f["corners"],
+                    f.get("projector_corners", "-"), "yes" if f["corners"] >= 6 else "no"]
+                   for f in ff])
+    # how many of the corners found got a projector position: what the projector fit gets
+    ctx.say(f"  projector corners {r['projector_corners']}/{r['corners_found']} "
+            f"({r['projector_corner_pct']:.0f} %) at fringe periods "
+            f"{_periods_words(r['periods_px'])} px ({_PERIOD_SOURCES.get(r['periods_source'], '?')})"
+            + ("" if r["accepted"] else "  - NOT accepted"))
+    if len(r.get("attempts") or []) > 1:
+        ctx.table(["tried periods (px)", "corners", "projector corners", "%", ""],
+                  [[_periods_words(t["periods_px"]), t["corners_found"], t["projector_corners"],
+                    f"{t['projector_corner_pct']:.0f}", "stored" if t["stored"] else ""]
+                   for t in r["attempts"]], indent="    ")
+    if fxs is not None:
+        ctx.say("  next: move the fixture (left / right / centre), turn it 20-45 deg about its "
+                "own axis, tip it a little, change the distance; 3 placements, then "
+                "calibrate-stereo")
     ctx.warn(r.get("warnings"))
-    return (EXIT_OK if len(r["faces_seen"]) >= 2 else EXIT_NOT_OK), r
+    return (EXIT_OK if r["accepted"] else EXIT_NOT_OK), r
+
+
+_PERIOD_SOURCES = {"argument": "--periods", "set": "this pose set's", "preset": "the default",
+                   "auto": "coarser than the default: retried automatically"}
+
+
+def _periods_words(periods) -> str:
+    return ",".join(f"{float(x):g}" for x in periods or []) or "-"
+
+
+def _parity_words(parity, source) -> str:
+    """The diamond row parity with how it is known: measured (also 'no offset'), set, or
+    not measured."""
+    from engine.calibrate.stereo import parity_text
+    return parity_text(parity, source)
+
+
+def _print_calibration_poses(ctx, rows: list) -> None:
+    """Which poses gave the projector fit its points (>= 6 corners with a projector
+    position): the per-pose table of calibrate-stereo."""
+    if not rows:
+        return
+    n = sum(1 for x in rows if x.get("contributed"))
+    ctx.say(f"  projector points from {n} of {len(rows)} poses:")
+    ctx.table(["pose", "corners", "projector corners", "%", "contributed"],
+              [[x.get("id"), x.get("corners"), x.get("projector_corners"),
+                _f(x.get("projector_corner_pct"), 0), "yes" if x.get("contributed") else "NO"]
+               for x in rows], indent="    ")
 
 
 def cmd_calibrate_stereo(ctx):
@@ -2041,11 +2221,31 @@ def cmd_calibrate_stereo(ctx):
         raise ValueError("--mock-fixture needs --mock (on the rig: calib-pose --fixture SPEC per "
                          "placement)")
     fxs = _fixture_arg(a.fixture)
-    r = api.calibrate_stereo(ctx.preset(), a.set, a.square, mock_poses=a.mock_poses or 0,
-                             steps=a.steps, periods=_periods(a.periods),
-                             projector_distortion=a.projector_distortion,
-                             fixture=str(Path(a.fixture).resolve()) if fxs else None,
-                             mock_fixture=a.mock_fixture or 0, rigid=not a.no_rigid)
+    from engine.calibrate.stereo import CalibrationRejected
+    try:
+        r = api.calibrate_stereo(ctx.preset(), a.set, a.square, mock_poses=a.mock_poses or 0,
+                                 steps=a.steps, periods=_periods(a.periods),
+                                 projector_distortion=a.projector_distortion,
+                                 fixture=str(Path(a.fixture).resolve()) if fxs else None,
+                                 mock_fixture=a.mock_fixture or 0, rigid=not a.no_rigid)
+    except CalibrationRejected as e:
+        # fail loudly: not a calibration, nothing saved, never exit 0
+        ctx.say("Stereo calibration REJECTED - NOTHING SAVED (the calibration in use, if any, "
+                "is unchanged):")
+        for why in e.reasons:
+            ctx.say(f"  ! {_one_line(why)}")
+        _print_calibration_poses(ctx, e.per_pose)
+        if e.numbers:
+            ctx.kv([[k, _f(v, 4)] for k, v in sorted(e.numbers.items())], indent="    ")
+        if e.report_path is not None:
+            ctx.say(f"  report: {e.report_path}")
+        if not ctx.json:
+            print(f"error: stereo calibration rejected: {_one_line('; '.join(e.reasons))}",
+                  file=sys.stderr)
+        return EXIT_NOT_OK, {"rejected": True, "saved": False, "calibration_id": None,
+                             "reasons": e.reasons, "per_pose": e.per_pose,
+                             "numbers": e.numbers, "report": e.report_path,
+                             "error": {"type": "CalibrationRejected", "message": str(e)}}
     rms = r["rms"]
     if r.get("fixture"):
         ctx.say(f"Stereo calibration {r['calibration_id']}  ({r['n_views']} face views from "
@@ -2059,7 +2259,9 @@ def cmd_calibrate_stereo(ctx):
             ["stereo RMS", _u(rms.get("stereo_px"), "px", 4)],
             ["baseline", _u(r["baseline_mm"], "mm", 2)], ["angle", _u(r["angle_deg"], "deg", 2)],
             ["f_v / f_u (diamond ~2)", _f(r["fv_over_fu"], 4)],
-            ["diamond parity", r["diamond_parity"]]])
+            ["diamond parity", r.get("diamond_parity_text") or r["diamond_parity"]],
+            ["fringe periods", f"{_periods_words(r.get('periods_px'))} px"]])
+    _print_calibration_poses(ctx, r.get("per_pose") or [])
     if r.get("fixture"):
         rg, fc = r["rigid"], r["face_check"]
         ctx.kv([["rigid-fixture refinement",
@@ -3076,7 +3278,10 @@ def cmd_rig_check(ctx):
         n = len([s for s in re.split(r"[,\s]+", a.mock_shift.strip()) if s])
         shift = _numbers(a.mock_shift, min(max(n, 2), 4),
                          "--mock-shift dx,dy[,roll_deg[,scale]] (camera px, deg, x)")
-    r = api.rig_check(ctx.preset(), a.set_reference, a.tol, shift)
+    if a.rehome and a.set_reference:
+        raise CLIError("--rehome and --set-reference exclude each other: a re-home is fitted "
+                       "against the stored reference and stores the new one itself")
+    r = api.rig_check(ctx.preset(), a.set_reference, a.tol, shift, rehome=bool(a.rehome))
     ctx.say(f"Rig check: {r['status']}  {r['message']}")
     rows = [["reference", r.get("reference_id") or "-"], ["base", r.get("base_id") or "-"],
             ["stereo calibration", r.get("calibration_id") or "-"]]
@@ -3093,9 +3298,30 @@ def cmd_rig_check(ctx):
                                             "tiles)"])
     if r.get("shift_mm") is not None:
         rows.append(["~mm", f"{r['shift_mm']:.3f} mm at {r.get('working_distance_mm')} mm"])
+    rh = r.get("rehome") or {}
+    if rh.get("rotation_deg") is not None:          # the camera rotation fitted to the flood
+        rows.append(["camera rotation",
+                     f"{rh['rotation_deg']:.4f} deg (pan {rh['pan_deg']:+.4f}, tilt "
+                     f"{rh['tilt_deg']:+.4f}, roll {rh['roll_deg']:+.4f} deg; shift at the "
+                     f"principal point {rh['shift_px'][0]:+.2f}, {rh['shift_px'][1]:+.2f} px, "
+                     f"scale {rh['scale_pct']:+.3f} %)"])
+        rows.append(["rotation fit", f"residual {rh['residual_px']:.2f} px rms, "
+                                     f"{rh.get('tiles_agree', 0)} of {rh.get('tiles_used', 0)} "
+                                     f"flood tiles agree, match {_f(rh.get('match'), 2)}"
+                                     + (f", pattern vs flood {rh['pattern_rms_px']:.2f} px"
+                                        if rh.get("pattern_rms_px") is not None else "")])
+    if rh.get("done"):
+        rows.append(["re-homed calibration", f"{rh['calibration_id']}  ({rh['note']})"])
+    elif a.rehome:
+        rows.append(["re-home", f"NOT done: {rh.get('why') or 'not applicable'}"])
+    elif rh.get("applicable"):
+        rows.append(["re-home", "possible: scan rig-check --rehome  (rotation only; a full "
+                                "calibration is the reference)"])
+    elif rh.get("why"):
+        rows.append(["re-home", f"not possible: {rh['why']}"])
     ctx.kv(rows)
     ctx.warn(r.get("warnings"))
-    return (EXIT_OK if r["status"] in ("OK", "REFERENCE_SET") else EXIT_NOT_OK), r
+    return (EXIT_OK if r["status"] in ("OK", "REFERENCE_SET", "REHOMED") else EXIT_NOT_OK), r
 
 
 # ------------------------------------------------------------ flow-ready job (run)
@@ -4158,6 +4384,16 @@ def _add_globals(p: argparse.ArgumentParser, sub: bool) -> None:
                         "scene: tube, endfaces, box_lid, plate)")
     p.add_argument("--json", action="store_true", default=d(False),
                    help="print one JSON document (for scripts and AI agents)")
+    p.add_argument("--interactive", action="store_true", default=d(False),
+                   help="allow questions on the terminal (wizard; delete without --yes; "
+                        "teach-presence without --empty-confirmed). Without it no command "
+                        "ever waits for input: it is refused (exit 2) and says which "
+                        "argument answers the question")
+    p.add_argument("--prompt-timeout", metavar="S", type=_prompt_timeout, default=d(None),
+                   help=f"with --interactive: a question gives up after S seconds and the "
+                        f"command stops, nothing done (default {PROMPT_TIMEOUT_S:g} s for a "
+                        f"y/N, {WIZARD_TIMEOUT_S:g} s per wizard step; at most "
+                        f"{PROMPT_TIMEOUT_MAX_S:g})")
     p.add_argument("--debug", action="store_true", default=d(False),
                    help="show full tracebacks on errors")
 
@@ -4169,7 +4405,8 @@ typical flow:
   scan scan part --known 106.95,56.5,21.9
   scan measure part                H/W/L (px until calibrated, then mm)
   scan calibrate part              fit Z/XY from known dims at this geometry
-  scan wizard                      guided: base -> part -> measure -> inspect -> 3D
+  scan wizard --interactive        guided: base -> part -> measure -> inspect -> 3D (asks
+                                   at every physical step; needs --interactive)
 
 zones ("scan the zone the part is in"):
   scan map                         camera<->projector map (once per rig position)
@@ -4180,8 +4417,10 @@ virtual sensors (the DMD draws the spot, the camera is the receiver):
   scan spot-size 6.5 [--measured K]      6.5 mm spot -> DMD px (cols x rows), nominal vs
                                          measured (K = measured mm / drawn columns)
   scan spot H8 --diameter 6.5            project + measure a spot (or dmd:COL,ROW, cam:X,Y)
-  scan teach-presence pe H8 --diameter 6.5 [--method bgs] [--empty-confirmed]
-                                         teach on the EMPTY field (asks unless confirmed)
+  scan teach-presence pe H8 --diameter 6.5 [--method bgs] --empty-confirmed
+                                         teach on the EMPTY field: a person clears it first;
+                                         refused (exit 2) without --empty-confirmed - it
+                                         never waits for an answer (--interactive asks)
   scan check-presence pe                 exit 0 PRESENT, 1 ABSENT or INDETERMINATE
   scan teach-align fixture <scan>        reference pose of the part in a scan
   scan check-align fixture <scan>        exit 0 ALIGNED, 1 NOT_ALIGNED or INDETERMINATE
@@ -4197,8 +4436,14 @@ virtual sensors (the DMD draws the spot, the camera is the receiver):
 metric (mm from a stereo calibration of the same geometry; refused otherwise):
   scan charuco [--square 25]             printable board (print at 100 %, caliper a square)
   scan parity                            diamond DMD row parity (bench step B3)
-  scan calib-pose [--set NAME]           one board pose (repeat 12-20x, tilt +-30 deg)
-  scan calibrate-stereo --square MM      camera + projector + stereo; RMS per pose / axis
+  scan calib-pose [--set NAME]           one board pose (repeat 12-20x, tilt +-30 deg); prints
+                                         projector corners k/n (< 60 %: retried at coarser
+                                         fringes 16,160,1280 / 24,192,1280 unless --periods;
+                                         one period set per pose set); exit 1 not accepted
+  scan calibrate-stereo --square MM      camera + projector + stereo; RMS per pose / axis and
+                                         which poses gave projector points. REJECTED, nothing
+                                         saved, exit 1: degenerate projector fit, stereo RMS
+                                         > 2 px, or too few poses with projector points
   scan calib-pose --fixture SPEC --set fx   one fixture placement = one view per face
                                          (3 placements; docs/CALIBRATION_FIXTURE.md)
   scan calibrate-stereo --set fx --fixture SPEC   + rigid-fixture refinement, face-angle check
@@ -4275,6 +4520,12 @@ Surfer atlas (regions become zones atlas:<name>/<region>, e.g. scan part --zone 
 
 rig check (has the camera / projector been nudged? also the operator UI's HOME):
   scan rig-check [--set-reference] [--tol 0.5]   exit 0 OK / reference set, 1 MOVED or UNKNOWN
+  scan rig-check --rehome                 a small CAMERA move only: a NEW stereo calibration
+                                         with the camera's rotation taken out (R1 = R0 @ Rd,
+                                         t unchanged; flagged re-homed, the original kept);
+                                         exit 0 re-homed / nothing to do, 1 refused (projector
+                                         moved, > ~5 px, poor match). Rotation only: absolute
+                                         depth may keep a small offset - recalibrate when you can
 
 flow-ready job (one station config in, one run folder out; see stations/):
   inspect / compare: base-relief depth calibration;  metric: stereo calibration (calibrate-stereo)
@@ -4297,8 +4548,12 @@ recipes (work-state checks: preset -> zones -> checks -> verdict painted on the 
   scan recipe-add|recipe-select|recipe-delete|recipe-show|recipe-validate
   station configs: job.type recipe + job.recipe NAME (the work state is the recipe)
 
-library: bases | scans | calibrations | readings | materials | banks | maps |
+library: bases | scans | calibrations | calib-poses | readings | materials | banks | maps |
          sensors | outputs;  bank-remove <scan> --bank NAME drops one bank member.
+         delete <id> --yes [--reason WHY] moves one entry to the library trash (bases, scans,
+         calibrations, calibration poses, rig references, parity measurements, ...).
+no command waits for input: answers are arguments (--yes, --empty-confirmed); only with
+--interactive does a command ask, and a question gives up after --prompt-timeout seconds.
 mock: --mock-part H,W,L[,albedo] is what the simulated human places for scan,
       wizard and check-presence (the bench is albedo 0.6; 'none' = empty);
       --mock-part cylinder[:R,H,dent_mm] places a standing cylinder; qr:TEXT a QR
@@ -4434,11 +4689,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = cmd("reject-base", cmd_reject_base, "mark a base unusable (kept, never picked again)")
     p.add_argument("id")
     p.add_argument("reason", nargs="+")
-    p = cmd("delete", cmd_delete, "move a base / scan / calibration / reading / map / bank / "
-                                  "material / sensor to trash/")
-    p.add_argument("id")
-    p.add_argument("--reason", default="")
-    p.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
+    p = cmd("delete", cmd_delete, "move a base / scan / calibration / calibration pose / rig "
+                                  "reference / parity measurement / reading / map / bank / "
+                                  "material / sensor to trash/ (recoverable, never destroyed)")
+    p.add_argument("id", help="entry id or label (a calibration pose: its id, see calib-poses)")
+    p.add_argument("--reason", default="", help="why (recorded with the trashed entry)")
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="confirm: required (the command never waits for input) unless "
+                        "--interactive, which asks")
     p = cmd("scan", cmd_scan, "scan a part against a base (relief, stored in objects/)",
             "object scanning")
     p.add_argument("label")
@@ -4581,7 +4839,10 @@ def build_parser() -> argparse.ArgumentParser:
             "the calibration pose")
     p.add_argument("--set", default="stereo", help="pose set name")
     p.add_argument("--steps", type=_positive_int)
-    p.add_argument("--periods", help="T,T,T DMD px, fine -> coarse")
+    p.add_argument("--periods", help="T,T,T DMD px, fine -> coarse. Default: this pose set's "
+                   "(fixed by its first accepted pose), else 8,80,1280 - captured again at "
+                   "16,160,1280, then 24,192,1280 when under 60 %% of the corners get a "
+                   "projector position. Given explicitly: used as they are, no retry")
     p.add_argument("--fixture", metavar="SPEC", help="calibration fixture spec JSON "
                    "(tools/make_calib_fixture.py): one PLACEMENT of the fixture, every face "
                    "detected on its own (3 placements in all)")
@@ -5026,6 +5287,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mock-shift", metavar="DX,DY[,ROLL[,SCALE]]",
                    help="mock only: move the fresh frames (px, deg, x; simulates a nudged "
                         "camera)")
+    p.add_argument("--rehome", action="store_true",
+                   help="after a small CAMERA move (MOVED: flood and pattern moved together): "
+                        "fit the camera rotation from the reference flood vs the fresh one and "
+                        "write a NEW stereo calibration R1 = R0 @ Rd (t unchanged), flagged "
+                        "re-homed (rotation only); the original is kept. Refused when the "
+                        "projector moved, the motion is > ~5 px or badly registered. Absolute "
+                        "depth may keep a small offset: a full calibration is the reference")
     p = cmd("run", cmd_run, "flow-ready job: run a station config, write result.json + "
                             "run.log.jsonl in a new run folder (exit 0 PASS, 1 FAIL, "
                             "2 refused, 4 crashed, 5 INVALID)", "the station job")
@@ -5069,7 +5337,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="bgs: height above the taught background, mm (default 3)")
     p.add_argument("--level", type=int, help="DMD level 1-255 (default 255)")
     p.add_argument("--empty-confirmed", action="store_true",
-                   help="the operator has cleared the sensor's field (else asks y/N)")
+                   help="the operator has cleared the sensor's field. Required: without it "
+                        "the command is refused at once (it never waits for input), unless "
+                        "--interactive, which asks y/N with a timeout")
+    p.add_argument("--field-empty", choices=("yes", "no"),
+                   help="the operator's answer as an argument: yes = --empty-confirmed, no = "
+                        "not taught (exit 1)")
     p = cmd("check-presence", cmd_check_presence, "fire a taught sensor: exit 0 PRESENT, "
                                                   "1 ABSENT / INDETERMINATE",
             "the part-present sensor")
@@ -5096,6 +5369,10 @@ def build_parser() -> argparse.ArgumentParser:
     # library listings
     p = cmd("calibrations", cmd_calibrations, "list calibrations (the one in use is marked)")
     p.add_argument("--geometry", help="only this geometry id")
+    p = cmd("calib-poses", cmd_calib_poses, "list calibration board poses (set, corners, "
+                                            "projector corners, fringe periods)")
+    p.add_argument("--geometry", help="only this geometry id")
+    p.add_argument("--set", help="only this pose set")
     cmd("readings", cmd_readings, "list code readings and spectral readings")
     cmd("materials", cmd_materials, "list learned materials")
     p = cmd("outputs", cmd_outputs, "list the output bin (every derived file)")

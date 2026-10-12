@@ -1,7 +1,8 @@
 @echo off
 rem Swiss Army Scanner command line:  scan.bat [--mock] <command> [...]
 rem   scan.bat --help          all commands
-rem   scan.bat --mock wizard   guided run on the simulated rig (no hardware)
+rem   scan.bat --mock wizard --interactive   guided run on the simulated rig (no hardware;
+rem                            no command waits for input unless --interactive is given)
 rem Runs from any folder: the repo is put on PYTHONPATH instead of cd-ing,
 rem so relative paths you type (e.g. --library) stay relative to YOUR folder.
 setlocal

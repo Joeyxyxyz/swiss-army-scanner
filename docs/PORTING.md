@@ -47,6 +47,12 @@ PULL, never a permission.
 
 Then prove the numbers on site (the last section) before anybody trusts a PASS.
 
+Not every use needs all six. The three **operating modes** (`README.md`) are the layers: a
+triangulation preset with its stereo calibration is enough to **measure** (`scan measure-run`:
+numbers with uncertainty, no verdict); add one check and a threshold for a **quick check**
+(`scan quick-check`: CONTINUE / REJECT / PULL, no sensors, no permissions); a **station**
+adds the station configuration, its profiles and work states, and the I/O.
+
 ## 1. Projector
 
 The engine drives the projector as an **extended display** (HDMI / DisplayPort): a full-screen
@@ -113,6 +119,46 @@ uses the FLIR Spinnaker SDK (`RealCamera`); any **GenICam** camera (**GigE Visio
 
 Every mm the engine reports comes from the stereo calibration of the SAME geometry and
 fingerprint (rule 6); without one a recipe run is INVALID and says how to calibrate.
+
+### Mobile rigs
+
+A rig that is carried or re-positioned between uses (a cart, a tripod, a head on an arm) is a
+**mobile** rig: say so in its preset (`scan preset-add my_cart --from <preset> --set
+rig.mount=mobile`; the default is `fixed`). The engine then **assumes it moved since its last
+use** and gives no mm - Measure answers NOT_MEASURABLE, Quick check and Station PULL - until
+it was verified in the current session (`README.md` *Operating modes*, `engine/rigstate.py`):
+
+- **Calibrate where it stands.** The printed calibration fixture is made for this: 3
+  placements (`scan calib-pose --fixture <spec> --set fx` x3, `scan calibrate-stereo --set fx
+  --fixture <spec>`, `docs/CALIBRATION_FIXTURE.md`), or the board poses. A calibration solved
+  from poses captured in this session is the verification (solving the stored poses of an
+  earlier session again is not: the rig is no longer where they were captured). `scan
+  rig-check --set-reference` right after it stores the reference later checks compare with -
+  now, while the rig is verified, so that it can be trusted.
+- **Or check it against that reference.** When the rig returns to the scene the reference
+  was taken on (a docking plate, a fixed target in view), `scan rig-check` OK verifies it:
+  the camera and the projector still sit as they did. Only at the default tolerance (0.5 px)
+  or tighter, only against the reference of the calibration in use, and only when that
+  reference was stored while the rig was verified: a reference taken of a rig in doubt -
+  the first check after carrying it, or `--set-reference` - verifies nothing, in that session
+  or any later one, so storing one and then checking does not wave a moved rig through.
+- **After a small camera nudge** (rig check MOVED, "camera", <= ~5 px): `scan rig-check
+  --rehome` writes a re-homed copy of the calibration (rotation only; the original is kept).
+  It verifies the rig when it was fitted against a trusted reference. Anything larger, or a
+  projector move: recalibrate.
+
+A session starts when the rig is set down: `scan rig-session --new` (or the web UI server's
+start, which is one). It is never older than 12 h, than the start of the computer or than
+the start of the web UI server; `scan rig-session` says whether mm are allowed and what to
+do when they are not. The engine cannot see the rig being carried or switched off: that
+is what `scan rig-session --new` is for. A fixed rig has no session: its calibration is
+trusted until a rig check says MOVED / UNKNOWN, and then until that is answered (a check OK
+against the reference stored before, a re-home, new poses + a calibration, or `--set-reference`
+by the operator). The mount is not part of the geometry fingerprint, but a `geometry_id` names
+one rig: once a mobile preset exists at a geometry, every preset at it - also the fixed one
+it was copied from - is gated as mobile. A rig that is bolted down and one that is carried
+are two geometries (`scan preset-add ... --geometry <new id>`), each with its own calibration
+and rig-state record (`calibrations/<geometry>/rig_state.jsonl`).
 
 ## 4. Recipe
 

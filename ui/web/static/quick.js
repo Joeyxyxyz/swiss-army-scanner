@@ -6,12 +6,27 @@
 // and the PROFILE LIBRARY SET it can call on (long tube / short tube). The PROFILE selector
 // picks the part variant. The WORK STATES are the steps of the configuration's flow: what the
 // line's sensor says, what the DLP says, and the permission that lets the line continue.
+//
+// Operating modes (the switch at the top; the bus holds the selected one: POST /api/cmd/mode):
+// STATION is all of the above. MEASURE is an instrument: a triangulation preset, what to
+// measure, a region or two picked camera px -> POST /api/measure -> a table of values with
+// their uncertainty and a neutral MEASURED / NOT MEASURABLE (never a verdict, never the lamp's
+// PASS / FAIL). QUICK CHECK is a preset + one check + a threshold -> POST /api/quick-check ->
+// the lamp shows CONTINUE / REJECT / PULL. Outside Station mode the bus starts no cycle.
+// The station's keys (1-9, P, T, A, N, K) work in Station mode only: in the other modes the
+// station selectors are hidden, and a key must never change what is hidden. The picker of
+// Measure / Quick check always shows the LOADED preset (the bus's active_preset: the one HOME
+// checks and the measurement runs with). The operator's confirmation of the physical setup
+// is for one setup: a mode change or another preset clears it.
 'use strict';
 
 const $ = (sel) => document.querySelector(sel);
 const state = { setupBusy: false, mode: null, stations: [], bus: null, runJobId: null, homeJobId: null,
   shownRun: null, shownHome: null, shownConfig: null, shownProfile: null, loadingStations: false,
-  lampDisp: null, flowKey: null, mockKey: null, profileKey: null, cycleKey: null, resultShown: false };
+  lampDisp: null, flowKey: null, mockKey: null, profileKey: null, cycleKey: null, resultShown: false,
+  // operating mode (null until the first bus state), its job, its pickers, the picture clicks
+  opMode: null, modeJobId: null, shownModeJob: null, rigKey: null, recipeKey: null,
+  pick: { n: 0, corner: null }, presetBusy: false, shownPreset: null, rigAsked: null };
 
 async function api(method, path, body) {
   const opt = { method, headers: {} };
@@ -57,6 +72,11 @@ function clearResult() {
   $('#qPull').textContent = '';
   $('#qPull').hidden = true;
   $('#qResultLink').hidden = true;
+  $('#qValues').hidden = true;
+  $('#qValuesBody').textContent = '';
+  $('#qValidity').textContent = '';
+  $('#qValuesLink').hidden = true;
+  $('#qPlyLink').hidden = true;
   clearChecks();
   steps('', '', '');
   state.resultShown = false;
@@ -130,6 +150,8 @@ function busWhy(b) {
 }
 
 function applyBus(b) {
+  // Measure / Quick check: the bus stands aside (no cycle, no PASS): the lamp is the mode's own
+  if (opMode(b) !== 'station') return;
   const d = busDisposition(b);
   if (d === null) {
     // idle with no result and no cycle: the bus has forgotten the last one (another profile or
@@ -176,8 +198,17 @@ function refreshButtons() {
   const usable = st && !st.error && !(b.unusable && b.unusable[shown])
     && (!state.bus || b.station_config === shown);
   const waitStep = s === 'WAITING' && c && c.waiting === 'step';
-  $('#qConfirmRow').hidden = state.mode !== 'real';
-  $('#qStart').disabled = !idle || !usable || !confirmed();
+  const m = state.opMode || 'station';
+  // a measurement / quick check of this page (or another client) is queued or running
+  const modeBusy = (b.mode_jobs || []).length > 0
+    || !!(state.modeJobId && state.shownModeJob !== state.modeJobId);
+  const free = (s === 'READY' || s === 'FAULT') && !modeBusy;
+  $('#qConfirmRow').hidden = state.mode !== 'real' || m === 'measure';
+  // Station: START begins a cycle; Quick check: START runs the one check
+  $('#qStart').disabled = m === 'station' ? (!idle || !usable || !confirmed()) : (!free || !confirmed());
+  $('#qMeasure').disabled = !free;
+  for (const k of MODES) $(MODE_BTN[k]).disabled = !(idle || s === 'FAULT') || modeBusy;
+  $('#qRigPreset').disabled = !free;
   $('#qAbort').disabled = false;                       // ABORT is never disabled
   $('#qHome').disabled = !(idle || s === 'FAULT' || s === 'ABORTING');
   $('#qArm').disabled = s === 'ARMED' ? false : (s !== 'READY' || !usable || !confirmed());   // DISARM: always
@@ -516,6 +547,384 @@ function showStepJob(job) {
   if (links.preview) img.src = `${links.preview}?t=${Date.now()}`;
 }
 
+// ---- operating modes: Measure | Quick check | Station
+
+const MODES = ['measure', 'quick_check', 'station'];
+const MODE_BTN = { measure: '#qModeMeasure', quick_check: '#qModeQuick', station: '#qModeStation' };
+const MODE_INFO = {
+  measure: 'an instrument: numbers with units and uncertainty. No tolerance, no verdict, nothing on the line\'s outputs',
+  quick_check: 'a triangulation preset + one check: CONTINUE / REJECT / PULL. No sensors, no permissions',
+  station: 'station configuration, profile, work states: the line\'s cycle',
+};
+const MODE_ACTION = {
+  measure: 'MEASURE: scan and report the numbers',
+  quick_check: 'START: run the one check',
+  station: 'run the cycle: START, then each work state is verified (STEP)',
+};
+
+function opMode(b) {
+  // the bus's operating mode (a bus that says none runs cycles: station)
+  const m = b && b.operating_mode;
+  return MODES.includes(m) ? m : 'station';
+}
+
+function applyMode(b) {
+  // the page always shows the bus's mode (another client or a PLC may have changed it)
+  const m = opMode(b);
+  for (const k of MODES) $(MODE_BTN[k]).classList.toggle('on', k === m);
+  if (m === state.opMode) return;
+  const first = state.opMode === null;
+  state.opMode = m;
+  $('#qPaneStation').hidden = m !== 'station';
+  $('#qStationExtras').hidden = m !== 'station';
+  $('#qPaneRig').hidden = m === 'station';
+  $('#qPaneMeasure').hidden = m !== 'measure';
+  $('#qPaneQuick').hidden = m !== 'quick_check';
+  $('#qMeasure').hidden = m !== 'measure';
+  $('#qStart').hidden = m === 'measure';
+  $('#qMeasImg').hidden = true;
+  $('#qModeInfo').textContent = MODE_INFO[m];
+  $('#qActionText').textContent = MODE_ACTION[m];
+  $('#qMockRow').hidden = state.mode !== 'mock';
+  if (!first) {                                  // another mode: nothing of the last one stays
+    const s = b && b.state ? b.state : 'READY';
+    lamp(s, s === 'FAULT' ? 'invalid' : 'ready');
+    clearResult();
+    $('#qReason').textContent = '';
+    notice('');
+    $('#qConfirm').checked = false;              // the confirmation was for the other mode's setup
+  }
+  $('#qNumLabel').textContent = m === 'measure' ? 'Measured' : 'Max deviation';
+  measFields();
+  quickFields();
+  if (m !== 'station') loadModes().catch(() => {});
+}
+
+async function selectMode(mode) {
+  try {
+    const r = await api('POST', '/api/cmd/mode', { mode, source: 'quick' });
+    state.bus = r.bus;
+    applyMode(r.bus);
+    syncConfig(r.bus);
+    renderCycle(r.bus);
+    notice(r.accepted ? '' : `${r.command}: ${r.message}`);
+  } catch (e) {
+    $('#qConn').hidden = false;
+  }
+  refreshButtons();
+}
+
+function fillSelect(sel, items, keyName, key) {
+  // rebuild a picker only when its list changed (the selection survives the polls)
+  if (state[keyName] === key) return;
+  state[keyName] = key;
+  const keep = sel.value;
+  sel.textContent = '';
+  for (const [value, text] of items) {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = text;
+    sel.appendChild(o);
+  }
+  if (keep) sel.value = keep;
+}
+
+async function loadModes() {
+  // the pickers of Measure / Quick check: the triangulation presets (mount, calibration)
+  // and the recipes
+  const d = await api('GET', '/api/modes');
+  const presets = (d.presets || []).filter((p) => p.valid !== false);
+  fillSelect($('#qRigPreset'), presets.map((p) => [p.name, p.name
+    + (p.mount === 'mobile' ? ' [mobile]' : '') + (p.calibrated ? '' : ' (no stereo calibration)')]),
+  'rigKey', JSON.stringify(presets.map((p) => [p.name, p.mount, p.calibrated])));
+  if (d.loaded_preset && !state.presetBusy && $('#qRigPreset').value !== d.loaded_preset) {
+    $('#qRigPreset').value = d.loaded_preset;
+  }
+  const recipes = d.recipes || [];
+  fillSelect($('#qQuickRecipe'), recipes.map((r) => [r, r]), 'recipeKey', JSON.stringify(recipes));
+}
+
+async function selectRigPreset(name) {
+  // the preset is LOADED: HOME (the rig check) and the measurement are about the same rig.
+  // Another preset is another rig setup: what the operator confirmed was not this one
+  if (!name) return;
+  $('#qConfirm').checked = false;
+  state.presetBusy = true;                       // the polls leave the picker alone meanwhile
+  try {
+    const j = await api('POST', `/api/presets/${encodeURIComponent(name)}/load`, {});
+    notice(j.error ? `preset ${name}: ${j.error}` : '');
+    state.presetBusy = false;
+    await loadModes();
+    await pollOnce();
+  } catch (e) {
+    notice(`preset ${name}: ${e.message || e}`);
+  } finally {
+    state.presetBusy = false;
+  }
+  refreshButtons();
+}
+
+function syncRigPreset(b) {
+  // the picker always shows the loaded preset (a PLC, another page or a station
+  // configuration may have loaded another one): what MEASURE / START runs and what HOME
+  // checks is what the operator sees. A change of it clears the confirmation.
+  const loaded = b.active_preset || '';
+  if (loaded !== state.shownPreset) {
+    if (state.shownPreset !== null) $('#qConfirm').checked = false;
+    state.shownPreset = loaded;
+  }
+  if (state.opMode === 'station' || state.presetBusy || !loaded) return;
+  const sel = $('#qRigPreset');
+  if (sel.value === loaded) return;
+  const listed = (sel.options ? Array.from(sel.options) : []).some((o) => o.value === loaded);
+  if (listed) sel.value = loaded;
+  else if (state.rigAsked !== loaded) {          // the list changed: read it again (once)
+    state.rigAsked = loaded;
+    loadModes().catch(() => {});
+  }
+}
+
+function showRigInfo(b) {
+  // the loaded preset's rig: fixed (trusted until a rig check says MOVED / UNKNOWN) or
+  // mobile (no mm until verified in this session: HOME)
+  const r = b.rig || null;
+  let t = `Loaded: ${b.active_preset || 'none'}`;
+  if (r) {
+    t += ` - ${r.mount} rig`;
+    if (!r.ok) t += ` - NO mm now: ${r.message}. HOME runs the rig check.`;
+    else if (r.mount === 'mobile') t += ', verified for this session';
+  }
+  $('#qRigInfo').textContent = t;
+  $('#qRigInfo').classList.toggle('qwarn', !!(r && !r.ok));
+}
+
+function measFields() {
+  // only the inputs the chosen measurement reads
+  const w = $('#qMeasWhat').value || 'flatness';
+  $('#qMeasRoiRow').hidden = w === 'endface';
+  $('#qMeasRoiLabel').textContent = w === 'step' ? 'Region A (camera px)'
+    : (w === 'distance' ? 'Plane region (camera px, optional)' : 'Region (camera px)');
+  $('#qMeasRoi2Row').hidden = w !== 'step';
+  $('#qMeasP1Row').hidden = w !== 'distance';
+  $('#qMeasP2Row').hidden = w !== 'distance';
+  $('#qMeasGoldenRow').hidden = w !== 'deviation';
+  $('#qMeasDiameterRow').hidden = w !== 'endface';
+  state.pick = { n: 0, corner: null };
+}
+
+function quickFields() {
+  const c = $('#qQuickCheck').value || 'flatness';
+  $('#qQuickThresholdRow').hidden = c === 'recipe';
+  $('#qQuickRoiRow').hidden = c === 'recipe';
+  $('#qQuickGuardRow').hidden = c === 'recipe';
+  $('#qQuickGoldenRow').hidden = c !== 'golden';
+  $('#qQuickRecipeRow').hidden = c !== 'recipe';
+}
+
+function numList(text, n, what) {
+  // "x0,y0,x1,y1" -> numbers; empty -> null; anything else is refused here, never guessed
+  const parts = String(text || '').split(/[,;\s]+/).filter(Boolean);
+  if (!parts.length) return null;
+  const v = parts.map(Number);
+  if (v.length !== n || v.some((x) => !Number.isFinite(x))) {
+    throw new Error(`${what}: ${n} numbers, comma-separated (camera px), got "${text}"`);
+  }
+  return v;
+}
+
+function numOrNull(text, what) {
+  const t = String(text || '').trim();
+  if (!t) return null;
+  const v = Number(t);
+  if (!Number.isFinite(v)) throw new Error(`${what}: "${text}" is not a number`);
+  return v;
+}
+
+function measureArgs() {
+  // what POST /api/measure gets: only what the chosen measurement reads
+  const what = $('#qMeasWhat').value || 'flatness';
+  const a = { what, source: 'quick', scan_kind: $('#qMeasScan').value || 'metric' };
+  if ($('#qRigPreset').value) a.preset = $('#qRigPreset').value;
+  const roi = what === 'endface' ? null : numList($('#qMeasRoi').value, 4, 'region');
+  if (roi) a.roi = roi;
+  if (what === 'step') {
+    const roi2 = numList($('#qMeasRoi2').value, 4, 'region B');
+    if (roi2) a.roi2 = roi2;
+  }
+  if (what === 'distance') {
+    const p1 = numList($('#qMeasP1').value, 2, 'point 1');
+    const p2 = numList($('#qMeasP2').value, 2, 'point 2');
+    if (p1) a.p1 = p1;
+    if (p2) a.p2 = p2;
+  }
+  if (what === 'deviation' && $('#qMeasGolden').value.trim()) a.golden = $('#qMeasGolden').value.trim();
+  if (what === 'endface') {
+    const d = numOrNull($('#qMeasDiameter').value, 'expected diameter');
+    if (d !== null) a.face_diameter_mm = d;
+  }
+  const rep = numOrNull($('#qMeasRepeats').value, 'repeats');
+  if (rep !== null && rep !== 1) a.repeats = rep;
+  if (state.mode === 'mock' && $('#qMockPart').value.trim()) a.mock_scene = $('#qMockPart').value.trim();
+  return a;
+}
+
+function quickArgs() {
+  // what POST /api/quick-check gets
+  const check = $('#qQuickCheck').value || 'flatness';
+  const a = { check, source: 'quick', operator_confirmed: confirmed() };
+  if (check === 'recipe') {
+    if (!$('#qQuickRecipe').value) throw new Error('pick the recipe');
+    a.recipe = $('#qQuickRecipe').value;
+  } else {
+    const t = numOrNull($('#qQuickThreshold').value, 'threshold');
+    if (t === null) throw new Error('give the threshold in mm');
+    a.threshold_mm = t;
+    const roi = numList($('#qQuickRoi').value, 4, 'region');
+    if (roi) a.roi = roi;
+    const gb = numOrNull($('#qQuickGuard').value, 'guard band');
+    if (gb) a.guard_band_pct = gb;
+    if ($('#qRigPreset').value) a.preset = $('#qRigPreset').value;
+    if (check === 'golden') {
+      if (!$('#qQuickGolden').value.trim()) throw new Error('name the golden scan');
+      a.golden = $('#qQuickGolden').value.trim();
+    }
+  }
+  if (state.mode === 'mock' && $('#qMockPart').value.trim()) a.mock_part = $('#qMockPart').value.trim();
+  return a;
+}
+
+async function sendModeJob(path, build, busyText, label) {
+  // one measurement / quick check as a job of its mode; the page then follows the job
+  let args;
+  try { args = build(); } catch (e) { notice(`${label}: ${e.message || e}`); return; }
+  try {
+    const j = await api('POST', path, args);
+    if (j.error || !j.id) { notice(`${label}: ${j.error || 'refused'}`); return; }
+    notice('');
+    if (j.bus) state.bus = j.bus;
+    state.modeJobId = j.id;
+    state.shownModeJob = null;
+    clearResult();
+    $('#qReason').textContent = '';
+    lamp(busyText, 'running');
+    if (path === '/api/quick-check' && state.mode === 'real') $('#qConfirm').checked = false;
+  } catch (e) {
+    notice(`${label}: ${e.message || e}`);
+  }
+  refreshButtons();
+}
+
+function sendMeasure() {
+  if ($('#qMeasure').disabled) return Promise.resolve();
+  return sendModeJob('/api/measure', measureArgs, 'MEASURING', 'MEASURE');
+}
+
+function sendQuick() {
+  if ($('#qStart').disabled) return Promise.resolve();
+  return sendModeJob('/api/quick-check', quickArgs, 'RUNNING', 'START');
+}
+
+function fmtValue(v, unit) {
+  return `${Number(v).toFixed(unit === 'mm' ? 4 : 3)} ${unit}`;
+}
+
+function showMeasure(job) {
+  // a measurement: a neutral MEASURED / NOT MEASURABLE and its values. Never a verdict:
+  // the lamp shows no PASS / FAIL / PULL here, whatever the document says
+  if (state.opMode !== 'measure') return;        // the mode was left: nothing of it is shown
+  const r = job.result || {};
+  state.resultShown = true;
+  const ok = job.status === 'done' && r.status === 'MEASURED';
+  lamp(ok ? 'MEASURED' : 'NOT MEASURABLE', ok ? 'measured' : 'notmeasurable');
+  $('#qVerdict').textContent = 'none (a measurement decides nothing)';
+  $('#qDisposition').textContent = '-';
+  $('#qPull').hidden = true;
+  $('#qNumLabel').textContent = 'Measured';
+  $('#qNumber').textContent = ok ? `${r.what}: ${(r.values || []).length} value(s), ${r.repeats} scan(s)` : '-';
+  $('#qTime').textContent = String(r.finished || job.finished || '-').replace('T', ' ');
+  $('#qRunId').textContent = r.run_id || '-';
+  $('#qReason').textContent = ok ? ''
+    : (job.status === 'error' ? (job.error || 'error')
+      : `${r.reason || 'not measurable'}: ${r.message || ''}` + (r.how_to_fix ? ` | fix: ${r.how_to_fix}` : ''));
+  $('#qValidity').textContent = ok ? (r.validity || '') : '';
+  const body = $('#qValuesBody');
+  body.textContent = '';
+  const vals = ok ? (r.values || []) : [];
+  $('#qValues').hidden = vals.length === 0;
+  for (const v of vals) {
+    const u = v.uncertainty || {};
+    const tr = document.createElement('tr');
+    if (v.near_resolution_limit) tr.className = 'near';
+    const cells = [v.label, fmtValue(v.value, v.units),
+      u.value == null ? '-' : `± ${fmtValue(u.value, u.units || v.units)}`,
+      (u.method || '-') + ((u.n_repeats || 1) > 1 ? ` ×${u.n_repeats}` : ''),
+      String(v.n_points)];
+    for (const c of cells) {
+      const td = document.createElement('td');
+      td.textContent = c;
+      tr.appendChild(td);
+    }
+    if ((v.notes || []).length) tr.title = v.notes.join(' | ');
+    body.appendChild(tr);
+    for (const n of v.notes || []) {
+      const nr = document.createElement('tr');
+      nr.className = 'note';
+      const td = document.createElement('td');
+      td.colSpan = cells.length;
+      td.textContent = n;
+      nr.appendChild(td);
+      body.appendChild(nr);
+    }
+  }
+  const links = job.links || {};
+  for (const [id, key] of [['#qResultLink', 'result_json'], ['#qValuesLink', 'values_csv'], ['#qPlyLink', 'ply']]) {
+    $(id).hidden = !links[key];
+    if (links[key]) $(id).href = links[key];
+  }
+  const img = $('#qMeasImg');                    // the picture the next clicks pick camera px on
+  if (links.preview) {
+    img.hidden = false;
+    img.src = `${links.preview}?t=${Date.now()}`;
+  }
+}
+
+function previewPx(ev) {
+  // a click on the measurement's picture -> camera px (the picture is the camera image,
+  // drawn smaller: scaled back by its natural size)
+  const img = $('#qMeasImg');
+  const w = img.clientWidth || img.naturalWidth || 1;
+  const h = img.clientHeight || img.naturalHeight || 1;
+  return [Math.round(ev.offsetX * (img.naturalWidth || w) / w),
+    Math.round(ev.offsetY * (img.naturalHeight || h) / h)];
+}
+
+function onPreviewClick(ev) {
+  // distance: the clicks are point 1, point 2, point 1 ...; anything else: two clicks are the
+  // corners of a region (step: region A, then region B)
+  const [x, y] = previewPx(ev);
+  const what = $('#qMeasWhat').value || 'flatness';
+  const pk = state.pick;
+  let said;
+  if (what === 'distance') {
+    const second = pk.n % 2 === 1;
+    $(second ? '#qMeasP2' : '#qMeasP1').value = `${x},${y}`;
+    pk.n += 1;
+    said = `point ${second ? 2 : 1} = camera px (${x}, ${y})`;
+  } else if (pk.corner === null) {
+    pk.corner = [x, y];
+    said = `corner at camera px (${x}, ${y}): click the opposite corner`;
+  } else {
+    const [cx, cy] = pk.corner;
+    const roi = [Math.min(cx, x), Math.min(cy, y), Math.max(cx, x) + 1, Math.max(cy, y) + 1];
+    const b = what === 'step' && pk.n % 2 === 1;
+    $(b ? '#qMeasRoi2' : '#qMeasRoi').value = roi.join(',');
+    pk.corner = null;
+    pk.n += 1;
+    said = `region${what === 'step' ? (b ? ' B' : ' A') : ''} = camera px ${roi.join(',')}`;
+  }
+  $('#qMeasHint').textContent = said;
+}
+
 async function send(name, extra) {
   const body = { source: 'quick', ...(extra || {}) };
   if (['start', 'trigger', 'arm'].includes(name)) {
@@ -656,6 +1065,9 @@ async function pollOnce() {
   const b = await api('GET', '/api/cmd/state');
   state.bus = b;
   if (b.mode) state.mode = b.mode;
+  applyMode(b);
+  syncRigPreset(b);
+  showRigInfo(b);
   if (!state.loadingStations && (b.state === 'READY' || b.state === 'FAULT') && stationListChanged(b)) {
     await fetchStations();                         // configs added / removed / renamed
   }
@@ -679,6 +1091,17 @@ async function pollOnce() {
   if (state.homeJobId && state.shownHome !== state.homeJobId) {
     const j = await api('GET', `/api/jobs/${state.homeJobId}`);
     if (j.status === 'done' || j.status === 'error') { showRig(j); state.shownHome = j.id; }
+  }
+  if (state.modeJobId && state.shownModeJob !== state.modeJobId) {
+    // the measurement / quick check this page started: shown when its job ends
+    const j = await api('GET', `/api/jobs/${state.modeJobId}`);
+    if (j.status === 'done' || j.status === 'error') {
+      // shown only while the page is still in the job's own mode (another client may have
+      // switched the bus meanwhile: Station's lamp is the bus's, never a quick check's)
+      if (j.verb === 'measure_run') showMeasure(j);
+      else if (state.opMode === 'quick_check') showRun(j);     // PASS / FAIL / PULL
+      state.shownModeJob = state.modeJobId;
+    }
   }
   if (b.state === 'HOMING') lamp('HOMING', 'running');
   else if (b.state === 'FAULT' && $('#qLamp').textContent === 'HOMING') lamp('FAULT', 'invalid');
@@ -777,10 +1200,20 @@ function onKey(ev) {
   const k = ev.key;
   if ((k === ' ' || k === 'Enter') && t && t.closest && t.closest(ACTIVATABLE)) return;
   const s = state.bus ? state.bus.state : 'READY';
+  const mode = state.opMode || 'station';
   let handled = true;
-  if (k === ' ' || k === 'Enter') { if (!$('#qStart').disabled) send('start'); }
-  else if (k === 'Escape') send('abort');
+  if (k === ' ' || k === 'Enter') {              // the mode's own action
+    if (mode === 'measure') sendMeasure();
+    else if (mode === 'quick_check') sendQuick();
+    else if (!$('#qStart').disabled) send('start');
+  } else if (k === 'm' || k === 'M') {           // M = MEASURE, in Measure mode only
+    if (mode === 'measure') sendMeasure();
+    else handled = false;
+  } else if (k === 'Escape') send('abort');
   else if (k === 'h' || k === 'H') send('home');
+  else if (mode !== 'station') handled = false;  // the station's keys: Station mode only (its
+  // selectors and buttons are hidden in the other modes - a digit typed after clicking the
+  // measurement picture must never select a station configuration and load its preset)
   else if (k === 't' || k === 'T') send('trigger');
   else if (k === 'a' || k === 'A') send(s === 'ARMED' ? 'disarm' : 'arm');
   else if (k === 'n' || k === 'N') { if (!$('#qStep').disabled) send('step'); }   // the next work state
@@ -868,7 +1301,13 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#qMockCase').addEventListener('change', () => setMockCase($('#qMockCase').value));
   $('#qInputs').addEventListener('click', onInputClick);
   $('#qConfirm').addEventListener('change', refreshButtons);
-  $('#qStart').addEventListener('click', () => send('start'));
+  for (const k of MODES) $(MODE_BTN[k]).addEventListener('click', () => selectMode(k));
+  $('#qRigPreset').addEventListener('change', () => selectRigPreset($('#qRigPreset').value));
+  $('#qMeasWhat').addEventListener('change', measFields);
+  $('#qQuickCheck').addEventListener('change', quickFields);
+  $('#qMeasure').addEventListener('click', sendMeasure);
+  $('#qMeasImg').addEventListener('click', onPreviewClick);
+  $('#qStart').addEventListener('click', () => (state.opMode === 'quick_check' ? sendQuick() : send('start')));
   $('#qAbort').addEventListener('click', () => send('abort'));
   $('#qHome').addEventListener('click', () => send('home'));
   $('#qStep').addEventListener('click', () => send('step'));

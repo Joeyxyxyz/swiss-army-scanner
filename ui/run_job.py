@@ -173,7 +173,16 @@ def load_station_config(path) -> StationConfig:
         raise StationConfigError(
             f"{path.name} is a station configuration with profiles and a flow, not a single "
             "job: `scan run` runs its work states (engine/flow/schema.load reads it)")
-    base_dir = path.resolve().parent
+    return config_from_doc(doc, path.resolve().parent, source=path.resolve())
+
+
+def config_from_doc(doc: dict, base_dir: Path, source: Optional[Path] = None) -> StationConfig:
+    """A single-job station config document (already read: a file's, or one generated for a
+    quick check, engine/modes/quick.py) -> StationConfig. Paths in it are relative to
+    base_dir."""
+    if not isinstance(doc, dict):
+        raise StationConfigError("a station config is a mapping (JSON object)")
+    base_dir = Path(base_dir)
     sid = str(doc.get("station_id") or "").strip()
     if not _ID.fullmatch(sid):
         raise StationConfigError("station_id is required: letters, digits, _ . - "
@@ -229,7 +238,7 @@ def load_station_config(path) -> StationConfig:
         min_area_px=int(min_area),
         operator_confirmed=_flag(doc, "operator_confirmed", False),
         mock_part=_mock_part(doc.get("mock_part")),
-        source=path.resolve(), raw=doc, **metric, **rec)
+        source=Path(source).resolve() if source else None, raw=doc, **metric, **rec)
 
 
 def _mock_part(v) -> Optional[str]:

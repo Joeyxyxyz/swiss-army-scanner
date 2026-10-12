@@ -42,6 +42,7 @@ def grid_axis(radius_mm: float, step_mm: float = GRID_MM) -> np.ndarray:
 
 def robust_plane(P: np.ndarray, iters: int = 3, k: float = 3.0) -> tuple:
     """(centroid, normal toward the camera) with `iters` MAD-trimmed refits."""
+    P = np.asarray(P, np.float64)       # a float32 mean over ~1e6 points is mm off
     c = P.mean(0)
     _, _, vt = np.linalg.svd(P - c, full_matrices=False)
     n = vt[2] * np.sign(-vt[2] @ c)

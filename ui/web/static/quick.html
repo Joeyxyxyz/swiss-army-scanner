@@ -16,6 +16,13 @@
   <span class="spacer"></span>
   <a class="qlink" href="/" title="The full engineering UI">Advanced UI</a>
 </header>
+<nav class="qmodes" aria-label="Operating mode">
+  <span class="qmodes-label">Mode</span>
+  <button id="qModeMeasure" class="qmode" title="An instrument: scan and report numbers with units and uncertainty. No tolerance, no pass / fail, no permission">Measure</button>
+  <button id="qModeQuick" class="qmode" title="A triangulation preset + ONE check: CONTINUE / REJECT / PULL. No sensors, no permissions">Quick check</button>
+  <button id="qModeStation" class="qmode" title="Station configuration, profile, work states: the line's cycle">Station</button>
+  <span id="qModeInfo" class="muted small"></span>
+</nav>
 <div id="qConn" class="banner warn" hidden>Lost contact with the UI server. Is it still running?</div>
 <div id="qWarn" class="banner warn" hidden></div>
 <div id="qPrompt" class="qprompt" hidden>
@@ -29,24 +36,93 @@
 
 <main class="qmain">
   <section class="qleft">
-    <div class="qselect">
-      <label class="qfield" title="What the station is and knows: its parameters and the profile library set it can call on"><span>Station configuration</span>
-        <select id="qStation"></select></label>
-      <label class="qfield" title="Which part variant of the configuration's profile library set the work states check"><span>Profile</span>
-        <select id="qProfile"></select></label>
+    <div id="qPaneRig" hidden>
+      <div class="qselect qselect1">
+        <label class="qfield" title="The triangulation preset: rig geometry, exposure, fringes and the stereo calibration bound to it. Its mount (fixed / mobile) says how far that calibration is trusted"><span>Triangulation preset</span>
+          <select id="qRigPreset"></select></label>
+      </div>
+      <div id="qRigInfo" class="qinfo"></div>
+      <label id="qMockRow" class="qline" hidden title="MOCK only: what the simulated human places before the scan"><span>Simulated part (MOCK)</span>
+        <input id="qMockPart" type="text" placeholder="none | scene:plate | scene:box_lid:ajar" autocomplete="off"></label>
     </div>
-    <div id="qStationInfo" class="qinfo muted"></div>
-    <div class="qinfo">Preset START runs: <b id="qPreset">-</b> <span id="qPresetLoaded" class="muted small"></span></div>
 
-    <div class="qflowhead"><b>Work states</b> <span class="muted small">the steps and permissions
-      that let the line continue: the sensor claims, the DLP confirms or corrects</span></div>
-    <div class="qinputs"><span class="muted small">Line sensors say</span>
-      <span id="qInputs" class="qchips"></span>
-      <span id="qMock" class="qmock" hidden><span class="muted small">Simulated line (MOCK)</span>
-        <select id="qMockCase" title="MOCK only: what the simulated human places and what the simulated sensors say"></select></span>
+    <div id="qPaneMeasure" hidden>
+      <div class="qflowhead"><b>Measure</b> <span class="muted small">numbers with units, points
+        and uncertainty: no tolerance, no verdict</span></div>
+      <label class="qline" title="What to measure"><span>What to measure</span>
+        <select id="qMeasWhat">
+          <option value="flatness">Flatness of a region (RMS, p2-p98, tilt)</option>
+          <option value="step">Step height between two regions</option>
+          <option value="distance">Distance between two points / point to plane</option>
+          <option value="dims">Bounding dimensions L x W x H of the part</option>
+          <option value="cylinder">Cylinder radius and axis</option>
+          <option value="endface">End-face diameter</option>
+          <option value="deviation">Deviation vs a golden scan (values only)</option>
+        </select></label>
+      <label id="qMeasRoiRow" class="qline" title="Region A: x0,y0,x1,y1 in camera px (empty = the whole field)"><span id="qMeasRoiLabel">Region (camera px)</span>
+        <input id="qMeasRoi" type="text" placeholder="x0,y0,x1,y1" autocomplete="off"></label>
+      <label id="qMeasRoi2Row" class="qline" hidden title="Region B: x0,y0,x1,y1 in camera px"><span>Region B (camera px)</span>
+        <input id="qMeasRoi2" type="text" placeholder="x0,y0,x1,y1" autocomplete="off"></label>
+      <label id="qMeasP1Row" class="qline" hidden title="A picked point: x,y in camera px"><span>Point 1 (camera px)</span>
+        <input id="qMeasP1" type="text" placeholder="x,y" autocomplete="off"></label>
+      <label id="qMeasP2Row" class="qline" hidden title="The second point: x,y in camera px (empty: point 1 to the region's plane)"><span>Point 2 (camera px)</span>
+        <input id="qMeasP2" type="text" placeholder="x,y" autocomplete="off"></label>
+      <label id="qMeasGoldenRow" class="qline" hidden title="The golden metric scan: its id or label"><span>Golden scan</span>
+        <input id="qMeasGolden" type="text" placeholder="id or label" autocomplete="off"></label>
+      <label id="qMeasDiameterRow" class="qline" hidden title="The expected end-face diameter in mm: the face is found near it, its diameter is then measured"><span>Expected diameter (mm)</span>
+        <input id="qMeasDiameter" type="text" inputmode="decimal" placeholder="21.0" autocomplete="off"></label>
+      <label class="qline" title="Scan N times: each value's mean and its repeatability. 1 = the predicted precision at that distance"><span>Repeats</span>
+        <input id="qMeasRepeats" type="text" inputmode="numeric" value="1" autocomplete="off"></label>
+      <label class="qline" title="metric: both axes, the preset's full set (slower, the accurate one). fast: the HDMI fast scan"><span>Scan</span>
+        <select id="qMeasScan">
+          <option value="metric">metric (both axes)</option>
+          <option value="fast">fast</option>
+        </select></label>
+      <div id="qMeasHint" class="qreason">Type camera px, or click the picture of the last
+        measurement: two clicks are the corners of a region (or the two points of a distance).</div>
     </div>
-    <ol id="qFlow" class="qflow"></ol>
-    <div id="qFlowMsg" class="qreason"></div>
+
+    <div id="qPaneQuick" hidden>
+      <div class="qflowhead"><b>Quick check</b> <span class="muted small">one check, no sensors,
+        no permissions: CONTINUE / REJECT / PULL</span></div>
+      <label class="qline" title="The one check this quick check runs"><span>Check</span>
+        <select id="qQuickCheck">
+          <option value="flatness">Flatness limit of a plane</option>
+          <option value="golden">Compare with a golden scan</option>
+          <option value="recipe">One recipe</option>
+        </select></label>
+      <label id="qQuickThresholdRow" class="qline" title="The limit in mm: the largest deviation allowed"><span>Threshold (mm)</span>
+        <input id="qQuickThreshold" type="text" inputmode="decimal" placeholder="0.5" autocomplete="off"></label>
+      <label id="qQuickRoiRow" class="qline" title="x0,y0,x1,y1 in camera px (empty = the whole field)"><span>Region (camera px)</span>
+        <input id="qQuickRoi" type="text" placeholder="x0,y0,x1,y1" autocomplete="off"></label>
+      <label id="qQuickGoldenRow" class="qline" hidden title="The golden metric scan: its id or label (a GOOD part scanned once)"><span>Golden scan</span>
+        <input id="qQuickGolden" type="text" placeholder="id or label" autocomplete="off"></label>
+      <label id="qQuickRecipeRow" class="qline" hidden title="The recipe: its own zones, tolerances and guard band"><span>Recipe</span>
+        <select id="qQuickRecipe"></select></label>
+      <label id="qQuickGuardRow" class="qline" title="A PASS within this % of the threshold is PULLed for quality inspection (0 = off)"><span>Guard band (%)</span>
+        <input id="qQuickGuard" type="text" inputmode="decimal" value="0" autocomplete="off"></label>
+    </div>
+
+    <div id="qPaneStation">
+      <div class="qselect">
+        <label class="qfield" title="What the station is and knows: its parameters and the profile library set it can call on"><span>Station configuration</span>
+          <select id="qStation"></select></label>
+        <label class="qfield" title="Which part variant of the configuration's profile library set the work states check"><span>Profile</span>
+          <select id="qProfile"></select></label>
+      </div>
+      <div id="qStationInfo" class="qinfo muted"></div>
+      <div class="qinfo">Preset START runs: <b id="qPreset">-</b> <span id="qPresetLoaded" class="muted small"></span></div>
+
+      <div class="qflowhead"><b>Work states</b> <span class="muted small">the steps and permissions
+        that let the line continue: the sensor claims, the DLP confirms or corrects</span></div>
+      <div class="qinputs"><span class="muted small">Line sensors say</span>
+        <span id="qInputs" class="qchips"></span>
+        <span id="qMock" class="qmock" hidden><span class="muted small">Simulated line (MOCK)</span>
+          <select id="qMockCase" title="MOCK only: what the simulated human places and what the simulated sensors say"></select></span>
+      </div>
+      <ol id="qFlow" class="qflow"></ol>
+      <div id="qFlowMsg" class="qreason"></div>
+    </div>
 
     <div class="qpanels">
       <details class="qpanel" id="qLights">
@@ -69,7 +145,7 @@
         <img id="qLiveImg" class="qpreview" alt="camera" hidden>
         <div id="qCamMsg" class="qreason"></div>
       </details>
-      <div class="qpanel qaction"><b>3 Action</b> run the cycle: START, then each work state is verified (STEP)</div>
+      <div class="qpanel qaction"><b>3 Action</b> <span id="qActionText">run the cycle: START, then each work state is verified (STEP)</span></div>
     </div>
     <div id="qSetupMsg" class="qreason"></div>
 
@@ -80,39 +156,43 @@
 
     <div id="qNotice" class="qnotice" role="status" hidden></div>
     <div class="qbuttons">
+      <button id="qMeasure" class="qbtn qmeasure" hidden title="Scan and report the numbers (key M)">MEASURE</button>
       <button id="qStart" class="qbtn qstart">START</button>
       <button id="qAbort" class="qbtn qabort">ABORT</button>
-      <button id="qHome" class="qbtn qhome">HOME</button>
+      <button id="qHome" class="qbtn qhome" title="The rig check: has the camera or projector moved? A mobile rig needs it before any mm (key H)">HOME</button>
     </div>
-    <div class="qbuttons2">
-      <button id="qStep" class="qbtn2 qstep" title="Verify the current work state (key N)">STEP</button>
-      <button id="qArm" class="qbtn2">ARM</button>
-      <button id="qTrigger" class="qbtn2">TRIGGER</button>
-      <span class="qstate">state <b id="qBusState">-</b></span>
-    </div>
-    <div class="qsignals" id="qSignals">
-      <span data-sig="READY">READY</span><span data-sig="BUSY">BUSY</span>
-      <span data-sig="PASS">PASS</span><span data-sig="FAIL">FAIL</span>
-      <span data-sig="ALARM">ALARM</span><span data-sig="PULL">PULL</span>
-      <span data-sig="KICKOUT">KICKOUT</span><span data-sig="PROMPT">PROMPT</span>
-      <span data-sig="SENSOR_MISMATCH">SENSOR_MISMATCH</span>
-    </div>
-    <div class="qsignals qpermits" id="qPermits"></div>
+    <div id="qStationExtras">
+      <div class="qbuttons2">
+        <button id="qStep" class="qbtn2 qstep" title="Verify the current work state (key N)">STEP</button>
+        <button id="qArm" class="qbtn2">ARM</button>
+        <button id="qTrigger" class="qbtn2">TRIGGER</button>
+        <span class="qstate">state <b id="qBusState">-</b></span>
+      </div>
+      <div class="qsignals" id="qSignals">
+        <span data-sig="READY">READY</span><span data-sig="BUSY">BUSY</span>
+        <span data-sig="PASS">PASS</span><span data-sig="FAIL">FAIL</span>
+        <span data-sig="ALARM">ALARM</span><span data-sig="PULL">PULL</span>
+        <span data-sig="KICKOUT">KICKOUT</span><span data-sig="PROMPT">PROMPT</span>
+        <span data-sig="SENSOR_MISMATCH">SENSOR_MISMATCH</span>
+      </div>
+      <div class="qsignals qpermits" id="qPermits"></div>
 
-    <ol class="qsteps" id="qSteps">
-      <li id="qStepLights"><b>Lights</b><span>projector ready</span></li>
-      <li id="qStepCamera"><b>Camera</b><span>capture</span></li>
-      <li id="qStepAction"><b>Action</b><span>measure + verdict</span></li>
-    </ol>
-    <div class="qlegend muted small">Keys: <kbd>Space</kbd>/<kbd>Enter</kbd> START (unless a button
-      or link has the focus: then they press it),
-      <kbd>Esc</kbd> ABORT, <kbd>H</kbd> HOME, <kbd>N</kbd> STEP (verify the next work state),
-      <kbd>K</kbd> ACK, <kbd>T</kbd> TRIGGER, <kbd>A</kbd> ARM / DISARM, <kbd>P</kbd> next profile,
-      <kbd>1</kbd>-<kbd>9</kbd> station configuration. Also POST
-      /api/cmd/&lt;start|abort|home|trigger|step|ack|retry|skip|arm|disarm|reset|config|profile&gt;
-      (reset acknowledges ALARM / FAULT; a good HOME does too) and POST /api/io/inputs
+      <ol class="qsteps" id="qSteps">
+        <li id="qStepLights"><b>Lights</b><span>projector ready</span></li>
+        <li id="qStepCamera"><b>Camera</b><span>capture</span></li>
+        <li id="qStepAction"><b>Action</b><span>measure + verdict</span></li>
+      </ol>
+    </div>
+    <div class="qlegend muted small">Keys: <kbd>Space</kbd>/<kbd>Enter</kbd> START (Measure mode:
+      MEASURE; unless a button or link has the focus: then they press it),
+      <kbd>M</kbd> MEASURE (Measure mode),
+      <kbd>Esc</kbd> ABORT, <kbd>H</kbd> HOME; in Station mode only: <kbd>N</kbd> STEP (verify
+      the next work state), <kbd>K</kbd> ACK, <kbd>T</kbd> TRIGGER, <kbd>A</kbd> ARM / DISARM,
+      <kbd>P</kbd> next profile, <kbd>1</kbd>-<kbd>9</kbd> station configuration. Also POST
+      /api/cmd/&lt;start|abort|home|trigger|step|ack|retry|skip|arm|disarm|reset|config|profile|mode&gt;
+      (reset acknowledges ALARM / FAULT; a good HOME does too), POST /api/io/inputs
       {"&lt;signal&gt;": true} for the line's sensor claims (for every part: a claim belongs
-      to one cycle).</div>
+      to one cycle), POST /api/measure and POST /api/quick-check (in their modes).</div>
   </section>
 
   <section class="qright">
@@ -125,11 +205,19 @@
       <div class="qkey"><span>Time</span><b id="qTime">-</b></div>
       <div class="qkey"><span>Run</span><b id="qRunId" class="mono small">-</b></div>
       <div id="qReason" class="qreason"></div>
+      <table id="qValues" class="qvalues" hidden>
+        <thead><tr><th>Value</th><th></th><th>Uncertainty</th><th>From</th><th>Points</th></tr></thead>
+        <tbody id="qValuesBody"></tbody>
+      </table>
+      <div id="qValidity" class="qreason"></div>
       <ul id="qZoneList" class="qzonelist" hidden></ul>
       <div id="qFeedback" class="qreason"></div>
       <div class="qlinks"><a id="qResultLink" href="#" hidden target="_blank" rel="noopener">result.json</a>
+        <a id="qValuesLink" href="#" hidden target="_blank" rel="noopener">values.csv</a>
+        <a id="qPlyLink" href="#" hidden target="_blank" rel="noopener">scan.ply</a>
         <a id="qFeedbackLink" href="#" hidden target="_blank" rel="noopener">projected verdict (DMD image)</a></div>
       <img id="qPreview" class="qpreview" alt="deviation map" hidden>
+      <img id="qMeasImg" class="qpreview qclick" alt="the measured scan: click to pick camera px" hidden>
     </div>
     <div class="qrig">
       <div class="qkey"><span>Rig check</span><b id="qRigStatus">not run</b></div>

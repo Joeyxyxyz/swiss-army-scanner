@@ -102,6 +102,11 @@ class ProjectionCfg:
 
 
 PROJECTOR_SIDES = ("left", "right", "above", "below")
+# how the rig is mounted (rig.mount): "fixed" = bolted to its station, the stored calibration is
+# trusted until a rig check says MOVED / UNKNOWN; "mobile" = carried / re-positioned between
+# uses, assumed MOVED since the last use: no mm until it is verified again in this session (a
+# rig check OK, a re-home, or a fresh board / fixture calibration - engine/rigstate.py)
+MOUNTS = ("fixed", "mobile")
 
 
 @dataclass
@@ -113,11 +118,17 @@ class RigCfg:
     axis carries depth: left/right baseline -> depth shifts are horizontal
     in the image, so the fringes must be VERTICAL in the camera image
     (check_signal verifies this and says when to toggle rotate90).
+
+    mount: "fixed" (default) or "mobile" (MOUNTS). Not geometry-bound (it is not part of the
+    geometry fingerprint): it says how far the stored calibration is trusted, not what a
+    decoded correspondence means. A mobile rig gives no mm until it was verified in this
+    session (engine/rigstate.py).
     """
     projector_side: str = "right"
     baseline_mm: Optional[float] = None       # camera-to-projector lens distance
     standoff_mm: Optional[float] = None       # projection distance: rig to base/wall
     throw_ratio: float = 1.4                  # DLP LightCrafter 4500, DLPU011E Table 1-1
+    mount: str = "fixed"                      # fixed | mobile (MOUNTS)
 
     @property
     def coded_axis(self) -> str:
@@ -222,6 +233,10 @@ def preset_from_dict(d: dict, *, mock: bool = False,
     rig = _section(RigCfg, d.get("rig"), "rig")
     if rig.projector_side not in PROJECTOR_SIDES:
         raise ConfigError(f"rig.projector_side must be one of {PROJECTOR_SIDES}")
+    if not isinstance(rig.mount, str) or rig.mount not in MOUNTS:
+        raise ConfigError(f"rig.mount must be one of {MOUNTS} (fixed: the stored calibration is "
+                          "trusted until a rig check says MOVED; mobile: verified again every "
+                          f"session), got {rig.mount!r}")
     for k in ("baseline_mm", "standoff_mm"):
         if getattr(rig, k) is not None:
             _positive(getattr(rig, k), f"rig.{k}")

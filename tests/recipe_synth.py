@@ -37,6 +37,21 @@ def truth_calibration(s, preset) -> StereoCalibration:
     return cal
 
 
+def calibrated_now(s, preset, n_poses: int = 3, now=None) -> StereoCalibration:
+    """truth_calibration() plus what a real calibration leaves on the geometry's rig-state
+    record (engine/rigstate.py): its poses were captured and it was solved NOW (`now`: the
+    time written on the records). That is the calibration that verifies a MOBILE rig for the
+    session and answers an earlier rig check MOVED; a calibration with no poses on the
+    record (truth_calibration alone) does neither."""
+    from engine import rigstate
+    cal = truth_calibration(s, preset)
+    poses = [f"{cal.path.name}_pose{i + 1}" for i in range(n_poses)]
+    for pose in poses:
+        rigstate.record_pose(s.store, preset, pose, "synthetic", now)
+    rigstate.record_calibration(s.store, preset, cal.id, poses, "synthetic", now)
+    return cal
+
+
 _WALL: dict = {}                    # the wall-only picture, per rig (traced once)
 
 

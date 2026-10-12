@@ -149,3 +149,33 @@ kbd { font: 12px var(--mono); padding: 1px 5px; border: 1px solid var(--line2); 
 .qstep.on { border-color: var(--accent); background: var(--info-bg); }
 /* a cycle that waits for STEP: not READY, not running */
 .lamp-wait { background: var(--info-bg); color: var(--text); border-color: var(--accent); font-size: 38px; }
+/* operating modes: Measure | Quick check | Station (the switch under the header) */
+.qmodes { display: flex; align-items: center; gap: 8px; padding: 8px 16px; flex-wrap: wrap;
+  background: var(--panel2); border-bottom: 1px solid var(--line); }
+.qmodes-label { color: var(--muted); font-size: 14px; margin-right: 4px; }
+.qmode { min-height: 44px; min-width: 132px; font-size: 16px; font-weight: 700; border-radius: 8px;
+  border: 2px solid var(--line2); background: var(--panel); color: var(--text); cursor: pointer; }
+.qmode:disabled { opacity: .45; cursor: not-allowed; }
+.qmode.on { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
+.qselect1 { grid-template-columns: minmax(0, 1fr); }
+.qline { display: grid; grid-template-columns: minmax(120px, 2fr) minmax(0, 3fr); gap: 10px;
+  align-items: center; margin: 6px 0; }
+.qline span { color: var(--muted); font-size: 14px; }
+.qline input, .qline select { font-size: 16px; padding: 8px; min-height: 40px; min-width: 0;
+  background: var(--panel2); color: var(--text); border: 1px solid var(--line2);
+  border-radius: var(--r); }
+.qinfo.qwarn { color: var(--warn); }
+.qmeasure { background: #2c5f9e; border-color: #3a74bd; }
+/* a measurement has no verdict: neutral, never the PASS green, the FAIL red or the PULL amber */
+.lamp-measured { background: var(--info-bg); color: var(--text); border-color: var(--accent);
+  font-size: 38px; }
+.lamp-notmeasurable { background: var(--panel2); color: var(--muted); border-style: dashed;
+  font-size: 34px; }
+.qvalues { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+.qvalues th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 6px;
+  border-bottom: 1px solid var(--line2); }
+.qvalues td { padding: 4px 6px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.qvalues td:nth-child(2), .qvalues td:nth-child(3) { font-family: var(--mono); white-space: nowrap; }
+.qvalues tr.near td:first-child { border-left: 4px solid var(--warn); }
+.qvalues tr.note td { color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); }
+.qclick { cursor: crosshair; }

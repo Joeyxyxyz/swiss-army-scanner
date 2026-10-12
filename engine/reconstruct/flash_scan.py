@@ -207,9 +207,10 @@ def fast_scan_flash(s, preset, pack=None, variant: Optional[str] = None, label: 
                         f"{preset.geometry_id!r}: its zone image lights the zones of that rig "
                         "position (rebuild the pack's zones at this geometry)")
     fp = config.geometry_fingerprint(preset)
-    cal = None
+    cal = rig = None
     if not dry_run:
         cal = metric_scan._require_cal(s, preset.geometry_id, fp, "fast_scan_flash")   # rule 6
+        rig = metric_scan._require_rig(s, preset, "fast_scan_flash")    # a mobile rig: verified
     full_shape = tuple(s.bench.cam_shape) if s.mock else softsync.SENSOR_SHAPE
     cam_mask, zone_label, dmd_zone, w2 = _camera_zone(s, preset, zone, roi, layout, pack_dir,
                                                       full_shape, manifest)
@@ -292,7 +293,7 @@ def fast_scan_flash(s, preset, pack=None, variant: Optional[str] = None, label: 
     ms = metric_scan._save(s, fld, cloud, label, cal, fp, preset.name, {
         "mode": MODE, "capture_s": times["record_s"], "steps": layout.steps,
         "periods_px": list(layout.periods), "diamond_parity": layout.diamond_parity,
-        "zone": zone_label, "fast": True, "flash": json_safe(flash)})
+        "zone": zone_label, "fast": True, "flash": json_safe(flash), "rig": rig})
     times["triangulate_save_s"] = round(time.perf_counter() - t0, 3)
     times["total_s"] = round(time.perf_counter() - t_all, 3)
     warnings += r.get("warnings", [])

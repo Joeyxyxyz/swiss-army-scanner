@@ -33,14 +33,20 @@ Exit codes let a script or an agent branch without parsing the text:
   3  the requested mode is not available yet (engine stub)
   4  dent-detect only: the detector itself failed (an unexpected error), so a
      crash is never read as FLAG (1) or CLEAR (0)
-  5  run / recipe-run / station-check / face-check: PULL (quality inspection) -
-     the job ran but its result is in doubt (INVALID, INCOMPLETE, a guard band,
-     an unreadable code): never a pass, never a reject
+  5  run / recipe-run / quick-check / station-check / face-check: PULL (quality
+     inspection) - the job ran but its result is in doubt (INVALID, INCOMPLETE, a
+     guard band, an unreadable code): never a pass, never a reject.
+     measure-run: NOT MEASURABLE (no calibration, a mobile rig not verified, too
+     few points ...): no number is given - never a px as mm
 `run <station config>` is the flow-ready entry point: one job, a new run
 folder with result.json + run.log.jsonl (ui/run_job.py). `recipe-run <recipe>` runs a
 recipe (the check of a work state: zones, checks, projected verdict) the same way. Their exit code
 is the disposition (engine/disposition.py): 0 CONTINUE, 1 REJECT, 5 PULL; refused 2,
 crashed 4 and ABORTED 1 keep their codes (disposition PULL in result.json).
+Operating modes (engine/modes/): `measure-run` = MEASURE (an instrument: numbers with
+units and uncertainty, no verdict; exit 0 MEASURED, 5 NOT MEASURABLE), `quick-check` =
+QUICK CHECK (a triangulation preset + one check -> CONTINUE / REJECT / PULL: 0 / 1 / 5),
+`run` on a station configuration = STATION.
 --json prints one JSON document per command instead of tables.
 """
 
@@ -738,6 +744,7 @@ def _pointcloud_units(path: Path) -> str:
 # ------------------------------------------------------------ commands
 
 def cmd_presets(ctx):
+    from engine import rigstate
     rows, data = [], []
     tiers = {i["name"]: i for i in api.preset_list()}
     selected = api.preset_active()
@@ -757,10 +764,17 @@ def cmd_presets(ctx):
         cal_txt = (f"{cal.id} ({'Z' if cal.has_z else ''}{'+XY' if cal.has_xy else ''})"
                    if cal else "none -> px")
         w, h = p.projection.size
-        rows.append([mark, p.name, tier, p.geometry_id, p.rig.projector_side, f"{w}x{h} px",
+        # a geometry_id names one rig: a preset at a mobile preset's geometry is gated as mobile
+        gated, by = rigstate.mount_of(ctx.session.store, p, ctx.session.presets_dir)
+        by = by if (by and by != p.name) else None
+        rows.append([mark, p.name, tier,
+                     p.geometry_id + (" [mobile]" if p.rig.mount == "mobile" else
+                                      f" [mobile: as {by}]" if by else ""),
+                     p.rig.projector_side, f"{w}x{h} px",
                      f"{p.camera.exposure_us} us, avg {p.camera.average}", _bases_text(p.bases),
                      cal_txt, stereo])
         data.append({"name": p.name, "valid": True, "tier": tier, "geometry_id": p.geometry_id,
+                     "mount": p.rig.mount, "gated_as": gated, "mount_declared_by": by,
                      "projector_side": p.rig.projector_side, "camera": p.camera,
                      "bases": p.bases, "calibration": cal, "warnings": p.warnings,
                      "calibrated": bool(info.get("calibrated")), "selected": name == selected,
@@ -778,6 +792,13 @@ def cmd_presets(ctx):
                 "until you `scan preset-select NAME` (or pass --preset)")
     return EXIT_OK, {"presets": data, "active": ctx.args.preset, "selected": selected,
                      "selected_missing": stale}
+
+
+def _mount_words(mount: str) -> str:
+    """rig.mount in words: how far the stored calibration is trusted."""
+    return {"fixed": "fixed (the calibration is trusted until a rig check says MOVED / UNKNOWN)",
+            "mobile": "mobile (assumed moved since its last use: verified again every session "
+                      "- rig-check / re-home / calibrate - before any mm)"}.get(mount, str(mount))
 
 
 def _parse_sets(items) -> dict:
@@ -828,6 +849,7 @@ def cmd_preset_show(ctx):
     r = api.preset_show(ctx.args.name)
     ctx.kv([["name", r["name"]], ["tier", r["tier"] + (" (read-only)" if r["tier"] == "builtin" else "")],
             ["selected", "yes" if r.get("active") else "no"], ["geometry_id", r.get("geometry_id")],
+            ["mount (rig.mount)", _mount_words(r.get("mount") or "fixed")],
             ["stereo calibration", "yes" if r.get("calibrated") else "none (uncalibrated)"],
             ["description", r.get("description") or "-"], ["copied from", r.get("base") or "-"],
             ["created", r.get("created") or "-"], ["author", r.get("author") or "-"]])
@@ -3319,9 +3341,53 @@ def cmd_rig_check(ctx):
                                 "calibration is the reference)"])
     elif rh.get("why"):
         rows.append(["re-home", f"not possible: {rh['why']}"])
+    gate = api.rig_state(ctx.preset())
+    if gate["mount"] == "mobile" or not gate["ok"]:     # what this check means for mm results
+        rows.append(["rig", _rig_words(gate)])
     ctx.kv(rows)
     ctx.warn(r.get("warnings"))
-    return (EXIT_OK if r["status"] in ("OK", "REFERENCE_SET", "REHOMED") else EXIT_NOT_OK), r
+    return (EXIT_OK if r["status"] in ("OK", "REFERENCE_SET", "REHOMED") else EXIT_NOT_OK), \
+        {**r, "rig_state": gate}
+
+
+def _rig_words(gate: dict) -> str:
+    """One line: may this rig give mm now (engine/rigstate.gate)?"""
+    st = gate.get("state") or {}
+    if gate["ok"]:
+        return (f"{gate['mount']}: verified by {st.get('verified_by')}"
+                if gate["mount"] == "mobile" else "fixed: the calibration is trusted")
+    return f"{gate['mount']}: NO mm - {_one_line(gate['message'])}"
+
+
+def cmd_rig_session(ctx):
+    """The rig's state for mm results; --new starts a new session (the rig was moved)."""
+    a = ctx.args
+    p = ctx.preset()
+    ctx.header()
+    marker = None
+    if a.new:
+        out = api.rig_session(p, a.reason or "")
+        marker, gate = out["marker"], out["gate"]
+        ctx.say(f"New rig session at geometry {p.geometry_id}: the rig counts as moved from "
+                f"{marker['time']}" + (f" ({marker['reason']})" if marker.get("reason") else ""))
+        if p.rig.mount != "mobile":
+            ctx.say("  ! this preset's rig is fixed (rig.mount): the marker is recorded and "
+                    "changes nothing")
+    else:
+        gate = api.rig_state(p)
+    st = gate.get("state") or {}
+    last = st.get("last_check") or {}
+    ctx.kv([["mount", _mount_words(gate["mount"])
+             + (f" - declared by preset {st['declared_by']} at this geometry (a geometry_id "
+                "names one rig)" if st.get("declared_by") else "")],
+            ["stereo calibration", st.get("calibration_id") or "none (uncalibrated)"],
+            ["session started", st.get("session_start") or "-  (a fixed rig has no session)"],
+            ["last rig check", f"{last.get('status')} at {last.get('time')}" if last else
+             "none since the calibration"],
+            ["mm results", "allowed" if gate["ok"] else
+             f"NOT allowed: {_one_line(gate['message'])}"],
+            *([["how to fix", _one_line(gate["how_to_fix"])]] if not gate["ok"] else [])])
+    return (EXIT_OK if gate["ok"] else EXIT_NOT_OK), {"marker": marker, **gate}
 
 
 # ------------------------------------------------------------ flow-ready job (run)
@@ -4291,6 +4357,20 @@ def cmd_run(ctx):
         cfg = RJ.load_station_config(a.config)
     except RJ.StationConfigError as e:
         raise CLIError(str(e)) from e
+    return _run_job(ctx, cfg)
+
+
+def _run_job(ctx, cfg, quick: Optional[dict] = None):
+    """One single job (a StationConfig) -> its run folder. quick: the generated config of a
+    QUICK CHECK (engine/modes/quick.py; a config file marked operating_mode quick_check is
+    one too): the same job, with result.json marked, the config kept in the run folder and
+    the rig asked strictly (any rig whose newest rig check said MOVED / UNKNOWN is a PULL)."""
+    from engine import modes, rigstate
+    from engine.modes import quick as quick_mode
+    from ui import run_job as RJ
+    a = ctx.args
+    if quick is None and cfg.raw.get(modes.RESULT_KEY) == quick_mode.MODE:
+        quick = cfg.raw
     lib = cfg.mock_library if (ctx.mock and cfg.mock_library is not None) else cfg.library
     if lib is not None and not a.library:           # --library on the command line wins
         ctx.session = api.configure(lib.resolve(), mock=ctx.mock)
@@ -4322,11 +4402,19 @@ def cmd_run(ctx):
     except ValueError:
         folder = str(run_dir)
     res = RJ.empty_result(cfg, run_id, folder, ctx.mock, confirmed)
+    if quick is not None:                           # QUICK CHECK: one check, no sensors
+        res[modes.RESULT_KEY] = quick_mode.MODE
+        if cfg.source is None:                      # generated now: kept with its run
+            (run_dir / quick_mode.CONFIG_FILE).write_text(json.dumps(quick, indent=2) + "\n",
+                                                          encoding="utf-8")
+            res["job"]["config"] = quick_mode.CONFIG_FILE
     log = RJ.RunLog(run_dir / "run.log.jsonl", run_id)
     code = EXIT_INVALID
     try:
         log.event("run_start", station=cfg.station_id, mode=res["mode"], job=cfg.job_type,
-                  config=str(cfg.source), operator_confirmed=confirmed)
+                  config=str(cfg.source) if cfg.source else res["job"]["config"],
+                  operator_confirmed=confirmed,
+                  **({"operating_mode": quick_mode.MODE} if quick is not None else {}))
         if not ctx.mock and not confirmed:
             raise CLIError("the real rig needs a human to confirm the physical setup first "
                            "(part placed, rig untouched since the base): pass "
@@ -4349,6 +4437,18 @@ def cmd_run(ctx):
                               exposure_us=p.camera.exposure_us, average=p.camera.average)
         log.event("preset", preset=p.name, geometry_id=p.geometry_id,
                   exposure_us=p.camera.exposure_us, average=p.camera.average)
+        # a MOBILE rig (preset rig.mount) gives no mm until it was verified in this session;
+        # a quick check also refuses any rig whose newest rig check said MOVED / UNKNOWN.
+        # Station mode on a fixed rig is not gated (engine/rigstate.py): unchanged
+        gate = rigstate.gate(ctx.session.store, p, strict=quick is not None,
+                             presets_dir=ctx.session.presets_dir)
+        if not gate["ok"]:
+            res["invalid_reason"] = gate["message"]
+            D.add(res, gate["code"], gate["message"])
+            log.event("refused", level="warning", reason=gate["message"], mount=gate["mount"],
+                      how_to_fix=gate["how_to_fix"])
+            _settle_run(res, recipe)                # a doubt: PULL
+            return _run_done(ctx, cfg, run_id, run_dir, res, log, D.exit_code(res))
         if cfg.job_type == "metric":            # stereo calibration: no base involved
             _run_metric(ctx, cfg, p, log, res, run_dir)
             _settle_metric(res, cfg)
@@ -4533,6 +4633,169 @@ def _run_done(ctx, cfg, run_id, run_dir, res, log, code) -> tuple:
             ["result.json", str(out)], ["log", str(run_dir / "run.log.jsonl")]])
     ctx.warn(res["warnings"])
     return code, {"run_id": run_id, "run_dir": str(run_dir), "result": res}
+
+
+# ------------------------------------------------------------ operating modes (engine/modes/)
+
+def _use_preset_arg(ctx) -> None:
+    """`measure-run PRESET` / `quick-check PRESET`: the triangulation preset named as the
+    command's own argument wins over --preset and the selected one."""
+    name = getattr(ctx.args, "preset_name", None)
+    if name:
+        ctx.args.preset, ctx.args.preset_given = name, True
+        ctx._preset = None
+
+
+def _mode_runs_dir(ctx) -> Path:
+    """Where a measure / quick-check run folder goes: --runs-dir, $SCANNER_RUNS_DIR, else
+    <library>/runs."""
+    a = ctx.args
+    if getattr(a, "runs_dir", None):
+        return Path(a.runs_dir).resolve()
+    env = os.environ.get("SCANNER_RUNS_DIR")
+    return Path(env).resolve() if env else Path(api.paths()["runs"]).resolve()
+
+
+def _px_point(text: Optional[str], what: str):
+    return None if not text else _numbers(text, 2, f"{what} x,y (camera px)", float)
+
+
+def _fmt_value(v: dict) -> list:
+    u = v.get("uncertainty") or {}
+    nd = 4 if v["units"] == "mm" else 3
+    return [v["label"], f"{_f(v['value'], nd)} {v['units']}",
+            f"+- {_f(u.get('value'), nd)} {u.get('units', '')}".strip() if u else "-",
+            (u.get("method") or "-") + (f" x{u['n_repeats']}" if (u.get("n_repeats") or 1) > 1
+                                        else ""),
+            str(v["n_points"]), "NEAR LIMIT" if v.get("near_resolution_limit") else ""]
+
+
+def cmd_measure_run(ctx):
+    """MEASURE mode: scan and report numbers (units, n points, uncertainty), no verdict."""
+    a = ctx.args
+    _use_preset_arg(ctx)
+    if not a.what and not a.spec:
+        raise CLIError("what to measure? --what flatness | step | distance | cylinder | endface "
+                       "| dims | deviation (or --spec FILE)")
+    try:
+        spec = api.measure_spec(
+            a.what, a.spec, roi=_roi(a.roi), roi2=_roi(a.roi2), zone=a.zone, zone2=a.zone2,
+            p1=_px_point(a.p1, "--p1"), p2=_px_point(a.p2, "--p2"), golden=a.golden,
+            radius_mm=a.radius, axis=a.axis, min_height_mm=a.min_height,
+            face_diameter_mm=a.diameter, n_faces=a.faces, repeats=a.repeats,
+            scan_kind=a.scan_kind, steps=a.steps, periods=_periods(a.periods),
+            average=a.average, name=a.name)
+    except ValueError as e:
+        raise CLIError(str(e)) from e
+    if spec.preset and not a.preset_given:          # the spec's own preset, unless one is named
+        a.preset = spec.preset
+        ctx._preset = None
+    ctx.header()
+    p = ctx.preset()
+    if spec.preset and spec.preset != p.name:
+        ctx.say(f"  ! the spec was made for preset {spec.preset}; measuring with {p.name}")
+    spec.preset = p.name                            # the preset it runs with (--save-spec)
+    scans = [_find_metric(k) for k in a.scan] if a.scan else None
+    if ctx.mock and scans is None:
+        _mock_place_metric(ctx)                     # the simulated human places the part
+    out = api.measure_run(preset=p, spec=spec, scans=scans, runs_dir=_mode_runs_dir(ctx),
+                          label=a.label)
+    doc, run_dir = out["result"], Path(out["run_dir"])
+    if doc["status"] == "MEASURED":
+        ctx.say(f"Measurement {out['run_id']}: MEASURED  ({spec.what}, {doc['repeats']} scan(s))")
+        ctx.table(["value", "", "uncertainty", "from", "n points", ""],
+                  [_fmt_value(v) for v in doc["values"]])
+        for v in doc["values"]:
+            for n in v.get("notes") or []:
+                ctx.say(f"    {v['label']}: {_one_line(n)}")
+    else:
+        ctx.say(f"Measurement {out['run_id']}: NOT MEASURABLE ({doc['reason']}) - no number "
+                "is given")
+        ctx.say(f"  why: {_one_line(doc['message'])}")
+        if doc.get("how_to_fix"):
+            ctx.say(f"  fix: {_one_line(doc['how_to_fix'])}")
+    ctx.say(f"  validity: {_one_line(doc['validity'])}")
+    files = [["result.json", str(run_dir / "result.json")],
+             ["values.csv", str(run_dir / doc["outputs"]["values_csv"])]]
+    files += [[k, str(run_dir / doc["outputs"][k])] for k in ("overlay", "ply")
+              if doc["outputs"].get(k)]
+    files.append(["spec.json", str(run_dir / doc["outputs"]["spec"])])
+    ctx.kv(files)
+    if a.save_spec:
+        dest = Path(a.save_spec)
+        with open(dest, "x", encoding="utf-8") as f:       # never overwritten
+            json.dump(spec.to_dict(), f, indent=2)
+            f.write("\n")
+        ctx.say(f"  spec saved: {dest}  (run it again: scan measure-run --spec {dest}; make it "
+                "a check: scan measure-to-check)")
+    ctx.warn(doc["warnings"])
+    return out["exit_code"], {"run_id": out["run_id"], "run_dir": str(run_dir),
+                              "status": doc["status"], "reason": doc["reason"],
+                              "values": doc["values"], "result": doc}
+
+
+def _parse_tols(items) -> dict:
+    """--tol NAME=LO,HI (a band; either side may be empty) or NAME=HI (an upper limit)."""
+    out = {}
+    for it in items or []:
+        key, sep, val = str(it).partition("=")
+        parts = [s.strip() for s in val.split(",")]
+        if not sep or not key.strip() or not 1 <= len(parts) <= 2 or not any(parts):
+            raise CLIError(f"--tol {it!r}: write NAME=LO,HI (a band, e.g. step_height=19.5,20.5; "
+                           "an empty side is open) or NAME=HI (an upper limit, e.g. "
+                           "flatness_p2_p98=0.3)")
+        nums = [None if s == "" else _number(s, f"--tol {key}") for s in parts]
+        out[key.strip()] = nums[0] if len(nums) == 1 else nums
+    return out
+
+
+def cmd_measure_to_check(ctx):
+    """A measurement spec + tolerances -> a check (a recipe / a single-job station config)."""
+    a = ctx.args
+    try:
+        out = api.measure_to_check(a.spec, _parse_tols(a.tol), a.name, a.guard_band or 0.0)
+    except ValueError as e:
+        raise CLIError(str(e)) from e
+    text = json.dumps(out["document"], indent=2)
+    what = "recipe" if out["kind"] == "recipe" else "single-job station config (a quick check)"
+    if a.out:
+        dest = Path(a.out)
+        with open(dest, "x", encoding="utf-8") as f:       # never overwritten
+            f.write(text + "\n")
+        ctx.say(f"Check written: {dest}  ({what})")
+        if out["kind"] == "recipe":
+            ctx.say(f"  run it: scan quick-check {out['document']['preset']} --check recipe "
+                    f"--recipe {dest}   (or scan recipe-add NAME --from {dest}, then name it in "
+                    "a profile of a station configuration)")
+        else:
+            ctx.say(f"  run it: scan run {dest}")
+    else:
+        ctx.say(f"The {what} (--out FILE writes it):", text)
+    return EXIT_OK, {"kind": out["kind"], "document": out["document"],
+                     "file": str(Path(a.out)) if a.out else None, "run_with": out["run_with"]}
+
+
+def cmd_quick_check(ctx):
+    """QUICK CHECK mode: a triangulation preset + ONE check -> CONTINUE / REJECT / PULL. The
+    minimal single-job station config is generated (engine/modes/quick.py) and run by the
+    station job runner, exactly as `scan run` would."""
+    from ui import run_job as RJ
+    a = ctx.args
+    _use_preset_arg(ctx)
+    preset = a.preset if a.preset_given else None
+    if preset is None and a.check != "recipe":      # the selected preset (refused when gone)
+        preset = ctx.preset().name
+    try:
+        doc = api.quick_check_config(
+            a.check, preset, threshold_mm=a.threshold, roi=_roi(a.roi), golden=a.golden,
+            recipe=a.recipe, guard_band_pct=a.guard_band or 0.0, runs_dir=_mode_runs_dir(ctx),
+            zone=a.zone, scan=a.scan_kind or "fast")
+        if a.recipe and a.recipe.lower().endswith((".json", ".yaml", ".yml")):
+            doc["job"]["recipe"] = str(Path(a.recipe).resolve())
+        cfg = RJ.config_from_doc(doc, Path.cwd())
+    except (ValueError, RJ.StationConfigError) as e:
+        raise CLIError(str(e)) from e
+    return _run_job(ctx, cfg, quick=doc)
 
 
 def _add_globals(p: argparse.ArgumentParser, sub: bool) -> None:
@@ -4721,6 +4984,28 @@ painted on the part):
   station configs: job.type recipe + job.recipe NAME (a single job verified by the recipe),
       or profiles + a flow (each work state verifies with a recipe of the active profile)
 
+operating modes (the triangulation preset - rig.mount fixed | mobile - is its own layer):
+  scan measure-run PRESET --what flatness [--roi X0,Y0,X1,Y1] [--repeats N]
+                                         MEASURE: an instrument - numbers with units, n points
+                                         and uncertainty; no tolerance, no verdict. --what
+                                         flatness | step (--roi --roi2) | distance (--p1 --p2,
+                                         or --p1 + --roi: point to plane) | cylinder | endface
+                                         (--diameter) | dims | deviation (--golden); a new run
+                                         folder: result.json, values.csv, overlay.png, scan.ply,
+                                         spec.json. Exit 0 MEASURED, 5 NOT MEASURABLE (no
+                                         calibration, a mobile rig not verified ...: no number,
+                                         never a px as mm). Not `measure` (H/W/L of a relief scan)
+  scan measure-to-check SPEC --tol NAME=LO,HI [--out FILE]
+                                         a measurement spec + tolerances -> a check (a recipe)
+  scan quick-check PRESET --check flatness --threshold MM [--roi ...] [--guard-band PCT]
+  scan quick-check PRESET --check golden --golden ID --threshold MM
+  scan quick-check [PRESET] --check recipe --recipe NAME
+                                         QUICK CHECK: one check, no sensors, no permissions;
+                                         exit 0 CONTINUE, 1 REJECT, 5 PULL (2 refused, 4 crashed)
+  scan run stations/<config>.json        STATION: configuration -> profile -> work states
+  scan rig-session [--new]               a MOBILE rig (preset-add --set rig.mount=mobile): is it
+                                         verified for mm? --new: it was moved / powered up now
+
 station configuration -> profiles -> work states (stations/README.md):
   scan flow-show stations/example_tube_line.json     parameters, profiles (the profile library
                                          set), work states (the flow: with the check that
@@ -4749,8 +5034,8 @@ ids: a full id, a label (newest wins), 'latest', or any unique piece of the id.
 exit codes: 0 ok | 1 not ok (verdict/signal/cancel/unexpected) | 2 refused (rule,
 geometry, safety, config, rig busy, bad input) | 3 mode not available yet |
 4 dent-detect's detector failed (its unexpected errors are not 1 = FLAG) |
-5 PULL (quality inspection: run / recipe-run INVALID or in doubt, station-check /
-face-check INCOMPLETE).
+5 PULL (quality inspection: run / recipe-run / quick-check INVALID or in doubt,
+station-check / face-check INCOMPLETE); measure-run: NOT MEASURABLE (no number given).
 --json prints one JSON document ({"ok", "exit_code", ...}) for scripts and agents.
 """
 
@@ -4894,7 +5179,9 @@ def build_parser() -> argparse.ArgumentParser:
             "point-cloud export")
     p.add_argument("id")
     p.add_argument("--fmt", choices=("ply", "xyz"), default="ply")
-    p = cmd("measure", cmd_measure, "H/W/L of a scan (mm when calibrated, else px)")
+    p = cmd("measure", cmd_measure, "H/W/L of a stored relief scan (mm when calibrated, else "
+                                    "px). Measure MODE - a scan + numbers with uncertainty - is "
+                                    "`measure-run`")
     p.add_argument("id")
     p = cmd("calibrate", cmd_calibrate, "fit Z/XY calibration from scans with known dims",
             "calibration")
@@ -5466,9 +5753,13 @@ def build_parser() -> argparse.ArgumentParser:
                                         "reference -> camera / projector motion (shift, roll, "
                                         "zoom; px, ~mm)", "the rig check")
     p.add_argument("--set-reference", action="store_true",
-                   help="store a new reference (right after base / calibration)")
+                   help="store a new reference (right after base / calibration). On a fixed rig "
+                        "it also answers an earlier MOVED (\"the rig is known good\"); on a "
+                        "mobile rig that is not verified it verifies nothing, now or later")
     p.add_argument("--tol", type=_finite_nonneg, default=0.5,
-                   help="MOVED above this image motion, px (default 0.5; finite, >= 0)")
+                   help="MOVED above this image motion, px (default 0.5; finite, >= 0). An OK at "
+                        "a looser tolerance than the default is reported but does not verify the "
+                        "rig for mm results")
     p.add_argument("--mock-shift", metavar="DX,DY[,ROLL[,SCALE]]",
                    help="mock only: move the fresh frames (px, deg, x; simulates a nudged "
                         "camera)")
@@ -5511,6 +5802,117 @@ def build_parser() -> argparse.ArgumentParser:
             "profiles (the profile library set), work states (the flow), permissions; exit 2 "
             "lists every problem", "the station configuration")
     p.add_argument("config", help="station config .json (or .yaml with PyYAML)")
+
+    # operating modes: Measure / Quick check (Station = `run` on a station configuration)
+    roi_help = "x0,y0,x1,y1 camera px (x1, y1 exclusive)"
+    p = cmd("measure-run", cmd_measure_run,
+            "MEASURE mode: scan and report numbers with units, n points and uncertainty - no "
+            "tolerance, no pass / fail. A new run folder (result.json, values.csv, overlay.png, "
+            "scan.ply, spec.json). Exit 0 MEASURED, 5 NOT MEASURABLE (uncalibrated, a mobile rig "
+            "not verified, rig check MOVED, too few points: no number is given), 2 refused, "
+            "4 crashed", "the measurement")
+    p.add_argument("preset_name", nargs="?", metavar="preset",
+                   help="the triangulation preset (default: --preset / the selected one, or "
+                        "the spec's)")
+    p.add_argument("--what", choices=("flatness", "step", "distance", "cylinder", "endface",
+                                      "dims", "deviation"),
+                   help="flatness: RMS, p2-p98, tilt of the region | step: region B (--roi2) "
+                        "above region A's plane (--roi) | distance: --p1 to --p2, or --p1 to "
+                        "the plane of --roi | cylinder: radius, diameter, axis | endface: "
+                        "end-face diameter (--diameter = the expected one) | dims: L x W x H of "
+                        "the part above the reference plane | deviation: vs --golden (values "
+                        "only)")
+    p.add_argument("--roi", metavar="X0,Y0,X1,Y1", help=f"region A: {roi_help}")
+    p.add_argument("--roi2", metavar="X0,Y0,X1,Y1", help=f"region B (step): {roi_help}")
+    p.add_argument("--zone", metavar="ZONE", help="region A as grid cells (H8:I11; also lights "
+                                                  "only them)")
+    p.add_argument("--zone2", metavar="ZONE", help="region B as grid cells (needs a projector "
+                                                   "map: scan map)")
+    p.add_argument("--p1", metavar="X,Y", help="a picked point, camera px")
+    p.add_argument("--p2", metavar="X,Y", help="a second picked point, camera px")
+    p.add_argument("--golden", metavar="ID", help="deviation: the golden metric scan (id / label)")
+    p.add_argument("--radius", type=float, metavar="MM",
+                   help="cylinder: fix the radius (it is then not measured)")
+    p.add_argument("--axis", choices=("auto", "x", "y", "z"),
+                   help="cylinder: axis hint in the camera frame (default auto)")
+    p.add_argument("--diameter", type=float, metavar="MM",
+                   help="endface: the expected face diameter (the face is found near it; its "
+                        "diameter is then measured)")
+    p.add_argument("--faces", type=_positive_int, metavar="N",
+                   help="endface: end faces in view (default 1)")
+    p.add_argument("--min-height", type=float, metavar="MM",
+                   help="dims: the part stands at least this far above the reference plane "
+                        "(default 2)")
+    p.add_argument("--repeats", type=_positive_int, metavar="N",
+                   help="scan N times: each value's mean and its repeatability (default 1: the "
+                        "predicted precision at that distance)")
+    p.add_argument("--scan", nargs="+", metavar="ID",
+                   help="measure stored metric scan(s) (id / label / latest) instead of "
+                        "capturing; several = the repeats")
+    p.add_argument("--scan-kind", choices=("metric", "fast"),
+                   help="metric (default: both axes, the preset's set) | fast (HDMI fast scan)")
+    p.add_argument("--steps", type=int, help="phase steps of the scan")
+    p.add_argument("--periods", metavar="T,T,..", help="fringe periods, DMD px (fine -> coarse)")
+    p.add_argument("--spec", metavar="FILE", help="a measurement spec (.json, e.g. the spec.json "
+                                                  "of an earlier run); the options override it")
+    p.add_argument("--save-spec", metavar="FILE", help="also write the spec that ran to FILE")
+    p.add_argument("--name", help="a name for the spec")
+    p.add_argument("--label", help="scan label (default measure_<what>)")
+    p.add_argument("--runs-dir", metavar="DIR", help="where the run folder goes (default "
+                   "$SCANNER_RUNS_DIR, else <library>/runs)")
+    p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a status
+    p = cmd("measure-to-check", cmd_measure_to_check,
+            "promote a measurement spec to a check by adding tolerances: flatness / step -> a "
+            "recipe, deviation -> a single-job station config", "the promotion")
+    p.add_argument("spec", help="measurement spec .json (the spec.json of a measure run)")
+    p.add_argument("--tol", action="append", metavar="NAME=LO,HI", required=True,
+                   help="a tolerance on a value of the measurement: NAME=LO,HI (a band) or "
+                        "NAME=HI (an upper limit), e.g. flatness_p2_p98=0.3, "
+                        "step_height=19.5,20.5, deviation_max=0.5 (repeatable)")
+    p.add_argument("--name", help="the check's name (default <what>_check)")
+    p.add_argument("--guard-band", type=_finite_nonneg, metavar="PCT",
+                   help="guard band in %% of the tolerance: a PASS that close to a limit is "
+                        "PULLed (default 0)")
+    p.add_argument("--out", metavar="FILE", help="write the check to FILE (never overwritten)")
+    p = cmd("quick-check", cmd_quick_check,
+            "QUICK CHECK mode: a triangulation preset + ONE check (a plane flatness limit, a "
+            "golden compare or one recipe) -> CONTINUE / REJECT / PULL; no sensors, no "
+            "permissions. Runs as a one-job station config (kept in the run folder as "
+            "quick_check.json). Exit 0 CONTINUE, 1 REJECT, 5 PULL, 2 refused, 4 crashed",
+            "the quick check")
+    p.add_argument("preset_name", nargs="?", metavar="preset",
+                   help="the triangulation preset (default: --preset / the selected one; a "
+                        "recipe check: the recipe's own)")
+    p.add_argument("--check", choices=("flatness", "golden", "recipe"), required=True,
+                   help="flatness: max |deviation| from the plane in --roi vs --threshold | "
+                        "golden: vs the golden metric scan --golden, within --threshold | "
+                        "recipe: the recipe --recipe (its own tolerances)")
+    p.add_argument("--threshold", "--limit", dest="threshold", type=float, metavar="MM",
+                   help="flatness / golden: the limit, mm")
+    p.add_argument("--roi", metavar="X0,Y0,X1,Y1", help=f"flatness / golden: {roi_help}")
+    p.add_argument("--zone", metavar="ZONE", help="flatness / golden: light only these grid cells")
+    p.add_argument("--golden", metavar="ID", help="golden: the golden metric scan (id / label)")
+    p.add_argument("--recipe", metavar="NAME", help="recipe: a recipe name or file")
+    p.add_argument("--guard-band", type=_finite_nonneg, metavar="PCT",
+                   help="flatness / golden: a PASS within this %% of the threshold is PULLed "
+                        "(default 0 = off)")
+    p.add_argument("--scan-kind", choices=("fast", "metric"),
+                   help="flatness / golden: fast (default) | metric")
+    p.add_argument("--operator-confirmed", action="store_true",
+                   help="a human confirmed the physical setup (required on the real rig)")
+    p.add_argument("--no-feedback", action="store_true",
+                   help="recipe: do not project the verdict on the part")
+    p.add_argument("--runs-dir", metavar="DIR", help="where the run folder goes (default "
+                   "$SCANNER_RUNS_DIR, else <library>/runs)")
+    p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a verdict (1)
+    p = cmd("rig-session", cmd_rig_session,
+            "the rig's state for mm results (mount, calibration, last rig check, verified?); "
+            "--new starts a new session: a MOBILE rig (rig.mount) counts as moved from now "
+            "and gives no mm until rig-check / re-home / calibrate. Exit 0 mm allowed, 1 not",
+            "the rig session")
+    p.add_argument("--new", action="store_true",
+                   help="the rig was set down / powered up / moved now")
+    p.add_argument("--reason", help="why (recorded with the marker)")
 
     # virtual sensors
     at_help = ("grid cell H8 (H8@96 pins the 96 px grid), zone G7:H9 (presence only), "
@@ -5699,7 +6101,7 @@ def main(argv: Optional[list] = None) -> int:
         return code
 
 
-DISPOSITION_COMMANDS = ("run", "recipe-run", "station-check", "face-check")
+DISPOSITION_COMMANDS = ("run", "recipe-run", "quick-check", "station-check", "face-check")
 
 
 def _error_disposition(e: BaseException, command: str, code: int, line: str) -> dict:

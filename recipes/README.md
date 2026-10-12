@@ -39,6 +39,13 @@ like a built-in one and its preset must exist; a built-in name is refused, an ex
 name too unless `--replace` (the old one moves to `trash/recipes/`). Delete refuses built-ins,
 the selected recipe and a recipe a station config's `job.recipe` names (`--force` overrides).
 
+**From a measurement.** A measurement spec (the `spec.json` a `scan measure-run` leaves in
+its run folder: what was measured, in which regions) becomes a recipe by adding tolerances:
+`scan measure-to-check spec.json --tol flatness_p2_p98=0.3 --out my_check.json` (flatness ->
+a `flatness` check on the roi; `--tol step_height=19.5,20.5` -> a `height` check of region B
+above region A's plane). Run it alone with `scan quick-check PRESET --check recipe --recipe
+my_check.json`, or add it to the library (`scan recipe-add NAME --from my_check.json`).
+
 **In a station configuration.** Two ways (`stations/README.md`):
 
 - A single-job station config with `"job": {"type": "recipe", "recipe": "box_lid"}`: its one
@@ -99,7 +106,7 @@ of the scan (the fixture), the verdict projected for 5 s.
 | `outputs.result_codes` | register values for PASS / FAIL / INVALID / ABORTED / PULL (default 1 / 2 / 3 / 4 / 5; 0 = no result yet). PULL may be left out: it gets 5, or the next code the others leave free (a recipe numbered `{"PASS": 5, "FAIL": 6, "INVALID": 7, "ABORTED": 8}` gets PULL 9); no doubt (INVALID, ABORTED, PULL) and no FAIL may share the PASS code, and PULL needs its own (not 0, not FAIL's, INVALID's or ABORTED's) |
 | `outputs.overlay` | write `overlay.png` (camera view with the zones and the verdict) |
 | `pull.guard_band_pct` | the guard band: a PASSing value within this % of the tolerance from a limit is PULLed for quality inspection (two-sided: % of the half width from each limit; one-sided: % of the limit; `presence` expect present: % of the room above `min_area_pct`, up to 100 %). A value on its limit is always in the band. `0` (default) = off; `0 <= pct < 100`, finite. The built-in examples use 10 |
-| `pull.invalid_reasons_to_reject` | doubt reasons this line REJECTS instead of pulling (default `[]`: every doubt is a PULL): any of `uncalibrated`, `stale_calibration`, `px_not_mm`, `too_few_points`, `zone_unresolved`, `golden`, `ambiguous_faces`, `incomplete`, `invalid`, `check_crashed`, `code_unreadable`, `rig_check`; `aborted`, `guard_band`, `refused` and `error` never reject, and a refused or crashed run is never rejected through this list |
+| `pull.invalid_reasons_to_reject` | doubt reasons this line REJECTS instead of pulling (default `[]`: every doubt is a PULL): any of `uncalibrated`, `stale_calibration`, `px_not_mm`, `too_few_points`, `zone_unresolved`, `golden`, `ambiguous_faces`, `incomplete`, `invalid`, `check_crashed`, `code_unreadable`, `rig_check`; `aborted`, `guard_band`, `refused`, `error` and `rig_unverified` (a mobile rig not verified in this session) never reject, and a refused or crashed run is never rejected through this list |
 
 **Part frame.** Heights are mm above the reference plane (+ toward the camera); u, v are mm in
 that plane, u ~ camera right, v ~ camera down, from the origin. A `part_mm` zone holds the

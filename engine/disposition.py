@@ -26,7 +26,11 @@ Doubt (`pull_reasons`, [{zone?, check?, reason, message}]; `reason` is one of RE
   invalid            any other INVALID
   check_crashed      a check raised (a bug is never a verdict)
   code_unreadable    an expected code could not be read at all (unreadable is not wrong)
-  rig_check          the rig check run before the cycle said MOVED / UNKNOWN
+  rig_check          the rig check run before the cycle said MOVED / UNKNOWN; or (Measure,
+                     Quick check on a FIXED rig) one on record did and was not answered since
+  rig_unverified     a MOBILE rig (preset rig.mount) was not verified in this session: no
+                     rig check OK, re-home or fresh calibration since it was set down - or
+                     its rig check said MOVED / UNKNOWN since (engine/rigstate.py)
   refused            the run was refused before a verdict (config, rule, confirmation);
                      recorded as such, never keyword-classified
   error              the run crashed (its message is never keyword-classified: a crash
@@ -53,15 +57,22 @@ with no span) cannot clear any value: every PASS of that tolerance is PULLed.
 
 recipe pull.invalid_reasons_to_reject (default []: every doubt is a PULL): reasons from
 REJECTABLE the line rejects instead of pulling (e.g. code_unreadable: no label, no part).
-`aborted`, `guard_band`, `refused` and `error` are never rejectable (they say nothing
-about the part), nor are the work-state reasons (a cycle's own kickout action decides), and
-a run that was refused or crashed is never rejected through the list.
+`aborted`, `guard_band`, `refused`, `error` and `rig_unverified` are never rejectable (they
+say nothing about the part), nor are the work-state reasons (a cycle's own kickout action
+decides), and a run that was refused or crashed is never rejected through the list.
 
 Exit codes (run, recipe-run, station-check, face-check): CONTINUE 0, REJECT 1, PULL 5
 (refused 2, crashed 4 and ABORTED 1 keep their documented codes; their disposition is
 PULL). Registers: the result code of the verdict, except that a PULL whose verdict is PASS
 or FAIL writes the PULL code and a REJECT writes the FAIL code (register_key): the PASS
 code is only ever written for CONTINUE.
+
+Measure mode (engine/modes/measure.py) is an instrument: it reports numbers and decides
+nothing about the part. Its result document carries result null and disposition "NONE"
+(NO_DISPOSITION) - never one of DISPOSITIONS - with a validity statement instead (status
+MEASURED / NOT_MEASURABLE). Whatever reads it as a run fails closed: of_result() and
+ensure() turn an unknown disposition into PULL, exit_code() into 5, and the command bus
+never raises PASS or a permission from it.
 
 Pure: no engine, no hardware (the command bus imports it).
 """
@@ -72,6 +83,7 @@ import math
 from typing import Optional
 
 DISPOSITIONS = ("CONTINUE", "REJECT", "PULL")
+NO_DISPOSITION = "NONE"             # a measurement (Measure mode): nothing is decided
 PULL_TEXT = "PULL (quality inspection)"
 EXIT_CODES = {"CONTINUE": 0, "REJECT": 1, "PULL": 5}
 REASONS = {
@@ -87,6 +99,7 @@ REASONS = {
     "check_crashed": "a check crashed",
     "code_unreadable": "an expected code could not be read",
     "rig_check": "the rig check before the cycle said MOVED / UNKNOWN",
+    "rig_unverified": "a mobile rig was not verified in this session",
     "refused": "the run was refused before a verdict",
     "error": "the run crashed",
     "aborted": "the cycle was aborted",
@@ -99,7 +112,7 @@ REASONS = {
 # never rejectable through a recipe's list: they say nothing definite about the part (the
 # work-state reasons belong to a cycle, whose own kickout action decides REJECT / PULL)
 NOT_REJECTABLE = ("aborted", "guard_band", "refused", "error", "sensor_mismatch",
-                  "sensor_unknown", "not_confirmed", "timeout")
+                  "sensor_unknown", "not_confirmed", "timeout", "rig_unverified")
 REJECTABLE = tuple(r for r in REASONS if r not in NOT_REJECTABLE)
 UNFINISHED = ("refused", "error")       # the run never finished: PULL, whatever it recorded
 MAX_GUARD_BAND_PCT = 100.0          # exclusive: 100 % would pull every pass
@@ -165,6 +178,8 @@ def classify(message, default: str = "invalid") -> str:
         return default
     if m.startswith("the check failed:"):
         return "check_crashed"
+    if "mobile rig not verified" in m:
+        return "rig_unverified"
     if "rig check" in m:
         return "rig_check"
     if (m.startswith("golden") or "golden scan" in m or "no golden" in m

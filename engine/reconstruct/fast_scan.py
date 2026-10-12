@@ -111,6 +111,7 @@ def scan_fast(s, preset, zone=None, steps: int = FAST_STEPS, periods=FAST_PERIOD
         average = MIN_AVERAGE
     fp = config.geometry_fingerprint(preset)
     cal = metric_scan._require_cal(s, preset.geometry_id, fp, "scan_fast")    # rule 6, before the rig
+    rig = metric_scan._require_rig(s, preset, "scan_fast")        # a mobile rig: verified
     run = replace(preset, camera=replace(preset.camera, average=int(average)),
                   projection=replace(preset.projection, min_hold_s=float(min_hold_s)))
     basis = flow.multifreq_basis(run, cal.diamond_parity, steps, periods, axis=axis)
@@ -132,6 +133,6 @@ def scan_fast(s, preset, zone=None, steps: int = FAST_STEPS, periods=FAST_PERIOD
              "n_patterns": len(pats), "capture_s": round(capture_s, 2),
              "per_pattern_s": round(capture_s / max(len(pats), 1), 3),
              "diamond_parity": cal.diamond_parity, "flood": "flood.npz (white, black)",
-             "warnings": warnings}
+             "warnings": warnings, "rig": rig}
     return metric_scan._save(s, fld, cloud, label, cal, fp, preset.name, extra,
                              arrays={"flood.npz": {"white": white, "black": black}})

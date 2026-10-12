@@ -646,6 +646,174 @@ def flow_run(config, profile: Optional[str] = None, inputs: Optional[dict] = Non
         hold_s=hold_s)
 
 
+# ------------------------------------- operating modes: Measure / Quick check / Station
+# engine/modes/: the triangulation preset (rig.mount fixed | mobile) is its own layer; three
+# modes sit on top. MEASURE reports numbers (no verdict), QUICK CHECK runs one check through
+# the station job runner (no sensors, no permissions), STATION is the configuration ->
+# profile -> work-state flow above. engine/rigstate.py says whether the rig may give mm.
+
+def rig_state(preset: Optional[Preset] = None, strict: bool = True) -> dict:
+    """What is known about the rig at the preset's geometry and whether it may give a mm
+    result now (engine/rigstate.gate): {ok, code, message, how_to_fix, mount, state:
+    {calibration_id, last_check, objection, session_start, verified, verified_by, why,
+    declared_by, ...}}. A FIXED rig is trusted until a rig check says MOVED / UNKNOWN, and
+    then until that is answered (strict, as Measure and Quick check ask; Station mode asks
+    with strict False: a fixed rig is never gated there); a MOBILE rig - the preset says so,
+    or another preset at its geometry does (`declared_by`) - only once it was verified in
+    this session: a calibration from poses captured in it, a rig check OK at the default
+    tolerance against a reference of that calibration stored while the rig was verified, or
+    a re-home against such a reference. Read-only."""
+    from . import rigstate
+    s = _engine()
+    return rigstate.gate(s.store, _preset(preset), strict=bool(strict), presets_dir=s.presets_dir)
+
+
+@_verb
+def rig_session(preset: Optional[Preset] = None, reason: str = "") -> dict:
+    """Start a new rig session at the preset's geometry: the rig was set down / powered up
+    / moved NOW (the engine cannot see that by itself). For a MOBILE rig (preset rig.mount)
+    whatever verified it before no longer does: no mm until a rig check OK (at the default
+    tolerance, against a reference of the calibration in use that was stored while the rig
+    was verified), a re-home against such a reference, or a calibration from poses captured
+    after this. On a fixed rig the marker is recorded and changes nothing.
+    -> {marker, gate: rig_state()}"""
+    from . import rigstate
+    s = _engine()
+    p = _preset(preset)
+    rec = rigstate.new_session(s.store, p, reason, by=s.holder)
+    return {"marker": {**rec, "geometry_id": p.geometry_id},
+            "gate": rigstate.gate(s.store, p, strict=True, presets_dir=s.presets_dir)}
+
+
+def _mode_runs_dir(runs_dir) -> Path:
+    if runs_dir:
+        return Path(runs_dir)
+    env = os.environ.get("SCANNER_RUNS_DIR")
+    return Path(env) if env else _engine().store.root / "runs"
+
+
+def measure_spec(what: Optional[str] = None, spec=None, **fields):
+    """A measurement spec (engine/modes/measure.Spec): `spec` (a Spec, a mapping, or a
+    .json file - e.g. the spec.json of an earlier measure run) with `what` and any given
+    field over it; scan_kind / steps / periods / average set its scan block. ValueError
+    lists every problem."""
+    from .modes import measure as mm
+    if isinstance(spec, mm.Spec):
+        d = spec.to_dict()
+    elif isinstance(spec, dict):
+        d = dict(spec)
+    elif spec is not None:
+        d = mm.load_spec(spec).to_dict()
+    else:
+        d = {}
+    if what is not None:
+        d["what"] = what
+    scan = d.get("scan")
+    scan = dict(scan) if isinstance(scan, dict) else ({} if scan is None else scan)
+    for k, key in (("scan_kind", "kind"), ("steps", "steps"), ("periods", "periods"),
+                   ("average", "average")):
+        v = fields.pop(k, None)
+        if v is not None and isinstance(scan, dict):
+            scan[key] = v
+    d["scan"] = scan
+    for k, v in fields.items():
+        if v is not None:
+            d[k] = v
+    return mm.spec_from(d)
+
+
+@_verb
+def measure_run(what: Optional[str] = None, preset: Optional[Preset] = None, spec=None,
+                roi=None, roi2=None, zone: Optional[str] = None, zone2: Optional[str] = None,
+                p1=None, p2=None, golden: Optional[str] = None,
+                radius_mm: Optional[float] = None, axis: Optional[str] = None,
+                min_height_mm: Optional[float] = None,
+                face_diameter_mm: Optional[float] = None, n_faces: Optional[int] = None,
+                repeats: Optional[int] = None,
+                scans: Optional[list] = None, scan_kind: Optional[str] = None,
+                steps: Optional[int] = None, periods: Optional[list] = None,
+                average: Optional[int] = None, runs_dir: Union[str, Path, None] = None,
+                label: Optional[str] = None, name: Optional[str] = None,
+                mock_scene: Optional[str] = None) -> dict:
+    """MEASURE mode: scan and report numbers - no tolerance, no pass / fail, no permission,
+    no disposition; a validity statement instead. Needs only a triangulation preset with a
+    valid stereo calibration (and, for a mobile rig, its verification in this session).
+
+    what: flatness (RMS, p2-p98, tilt of the region) | step (region B above region A's
+    plane) | distance (p1 - p2 as 3-D points; p1 to the plane of the region) | cylinder
+    (radius, diameter, axis; radius_mm fixes the radius, axis x | y | z | auto) | endface
+    (the diameter and flatness of n_faces circular end faces toward the camera, found near
+    face_diameter_mm) | dims (L x W x H of the part above the reference plane) | deviation
+    (vs the golden metric scan `golden`: values only). Regions: roi / roi2 ([x0, y0, x1,
+    y1] camera px) or zone / zone2
+    (grid cells); p1 / p2: [x, y] camera px. spec: a measurement spec (mapping, Spec or
+    .json) the arguments override. repeats: N scans -> each value's mean and its
+    repeatability; one scan -> the predicted precision at that distance (or the scan's
+    measured noise). scans: stored metric scans (ids / labels / handles) measured instead of
+    capturing. scan_kind metric (default: both axes, the preset's set) | fast.
+
+    -> {run_id, run_dir, result, exit_code}: a NEW run folder (runs_dir, default
+    $SCANNER_RUNS_DIR, else <library>/runs) with result.json (operating_mode "measure",
+    status MEASURED | NOT_MEASURABLE + reason + how_to_fix, values [{name, label, value,
+    units, n_points, uncertainty {value, units, method, n_repeats}, near_resolution_limit,
+    notes}], result null, disposition "NONE"), values.csv, overlay.png, scan.ply and
+    spec.json. NOT_MEASURABLE (never a px as mm, never a number that is not what its name
+    says): uncalibrated, stale_calibration, rig_unverified (mobile), rig_check (a fixed
+    rig's MOVED / UNKNOWN, or a stored scan made while / just before it), too_few_points,
+    incomplete (a part cut by the image border or the roi, a patch too far from the golden
+    to compare), invalid (no cylinder in the region, a picked px on an edge) ... exit_code
+    0 MEASURED, 5 NOT_MEASURABLE (1 aborted, 2 refused - also the same scan given twice, a
+    zone that can't cut a stored scan -, 4 crashed). A value's uncertainty is the depth
+    noise of the px it rests on (or the prediction, if larger); repeats never report less
+    than one scan's / sqrt(repeats). mock_scene (MOCK only): 'scene:<name>[:<variant>]' or
+    'none', placed first."""
+    from .modes import measure as mm
+    s = _engine()
+    p = _preset(preset)
+    sp = measure_spec(what, spec, roi=roi, roi2=roi2, zone=zone, zone2=zone2, p1=p1, p2=p2,
+                      golden=golden, radius_mm=radius_mm, axis=axis,
+                      min_height_mm=min_height_mm, face_diameter_mm=face_diameter_mm,
+                      n_faces=n_faces, repeats=repeats, scan_kind=scan_kind,
+                      steps=steps, periods=periods, average=average, name=name)
+    sp.preset = p.name                      # the preset it ran with (spec.json names it)
+    place = None
+    if mock_scene:
+        if not s.mock:
+            raise ValueError("mock_scene is MOCK ONLY: physical steps on the real rig are human")
+        from .flow import verify as flow_verify_mod
+        place = flow_verify_mod.mock_placer(s, mock_scene)
+    return mm.run(s, p, sp, runs_dir=_mode_runs_dir(runs_dir),
+                  scans=list(scans) if scans else None, mock_place=place, label=label)
+
+
+def measure_to_check(spec, tolerances: dict, name: Optional[str] = None,
+                     guard_band_pct: float = 0.0) -> dict:
+    """Promote a measurement spec to a check by adding tolerances ({value name: [lo, hi] or
+    an upper limit}): flatness -> a recipe with a `flatness` check on the roi; step -> a
+    recipe with a `height` check of region B above region A's plane; deviation -> a
+    single-job station config (metric golden compare). The recipe is validated here.
+    -> {kind: "recipe" | "station_config", document, run_with}. Run the recipe with `scan
+    quick-check <preset> --check recipe --recipe <file>` or name it in a profile; the
+    station config with `scan run <file>`. Pure: nothing is written."""
+    from .modes import measure as mm
+    out = mm.to_check(measure_spec(None, spec), tolerances, name, guard_band_pct)
+    if out["kind"] == "recipe":
+        v = recipe_validate(out["document"])
+        if not v["valid"]:
+            raise ValueError("the promoted recipe is not valid: " + "; ".join(v["problems"]))
+    return out
+
+
+def quick_check_config(check: str, preset: Optional[str] = None, **options) -> dict:
+    """QUICK CHECK mode: the minimal single-job station config of ONE check (engine/modes/
+    quick.build_config) - flatness (threshold_mm, roi), golden (threshold_mm, golden, roi)
+    or recipe (recipe). The station job runner runs it (`scan quick-check`, `scan run
+    <file>`, the web UI's quick_check verb): CONTINUE / REJECT / PULL, no sensors, no
+    permissions. Pure: nothing is written."""
+    from .modes import quick
+    return quick.build_config(check, preset, **options)
+
+
 # ------------------------------------------------------------------ verbs
 
 @_verb
@@ -2006,6 +2174,13 @@ def rig_check(preset: Optional[Preset] = None, set_reference: bool = False,
     the first one, a new calibration, on request) | REHOMED (rehome=True only). tol_px must
     be finite and >= 0 (ValueError). mock_shift_px (dx, dy[, roll_deg[, scale]]; mock only)
     moves the fresh frames to simulate a nudged camera.
+
+    Every check goes on the geometry's rig-state record (engine/rigstate.py) with its
+    tolerance, the reference it compared with, the calibration that reference belongs to and
+    what the reference can be trusted for (`reference_trust`: was the rig verified / free of
+    an objection when it was stored). For a mm result an OK counts only at the default
+    tolerance or tighter, against a reference of the calibration in use that was trusted
+    when stored (`warnings` say when a check does not count).
 
     rehome=True: when the check finds a small CAMERA move (MOVED, the flood and the
     projected pattern moving together), fit the camera's rotation from the reference flood

@@ -16,8 +16,9 @@ Sources (all call CommandBus.command):
                           A ARM / DISARM, N STEP (next work state), K ACK, P next profile,
                           1-9 station configuration
     HTTP                  POST /api/cmd/<start|abort|home|trigger|step|ack|retry|skip|arm|
-                          disarm|reset|config|profile> (a PLC / HMI gateway or an automation
-                          flow); sensor claims: POST /api/io/inputs {signal: true | false}
+                          disarm|reset|config|profile|mode> (a PLC / HMI gateway or an
+                          automation flow); sensor claims: POST /api/io/inputs {signal: true |
+                          false}
     hardware (PLACEHOLDER) InputBackend subclasses below: camera GPIO lines, serial /
                           USB-IO, a 24 V digital I/O module, and the industrial networks
                           (Modbus TCP, OPC UA, EtherNet/IP). Config-driven mapping
@@ -42,6 +43,15 @@ confirmation was for the old one). START / TRIGGER / ARM may name the configurat
 profile) the sender expects: refused when the selected one differs. A configuration the
 owner marked unusable (its file is invalid or gone, the profile is not in it) is never
 started: refused, result INVALID. A cancelled or aborted cycle never re-arms.
+
+Operating mode (engine/modes/; SELECT_MODE, POST /api/cmd/mode {"mode": ...}): `station`
+(the default: everything in this module), `quick_check` or `measure`. The bus runs cycles
+only in Station mode. In the other two the owner runs its measurement / quick-check jobs
+itself and the bus stands aside: START / TRIGGER / ARM are refused, READY and PASS are off
+and no permission is granted, so a measurement (which has no verdict at all) or a quick
+check never reaches the line's outputs. ABORT and HOME (the rig check) work in every mode.
+The mode can't change while a cycle runs; a change forgets the last cycle (as another
+configuration does) and, while ARMED, disarms.
 
 The last cycle speaks only for the part it checked. A START / TRIGGER that starts no cycle
 while none is open (refused, or ignored because the bus is not armed) announces a part that
@@ -146,10 +156,11 @@ from typing import Callable, Optional
 from .. import disposition as D
 from ..flow import schema as FS
 from ..flow.cycle import OUTCOME_CODES, Cycle, CycleError
+from ..modes import DEFAULT_MODE, MODES, TITLES, check_mode
 
 STATES = ("READY", "ARMED", "RUNNING", "ABORTING", "HOMING", "FAULT", "WAITING")
 COMMANDS = ("START", "ABORT", "HOME", "TRIGGER", "STEP", "ACK", "RETRY", "SKIP",
-            "SELECT_CONFIG", "SELECT_PROFILE", "ARM", "DISARM", "RESET")
+            "SELECT_CONFIG", "SELECT_PROFILE", "SELECT_MODE", "ARM", "DISARM", "RESET")
 # old names still accepted (the reply says so): SELECT_WORKSTATE selected a station
 # configuration, never a work state
 DEPRECATED_COMMANDS = {"SELECT_WORKSTATE": "SELECT_CONFIG"}
@@ -221,6 +232,7 @@ class CommandBus:
         self.require_confirmation = bool(require_confirmation)
         self.clock = clock
         self.state = "READY"
+        self.mode: str = DEFAULT_MODE                # station | quick_check | measure
         self.config: Optional[str] = self.configs[0] if self.configs else None
         self.flows: dict = {}                        # config -> StationConfiguration (owner)
         self.profile: Optional[str] = None           # the active profile of self.config
@@ -287,7 +299,7 @@ class CommandBus:
     # ------------------------------------------------------------ outputs
     def signals(self) -> dict:
         s, d, cyc = self.state, self.last_disposition, self.cycle
-        sig = {"READY": s in IDLE and self.fault is None,
+        sig = {"READY": s in IDLE and self.fault is None and self.mode == DEFAULT_MODE,
                "BUSY": s in BUSY,
                "PASS": s in IDLE and self.last_result == "PASS" and d == "CONTINUE",
                "FAIL": s in IDLE and d == "REJECT",
@@ -350,6 +362,7 @@ class CommandBus:
             cfg = self.flow_of(self.config)
             cyc = self.cycle
             return {"state": self.state,
+                    "operating_mode": self.mode, "operating_modes": list(MODES),
                     "station_config": self.config, "station_configs": list(self.configs),
                     "unusable": dict(self.unusable),
                     "profile": self.profile,
@@ -563,7 +576,14 @@ class CommandBus:
             self._publish()
         return self._no(cmd, msg)
 
+    def _held(self) -> str:
+        """Why no cycle starts outside Station mode."""
+        return (f"the station is in {TITLES[self.mode]} mode (no cycle, no verdict on the line, "
+                "no permission): select Station mode to run cycles (SELECT_MODE)")
+
     def _begin(self, cmd: str, confirmed: bool, arg=None) -> Reply:
+        if self.mode != DEFAULT_MODE:
+            return self._not_started(cmd, self._held())
         if self.config is None:
             return self._not_started(cmd, "no station configuration selected")
         refused = self._expect(cmd, arg)
@@ -928,7 +948,37 @@ class CommandBus:
             self._result(None, None)            # the last cycle checked the other profile
         return self._select("SELECT_PROFILE", note)
 
+    def _c_select_mode(self, arg, confirmed):
+        """Select the operating mode (engine/modes/): station, quick_check or measure.
+        Refused while a cycle runs or a job is busy. A change drops every permission and
+        forgets the last cycle - its PASS / FAIL / PULL outputs, its result code, its work
+        states and the sensor claims made for it - and, while ARMED, disarms. Outside Station
+        mode no cycle starts and READY, PASS and every permission stay off."""
+        if self.state not in IDLE + ("FAULT",):
+            return self._no("SELECT_MODE", f"refused while {self.state}" + (
+                ": a cycle is running" if self.state in IN_CYCLE else ""))
+        want = arg.get("mode") if isinstance(arg, dict) else arg
+        try:
+            mode = check_mode(want)
+        except ValueError as e:
+            return self._no("SELECT_MODE", str(e))
+        note = ""
+        if mode != self.mode:
+            if self.state == "ARMED":           # armed for cycles of the mode being left
+                self.armed_confirmed = False
+                self.state = "READY"
+                note = " - disarmed"
+            self._drop_permissions("another operating mode was selected")
+            self._forget_inputs("another operating mode was selected")
+            self.mode = mode
+            self.cycle = None
+            self._result(None, None)            # the last cycle belonged to the other mode
+        self._publish()
+        return self._ok("SELECT_MODE", f"{TITLES[mode]} mode" + note)
+
     def _c_arm(self, arg, confirmed):
+        if self.mode != DEFAULT_MODE:
+            return self._no("ARM", self._held())
         if self.state != "READY":
             return self._no("ARM", f"not READY ({self.state})")
         if self.config is None:
@@ -1068,8 +1118,9 @@ class CommandBus:
                     self._step_finished(cyc, aborted, result, error, disposition, step)
                     return
                 res = "ABORTED" if aborted else (result or "INVALID")
-                if error and not aborted:
-                    res = "INVALID"
+                if (error and not aborted) or res not in ("PASS", "FAIL", "INVALID", "ABORTED"):
+                    res = "INVALID"             # a crash, or not a verdict at all (a
+                                                # measurement's status): never a pass
                 self._result(res, D.of_result(
                     res, None if (aborted or error) else disposition,
                     error=bool(error) or aborted))

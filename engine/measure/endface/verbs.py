@@ -599,6 +599,8 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
         p = replace(p, projection=replace(p.projection, duty=float(duty)))
     fp = config.geometry_fingerprint(p)
     cal = stereo.require(s.store, p.geometry_id, fp, "targeted_face_scan")    # rule 6, pre-rig
+    from ...reconstruct import metric_scan as _ms
+    rig_stamp = _ms._require_rig(s, p, "targeted_face_scan")                   # mobile: verified
     t = as_face(s, face, p, "targeted_face_scan")                               # rule 5
     warnings = []
     if t.calibration_id != cal.id:
@@ -662,7 +664,8 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
                                     "periods_px": set_meta["periods_px"], "depth_mode": mode,
                                     "diamond_parity": cal.diamond_parity, "zone": "custom:face_ellipse",
                                     "targeted": True, "face_target": t.id, "facescan": d.name,
-                                    "repeat": k + 1, "duty": p.projection.duty})
+                                    "repeat": k + 1, "duty": p.projection.duty,
+                                    "rig": rig_stamp})
             if specs:
                 _save_npy(d / f"polar_frames_r{k + 1}.npy",
                           np.stack([np.asarray(f, np.float32)[y0:y1, x0:x1] for f in fr[nb:]]))

@@ -54,6 +54,21 @@ inputs) goes through one state machine: engine/control/commands.py. Every bus jo
 reports back to it when it ends, also when it is cancelled or dropped before it ran;
 a busy state with no job left to report back is settled (never wedged).
 
+Operating modes (engine/modes/): the page's mode switch sends SELECT_MODE to the bus (POST
+/api/cmd/mode). Station is everything above. In MEASURE mode POST /api/measure runs a
+`measure_run` job (a triangulation preset, what to measure, an roi or two picked camera px):
+numbers with units and uncertainty, a neutral MEASURED / NOT MEASURABLE - never a lamp
+verdict. In QUICK CHECK mode POST /api/quick-check runs a `quick_check` job (a preset + one
+check): CONTINUE / REJECT / PULL on the page's lamp. Neither is a bus job: outside Station
+mode the bus starts no cycle and keeps READY, PASS and every permission off, so nothing a
+measurement or a quick check says reaches the line's outputs. Both verbs are refused in any
+other mode. ABORT stops them; HOME is the rig check a MOBILE rig (preset rig.mount) needs
+before any mm (engine/rigstate.py). The server's start is a new rig session: a marker is
+recorded for every mobile preset it knows, and for one it first sees later the session is
+still never older than the server's start (rigstate.open_process_session) - nothing that
+verified a rig before the server started counts in it. The rig's state in the bus snapshot
+is cached (the record's size and time, a few seconds): polling it does not read the record.
+
 Live view: it holds the rig (camera + DMD + the machine-wide rig lock), so
 it stops when a rig job is queued, when the operator presses Stop (even
 while it is still queued), and when no viewer has polled it for
@@ -83,11 +98,12 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import numpy as np
 
-from engine import api, config, rules
+from engine import api, config, modes, rigstate, rules
 from engine import disposition as D
 from engine import runs as R
 from engine.control.commands import BUSY as BUS_BUSY
 from engine.control.commands import IN_CYCLE as BUS_IN_CYCLE
+from engine.control.commands import Reply
 from engine.flow import schema as flow_schema
 from engine.flow import verify as flow_verify
 from engine.library import presets as preset_lib
@@ -105,8 +121,11 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 STATIONS_DIR = Path(__file__).resolve().parents[2] / "stations"
 RUN_FILES = {"result.json": "application/json", "run.log.jsonl": "text/plain; charset=utf-8",
              "deviation.png": "image/png", "overlay.png": "image/png",
-             "feedback_dmd.png": "image/png", "feedback_photo.png": "image/png"}
-# ^ what /runs/<run_id>/ serves of a run folder (recipe runs: overlay + the DMD feedback)
+             "feedback_dmd.png": "image/png", "feedback_photo.png": "image/png",
+             "values.csv": "text/csv; charset=utf-8", "spec.json": "application/json",
+             "scan.ply": "application/octet-stream", "quick_check.json": "application/json"}
+# ^ what /runs/<run_id>/ serves of a run folder (recipe runs: overlay + the DMD feedback;
+#   measure runs: values.csv, the overlay, the scan's PLY, the spec; quick checks: their config)
 LIVE_IDLE_S = 30.0            # live view stops when nobody polled it for this long
 MAX_LIVE_S = 1800.0           # longest live view one start may ask for (it holds the rig)
 MAX_HOLD_S = 300.0            # pumped grid / zone holds can't be interrupted: keep them short
@@ -684,9 +703,13 @@ VERBS: dict = {
                   "judged), px and ~mm at the working distance. OK only with the pattern "
                   "matched and its roll / zoom determined | MOVED (also: the pattern visible "
                   "but no longer matching) | UNKNOWN (no pattern or texture, roll / zoom not "
-                  "determined, or the flood no longer matching) | REFERENCE_SET (first check).",
+                  "determined, or the flood no longer matching) | REFERENCE_SET (first check). "
+                  "Recorded on the rig-state record: for a mm result an OK counts only at the "
+                  "default tolerance or tighter, against a reference of the calibration in use "
+                  "stored while the rig could be trusted (`warnings` say when it does not).",
                   {"set_reference": "bool: store a new reference (after base / calibration)",
-                   "tol_px": "MOVED above this image motion, px (default 0.5; finite, >= 0)",
+                   "tol_px": "MOVED above this image motion, px (default 0.5; finite, >= 0; an "
+                             "OK at a looser one does not verify the rig)",
                    "mock_shift_px": "MOCK ONLY: [dx, dy] or [dx, dy, roll_deg] or [dx, dy, "
                                     "roll_deg, scale]: moves the fresh frames"}),
     "flow_verify": ("The DLP check of ONE work state of a station configuration (profiles + "
@@ -721,7 +744,65 @@ VERBS: dict = {
                   "hold_s": "fault projection hold, s (default the recipe's)",
                   "mock_scene": "MOCK ONLY: a scene, or {step id: scene}, placed before a scan",
                   "mock_case": "MOCK ONLY: a named case of the configuration (scene + inputs)"}),
+    # operating modes (engine/modes/): Measure / Quick check. Each runs only while its mode
+    # is selected (POST /api/cmd/mode): outside Station mode the bus starts no cycle
+    "measure_run": ("MEASURE mode: scan and report numbers - no tolerance, no pass / fail, no "
+                    "permission. A new run folder: result.json (operating_mode measure, status "
+                    "MEASURED | NOT_MEASURABLE + reason + how_to_fix, values [{name, label, "
+                    "value, units, n_points, uncertainty, near_resolution_limit, notes}], "
+                    "result null, disposition NONE), values.csv, overlay.png, scan.ply, "
+                    "spec.json. NOT_MEASURABLE (no number, never a px as mm): uncalibrated, "
+                    "stale_calibration, rig_unverified (a mobile rig: HOME first), rig_check "
+                    "(a fixed rig's MOVED / UNKNOWN), too_few_points, incomplete (a cut part, "
+                    "an uncompared patch), invalid (no cylinder, a pick on an edge) ... Refused "
+                    "unless Measure mode is "
+                    "selected (POST /api/cmd/mode {\"mode\": \"measure\"}).",
+                    {"what": "flatness | step | distance | cylinder | endface | dims | deviation",
+                     "preset": "triangulation preset (default: the loaded one; another one is "
+                               "loaded first)",
+                     "spec": "a measurement spec mapping (the other args override it)",
+                     "roi": "[x0, y0, x1, y1] camera px: region A (x1, y1 exclusive)",
+                     "roi2": "[x0, y0, x1, y1] camera px: region B (step)",
+                     "zone": "region A as grid cells", "zone2": "region B as grid cells",
+                     "p1": "[x, y] camera px: a picked point (distance)",
+                     "p2": "[x, y] camera px: the second point",
+                     "golden": "deviation: the golden metric scan (id / label)",
+                     "radius_mm": "cylinder: fix the radius", "axis": "cylinder: auto | x | y | z",
+                     "min_height_mm": "dims: the part stands this far out (default 2)",
+                     "face_diameter_mm": "endface: the expected diameter",
+                     "n_faces": "endface: end faces in view (default 1)",
+                     "repeats": "scans: > 1 gives each value's repeatability (default 1)",
+                     "metric_ids": "[metric scan ids] measured instead of capturing",
+                     "scan_kind": "metric (default) | fast", "steps": "phase steps",
+                     "periods": "[T, ...] DMD px", "average": "camera frames per pattern",
+                     "label": "scan label", "name": "a name for the spec",
+                     "mock_scene": "MOCK ONLY: scene:<name>[:<variant>] or none, placed first"}),
+    "rig_session": ("Start a new rig session at the loaded preset's geometry: the rig was set "
+                    "down / powered up / moved now. A MOBILE rig (preset rig.mount) then gives "
+                    "no mm until a rig check OK, a re-home or a fresh calibration (this server's "
+                    "start already is one). -> the marker + the rig's state.",
+                    {"reason": "why (recorded)"}),
     # UI verbs (not engine.api verbs)
+    "quick_check": ("QUICK CHECK mode: a triangulation preset + ONE check -> PASS / FAIL / "
+                    "INVALID and CONTINUE / REJECT / PULL; no sensors, no permissions, no bus "
+                    "outputs. Runs the generated one-job station config exactly like `scan "
+                    "quick-check` (a new run folder: result.json with operating_mode "
+                    "quick_check, run.log.jsonl, quick_check.json). A mobile rig not verified "
+                    "in this session, or a rig whose newest rig check said MOVED / UNKNOWN, is a "
+                    "PULL. The real rig needs operator_confirmed. Refused unless Quick check "
+                    "mode is selected (POST /api/cmd/mode {\"mode\": \"quick_check\"}).",
+                    {"check": "flatness | golden | recipe",
+                     "preset": "triangulation preset (default: the loaded one; a recipe "
+                               "check: the recipe's own)",
+                     "threshold_mm": "flatness / golden: the limit, mm",
+                     "roi": "flatness / golden: [x0, y0, x1, y1] camera px",
+                     "zone": "flatness / golden: light only these grid cells",
+                     "golden": "golden: the golden metric scan (id / label)",
+                     "recipe": "recipe: a recipe name (GET /api/recipes)",
+                     "guard_band_pct": "flatness / golden: a PASS this close to the limit is "
+                                       "PULLed (default 0)",
+                     "operator_confirmed": "bool (required on the real rig)",
+                     "mock_part": "MOCK ONLY: what the simulated human places (as --mock-part)"}),
     "run_station": ("Run one station config (stations/<config>.json) exactly like `scan run`: "
                     "a new run folder with result.json + run.log.jsonl; PASS / FAIL / INVALID / "
                     "ABORTED, disposition CONTINUE / REJECT / PULL (quality inspection) "
@@ -774,13 +855,17 @@ PRESET_CHANGE_VERBS = frozenset({"load_preset", "preset_select", "preset_delete"
 # running jobs that may be aborted: the engine checks the job's cancel event before every
 # capture (ScanSession.cancel), so the rig is never left mid-sequence
 CANCELLABLE_VERBS = frozenset({"run_station", "rig_check", "recipe_run", "recipe_feedback",
-                               "flow_verify", "flow_run"})
+                               "flow_verify", "flow_run", "measure_run", "quick_check"})
+# verbs of an operating mode: accepted only while the bus is in that mode (engine/modes/), so
+# a measurement or a quick check never runs beside a cycle of the line
+MODE_VERBS = {"measure_run": "measure", "quick_check": "quick_check"}
 CONFIRMED_CMDS = frozenset({"START", "TRIGGER", "ARM"})   # bus commands that read operator_confirmed
 # POST /api/cmd/<name> -> the bus command; `workstate` is the deprecated name of `config`
 # (it always selected a station configuration, never a work state)
-CMD_NAMES = {"config": "SELECT_CONFIG", "profile": "SELECT_PROFILE",
+CMD_NAMES = {"config": "SELECT_CONFIG", "profile": "SELECT_PROFILE", "mode": "SELECT_MODE",
              "workstate": "SELECT_WORKSTATE"}
 BUS_TICK_S = 0.5              # how often a waiting work state's timeout is looked at
+RIG_GATE_TTL_S = 5.0          # the rig's state in the snapshot is re-read at least this often
 
 
 class ArgError(ValueError):
@@ -1239,6 +1324,12 @@ class App:
         # worker can never finish it unannounced), popped by _bus_notify. Lock order:
         # bus._lock, then _cv - never the other way round.
         self._bus_jobs: dict = {}
+        # geometries of MOBILE rigs (preset rig.mount) this server has opened a rig session
+        # for: its start is a new session, so each must be verified again before any mm
+        self._mobile_sessions: set = set()
+        # (preset, mount, strict) -> (record signature, when, the gate's answer): GET
+        # /api/cmd/state is polled twice a second and must not read the rig-state record
+        self._rig_cache: dict = {}
         self.library = Path(library) if library else None
         self.presets_dir = Path(presets_dir) if presets_dir else None
         self.preset_name = preset_name
@@ -1297,6 +1388,8 @@ class App:
             self._bus_notify(job)
         if self._thread.is_alive() and threading.current_thread() is not self._thread:
             self._thread.join(timeout)
+        if getattr(self, "session", None) is not None:
+            rigstate.close_process_session(self.session.store)   # its rig session ends with it
 
     @property
     def presets_path(self) -> Path:
@@ -1306,6 +1399,8 @@ class App:
         """Mode is fixed here, once: api.configure(mock=...) on the worker."""
         self.session = api.configure(self.library, mock=self.mock, presets_dir=self.presets_dir)
         self.root = self.session.store.root.resolve()
+        # this server owns the rig from now: no mobile rig's session is older than its start
+        rigstate.open_process_session(self.session.store)
         names = self.preset_names()
         sel = api.preset_selection()
         gone = bool(sel.get("name")) and not sel.get("exists")
@@ -1334,9 +1429,40 @@ class App:
             except Exception as e:      # noqa: BLE001 - reported in the UI, not fatal
                 self.startup_warnings.append(f"could not load preset {name!r}: "
                                              f"{type(e).__name__}: {e}")
+        self._mobile_sessions_at_start()
         self._refresh_snapshot()
         self.refresh_configs()
         self._mock_line_default()
+
+    def _mobile_session(self, preset) -> None:
+        """A MOBILE rig (preset rig.mount) is assumed moved since its last use, and this
+        server's start is a new session: the first time its geometry is seen here a session
+        marker is recorded (engine/rigstate.py), so whatever verified it before no longer
+        does - HOME (the rig check), a re-home or a calibration must, before any mm. Always
+        BEFORE the preset's first job (a marker written after one would undo what that job
+        verified); a preset that slips past this is still held by the server's own session
+        (rigstate.open_process_session in _startup)."""
+        if preset is None or preset.rig.mount != "mobile" or \
+                preset.geometry_id in self._mobile_sessions:
+            return
+        self._mobile_sessions.add(preset.geometry_id)
+        try:
+            rigstate.new_session(self.session.store, preset,
+                                 "the web UI server started (a new rig session)",
+                                 by=self.session.holder or "web UI")
+        except OSError as e:            # unrecorded: the rig stays unverified at most 12 h
+            self.startup_warnings.append(f"rig session marker for {preset.name} not written: {e}")
+
+    def _mobile_sessions_at_start(self) -> None:
+        """Every mobile preset of this library (and the loaded one) starts a rig session."""
+        for name in self.preset_names():
+            try:
+                p = config.load_preset(name, presets_dir=self.session.presets_dir,
+                                       store=self.session.store, mock=self.mock)
+            except Exception:           # noqa: BLE001 - an invalid preset is listed as such
+                continue
+            self._mobile_session(p)
+        self._mobile_session(self.session.preset)
 
     def _run(self):
         try:
@@ -1423,6 +1549,12 @@ class App:
         if verb in PRESET_CHANGE_VERBS and self.bus.state in (*BUS_BUSY, *BUS_IN_CYCLE):
             raise HTTPError(409, f"{verb} refused while the station is {self.bus.state}: "
                                  "the running job / cycle uses the loaded preset")
+        need = MODE_VERBS.get(verb)
+        if need is not None and self.bus.mode != need:
+            raise HTTPError(409, f"{verb} runs in {modes.TITLES[need]} mode and the station is "
+                                 f"in {modes.TITLES[self.bus.mode]} mode: select it first (POST "
+                                 f"/api/cmd/mode {{\"mode\": \"{need}\"}}) - outside Station "
+                                 "mode the bus starts no cycle")
         with self._cv:
             if self._closing:
                 raise HTTPError(503, "server is shutting down")
@@ -1519,6 +1651,12 @@ class App:
         with self._cv:
             jobs = list(self._jobs.values())[-n:]
             return [j.public(full=False) for j in reversed(jobs)]
+
+    def mode_jobs(self) -> list:
+        """Ids of the measurement / quick-check jobs still queued or running."""
+        with self._cv:
+            return [j.id for j in [self._current, *self._queue]
+                    if j is not None and j.verb in MODE_VERBS and j.status in ("queued", "running")]
 
     # ------------------------------------------------------------ command bus
     def clear_feedback(self, why: str = "cleared by a new command") -> list:
@@ -1727,6 +1865,10 @@ class App:
         snap["run_preset"] = snap.get("config_preset") or snap["active_preset"]
         snap["warnings"] = list(self.startup_warnings)     # e.g. the selected preset is gone
         snap["mode"] = "mock" if self.mock else "real"
+        snap["mode_jobs"] = self.mode_jobs()
+        # Measure / Quick check ask strictly; Station mode asks as the station does (a fixed
+        # rig is not gated there, and nothing is read for it)
+        snap["rig"] = self.rig_gate(p, strict=self.bus.mode != modes.DEFAULT_MODE)
         snap["last_cycle"] = dict(self.last_cycle) if self.last_cycle else None
         cyc = snap.get("cycle") or {}
         if cyc.get("cycle_id") and cyc.get("active"):
@@ -1737,6 +1879,78 @@ class App:
                             "inputs": dict(self.mock_inputs),
                             "cases": cfg.public()["mock_cases"] if cfg is not None else []}
         return snap
+
+    def _rig_signature(self, p) -> tuple:
+        """What the rig's state rests on, by two stat calls: the rig-state record (it only
+        grows) and the geometry's calibration folder (an entry added or trashed)."""
+        out = []
+        try:
+            folder = rigstate.log_path(self.session.store, p.geometry_id).parent
+            for f in (folder / rigstate.LOG_FILE, folder):
+                try:
+                    st = f.stat()
+                    out.append((st.st_size, st.st_mtime_ns))
+                except OSError:
+                    out.append(None)
+        except ValueError:
+            out.append(None)
+        return tuple(out)
+
+    def rig_gate(self, preset=None, strict: bool = True) -> Optional[dict]:
+        """May the loaded preset's rig give mm now (engine/rigstate.gate; strict: what Measure
+        and Quick check ask)? {ok, code, message, how_to_fix, mount}; None: no preset. Cached
+        while the rig-state record and the calibration folder are unchanged, for at most
+        RIG_GATE_TTL_S (a session also ends by the clock)."""
+        p = preset if preset is not None else (self.session.preset if self.session else None)
+        if p is None:
+            return None
+        key, sig = (p.name, p.rig.mount, bool(strict)), self._rig_signature(p)
+        now = time.monotonic()
+        hit = self._rig_cache.get(key)
+        if hit is not None and hit[0] == sig and now - hit[1] < RIG_GATE_TTL_S:
+            return dict(hit[2])
+        try:
+            g = rigstate.gate(self.session.store, p, strict=bool(strict),
+                              presets_dir=self.session.presets_dir)
+        except Exception as e:          # noqa: BLE001 - unreadable: no mm, and it says why
+            return {"ok": False, "code": "rig_unverified" if p.rig.mount == "mobile" else
+                    "rig_check", "mount": p.rig.mount, "how_to_fix": "",
+                    "message": f"the rig's state could not be read: {type(e).__name__}: {e}"}
+        out = {k: g[k] for k in ("ok", "code", "message", "how_to_fix", "mount")}
+        if len(self._rig_cache) > 64:
+            self._rig_cache.clear()
+        self._rig_cache[key] = (sig, time.monotonic(), out)     # (timed when it was known)
+        return dict(out)
+
+    def modes_info(self) -> dict:
+        """What the operator page's mode switch and pickers show: the modes, the selected
+        one, the triangulation presets (mount, stereo calibration), the recipes."""
+        from engine.modes import measure as measure_mode
+        from engine.modes import quick as quick_mode
+        p = self.session.preset
+        presets = [{k: i.get(k) for k in ("name", "tier", "mount", "calibrated", "geometry_id",
+                                          "valid", "description")}
+                   for i in preset_lib.listing(self.session.store, self.presets_path, self.mock)]
+        # a geometry_id names one rig: a preset at a geometry another preset calls mobile is
+        # gated as mobile (engine/rigstate.mount_of), and listed so
+        mobile = {i["geometry_id"]: i["name"] for i in presets
+                  if i.get("mount") == "mobile" and i.get("geometry_id")}
+        for i in presets:
+            by = mobile.get(i.get("geometry_id"))
+            if by and i.get("mount") != "mobile":
+                i.update(mount="mobile", mount_declared_by=by)
+        try:
+            recipes = [i["name"] for i in api.recipe_list() if i.get("valid")]
+        except Exception:               # noqa: BLE001 - listed empty rather than a 500
+            recipes = []
+        return {"mode": self.bus.mode,
+                "modes": [{"name": m, "title": modes.TITLES[m], "needs": modes.NEEDS[m]}
+                          for m in modes.MODES],
+                "measure": {"whats": list(measure_mode.WHATS)},
+                "quick_check": {"checks": list(quick_mode.CHECKS)},
+                "presets": presets, "recipes": recipes,
+                "loaded_preset": p.name if p is not None else None,
+                "rig": self.rig_gate(p)}
 
     def refresh_configs(self) -> list:
         """Re-read the station configurations and hand them to the bus: every config in
@@ -2230,7 +2444,9 @@ class App:
             self.check_preset_name(name)
         except HTTPError as e:
             raise ArgError(e.msg) from None
-        return api.load_preset(name)
+        p = api.load_preset(name)
+        self._mobile_session(p)
+        return p
 
     def _v_preset_add(self, a):
         ov = a.get("overrides")
@@ -2244,6 +2460,7 @@ class App:
         name = self.check_preset_name_arg(_s(a, "name", required=True))
         rec = api.preset_select(name)
         p = api.load_preset(name)
+        self._mobile_session(p)
         return {"selected": rec, "loaded": p.name, "geometry_id": p.geometry_id,
                 "warnings": list(p.warnings)}
 
@@ -3304,11 +3521,18 @@ class App:
         elif not self._config_names_preset(f):
             raise ArgError("this station config names no preset and none is loaded: load one "
                            "in Setup (or name one in the config)")
+        return self._cli_job(cli.cmd_run, args)
+
+    def _cli_job(self, cmd, args):
+        """A station job through the CLI's own code path (cmd_run / cmd_quick_check) on the
+        server's session -> (result + exit_code, links); a recipe job's verdict is then
+        painted on the part by its own `recipe_feedback` job."""
+        from ui import cli
         ctx = cli.Ctx(args)
         ctx.session = self.session
         ctx._outputs_before = len(self.session.store.outputs())
         try:
-            code, data = cli.cmd_run(ctx)
+            code, data = cmd(ctx)
             res, run_dir = data["result"], Path(data["run_dir"])
         except Exception as e:          # noqa: BLE001 - a refused / crashed run is INVALID
             res = getattr(e, "run_result", None)
@@ -3334,6 +3558,114 @@ class App:
                     res = {**res, "feedback_job": self.submit("recipe_feedback",
                                                               {"run_id": res["run_id"]}).id}
         return {"exit_code": code, **res}, self._run_links(res, run_dir)
+
+    # ------------------------------------------------ operating modes: Measure / Quick check
+    def _mode_preset(self, a: dict):
+        """The triangulation preset a measurement / quick check runs with: the loaded one,
+        or `preset` (loaded first, so HOME - the rig check - is about the same rig)."""
+        name = _s(a, "preset")
+        cur = self.session.preset
+        if name and (cur is None or cur.name != name):
+            api.load_preset(self.check_preset_name_arg(name))
+        p = self._preset()
+        self._mobile_session(p)
+        return p
+
+    @staticmethod
+    def _roi_arg(a: dict, k: str) -> Optional[list]:
+        v = _num_list(a, k, int)
+        if v is not None and len(v) != 4:
+            raise ArgError(f"{k} must be [x0, y0, x1, y1] camera px")
+        return v
+
+    def _v_measure_run(self, a):
+        """MEASURE mode: api.measure_run on the server's session (numbers, never a verdict)."""
+        spec = a.get("spec")
+        if spec is not None and not isinstance(spec, dict):
+            raise ArgError("'spec' must be a measurement spec mapping")
+        p = self._mode_preset(a)
+        ids = a.get("metric_ids") or None
+        if ids is not None and not isinstance(ids, list):
+            raise ArgError("metric_ids must be a list of metric scan ids")
+        scans = [self._entry("metric", i) for i in ids] if ids else None
+        scene = self._mock_scene(a)
+        if scene is None and self.mock and scans is None:
+            scene = "none"              # MOCK: the simulated (stereo) bench, nothing placed
+        try:
+            out = api.measure_run(
+                _s(a, "what"), p, spec, roi=self._roi_arg(a, "roi"),
+                roi2=self._roi_arg(a, "roi2"), zone=_s(a, "zone"), zone2=_s(a, "zone2"),
+                p1=_point(a, "p1"), p2=_point(a, "p2"), golden=_s(a, "golden"),
+                radius_mm=_num(a, "radius_mm"), axis=_s(a, "axis"),
+                min_height_mm=_num(a, "min_height_mm"),
+                face_diameter_mm=_num(a, "face_diameter_mm"),
+                n_faces=_num(a, "n_faces", None, int), repeats=_num(a, "repeats", None, int),
+                scans=scans, scan_kind=_s(a, "scan_kind"), steps=_num(a, "steps", None, int),
+                periods=_num_list(a, "periods"), average=_num(a, "average", None, int),
+                label=_s(a, "label"), name=_s(a, "name"), mock_scene=scene)
+        except ValueError as e:         # a malformed spec: nothing ran, no run folder
+            raise ArgError(str(e)) from None
+        doc, run_dir = out["result"], Path(out["run_dir"])
+        rid = doc["run_id"]
+        self._runs[rid] = run_dir
+        links = {"result_json": f"/runs/{rid}/result.json", "log": f"/runs/{rid}/run.log.jsonl",
+                 "values_csv": f"/runs/{rid}/values.csv", "spec": f"/runs/{rid}/spec.json"}
+        if doc["outputs"].get("overlay"):
+            links["preview"] = f"/runs/{rid}/overlay.png"
+        if doc["outputs"].get("ply"):
+            links["ply"] = f"/runs/{rid}/scan.ply"
+        return ({"exit_code": out["exit_code"], **doc},
+                {k: _UILink(v) for k, v in links.items()})
+
+    def _v_rig_session(self, a):
+        return api.rig_session(self._preset(), _s(a, "reason", "") or "")
+
+    def _v_quick_check(self, a):
+        """QUICK CHECK mode: `scan quick-check` in-process, on the server's own session."""
+        from ui import cli
+        check = _s(a, "check", required=True)
+        confirmed = _confirmed(a, "operator_confirmed")
+        mock_part = _s(a, "mock_part")
+        if mock_part is not None and not self.mock:
+            raise ArgError("mock_part is MOCK ONLY")
+        if not self.mock and not confirmed:
+            raise rules.RuleViolation("the real rig needs the operator's confirmation of the "
+                                      "physical setup (part placed, rig untouched)")
+        recipe = _s(a, "recipe")
+        if recipe is not None:
+            self.check_recipe_name(recipe)      # a name of this library, never a file path
+        preset = _s(a, "preset")
+        if preset is None and check != "recipe":
+            preset = self._preset().name        # the loaded one: what the page shows
+        if preset is not None:
+            self.check_preset_name_arg(preset)
+        argv = ["--json", "--library", str(self.root)] + (["--mock"] if self.mock else [])
+        argv += (["--mock-part", mock_part] if mock_part else [])
+        argv += ["quick-check"] + ([preset] if preset else []) + ["--check", check, "--no-feedback"]
+        for opt, v in (("--threshold", _num(a, "threshold_mm")),
+                       ("--guard-band", _num(a, "guard_band_pct")), ("--zone", _s(a, "zone")),
+                       ("--golden", _s(a, "golden")), ("--recipe", recipe)):
+            if v is not None:
+                argv += [opt, str(v)]
+        roi = self._roi_arg(a, "roi")
+        if roi is not None:
+            argv += ["--roi", ",".join(str(v) for v in roi)]
+        argv += ["--operator-confirmed"] if confirmed else []
+        try:
+            args = cli.build_parser().parse_args(argv)
+        except SystemExit:              # argparse refused a value (its message went to stderr)
+            raise ArgError("quick_check: the arguments were refused (check, threshold_mm, "
+                           "guard_band_pct ...)") from None
+        args.preset_given = False               # cmd_quick_check takes the preset argument
+        args.mock_part_given = mock_part is not None
+        if preset is not None:                  # its rig session opens BEFORE the check runs
+            try:
+                self._mobile_session(config.load_preset(
+                    preset, presets_dir=self.session.presets_dir, store=self.session.store,
+                    mock=self.mock))
+            except config.ConfigError:
+                pass                            # the run refuses the preset with its own error
+        return self._cli_job(cli.cmd_quick_check, args)
 
     def _run_links(self, res: dict, run_dir: Path) -> dict:
         links = {"result_json": f"/runs/{res['run_id']}/result.json",
@@ -3681,7 +4013,10 @@ ROUTES = [
     ("GET", r"/api/stations", "stations"),
     ("GET", r"/api/cmd/state", "cmd_state"),
     ("POST", r"/api/cmd/(?P<name>start|abort|home|trigger|step|ack|retry|skip|arm|disarm|reset"
-             r"|config|profile|workstate)", "cmd"),
+             r"|config|profile|mode|workstate)", "cmd"),
+    ("GET", r"/api/modes", "modes"),
+    ("POST", r"/api/measure", "measure"),
+    ("POST", r"/api/quick-check", "quick_check"),
     ("GET", r"/api/io/inputs", "io_inputs"),
     ("POST", r"/api/io/inputs", "io_inputs_set"),
     ("POST", r"/api/mock/case", "mock_case"),
@@ -3880,6 +4215,8 @@ class Handler(BaseHTTPRequestHandler):
             arg = body.get("config", body.get("workstate"))
         elif cmd == "SELECT_PROFILE":
             arg = body.get("profile")
+        elif cmd == "SELECT_MODE":
+            arg = body.get("mode")
         elif cmd == "STEP":
             arg = body.get("step")
         elif cmd in CONFIRMED_CMDS:     # the configuration (+ profile) the sender expects
@@ -3890,7 +4227,13 @@ class Handler(BaseHTTPRequestHandler):
         src = str(body.get("source") or "http")[:40]
         if cmd != "ABORT":          # ABORT settles a lost job itself (and wins over a queued HOME)
             app.bus_reconcile()
-        r = app.bus.command(cmd, source=src, arg=arg, confirmed=confirmed is True)
+        busy = app.mode_jobs() if cmd == "SELECT_MODE" else []
+        if busy:                    # its measurement / quick check is still on the rig
+            r = Reply(False, cmd, app.bus.state,
+                      f"refused: {', '.join(busy)} of {modes.TITLES[app.bus.mode]} mode is still "
+                      "queued or running: wait for it, or ABORT")
+        else:
+            r = app.bus.command(cmd, source=src, arg=arg, confirmed=confirmed is True)
         if "workstate" in body and name != "workstate" and "deprecated" not in r.message:
             # the old body key (it named a station configuration, never a work state)
             r.message = (r.message + " " if r.message else "") + \
@@ -3900,8 +4243,28 @@ class Handler(BaseHTTPRequestHandler):
                "active_preset": st["active_preset"]}
         self._json(out, 200 if r.accepted else 409)
 
+    def r_modes(self, q, body):
+        """The operating modes, the selected one and what their pickers offer."""
+        self._json(jsonable(self.app.modes_info(), self.app.root))
+
+    def _mode_job(self, verb: str, body: dict):
+        args = {k: v for k, v in body.items() if k != "source" and v is not None}
+        job = self.app.submit(verb, args)
+        self._json({**self.app.job(job.id), "bus": self.app.cmd_state()})
+
+    def r_measure(self, q, body):
+        """MEASURE mode: one measurement (the measure_run verb's arguments) as a job ->
+        {id, status, ...}; poll GET /api/jobs/<id>. 409 unless Measure mode is selected."""
+        self._mode_job("measure_run", body)
+
+    def r_quick_check(self, q, body):
+        """QUICK CHECK mode: one quick check (the quick_check verb's arguments) as a job.
+        409 unless Quick check mode is selected."""
+        self._mode_job("quick_check", body)
+
     def r_run_file(self, q, body, run_id, name):
-        self._file(self.app.run_file(run_id, name), RUN_FILES[name])
+        self._file(self.app.run_file(run_id, name), RUN_FILES[name],
+                   download=name.endswith(".ply"))
 
     def r_static(self, q, body, name):
         target = (STATIC_DIR / name).resolve()

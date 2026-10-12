@@ -327,6 +327,16 @@ def capture_pose(s, preset, set_label: str = "stereo", spec: Optional[BoardSpec]
                                                                   shot["mapped"])]}
             meta["faces_seen"] = seen
         s.store.write_json(d / "meta.json", json_safe(meta))
+    # the rig-state record keeps WHEN a pose was captured, in the order of events: a
+    # calibration verifies a mobile rig / answers a MOVED only from poses captured since
+    from .. import rigstate
+    try:
+        rigstate.record_pose(s.store, preset, d.name, set_label)
+    except OSError as e:
+        warnings.append(f"the rig-state record was not updated ({type(e).__name__}: {e}): a "
+                        "calibration from this pose will not verify a mobile rig or answer an "
+                        "earlier rig check MOVED")
+        meta["warnings"] = warnings
     return {**meta, "path": d}
 
 
@@ -471,7 +481,7 @@ def calibrate_stereo(s, preset, set_label: Optional[str] = None, square_mm: Opti
     summary["warnings"] += pwarn
     if truth is not None:
         summary["vs_truth"] = stereo.compare_truth(cal, truth)
-    return _finish(s, preset, cal, fit, summary, set_label, par)
+    return _finish(s, preset, cal, fit, summary, set_label, par, ids)
 
 
 def _one_period_set(poses: list, set_label: str) -> tuple:
@@ -581,7 +591,17 @@ def _summary(cal, fit: dict, set_label: str, n_captured: int, par,
             "path": cal.path, "units": "px (reprojection), mm (baseline)", "warnings": []}
 
 
-def _finish(s, preset, cal, fit: dict, summary: dict, set_label: str, par) -> tuple:
+def _finish(s, preset, cal, fit: dict, summary: dict, set_label: str, par,
+            pose_ids: Optional[list] = None) -> tuple:
+    # on the rig-state record: this calibration and the poses it was solved from (a
+    # calibration from poses captured before the rig was last in doubt answers nothing)
+    from .. import rigstate
+    try:
+        rigstate.record_calibration(s.store, preset, cal.id, pose_ids or [], set_label)
+    except OSError as e:
+        summary["warnings"].append(
+            f"the rig-state record was not updated ({type(e).__name__}: {e}): this calibration "
+            "does not verify a mobile rig or answer an earlier rig check MOVED")
     if not fit["cam"]["ok"]:
         summary["warnings"].append(f"camera RMS {fit['cam']['rms']:.3f} px >= 0.3 px target")
     if not fit["proj"]["ok"]:
@@ -730,7 +750,7 @@ def _calibrate_fixture(s, preset, poses: list, set_label: str, square_mm, projec
                                        K_proj=np.asarray(indep["K_proj"]), dist_proj=cal.dist_proj,
                                        R=np.asarray(indep["R"]), t=np.asarray(indep["t"]))
         summary["vs_truth_independent"] = stereo.compare_truth(ind, truth)
-    return _finish(s, preset, cal, fit, summary, set_label, par)
+    return _finish(s, preset, cal, fit, summary, set_label, par, [p["id"] for p in poses])
 
 
 def _apply_rigid(fit: dict, r: dict) -> dict:

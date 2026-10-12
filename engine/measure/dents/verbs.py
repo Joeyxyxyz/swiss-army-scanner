@@ -140,6 +140,8 @@ def capture_dent_set(s, long_preset, short_preset, label: str = "dentset",
     cal = None
     if metric:                           # rule 6, before the rig is touched
         cal = stereo.require(s.store, long_preset.geometry_id, fp, "capture_dent_set (metric scan)")
+        from ...reconstruct import metric_scan as _ms
+        _ms._require_rig(s, metric_preset, "capture_dent_set (metric scan)")   # mobile: verified
     proj_mask = cam_mask = None
     cells = []
     if zone:

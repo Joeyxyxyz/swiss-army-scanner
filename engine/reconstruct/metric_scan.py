@@ -28,6 +28,15 @@ def _require_cal(s, geometry_id: str, fp: Optional[dict], what: str):
     return stereo.require(s.store, geometry_id, fp, what)
 
 
+def _require_rig(s, preset, what: str, scan=None) -> Optional[dict]:
+    """The rig gate of a capture that gives mm (engine/rigstate.require): a MOBILE rig that
+    is not verified in this session is refused (rules.RuleViolation) before the rig is
+    touched; a fixed rig never is. -> what the scan records of it (meta "rig": the
+    verification it was captured under; None for a fixed rig)."""
+    from .. import rigstate
+    return rigstate.stamp(rigstate.require(s, preset, what, scan=scan))
+
+
 def scan_metric(s, preset, label: str = "metric", method: str = "auto", steps=None,
                 periods=None, max_consistency_mm: Optional[float] = None,
                 zone: Optional[str] = None) -> MetricScan:
@@ -36,6 +45,7 @@ def scan_metric(s, preset, label: str = "metric", method: str = "auto", steps=No
     safe_label(label)
     fp = config.geometry_fingerprint(preset)
     cal = _require_cal(s, preset.geometry_id, fp, "scan_metric")       # before the rig
+    rig = _require_rig(s, preset, "scan_metric")                       # a mobile rig: verified
     basis = flow.multifreq_basis(preset, cal.diamond_parity, steps, periods)
     t0 = time.perf_counter()
     proj_mask = cam_mask = cells = None
@@ -52,7 +62,7 @@ def scan_metric(s, preset, label: str = "metric", method: str = "auto", steps=No
     fld.meta.update({"preset": preset.name, "label": label, "mock": s.mock})
     return _save(s, fld, cloud, label, cal, fp, preset.name,
                  {"capture_s": capture_s, "steps": basis.steps, "periods_px": basis.periods,
-                  "diamond_parity": cal.diamond_parity, "zone": zone})
+                  "diamond_parity": cal.diamond_parity, "zone": zone, "rig": rig})
 
 
 def _save(s, fld, cloud: MetricCloud, label: str, cal, fp, preset_name, extra: dict,
@@ -83,6 +93,35 @@ def _save(s, fld, cloud: MetricCloud, label: str, cal, fp, preset_name, extra: d
     return MetricScan(id=d.name, label=label, geometry_id=fld.geometry_id, path=d,
                       created=created, calibration_id=cal.id, meta=meta, _cloud=cloud,
                       _field=fld)
+
+
+def _require_rig_of(s, scan, what: str) -> Optional[dict]:
+    """_require_rig for a STORED capture (no preset in hand): the preset it was captured
+    with says how the rig is mounted. A capture of a mobile rig gives mm only when it was
+    made in the session the rig is verified in now. A capture whose preset is gone is
+    refused when any preset at its geometry says mobile (it can't be shown to be covered)."""
+    from .. import rigstate
+    name = (scan.meta or {}).get("preset")
+    preset = None
+    try:
+        if name:
+            preset = config.load_preset(name, presets_dir=s.presets_dir, store=s.store,
+                                        mock=s.mock)
+    except config.ConfigError:
+        preset = None
+    if preset is not None and preset.geometry_id == scan.geometry_id:
+        return _require_rig(s, preset, what, scan=scan)
+    geo = scan.geometry_id
+    if s.mock and geo.startswith(config.MOCK_PREFIX):
+        geo = geo[len(config.MOCK_PREFIX):]
+    builtin = s.presets_dir or config.PRESETS_DIR
+    by = rigstate._mobile_presets(s.store, builtin).get(geo)
+    if by:
+        raise rules.RuleViolation(
+            f"{what}: {rigstate.UNVERIFIED} (preset {by[0]} declares the rig at geometry {geo} "
+            f"mobile, and the preset {name or '?'} this capture was made with can't be loaded: "
+            "it can't be shown to come from a verified session - scan again)")
+    return None
 
 
 def list_metric(store, geometry_id: Optional[str] = None) -> list:
@@ -118,6 +157,7 @@ def triangulate_scan(s, scan, method: str = "auto", label: Optional[str] = None)
     a new metric cloud with the current stereo calibration + .ply."""
     fp = (scan.meta or {}).get("geometry_fp")
     cal = _require_cal(s, scan.geometry_id, fp, "triangulate")
+    rig = _require_rig_of(s, scan, "triangulate")
     fld = scan.field
     warnings = []
     basis = (scan.meta or {}).get("basis_names") or fld.basis_names
@@ -126,7 +166,8 @@ def triangulate_scan(s, scan, method: str = "auto", label: Optional[str] = None)
                         "(gray code + phase): expect a +-0.25 column zigzag; use scan_metric")
     cloud = triangulate(fld, cal, method)
     ms = _save(s, fld, cloud, label or f"{scan.label}_tri", cal, fp,
-               (scan.meta or {}).get("preset"), {"source_scan": scan.id, "warnings": warnings})
+               (scan.meta or {}).get("preset"), {"source_scan": scan.id, "warnings": warnings,
+                                                 "rig": rig})
     return {"scan": ms, "calibration_id": cal.id, "method": cloud.method,
             "n_points": int(cloud.mask.sum()), "consistency": cloud.consistency_stats(),
             "units": "mm", "warnings": warnings}

@@ -45,7 +45,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from .. import config, rules
+from .. import config, rigstate, rules
 from .. import disposition as D
 from .. import runs as R
 from . import feedback as FB
@@ -258,6 +258,8 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
             return state
         if rc["status"] == "REFERENCE_SET":
             res["warnings"].append(f"rig check: {rc.get('message') or 'reference stored'}")
+    if scan is None and _rig_refused(s, preset, res, log):
+        return state
     codes = None
     if recipe.scan["codes"] and scan is None:
         rd = api.read_codes(preset, label=f"{label or recipe.name}_codes")
@@ -274,6 +276,8 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
         ms = _find_metric(s, scan, preset.geometry_id)
         rules.require_same_geometry(ms.geometry_id, preset.geometry_id, "recipe_run scan")
         metric_scan.check_cal(s, ms, "recipe_run")               # rule 6 at use time
+        if _rig_refused(s, preset, res, log, ms):
+            return state
         res["capture"]["patterns"] = f"stored metric scan ({(ms.meta or {}).get('method', '?')})"
         res["warnings"].append(f"offline: checks run on the stored scan {ms.id} (nothing captured)")
     _same_setup(ms, preset, fp, cal, "recipe_run scan")      # this preset's settings + calibration
@@ -374,6 +378,24 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
     log.event("verdict", result=verdict, disposition=disp, pull_reasons=pulls,
               zones={z["id"]: z["verdict"] for z in zres}, feedback_rendered=info["rendered"])
     return state
+
+
+def _rig_refused(s, preset, res: dict, log, scan=None) -> bool:
+    """A MOBILE rig (preset rig.mount; or another preset at its geometry says so) is assumed
+    moved since its last use: no mm until it was verified in this session, and a stored scan
+    must have been made after that (engine/rigstate.py). -> True when the run stops here:
+    INVALID, a doubt (PULL; `rig_unverified`, which no recipe can turn into a reject). A
+    fixed rig is never gated here (unchanged: its calibration is trusted until a rig check
+    says MOVED / UNKNOWN - scan.rig_check, the command bus's HOME)."""
+    gate = rigstate.gate(s.store, preset, strict=False, scan=scan,
+                         presets_dir=getattr(s, "presets_dir", None))
+    if gate["ok"]:
+        return False
+    res["invalid_reason"] = gate["message"]
+    D.add(res, gate["code"], gate["message"])
+    log.event("refused", level="warning", reason=gate["message"], mount=gate["mount"],
+              how_to_fix=gate["how_to_fix"])
+    return True
 
 
 def settle(res: dict, recipe) -> dict:

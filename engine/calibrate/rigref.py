@@ -6,12 +6,23 @@ before it silently skews every measurement.
 Library layout (append-only, rule 7):
     calibrations/<geometry_id>/<ts>_rigref/   rigref.npz (white, black, pattern),
                                               flood.png, rigref.json (last)
+    calibrations/<geometry_id>/rig_state.jsonl   every check's result, one line each
+                                              (engine/rigstate.py)
 
 The reference is bound to the geometry fingerprint and records the newest
 base and stereo calibration it was taken with. The first check at a geometry
 (or set_reference=True) stores a new reference: take it right after base /
 calibration, with the station in its usual empty state. A later check then
 compares (numbers in engine/capture/rigcheck.py, pure and unit-tested).
+On a MOBILE rig that was just calibrated where it stands (verified by that calibration), a
+check that finds only another calibration's reference stores this calibration's own instead
+of comparing with where the rig stood before.
+A reference also records what it can be trusted for (`rig_trust`, engine/rigstate.py):
+whether the rig was verified (the mobile rule) and whether no rig check objection stood
+(the fixed rule; or the operator asked for it) at the moment it was stored. Every check
+made against it carries that with it: an OK against a reference taken while the rig was in
+doubt verifies nothing. Only an OK at the default tolerance or tighter counts for a mm
+result; a looser one is reported and says so.
 The REFERENCE_SET message says why a reference was stored: the first one at
 this geometry, a new calibration (the previous reference belonged to another
 one), on request, or after a re-home.
@@ -119,8 +130,9 @@ TAKE_IT = "take it right after base / calibration, station in its usual empty st
 
 
 def _store_reference(s, preset, out: dict, fp, white, pattern, black, label: str,
-                     why: str) -> Path:
-    """A new reference entry (append-only) from these frames; `why` is recorded with it."""
+                     why: str, trust: Optional[dict] = None) -> Path:
+    """A new reference entry (append-only) from these frames; `why` and what it can be
+    trusted for (`trust`: rigstate.trust_now at this moment) are recorded with it."""
     d = s.store.new_dir("calibrations", preset.geometry_id, label=label)
     with s.store.filling(d):
         s.store.write_npz(d / "rigref.npz", white=np.asarray(white, np.float32),
@@ -128,6 +140,7 @@ def _store_reference(s, preset, out: dict, fp, white, pattern, black, label: str
                           pattern=np.asarray(pattern, np.float32))
         s.store.write_preview(d / "flood.png", np.asarray(white, np.float64))
         meta = {**out, "kind": "rigref", "geometry_fp": fp, "reason": why,
+                "rig_trust": trust, "mount": preset.rig.mount,
                 "created": datetime.now().isoformat(timespec="seconds")}
         s.store.write_json(d / REF_FILE, json_safe(meta))
     return d
@@ -152,6 +165,15 @@ def _reference_message(prev: Optional[dict], cal, requested: bool) -> tuple:
                                    f"{TAKE_IT})")
     return "requested", (f"new reference stored on request ({old} stays in the library, "
                          f"unused; {TAKE_IT})")
+
+
+def _mobile_verified(s, preset) -> bool:
+    """Is this a mobile rig (engine/rigstate.mount_of) that is verified at this moment?"""
+    from .. import rigstate
+    pdir = getattr(s, "presets_dir", None)
+    if rigstate.mount_of(s.store, preset, pdir)[0] != "mobile":
+        return False
+    return rigstate.state(s.store, preset, presets_dir=pdir)["verified"] is True
 
 
 def _camera_like(verdict: dict) -> bool:
@@ -184,6 +206,22 @@ def _rehome_public(fit: dict) -> dict:
 
 def rig_check(s, preset, set_reference: bool = False, tol_px: float = rigcheck.DEFAULT_TOL_PX,
               mock_shift_px=None, label: str = "rigref", rehome: bool = False) -> dict:
+    """The rig check (module docstring); its result is also appended to the geometry's
+    rig-state record (engine/rigstate.py: what a fixed rig is trusted until, what verifies a
+    mobile one)."""
+    from .. import rigstate
+    res = _rig_check(s, preset, set_reference, tol_px, mock_shift_px, label, rehome)
+    try:
+        rigstate.record_check(s.store, preset, res)
+    except OSError as e:                    # the check stands; the record says nothing new
+        res["warnings"] = [*(res.get("warnings") or []),
+                           f"the rig-state record was not updated ({type(e).__name__}: {e}): "
+                           "a mobile rig stays unverified"]
+    return res
+
+
+def _rig_check(s, preset, set_reference: bool = False, tol_px: float = rigcheck.DEFAULT_TOL_PX,
+               mock_shift_px=None, label: str = "rigref", rehome: bool = False) -> dict:
     if mock_shift_px is not None and not s.mock:
         raise rules.RuleViolation("mock_shift_px is mock-only (it fakes a nudged camera)")
     tol_px = rigcheck.check_tol(tol_px)                 # before any frame is captured
@@ -222,17 +260,41 @@ def rig_check(s, preset, set_reference: bool = False, tol_px: float = rigcheck.D
     cal = stereo.latest(s.store, preset.geometry_id, fp)
     prev = latest_reference(s.store, preset.geometry_id, fp)
     ref = None if set_reference else prev
+    if ref is not None and cal is not None and ref.get("calibration_id") != cal.id \
+            and not rehome and _mobile_verified(s, preset):
+        # a MOBILE rig calibrated where it stands now: the newest reference is another
+        # calibration's, taken where the rig stood THEN. Comparing with it says nothing
+        # about this calibration (and a MOVED would undo what the calibration just
+        # verified): this check stores the calibration's own reference instead
+        ref = None
     out = {"geometry_id": preset.geometry_id, "preset": preset.name, "tol_px": tol_px,
            "base_id": base.id if base is not None else None,
            "calibration_id": cal.id if cal is not None else None, "mock": s.mock}
     if ref is None:
+        from .. import rigstate
         reason, message = _reference_message(prev, cal, bool(set_reference))
-        d = _store_reference(s, preset, out, fp, white, pattern, black, label, reason)
+        # what this reference can verify later: the rig's state at this moment
+        pdir = getattr(s, "presets_dir", None)
+        trust = rigstate.trust_now(s.store, preset, requested=bool(set_reference),
+                                   presets_dir=pdir)
+        d = _store_reference(s, preset, out, fp, white, pattern, black, label, reason, trust)
+        warnings = []
+        if rigstate.mount_of(s.store, preset, pdir)[0] == "mobile":
+            if not trust["mobile"]:
+                warnings.append("this reference was stored while the mobile rig was NOT "
+                                "verified: a rig check against it verifies nothing (calibrate "
+                                "from poses captured now, then store the reference: "
+                                "set_reference)")
+        elif not trust["fixed"]:
+            warnings.append("this reference was stored while a rig check's MOVED / UNKNOWN "
+                            "stood: a rig check against it does not clear that (with the rig "
+                            "known good: set_reference)")
         return {**out, "status": "REFERENCE_SET", "reference_id": d.name, "path": d,
                 "flood": None, "pattern": None, "shift_px": None, "shift_mm": None,
-                "reference_reason": reason,
+                "reference_reason": reason, "requested": bool(set_reference),
+                "reference_calibration_id": out["calibration_id"], "reference_trust": trust,
                 "previous_reference_id": prev["path"].name if prev is not None else None,
-                "message": message}
+                "message": message, "warnings": warnings}
     fr = ref["frames"]
     # shift + roll + scale over the frame (a global shift alone misses a roll or a zoom /
     # focus nudge about the image centre)
@@ -251,10 +313,16 @@ def rig_check(s, preset, set_reference: bool = False, tol_px: float = rigcheck.D
     if mm_per_px is None:
         warnings.append("shift in camera px only: mm need a stereo calibration and a metric "
                         "scan at this geometry (the working distance)")
+    if verdict.get("status") == "OK" and tol_px > rigcheck.DEFAULT_TOL_PX:
+        warnings.append(f"OK at a tolerance of {tol_px:g} px, looser than the default "
+                        f"{rigcheck.DEFAULT_TOL_PX:g} px: this check does not verify the rig "
+                        "for a mm result (a mobile rig stays unverified, an earlier MOVED "
+                        "stands)")
     res = {**out, **verdict, "reference_id": ref["path"].name, "flood": fl, "pattern": pt,
            "working_distance_mm": round(dist, 1) if dist else None,
            "mm_per_px": round(mm_per_px, 5) if mm_per_px else None, "warnings": warnings,
-           "rehome": None}
+           "reference_calibration_id": ref.get("calibration_id"),
+           "reference_trust": ref.get("rig_trust"), "rehome": None}
     if not rehome and not (_camera_like(verdict) and cal is not None and bound):
         return res
     if not _camera_like(verdict):                       # rehome asked, nothing to re-home
@@ -294,10 +362,13 @@ def rig_check(s, preset, set_reference: bool = False, tol_px: float = rigcheck.D
         "pattern_rms_px": fit["pattern_rms_px"], "tiles_agree": fit["tiles_agree"],
         "tiles_used": fit["tiles_used"], "mock": s.mock})
     out2 = {**out, "calibration_id": new.id}
-    d = _store_reference(s, preset, out2, fp, white, pattern, black, label, "rehome")
+    # the re-homed calibration's reference is trusted as far as the one it was fitted against
+    d = _store_reference(s, preset, out2, fp, white, pattern, black, label, "rehome",
+                         ref.get("rig_trust"))
     res.update(out2)
     res.update(status="REHOMED", moved="camera", path=new.path, reference_id=d.name,
                previous_reference_id=ref["path"].name, reference_reason="rehome",
+               rehome_from=cal.id,
                message=(f"camera re-homed: {stereo.REHOME_NOTE.format(id=cal.id)} -> "
                         f"{new.id} (rotation {fit['rotation_deg']:.4f} deg: pan "
                         f"{fit['pan_deg']:+.4f}, tilt {fit['tilt_deg']:+.4f}, roll "

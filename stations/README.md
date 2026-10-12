@@ -23,6 +23,18 @@ Two forms load:
 `scan run <config>` runs either; `scan flow-show <config>` prints and validates either.
 `io_*.json` files here are command I/O mappings (`io_example.json`), not stations.
 
+A station configuration is the **Station** operating mode (`README.md` *Operating modes*):
+the layer on top of a triangulation preset that adds profiles, work states, sensor claims and
+permissions. The other two modes need no file here: **Measure** (`scan measure-run`) only
+reports numbers, and **Quick check** (`scan quick-check PRESET --check flatness|golden|recipe`)
+generates its own one-job config - a single-job station config marked `"operating_mode":
+"quick_check"`, kept in its run folder as `quick_check.json` and runnable again with `scan
+run`. A configuration or profile that pins a **mobile** preset (`rig.mount`; or a preset at
+the geometry of one) ends its runs and work states PULL (`rig_unverified`: "mobile rig not
+verified: run rig-check / re-home / calibrate" - never a reject, whatever the recipe's
+`invalid_reasons_to_reject` lists) until the rig was verified in the current session; a fixed
+rig is not gated in Station mode.
+
 ## Profiles and work states
 
 ```json

@@ -268,6 +268,7 @@ def scan_trigger(s, preset, pack, variant: Optional[str] = None, label: str = "t
                         f"{preset.geometry_id!r}")
     fp = config.geometry_fingerprint(preset)
     cal = metric_scan._require_cal(s, preset.geometry_id, fp, "scan_trigger")      # rule 6
+    rig = metric_scan._require_rig(s, preset, "scan_trigger")           # a mobile rig: verified
     n = len(names)
     n_frames = (repeats + 1) * n if onebit else repeats * n
     P = tm["period_us"]
@@ -364,7 +365,7 @@ def scan_trigger(s, preset, pack, variant: Optional[str] = None, label: str = "t
     ms = metric_scan._save(s, fld, cloud, label, cal, fp, preset.name, {
         "mode": MODE, "capture_s": capture_s, "steps": steps, "periods_px": periods,
         "diamond_parity": parity, "fast": True, "experimental": True,
-        "trigger": json_safe(trig)})
+        "trigger": json_safe(trig), "rig": rig})
     times = {"capture_s": capture_s, "decode_s": decode_s,
              "triangulate_save_s": round(time.perf_counter() - t0, 3),
              "total_s": round(time.perf_counter() - t_all, 3)}

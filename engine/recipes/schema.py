@@ -1,9 +1,11 @@
 """
 Recipe schema (versioned data, JSON or YAML) and its validator.
 
-A recipe is one work-state check, portable to any DMD projector + camera line:
+A recipe is what the DLP checks to verify a work state (a station configuration's profiles
+name the recipes of each part variant, its flow's work states name which one verifies them:
+engine/flow/), portable to any DMD projector + camera line:
 
-    preset (the profile: rig geometry + capture settings)
+    preset (the rig: geometry + capture settings)
       -> scan      how to capture (fast | metric | trigger), axis, lit zone
       -> part      the part frame (reference plane, origin) and the scan label
       -> zones     where to look: rect | circle | polygon | grid-cells, in camera px,
@@ -249,7 +251,7 @@ def validate(doc: dict, source: Optional[Path] = None) -> Recipe:
         E.add("name", "is required: letters, digits, _ . - (max 64), e.g. box_lid_check")
     preset = doc.get("preset")
     if not isinstance(preset, str) or not _ID.match(preset):
-        E.add("preset", "is required: the preset (profile) this recipe pins, e.g. bench_9in_metric")
+        E.add("preset", "is required: the rig preset this recipe pins, e.g. bench_9in_metric")
     desc = doc.get("description", "")
     if not isinstance(desc, str):
         E.add("description", "must be text")

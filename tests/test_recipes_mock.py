@@ -1,4 +1,4 @@
-"""Recipes (work-state checks), MOCK only: the schema and its validator, every built-in check
+"""Recipes (the checks a work state is verified with), MOCK only: the schema and its validator, every built-in check
 PASS and FAIL on synthetic clouds, the check plugin registry, the runner's verdict and
 INVALID rules, result.json zones, the projected feedback landing on the right surfaces of
 the mock scene, the recipe library (built-in read-only, user add / select / delete to
@@ -422,7 +422,9 @@ RESULT_KEYS = {"schema_version", "run_id", "run_folder", "mode", "station",
                "deviation_units", "threshold_mm", "result", "invalid_reason", "engine_verdict",
                "disposition", "pull_reasons",
                "warnings", "outputs", "recipe", "zones", "feedback", "software", "started",
-               "finished"}
+               "finished",
+               # schema 0.4: the work states (a recipe run: one implicit work state "run")
+               "station_config", "profile", "steps", "permissions", "cycle"}
 
 
 @pytest.fixture(scope="module")
@@ -465,7 +467,11 @@ def test_box_lid_pass_and_ajar_fail(eng_lib, tmp_path):
     s, scans = eng_lib
     out, res, run_dir, ev = _run("box_lid", scans["box_lid"], tmp_path, project_feedback=False)
     assert res["result"] == "PASS" and out["exit_code"] == 0, res["invalid_reason"]
-    assert res["schema_version"] == "0.3" and res["job"]["type"] == "recipe"
+    assert res["schema_version"] == "0.4" and res["job"]["type"] == "recipe"
+    (step,) = res["steps"]                  # a single job is one implicit work state
+    assert step["id"] == "run" and step["outcome"] == "CONFIRMED" and step["permit"] is None
+    assert step["permission_granted"] is False and res["permissions"] == {}
+    assert res["station_config"] is None and res["profile"] is None and res["cycle"] is None
     assert res["recipe"]["name"] == "box_lid" and res["recipe"]["tier"] == "builtin"
     assert res["recipe"]["preset"] == "bench_9in_metric" and res["recipe"]["result_code"] == 1
     assert [z["id"] for z in res["zones"]] == ["lid_left", "lid_right"]
@@ -737,19 +743,22 @@ def test_bus_registers_follow_the_recipe_codes():
     bus = C.CommandBus(C.Handlers(), ["a.json", "b.json"])
     out = C.SimulatedOutput()
     bus.outputs.append(out)
-    bus.workstate_info["a.json"] = {"recipe": "box_lid",
+    bus.config_info["a.json"] = {"recipe": "box_lid",
                                     "result_codes": {"PASS": 10, "FAIL": 20, "INVALID": 30,
                                                      "ABORTED": 40}}
     bus.command("START")
     assert out.registers == {"result_code": 0, "state_code": C.STATES.index("RUNNING"),
-                             "workstate": 1}
+                             "station_config": 1, "profile": 1, "work_state": 1,
+                             "work_state_code": 0}
     bus.job_finished("run", "FAIL")
     assert out.current["FAIL"] and out.registers["result_code"] == 20
-    assert bus.snapshot()["workstate_recipe"] == "box_lid"
-    bus.command("SELECT_WORKSTATE", arg="b.json")
+    assert bus.snapshot()["config_recipe"] == "box_lid"
+    bus.command("SELECT_CONFIG", arg="b.json")
     bus.command("START")
     bus.job_finished("run", "PASS")
-    assert out.registers == {"result_code": 1, "state_code": 0, "workstate": 2}
+    assert out.registers == {"result_code": 1, "state_code": 0, "station_config": 2,
+                             "profile": 1, "work_state": 1,
+                             "work_state_code": C.OUTCOME_CODES["CONFIRMED"]}
 
 
 @pytest.mark.parametrize("cls_name, proto", [("ModbusTcp", "Modbus TCP"), ("OpcUa", "OPC UA"),

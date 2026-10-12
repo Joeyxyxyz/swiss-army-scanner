@@ -1,0 +1,76 @@
+{
+  "_comment": "Example STATION CONFIGURATION with a profile library set and work states (`scan run`, the operator page /quick, the command bus). The configuration is what the station knows: its parameters and the profiles it can call on (long tube / short tube: each names the recipes that say what that tube looks like). It is NOT a work state: the work states are the steps of the flow (../flows/example_tube_line.json): a claim of the line's own sensor that the DLP confirms or corrects, and the permission it grants. Paths are relative to this file; $ENV_VARS expand. MOCK: `mock.cases` are the simulated line (the scene the simulated human places + what the simulated part-present sensor says).",
+  "schema_version": 2,
+  "station_id": "example_tube_line",
+  "description": "Tube line: tube loaded? aligned? end face OK? - long and short tubes",
+  "parameters": {
+    "preset": "bench_9in_metric_bright",
+    "library": null,
+    "mock_library": "../library_mock",
+    "runs_dir": "../runs",
+    "operator_confirmed": false,
+    "default_profile": "long_tube",
+    "io": {
+      "inputs": {
+        "part_present": {
+          "description": "the seat's part-present sensor (the line's own)",
+          "source": "a PLC input: POST /api/io/inputs {\"part_present\": true}, or an input backend's `signals` map (stations/io_example.json)"
+        }
+      }
+    },
+    "defaults": {"retries": 1, "timeout_s": null, "trigger": "step"}
+  },
+  "profiles": {
+    "long_tube": {
+      "title": "Long tube (60 mm)",
+      "description": "the 60 mm tube: its end face stands 62 mm above the seat plane",
+      "preset": null,
+      "recipes": {
+        "presence": "tube_long_presence",
+        "alignment": "tube_long_alignment",
+        "end_face": "tube_long_end_face"
+      },
+      "mock_scene": "scene:tube_long"
+    },
+    "short_tube": {
+      "title": "Short tube (38 mm)",
+      "description": "the 38 mm tube: its end face stands 40 mm above the seat plane",
+      "preset": null,
+      "recipes": {
+        "presence": "tube_short_presence",
+        "alignment": "tube_short_alignment",
+        "end_face": "tube_short_end_face"
+      },
+      "mock_scene": "scene:tube_short"
+    }
+  },
+  "flow": "../flows/example_tube_line.json",
+  "mock": {
+    "default_case": "all_good",
+    "cases": {
+      "all_good": {
+        "description": "a good tube on its seat; the sensor says present",
+        "inputs": {"part_present": true}
+      },
+      "sensor_true_part_absent": {
+        "description": "the sensor says present, the seat is empty: the DLP CORRECTS it",
+        "variant": "absent",
+        "inputs": {"part_present": true}
+      },
+      "sensor_false_part_present": {
+        "description": "a tube on its seat, the sensor says absent: the DLP CORRECTS it",
+        "inputs": {"part_present": false}
+      },
+      "misaligned": {
+        "description": "the tube sits 3.4 mm off its seat: DEFECT at 'Tube aligned?'",
+        "variant": "misaligned",
+        "inputs": {"part_present": true}
+      },
+      "dented": {
+        "description": "a 0.4 mm dent on the end face: DEFECT at 'End face OK?', kicked out",
+        "variant": "dent",
+        "inputs": {"part_present": true}
+      }
+    }
+  }
+}

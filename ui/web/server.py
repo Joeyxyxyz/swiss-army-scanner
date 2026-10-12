@@ -23,18 +23,29 @@ neither post to the rig nor clickjack this page. /files serves only
 whitelisted types from inside the library root. Nothing here talks to
 hardware: the engine enforces §9.
 
-Operator page (/quick): START runs a station config (stations/*.json) through
-the same code path as `scan run` (ui/cli.py cmd_run) as one job (a recipe work state:
+Operator page (/quick): the top selects the STATION CONFIGURATION (stations/*.json: the
+station's parameters + its profile library set) and the active PROFILE (which part variant:
+long tube / short tube); the middle shows the WORK STATES, the steps of the configuration's
+flow. START begins a cycle; STEP verifies the current work state: the line's sensor claims
+(POST /api/io/inputs, for every part: a claim belongs to one cycle; MOCK: the simulated
+line's sensors report per cycle) are read, the DLP scans (`flow_verify`: one recipe run of
+the active
+profile, engine/flow/verify.py) and the work state is CONFIRMED (its permission, PERMIT_<NAME>,
+is granted) or CORRECTED / NOT_MET / DEFECT / DOUBT (withheld; the fault is painted on the
+part, a prompt waits for ACK, the part is kicked out ...). Each cycle writes a cycle folder
+(result.json: station config, profile, steps, permissions, disposition). A single-job
+station config is a one-step flow: START runs it through
+the same code path as `scan run` (ui/cli.py cmd_run) as one job (a recipe job:
 job.type recipe, engine/recipes/; its verdict is then painted on the part by a separate
-`recipe_feedback` job that any next command - START, TRIGGER, HOME, ABORT, a new work
-state - clears); ABORT sets
+`recipe_feedback` job that any next command - START, TRIGGER, HOME, ABORT, another
+configuration - clears); ABORT sets
 the job's cancel event, which the engine checks before every capture (the
 rig is closed on the way out: projector idle, rig lock released) and the run
 is recorded as ABORTED. The lamp shows the run's disposition (engine/disposition.py): PASS
 (CONTINUE), FAIL (REJECT) or, amber, "PULL - quality inspection" with the pull reasons
 (any doubt: INVALID, ABORTED, a guard band, an unreadable code), and never a PASS the bus
-outputs do not give (an ABORT after the run's verdict, a START refused on an unusable work
-state: the bus PULLs, the lamp shows PULL; the job's result and run log say so too, and no
+outputs do not give (an ABORT after the run's verdict, a START refused on an unusable
+configuration: the bus PULLs, the lamp shows PULL; the job's result and run log say so too, and no
 verdict is projected after an ABORT). ABORT in any state also
 stops what runs outside a cycle: the projected verdict, the live view, station / recipe runs and rig checks submitted as jobs.
 HOME (when idle, or queued behind an ABORT) runs the
@@ -76,6 +87,9 @@ from engine import api, config, rules
 from engine import disposition as D
 from engine import runs as R
 from engine.control.commands import BUSY as BUS_BUSY
+from engine.control.commands import IN_CYCLE as BUS_IN_CYCLE
+from engine.flow import schema as flow_schema
+from engine.flow import verify as flow_verify
 from engine.library import presets as preset_lib
 from engine.library.store import OUTPUT_KINDS
 from engine.reconstruct import pointcloud
@@ -675,13 +689,47 @@ VERBS: dict = {
                    "tol_px": "MOVED above this image motion, px (default 0.5; finite, >= 0)",
                    "mock_shift_px": "MOCK ONLY: [dx, dy] or [dx, dy, roll_deg] or [dx, dy, "
                                     "roll_deg, scale]: moves the fresh frames"}),
+    "flow_verify": ("The DLP check of ONE work state of a station configuration (profiles + "
+                    "flow) for a profile: scan with the profile's preset, run the recipe that "
+                    "work state verifies with, a new run folder; nothing is projected and no "
+                    "permission is granted (the command bus does that: POST /api/cmd/start, "
+                    "/step). -> the run's result + dlp {result, disposition, observed: {signal: "
+                    "true | false | null}}. The real rig needs operator_confirmed.",
+                    {"config": "station config file name (GET /api/stations)",
+                     "profile": "profile name (default: the configuration's default profile)",
+                     "step": "work state id",
+                     "operator_confirmed": "bool (required on the real rig)",
+                     "scan_id": "check a stored metric scan instead of capturing (optional)",
+                     "mock_scene": "MOCK ONLY: scene:<name>[:<variant>] or none, placed first",
+                     "cycle_id": "the open cycle this check belongs to (the command bus)",
+                     "attempt": "the attempt the command bus asked for (echoed in dlp with "
+                                "step and cycle_id: the bus takes only the answer to the "
+                                "verify it asked for)"}),
+    "flow_run": ("One whole cycle of a station configuration's flow, in line and unattended: "
+                 "every work state is verified in turn against `inputs` (the sensor claims), "
+                 "its actions run, a new cycle folder is written (result.json: station config, "
+                 "profile, steps, permissions; CONTINUE only when every required work state "
+                 "was CONFIRMED). A prompt nobody acknowledges ends the cycle PULL unless "
+                 "acknowledge is true. The real rig needs operator_confirmed. The operator "
+                 "page and a PLC walk the same cycle step by step: POST /api/cmd/*.",
+                 {"config": "station config file name (GET /api/stations)",
+                  "profile": "profile name (default: the configuration's default profile)",
+                  "inputs": "{signal: true | false}: what the line's sensors say",
+                  "operator_confirmed": "bool (required on the real rig)",
+                  "acknowledge": "bool: ACK every prompt (default false: fail closed)",
+                  "project_faults": "bool (default true): paint the faults on the part",
+                  "hold_s": "fault projection hold, s (default the recipe's)",
+                  "mock_scene": "MOCK ONLY: a scene, or {step id: scene}, placed before a scan",
+                  "mock_case": "MOCK ONLY: a named case of the configuration (scene + inputs)"}),
     # UI verbs (not engine.api verbs)
     "run_station": ("Run one station config (stations/<config>.json) exactly like `scan run`: "
                     "a new run folder with result.json + run.log.jsonl; PASS / FAIL / INVALID / "
                     "ABORTED, disposition CONTINUE / REJECT / PULL (quality inspection) "
                     "(cancel the job to abort between captures). A config naming no "
                     "preset (and not a recipe) runs the LOADED preset (refused when none is "
-                    "loaded). The real rig needs operator_confirmed.",
+                    "loaded). A configuration with profiles + a flow runs one whole cycle in "
+                    "line (as flow_run, its default profile, no sensor claims). The real rig "
+                    "needs operator_confirmed.",
                     {"config": "station config file name (GET /api/stations)",
                      "operator_confirmed": "bool: a human confirmed the physical setup "
                                            "(required on the real rig)",
@@ -725,8 +773,14 @@ PRESET_CHANGE_VERBS = frozenset({"load_preset", "preset_select", "preset_delete"
 
 # running jobs that may be aborted: the engine checks the job's cancel event before every
 # capture (ScanSession.cancel), so the rig is never left mid-sequence
-CANCELLABLE_VERBS = frozenset({"run_station", "rig_check", "recipe_run", "recipe_feedback"})
+CANCELLABLE_VERBS = frozenset({"run_station", "rig_check", "recipe_run", "recipe_feedback",
+                               "flow_verify", "flow_run"})
 CONFIRMED_CMDS = frozenset({"START", "TRIGGER", "ARM"})   # bus commands that read operator_confirmed
+# POST /api/cmd/<name> -> the bus command; `workstate` is the deprecated name of `config`
+# (it always selected a station configuration, never a work state)
+CMD_NAMES = {"config": "SELECT_CONFIG", "profile": "SELECT_PROFILE",
+             "workstate": "SELECT_WORKSTATE"}
+BUS_TICK_S = 0.5              # how often a waiting work state's timeout is looked at
 
 
 class ArgError(ValueError):
@@ -1166,8 +1220,21 @@ class App:
         from engine.control.commands import CommandBus, Handlers
         self.bus = CommandBus(Handlers(start=self._bus_start, abort=self._bus_abort,
                                        home=self._bus_home, select=self._bus_select,
-                                       pending=self._bus_pending),
+                                       pending=self._bus_pending, verify=self._bus_verify,
+                                       project=self._bus_project,
+                                       cycle_begin=self._bus_cycle_begin,
+                                       cycle_end=self._bus_cycle_end, log=self._bus_log),
                               require_confirmation=not self.mock)
+        self._cycles: dict = {}                 # open cycle id -> its folder, log, config
+        self.last_cycle: Optional[dict] = None  # the last cycle written (links for /quick)
+        # MOCK only: the case of the simulated line (the scene the simulated human places
+        # for the next scans + what the simulated sensors say); None = the profile's good part
+        self.mock_case: Optional[str] = None
+        self.mock_scene: Optional[str] = None   # an explicit scene instead of a named case
+        # ... and what its simulated sensors say (signal -> level): reported to the bus when
+        # they change and again for every cycle (a claim belongs to one cycle)
+        self.mock_inputs: dict = {}
+        self._mock_config: Optional[str] = None  # the configuration the mock line belongs to
         # job id -> "run" | "home": registered under _cv BEFORE the job is queued (so the
         # worker can never finish it unannounced), popped by _bus_notify. Lock order:
         # bus._lock, then _cv - never the other way round.
@@ -1194,6 +1261,8 @@ class App:
         self._ready = threading.Event()
         self._startup_error: Optional[BaseException] = None
         self._thread = threading.Thread(target=self._run, name="engine-worker", daemon=True)
+        self._ticker = threading.Thread(target=self._tick_loop, name="bus-tick", daemon=True)
+        self._stop_tick = threading.Event()
 
     # ----------------------------------------------------------- lifecycle
     def start(self, timeout: float = 120.0) -> "App":
@@ -1202,9 +1271,20 @@ class App:
             raise RuntimeError("engine worker did not start")
         if self._startup_error is not None:
             raise self._startup_error
+        self._ticker.start()
         return self
 
+    def _tick_loop(self) -> None:
+        """A work state that waits for STEP / ACK longer than its timeout_s ends its cycle
+        PULL even when nobody polls the page (CommandBus.tick)."""
+        while not self._stop_tick.wait(BUS_TICK_S):
+            try:
+                self.bus.tick()
+            except Exception:           # noqa: BLE001 - the next tick tries again
+                pass
+
     def close(self, timeout: float = 10.0) -> None:
+        self._stop_tick.set()
         with self._cv:
             self._stop_live_locked("server shutting down")
             self._closing = True
@@ -1255,7 +1335,8 @@ class App:
                 self.startup_warnings.append(f"could not load preset {name!r}: "
                                              f"{type(e).__name__}: {e}")
         self._refresh_snapshot()
-        self.refresh_workstates()
+        self.refresh_configs()
+        self._mock_line_default()
 
     def _run(self):
         try:
@@ -1339,9 +1420,9 @@ class App:
         if extra:
             raise HTTPError(400, f"{verb}: unknown args {sorted(extra)}; expected "
                                  f"{sorted(allowed) or 'none'}")
-        if verb in PRESET_CHANGE_VERBS and self.bus.state in ("RUNNING", "ABORTING", "HOMING"):
+        if verb in PRESET_CHANGE_VERBS and self.bus.state in (*BUS_BUSY, *BUS_IN_CYCLE):
             raise HTTPError(409, f"{verb} refused while the station is {self.bus.state}: "
-                                 "the running job uses the loaded preset")
+                                 "the running job / cycle uses the loaded preset")
         with self._cv:
             if self._closing:
                 raise HTTPError(503, "server is shutting down")
@@ -1456,18 +1537,108 @@ class App:
                 touched.append(cur.id)
         return touched
 
-    def _bus_start(self, workstate: str, confirmed: bool) -> str:
+    def _bus_start(self, config: str, confirmed: bool) -> str:
+        """START on a single-job station config: its job, as `scan run`."""
         self.clear_feedback("cleared: the next cycle started")
-        return self.submit("run_station", {"config": workstate,
+        return self.submit("run_station", {"config": config,
                                            "operator_confirmed": confirmed is True},
                            bus_kind="run").id
 
-    def _bus_select(self, workstate: str, preset: Optional[str]) -> Optional[str]:
-        """SELECT_WORKSTATE accepted: load the work state's preset (its part recipe)."""
-        self.clear_feedback("cleared: another work state was selected")
+    def _bus_select(self, config: str, preset: Optional[str]) -> Optional[str]:
+        """SELECT_CONFIG / SELECT_PROFILE accepted: load the preset the configuration's
+        active profile pins."""
+        self.clear_feedback("cleared: another station configuration / profile was selected")
+        self._mock_line_default()
         if not preset or preset not in self.preset_names():
             return None
         return self.submit("load_preset", {"name": preset}).id
+
+    def _mock_line_default(self) -> None:
+        """MOCK only: a newly selected station configuration starts with ITS simulated line:
+        its default mock case (the scene the simulated human places + what the simulated
+        sensors say), so scene and sensor claims always belong together. The real rig's
+        claims only ever come from the line (POST /api/io/inputs, an input backend)."""
+        if not self.mock or self._mock_config == self.bus.config:
+            return
+        self._mock_config = self.bus.config
+        self.mock_case = self.mock_scene = None
+        self.mock_inputs = {}
+        cfg = self.bus.flow_of(self.bus.config)
+        try:
+            c = cfg.mock_case(None, self.bus.profile) if cfg is not None else {"name": None}
+        except flow_schema.StationConfigError:
+            return
+        if c.get("name"):
+            self.mock_case = c["name"]
+            self.mock_inputs = dict(c["inputs"])
+            self._mock_line_report("mock case")
+
+    def _mock_line_report(self, source: str = "mock line", missing_only: bool = False) -> None:
+        """MOCK only: the simulated line reports what its simulated sensors say (as a line's
+        gateway would for every part). missing_only: only the signals nobody reported for
+        this cycle (a claim posted to /api/io/inputs wins for the cycle it was made for)."""
+        if not self.mock:
+            return
+        held = self.bus.inputs
+        known = set(self.bus.known_signals())
+        say = {k: v for k, v in self.mock_inputs.items()
+               if (not known or k in known) and not (missing_only and k in held)}
+        if say:
+            try:
+                self.bus.set_inputs(say, source=source)
+            except ValueError:          # a case of another configuration: nothing to report
+                pass
+
+    # the cycle of a flow: the bus walks the work states (engine/flow/cycle.py), the server
+    # runs each DLP check as a `flow_verify` job and keeps the cycle folder
+    def _bus_cycle_begin(self, info: dict) -> dict:
+        """A cycle starts: a NEW cycle folder + its log (step run folders go under it)."""
+        cfg = self.bus.flow_of(info["config"])
+        opened = flow_verify.open_cycle(cfg, info["profile"], mock=self.mock,
+                                        operator_confirmed=info.get("confirmed") is True,
+                                        source=str(info.get("source") or ""))
+        with self._cv:
+            self._cycles[opened["cycle_id"]] = {**opened, "cfg": cfg,
+                                                "confirmed": info.get("confirmed") is True}
+            self._runs[opened["cycle_id"]] = opened["cycle_dir"]
+        self.clear_feedback("cleared: the next cycle started")
+        self._mock_line_report(missing_only=True)       # MOCK: the simulated sensors, per part
+        return {"cycle_id": opened["cycle_id"]}
+
+    def _bus_verify(self, req: dict) -> str:
+        """The current work state is verified: one DLP check, as a job that reports back."""
+        self.clear_feedback("cleared: the next work state is verified")
+        return self.submit("flow_verify", {"config": req["config"], "profile": req["profile"],
+                                           "step": req["step"], "cycle_id": req.get("cycle_id"),
+                                           "attempt": req.get("attempt"),
+                                           "operator_confirmed": req.get("confirmed") is True},
+                           bus_kind="run").id
+
+    def _bus_project(self, req: dict) -> Optional[str]:
+        """project_fault: paint that work state's fault on the part (its own job: the next
+        verify, HOME or ABORT clears it)."""
+        if not req.get("run_id") or req["run_id"] not in self._runs:
+            return None
+        return self.submit("recipe_feedback", {"run_id": req["run_id"]}).id
+
+    def _bus_log(self, meta: dict, event: dict) -> None:
+        with self._cv:
+            c = self._cycles.get((meta or {}).get("cycle_id"))
+        if c is not None:
+            flow_verify.log_event(c["log"], event)
+
+    def _bus_cycle_end(self, record: dict) -> None:
+        """The cycle ended: its result.json (written once) and run_end in its log."""
+        with self._cv:
+            c = self._cycles.pop(record.get("cycle_id"), None)
+        if c is None:
+            return
+        doc = flow_verify.write_cycle(c["cfg"], record, c, mock=self.mock,
+                                      operator_confirmed=c["confirmed"])
+        self.last_cycle = {"cycle_id": c["cycle_id"], "result": doc["result"],
+                           "disposition": doc["disposition"],
+                           "links": {"result_json": f"/runs/{c['cycle_id']}/result.json",
+                                     "log": f"/runs/{c['cycle_id']}/run.log.jsonl"}}
 
     def _bus_abort(self) -> list:
         return self.abort_runs("ABORT")
@@ -1504,7 +1675,9 @@ class App:
                 if error and job.error_type == "Cancelled":    # dropped before it ran: an
                     result, error, disp = "ABORTED", None, None     # abort, not a crash
                 aborting = self.bus.state == "ABORTING"
-                self.bus.job_finished("run", result, error, disposition=disp)
+                # a work state's DLP check (flow_verify) carries its answer: what the DLP saw
+                self.bus.job_finished("run", result, error, disposition=disp,
+                                      step=r.get("dlp") if job.verb == "flow_verify" else None)
                 if (aborting and self.bus.last_result == "ABORTED" and isinstance(job.result, dict)
                         and r.get("result") not in (None, "ABORTED")):
                     job.result = self._aborted_after_verdict(job.result)
@@ -1540,32 +1713,123 @@ class App:
                 self.bus.job_lost("no station job is running or queued any more")
 
     def cmd_state(self) -> dict:
-        """The bus snapshot for /quick and a PLC gateway, plus the bus jobs, the loaded
-        preset (active_preset) and the preset START would run (run_preset: the work state's
-        own preset, else the loaded one - what _v_run_station uses)."""
+        """The bus snapshot for /quick and a PLC gateway (station configuration, profile, the
+        cycle's work states, permissions, sensor inputs, signals, registers), plus the bus
+        jobs, the loaded preset (active_preset), the preset START would run (run_preset: the
+        configuration's / profile's own preset, else the loaded one), the last cycle's
+        links and, in MOCK, the simulated line's case."""
         self.bus_reconcile()
+        self.bus.tick()
         snap = self.bus.snapshot()
         snap["jobs"] = self.bus_jobs()
         p = self.session.preset
         snap["active_preset"] = p.name if p is not None else None
-        snap["run_preset"] = snap.get("workstate_preset") or snap["active_preset"]
+        snap["run_preset"] = snap.get("config_preset") or snap["active_preset"]
         snap["warnings"] = list(self.startup_warnings)     # e.g. the selected preset is gone
+        snap["mode"] = "mock" if self.mock else "real"
+        snap["last_cycle"] = dict(self.last_cycle) if self.last_cycle else None
+        cyc = snap.get("cycle") or {}
+        if cyc.get("cycle_id") and cyc.get("active"):
+            snap["cycle_links"] = {"log": f"/runs/{cyc['cycle_id']}/run.log.jsonl"}
+        if self.mock:
+            cfg = self.bus.flow_of(self.bus.config)
+            snap["mock"] = {"case": self.mock_case, "scene": self.mock_scene,
+                            "inputs": dict(self.mock_inputs),
+                            "cases": cfg.public()["mock_cases"] if cfg is not None else []}
         return snap
 
-    def refresh_workstates(self) -> list:
-        """Re-read the station configs and hand them to the bus: every config in file-name
-        order (an invalid one keeps its number and is marked unusable, so a PLC's work-state
-        number never shifts because another config broke). The bus never switches the
-        selected work state on its own, and keeps the list as it is while ARMED or busy."""
-        items = self.stations()
+    def refresh_configs(self) -> list:
+        """Re-read the station configurations and hand them to the bus: every config in
+        file-name order (an invalid one keeps its number and is marked unusable, so a PLC's
+        configuration number never shifts because another config broke), with its profiles
+        and work states. The bus never switches the selected configuration or profile on its
+        own, and keeps the list as it is while ARMED or in a cycle."""
+        flows: dict = {}
+        items = self.stations(flows)
         ok = [i for i in items if not i.get("error")]
-        self.bus.update_workstates(
+        self.bus.update_configs(
             [i["config"] for i in items],
             unusable={i["config"]: i["error"] for i in items if i.get("error")},
             presets={i["config"]: i.get("preset") for i in ok},
             info={i["config"]: {"recipe": i["recipe"], "result_codes": i.get("result_codes")}
-                  for i in ok if i.get("recipe")})
+                  for i in ok if i.get("recipe")},
+            flows=flows)
         return items
+
+    def set_inputs(self, values: dict, source: str = "http") -> dict:
+        """Sensor claims from the line (POST /api/io/inputs): {signal: true | false}. MOCK:
+        a signal the line itself reports is the line's from then on - the simulated sensor
+        of that name stops reporting it (until a mock case is chosen again), so a gateway
+        tested against the mock server must report for every part, as on the real line."""
+        try:
+            held = self.bus.set_inputs(values, source=source)
+        except ValueError as e:
+            raise HTTPError(400, str(e)) from None
+        for k in values:
+            self.mock_inputs.pop(k, None)
+        return held
+
+    def set_mock_case(self, case=None, scene=None, inputs=None) -> dict:
+        """MOCK only: the simulated line. A named case of the selected configuration (the
+        scene the simulated human places for the next scans + what the simulated sensors
+        say), or an explicit scene / inputs ({signal: true | false}; null: that simulated
+        sensor stops reporting). {} goes back to the configuration's default case. The
+        simulated sensors are reported to the bus now and again for every cycle, as a line's
+        gateway reports its sensors for every part."""
+        if not self.mock:
+            raise HTTPError(400, "the simulated line is MOCK ONLY: on the real rig the part "
+                                 "is placed by a human and the sensors are the line's own")
+        cfg = self.bus.flow_of(self.bus.config)
+        if case is not None:
+            if cfg is None or not isinstance(case, str):
+                raise HTTPError(400, "case must be the name of a mock case")
+            try:
+                c = cfg.mock_case(case, self.bus.profile)
+            except flow_schema.StationConfigError as e:
+                raise HTTPError(400, str(e)) from None
+            self.mock_case, self.mock_scene = c["name"], None
+            self.mock_inputs = dict(c["inputs"])
+            self._mock_line_report("mock case")
+        elif scene is not None or inputs is not None:
+            if scene is not None:
+                if not isinstance(scene, str):
+                    raise HTTPError(400, "scene must be text: scene:<name>[:<variant>] or none")
+                try:
+                    flow_verify.mock_placer(self.session, scene)
+                except ValueError as e:
+                    raise HTTPError(400, str(e)) from None
+                self.mock_case, self.mock_scene = None, scene
+            if inputs is not None:
+                try:                    # strict: JSON booleans / null, declared signals only
+                    self.bus.set_inputs(inputs, source="mock")
+                except ValueError as e:
+                    raise HTTPError(400, str(e)) from None
+                self.mock_inputs = {k: v for k, v in {**self.mock_inputs, **inputs}.items()
+                                    if v is not None}
+        else:                           # the configuration's default case again
+            self.mock_case = self.mock_scene = None
+            self.mock_inputs = {}
+            try:
+                if cfg is not None:
+                    self.mock_inputs = dict(cfg.mock_case(None, self.bus.profile)["inputs"])
+            except flow_schema.StationConfigError:
+                pass
+            self._mock_line_report("mock case")
+        return {"case": self.mock_case, "scene": self.mock_scene,
+                "inputs": dict(self.bus.inputs), "simulated": dict(self.mock_inputs)}
+
+    def _mock_scene_now(self, cfg, profile: str) -> Optional[str]:
+        """MOCK: what the simulated human places before a work state's scan: the explicit
+        scene, else the selected case's, else the configuration's default case / the
+        profile's good part."""
+        if not self.mock:
+            return None
+        if self.mock_scene is not None:
+            return self.mock_scene
+        try:
+            return cfg.mock_case(self.mock_case, profile)["scene"]
+        except flow_schema.StationConfigError:      # a case of another configuration
+            return cfg.mock_case(None, profile)["scene"]
 
     def abort_runs(self, why: str = "aborted by the operator") -> list:
         """ABORT (in any bus state): drop queued station / recipe runs, rig checks and
@@ -2943,22 +3207,44 @@ class App:
         finally:
             self.session.cancel = None
 
-    def stations(self) -> list:
-        """Station configs (the operator page's work states): stations/*.json."""
+    def stations(self, flows: Optional[dict] = None) -> list:
+        """The station configurations: stations/*.json. One with profiles + a flow lists its
+        profile library set and its work states; an old single-job config is one implicit
+        profile ("default") and a one-step flow (its job). flows (optional): filled with
+        config -> StationConfiguration for every usable one (what the bus walks)."""
         from ui import run_job as RJ
         out = []
+        flows = {} if flows is None else flows
         d = self.stations_dir
         for f in sorted(d.glob("*.json")) if d.is_dir() else []:
             if f.name.startswith("io_"):        # I/O mappings live here too, not stations
                 continue
             item = {"config": f.name}
             try:
+                cfg = flow_schema.load(f)
+                pub = cfg.public()
+                item.update(kind="single job" if cfg.legacy else "flow",
+                            profiles=pub["profiles"], default_profile=pub["default_profile"],
+                            flow=pub["flow"], permissions=pub["permissions"],
+                            signals=pub["signals"], mock_cases=pub["mock_cases"])
+                if not cfg.legacy:
+                    item.update(station_id=cfg.station_id, part_label=pub["default_profile"],
+                                job_type="flow", preset=cfg.preset_for(None),
+                                description=cfg.description, threshold_mm=None, zone=None,
+                                measure=None, flow_source=cfg.flow_source)
+                    probs = flow_verify.check_config(cfg)
+                    if probs:
+                        raise flow_schema.StationConfigError("; ".join(probs), probs)
+                    flows[f.name] = cfg
+                    out.append(item)
+                    continue
                 c = RJ.load_station_config(f)
+                flows[f.name] = cfg
                 item.update(station_id=c.station_id, part_label=c.part_label,
                             job_type=c.job_type, preset=c.preset, threshold_mm=c.threshold_mm,
                             zone=c.zone,
                             measure=c.measure if c.job_type == "metric" else None)
-                if c.job_type == "recipe":          # the work state IS the recipe
+                if c.job_type == "recipe":          # the one work state is verified by a recipe
                     r = api.recipe_load(c.recipe)
                     item.update(recipe=r.name, preset=c.preset or r.preset,
                                 recipe_preset=r.preset, description=r.description,
@@ -2968,6 +3254,7 @@ class App:
                                 result_codes=dict(r.outputs["result_codes"]))
             except Exception as e:      # noqa: BLE001 - shown as an unusable entry
                 item["error"] = f"{type(e).__name__}: {e}"
+                flows.pop(f.name, None)
             out.append(item)
         return out
 
@@ -2977,6 +3264,8 @@ class App:
         An unreadable config counts as yes: the run then refuses it with its own error."""
         from ui import run_job as RJ
         try:
+            if not flow_schema.is_legacy(flow_schema.read_doc(f)):
+                return True             # profiles + flow: its profiles / recipes pin presets
             c = RJ.load_station_config(f)
         except Exception:               # noqa: BLE001 - cmd_run reports the config's error
             return True
@@ -3068,6 +3357,87 @@ class App:
         if not f.is_file():
             raise HTTPError(404, f"no file {name} in run {run_id}")
         return f
+
+    # ------------------------------------------------ work states (flows)
+    def _flow_cfg(self, a: dict, cycle: Optional[dict] = None):
+        """The station configuration a flow verb runs: the open cycle's own (what the bus
+        walks), else the file named `config` (must have profiles + a flow, and pass the
+        checks the schema can't see)."""
+        if cycle is not None:
+            return cycle["cfg"]
+        cfg = flow_schema.load(self._station_file(a.get("config")))
+        if cfg.legacy:
+            raise ArgError(f"{a.get('config')} is a single-job station config (no profiles, no "
+                           "flow): run it with run_station")
+        probs = flow_verify.check_config(cfg)
+        if probs:
+            raise ArgError("; ".join(probs))
+        return cfg
+
+    def _v_flow_verify(self, a):
+        """The DLP check of one work state (the job behind STEP; also on its own)."""
+        cid = _s(a, "cycle_id")
+        with self._cv:
+            cycle = self._cycles.get(cid) if cid else None
+        if cid and cycle is None:
+            raise ArgError(f"no open cycle {cid!r} of this server")
+        cfg = self._flow_cfg(a, cycle)
+        profile = _s(a, "profile") or cfg.default_profile
+        step = _s(a, "step", required=True)
+        confirmed = _confirmed(a, "operator_confirmed")
+        scan = _s(a, "scan_id")
+        if not self.mock and not confirmed and scan is None:
+            raise rules.RuleViolation("the real rig needs the operator's confirmation of the "
+                                      "physical setup (part placed, rig untouched)")
+        if scan is not None:
+            self._entry("metric", scan)
+        scene = self._mock_scene(a)
+        if scene is None and scan is None:
+            scene = self._mock_scene_now(cfg, profile)
+        runs_dir = (Path(cycle["cycle_dir"]) / flow_verify.STEPS_DIR) if cycle is not None \
+            else None
+        out = api.flow_verify(cfg, profile, step, runs_dir=runs_dir,
+                              operator_confirmed=confirmed, mock_scene=scene, scan=scan)
+        res, run_dir = out["result"], Path(out["run_dir"])
+        self._runs[res["run_id"]] = run_dir
+        # the answer says which verify it answers (work state, attempt, cycle): the command
+        # bus takes no other
+        dlp = {**out["dlp"], "step": step, "attempt": a.get("attempt"), "cycle_id": cid}
+        return ({"exit_code": out["exit_code"], **res, "dlp": dlp},
+                self._run_links(res, run_dir))
+
+    def _v_flow_run(self, a):
+        """One whole cycle in line (unattended): api.flow_run."""
+        cfg = self._flow_cfg(a)
+        profile = _s(a, "profile") or cfg.default_profile
+        confirmed = _confirmed(a, "operator_confirmed")
+        if not self.mock and not confirmed:
+            raise rules.RuleViolation("the real rig needs the operator's confirmation of the "
+                                      "physical setup (part placed, rig untouched)")
+        inputs = a.get("inputs")
+        if inputs is not None and (not isinstance(inputs, dict) or not all(
+                isinstance(v, bool) for v in inputs.values())):
+            raise ArgError("'inputs' must be an object {signal: true | false}")
+        scene, case = a.get("mock_scene"), _s(a, "mock_case")
+        if (scene is not None or case is not None) and not self.mock:
+            raise ArgError("mock_scene / mock_case are MOCK ONLY")
+        if scene is not None and not isinstance(scene, (str, dict)):
+            raise ArgError("'mock_scene' must be a scene or an object {step id: scene}")
+        if self.mock and scene is None:
+            try:
+                c = cfg.mock_case(case, profile)
+            except flow_schema.StationConfigError as e:
+                raise ArgError(str(e)) from None
+            scene = c["scene"]
+            if inputs is None:
+                inputs = c["inputs"]
+        out = api.flow_run(cfg, profile, inputs=inputs, operator_confirmed=confirmed,
+                           mock_scene=scene, acknowledge=_bool(a, "acknowledge"),
+                           project_faults=_bool(a, "project_faults", True),
+                           hold_s=_num(a, "hold_s"))
+        res, cycle_dir = out["result"], Path(out["cycle_dir"])
+        self._runs[res["run_id"]] = cycle_dir
+        return {"exit_code": out["exit_code"], **res}, self._run_links(res, cycle_dir)
 
     # ------------------------------------------------ recipes (work-state checks)
     def recipe_names(self) -> list:
@@ -3310,7 +3680,11 @@ ROUTES = [
     ("GET", r"/quick(?:\.html)?", "quick"),
     ("GET", r"/api/stations", "stations"),
     ("GET", r"/api/cmd/state", "cmd_state"),
-    ("POST", r"/api/cmd/(?P<name>start|abort|home|trigger|arm|disarm|workstate|reset)", "cmd"),
+    ("POST", r"/api/cmd/(?P<name>start|abort|home|trigger|step|ack|retry|skip|arm|disarm|reset"
+             r"|config|profile|workstate)", "cmd"),
+    ("GET", r"/api/io/inputs", "io_inputs"),
+    ("POST", r"/api/io/inputs", "io_inputs_set"),
+    ("POST", r"/api/mock/case", "mock_case"),
     ("GET", r"/runs/(?P<run_id>[A-Za-z0-9_.\-]+)/(?P<name>[A-Za-z0-9_.\-]+)", "run_file"),
 ]
 _ROUTES = [(m, re.compile(p), name) for m, p, name in ROUTES]
@@ -3437,9 +3811,43 @@ class Handler(BaseHTTPRequestHandler):
         self._file(STATIC_DIR / "quick.html", STATIC_TYPES[".html"])
 
     def r_stations(self, q, body):
-        self._json({"stations": self.app.refresh_workstates(),
+        self._json({"stations": self.app.refresh_configs(),
                     "mode": "mock" if self.app.mock else "real",
                     "dir": str(self.app.stations_dir)})
+
+    def r_io_inputs(self, q, body):
+        """What the line's sensors say now, and what the scanner says back: the sensor
+        claims held, the signals the selected configuration expects, the permissions."""
+        st = self.app.cmd_state()
+        self._json({"inputs": st["inputs"], "signals": st["signal_names"],
+                    "permissions": st["permissions"], "outputs": st["signals"],
+                    "registers": st["registers"]})
+
+    def r_io_inputs_set(self, q, body):
+        """Sensor claims from the line (a PLC / HMI gateway, a test): {signal: true | false,
+        ...} (null forgets one), or {"inputs": {...}, "source": "plc"} - one form or the
+        other, never both. Only JSON booleans count, and only signals a station configuration
+        declares: anything else is a 400, never guessed, nothing applied. A claim belongs to
+        one cycle (forgotten when it ends): report the sensors for every part. The DLP
+        confirms or corrects them when a work state is verified."""
+        values, src = body, "http"
+        if "inputs" in body:
+            extra = sorted(set(body) - {"inputs", "source"})
+            if not isinstance(body["inputs"], dict) or extra:
+                raise HTTPError(400, "send either {\"<signal>\": true | false, ...} or "
+                                     "{\"inputs\": {...}, \"source\": \"...\"}, not both"
+                                     + (f" (also got {', '.join(map(str, extra))})" if extra
+                                        else ": 'inputs' must be an object"))
+            values, src = body["inputs"], str(body.get("source") or "http")[:40]
+        held = self.app.set_inputs(values, source=src)
+        self._json({"inputs": held, "bus": self.app.cmd_state()})
+
+    def r_mock_case(self, q, body):
+        """MOCK only: the simulated line for the next scans: {"case": "<name>"} (a case of
+        the selected configuration: scene + sensor claims), {"scene": ..., "inputs": {...}},
+        or {} to clear it."""
+        out = self.app.set_mock_case(body.get("case"), body.get("scene"), body.get("inputs"))
+        self._json({**out, "bus": self.app.cmd_state()})
 
     def r_cmd_state(self, q, body):
         self._json(self.app.cmd_state())
@@ -3448,11 +3856,15 @@ class Handler(BaseHTTPRequestHandler):
         """One command through the bus (page buttons, keys, a PLC / HMI gateway). 200 when
         accepted, 409 when the state machine refused it (the reply says why), 400 for a
         malformed body. body: operator_confirmed (start / trigger / arm on the real rig: a
-        JSON boolean, only true confirms), workstate (workstate: the config name or 1-based
-        index to select; start / trigger / arm: the one the sender expects - refused when
-        another is selected), home: set_reference, tol_px, mock_shift_px."""
+        JSON boolean, only true confirms); config (config: the station configuration's file
+        name or 1-based number to select; start / trigger / arm: the one the sender expects -
+        refused when another is selected); profile (profile: the profile name or 1-based
+        number to select; start / trigger / arm: the one the sender expects); step (step: the
+        work state id / number the sender expects to verify); home: set_reference, tol_px,
+        mock_shift_px. Deprecated: /api/cmd/workstate and the `workstate` key are the old
+        names of /api/cmd/config and `config`."""
         app = self.app
-        cmd = {"workstate": "SELECT_WORKSTATE"}.get(name, name.upper())
+        cmd = CMD_NAMES.get(name, name.upper())
         confirmed = body.get("operator_confirmed")
         # only the commands that start something read the confirmation: a malformed one is
         # refused there; ABORT / DISARM / HOME / RESET ignore the field (never refused for it)
@@ -3464,12 +3876,25 @@ class Handler(BaseHTTPRequestHandler):
         if cmd == "HOME":           # the options travel with the request the bus accepts
             arg = {k: body[k] for k in ("set_reference", "tol_px", "mock_shift_px")
                    if body.get(k) is not None}
+        elif cmd in ("SELECT_CONFIG", "SELECT_WORKSTATE"):
+            arg = body.get("config", body.get("workstate"))
+        elif cmd == "SELECT_PROFILE":
+            arg = body.get("profile")
+        elif cmd == "STEP":
+            arg = body.get("step")
+        elif cmd in CONFIRMED_CMDS:     # the configuration (+ profile) the sender expects
+            arg = {"config": body.get("config", body.get("workstate")),
+                   "profile": body.get("profile")}
         else:
-            arg = body.get("workstate")
+            arg = None
         src = str(body.get("source") or "http")[:40]
         if cmd != "ABORT":          # ABORT settles a lost job itself (and wins over a queued HOME)
             app.bus_reconcile()
         r = app.bus.command(cmd, source=src, arg=arg, confirmed=confirmed is True)
+        if "workstate" in body and name != "workstate" and "deprecated" not in r.message:
+            # the old body key (it named a station configuration, never a work state)
+            r.message = (r.message + " " if r.message else "") + \
+                "[the `workstate` key is deprecated: use `config`]"
         st = app.cmd_state()
         out = {**r.to_dict(), "bus": st, "jobs": st["jobs"],
                "active_preset": st["active_preset"]}

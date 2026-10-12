@@ -1,6 +1,6 @@
-"""Recipes through the full MOCK capture path: `scan run` with job.type recipe (a station
-config whose work state IS a recipe), `scan recipe-*` on the command line, and the operator
-page / command bus: the work state selects the recipe (which pins its preset), START runs it,
+"""Recipes through the full MOCK capture path: `scan run` with job.type recipe (a single-job
+station config verified by a recipe), `scan recipe-*` on the command line, and the operator
+page / command bus: the configuration names the recipe (which pins its preset), START runs it,
 PASS / FAIL / ALARM + the result-code register go to the outputs, the verdict is painted on
 the part by a separate job that the next command (HOME here) clears."""
 
@@ -174,7 +174,7 @@ def _wait_state(c, want, timeout=120.0):
         time.sleep(0.2)
 
 
-def test_quick_lists_the_recipe_work_state(quick):
+def test_quick_lists_the_recipe_configuration(quick):
     c, app = quick
     _, d = c.get("/api/stations")
     (st,) = d["stations"]
@@ -182,8 +182,8 @@ def test_quick_lists_the_recipe_work_state(quick):
     assert st["preset"] == "bench_9in_metric" and st["zones"] == ["lid_left", "lid_right"]
     assert set(st["checks"]) == {"presence", "height", "flatness"} and st["feedback"]
     _, b = c.get("/api/cmd/state")
-    assert b["workstate"] == "lid_check.json" and b["workstate_recipe"] == "box_lid"
-    status, r = c.post("/api/cmd/workstate", {"workstate": 1})
+    assert b["station_config"] == "lid_check.json" and b["config_recipe"] == "box_lid"
+    status, r = c.post("/api/cmd/config", {"config": 1})
     assert status == 200 and "bench_9in_metric" in r["message"]
     _, d = c.get("/api/recipes")
     assert {"box_lid", "flat_plate"} <= {x["name"] for x in d["recipes"]}
@@ -211,7 +211,7 @@ def test_start_runs_the_recipe_outputs_and_the_projected_verdict(quick):
                                                              "lid_right": "FAIL"}
     b = _wait_state(c, {"READY"})
     assert b["signals"]["FAIL"] and not b["signals"]["PASS"]
-    assert b["registers"]["result_code"] == 2 and b["registers"]["workstate"] == 1
+    assert b["registers"]["result_code"] == 2 and b["registers"]["station_config"] == 1
     assert out.current["FAIL"] and out.registers["result_code"] == 2
     for k in ("result_json", "preview", "feedback"):
         assert c.request("GET", j["links"][k])[0] == 200, k

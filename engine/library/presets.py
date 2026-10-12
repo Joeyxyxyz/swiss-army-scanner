@@ -370,8 +370,10 @@ def _pins(path: Path, name: str) -> bool:
 
 
 def station_refs(stations_dir: Optional[Path], name: str) -> list:
-    """Station configs (stations/*.json|yaml) whose preset is `name` (a YAML one that can't
-    be parsed here: whose text mentions it)."""
+    """Station configs (stations/*.json|yaml) that pin preset `name`: an old single-job
+    config's `preset`, a configuration's `parameters.preset` or one of its profiles' `preset`
+    (a YAML one that can't be parsed here: whose text mentions it)."""
+    from ..flow.schema import references
     d = Path(stations_dir) if stations_dir else None
     if d is None or not d.is_dir():
         return []
@@ -383,7 +385,7 @@ def station_refs(stations_dir: Optional[Path], name: str) -> list:
             doc, text = read_or_text(f)
         except Exception:                       # noqa: BLE001 - not a station config we can read
             continue
-        if (mentions(text, name) if doc is None else doc.get("preset") == name):
+        if (mentions(text, name) if doc is None else name in references(doc)["presets"]):
             out.append(f.name)
     return out
 
@@ -392,11 +394,13 @@ def recipe_refs(store: LibraryStore, name: str, recipes_dir: Optional[Path] = No
                 stations_dir: Optional[Path] = None) -> dict:
     """What pins preset `name` through a recipe: {"recipes": built-in + user recipes whose
     preset it is, "selected": the selected recipe if it is one of them, "stations": station
-    configs whose recipe job (job.recipe: a name or a recipe file) runs one of them}.
+    configs whose recipe job (job.recipe: a name or a recipe file) or whose profiles'
+    recipes run one of them with no preset of their own to override it}.
     job.recipe is read as run_job reads it (stripped; a file: $VARS, ~, relative to the
     config). A YAML file that can't be parsed here is never skipped: a recipe pins `name`
     when its text mentions it, a station runs one when its text mentions a pinning recipe's
     name or a recipe file that pins it (its own preset is not trusted to a pattern)."""
+    from ..flow.schema import references
     from ..recipes import library as recipe_lib
     builtin = Path(recipes_dir) if recipes_dir else recipe_lib.BUILTIN_DIR
     pinned = []
@@ -422,17 +426,23 @@ def recipe_refs(store: LibraryStore, name: str, recipes_dir: Optional[Path] = No
                         _pins_quietly(rp, name) for rp in file_refs(text, f.resolve().parent)):
                     stations.append(f.name)
                 continue
-            job = doc.get("job") if isinstance(doc, dict) else None
-            ref = job.get("recipe") if isinstance(job, dict) else None
-            if doc.get("preset") or not isinstance(ref, str) or not ref.strip():
-                continue                        # the station's own preset wins over the recipe's
-            ref = ref.strip()                   # as run_job reads it
-            if ref in pinned:
-                stations.append(f.name)
-            elif ref.lower().endswith((".json", ".yaml", ".yml")):
-                rp = Path(os.path.expandvars(os.path.expanduser(ref)))   # as run_job does
-                if _pins_quietly(rp if rp.is_absolute() else f.resolve().parent / rp, name):
+            for r in references(doc)["recipes"]:    # a single job's recipe, or a profile's
+                ref = r["ref"]
+                if r["preset"]:
+                    continue                    # the station's own preset wins over the recipe's
+                if isinstance(ref, dict):       # a profile's inline recipe mapping
+                    hit = ref.get("preset") == name
+                elif ref in pinned:
+                    hit = True
+                elif ref.lower().endswith((".json", ".yaml", ".yml")):
+                    rp = Path(os.path.expandvars(os.path.expanduser(ref)))   # as run_job does
+                    hit = _pins_quietly(rp if rp.is_absolute() else f.resolve().parent / rp,
+                                        name)
+                else:
+                    hit = False
+                if hit:
                     stations.append(f.name)
+                    break
     return {"recipes": pinned, "selected": sel if sel in pinned else None, "stations": stations}
 
 

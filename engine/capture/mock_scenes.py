@@ -13,6 +13,10 @@ in a good and a bad variant, so every example recipe runs end to end in --mock.
                                                      edge) | missing (no box)
     plate      a flat plate                          ok | bump (0.8 mm bump on the top face) |
                                                      burr (a 3 mm tab on the top edge)
+    tube_long  one tube on its seat, end face        ok | absent (no tube) | misaligned (3.4 mm
+    tube_short toward the camera: 60 mm long /       off its seat) | dent (0.4 x 3 mm dent on
+               38 mm long (two profiles of one       the end face)
+               station: stations/example_tube_line.json)
 
 Frame: camera mm (x right, y down, z forward); the wall is z = 823, so a point's height
 above the wall is 823 - z. Part-frame (u, v) of the recipes ~ (x, y) at the wall.
@@ -99,7 +103,37 @@ def plate(variant: str = "ok") -> list:
     return out
 
 
+TUBE_END_VARIANTS = ("ok", "absent", "misaligned", "dent")
+
+
+def tube_end(length: float, variant: str = "ok") -> list:
+    """One tube standing on its seat at the part-frame origin, its end face toward the
+    camera, `length` mm long (the face is length + 2 mm above the wall)."""
+    if variant == "absent":
+        return []
+    radius = 10.5
+    n = np.array([0.0, 0.0, -1.0])
+    off = (3.0, 1.5) if variant == "misaligned" else (0.0, 0.0)
+    c = np.array([off[0], off[1], WALL_Z - 2.0 - length])
+    dents = ([{"depth_mm": 0.4, "size_mm": 3.0, "u_mm": 3.0, "v_mm": -2.0}]
+             if variant == "dent" else [])
+    return [EndFace(center=tuple(c), normal=tuple(n), radius=radius, dents=dents,
+                    chamfer_mm=0.5, chamfer_depth_mm=0.1, albedo=0.85),
+            MetricCylinder(center=tuple(c - n * length / 2), radius=radius, height=length,
+                           axis=tuple(n), albedo=0.5)]
+
+
+def tube_long(variant: str = "ok") -> list:
+    return tube_end(60.0, variant)
+
+
+def tube_short(variant: str = "ok") -> list:
+    return tube_end(38.0, variant)
+
+
 SCENES = {"tube": (tube, ("ok", "misaligned")),
+          "tube_long": (tube_long, TUBE_END_VARIANTS),
+          "tube_short": (tube_short, TUBE_END_VARIANTS),
           "endfaces": (endfaces, ("ok", "dent", "proud")),
           "box_lid": (box_lid, ("ok", "ajar", "missing")),
           "plate": (plate, ("ok", "bump", "burr"))}

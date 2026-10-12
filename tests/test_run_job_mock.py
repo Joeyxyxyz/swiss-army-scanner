@@ -27,7 +27,9 @@ RESULT_KEYS = {"schema_version", "run_id", "run_folder", "mode", "station",
                "disposition", "pull_reasons",
                "warnings", "outputs", "software", "started", "finished",
                # schema 0.2: recipe jobs fill these; null / [] for the other job types
-               "recipe", "zones", "feedback"}
+               "recipe", "zones", "feedback",
+               # schema 0.4: the work states (a single job: one implicit work state "run")
+               "station_config", "profile", "steps", "permissions", "cycle"}
 
 
 def _station(tmp_path, name="cfg.json", **over) -> Path:
@@ -121,7 +123,11 @@ def test_run_folders_are_new_and_files_never_overwritten(tmp_path):
         RJ.RunLog(run_dir / "run.log.jsonl", run_id)
     res = RJ.empty_result(cfg, run_id, str(run_dir), True, False)
     assert set(res) == RESULT_KEYS and res["result"] == "INVALID"
-    assert res["schema_version"] == "0.3" and res["zones"] == [] and res["recipe"] is None
+    assert res["schema_version"] == "0.4" and res["zones"] == [] and res["recipe"] is None
+    # a single job: the configuration's one implicit profile; its work state is filled in
+    # when the result is written
+    assert res["station_config"] == cfg.source.name and res["profile"] == "default"
+    assert res["steps"] == [] and res["permissions"] == {} and res["cycle"] is None
     with pytest.raises(ValueError):
         RJ.write_result(run_dir, {**res, "result": "MAYBE"})
     RJ.write_result(run_dir, res)

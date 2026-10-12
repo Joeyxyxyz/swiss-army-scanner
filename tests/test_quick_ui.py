@@ -1,9 +1,10 @@
 """Operator page (/quick) + the command bus over HTTP, in MOCK mode: the page and its
-links, the work states (station configs), START -> a PASS run, ABORT mid-run -> ABORTED,
+links, the station configurations, START -> a PASS run, ABORT mid-run -> ABORTED,
 HOME -> the rig check (reference, OK, a simulated nudge -> MOVED -> FAULT), and the
 gateway rules (TRIGGER only when armed, HOME refused while running). The bus plumbing
-tests (every bus job reports back, strict confirmation, ABORT in any state, stable work
-states) drive fake station runs / rig checks instead of captures; the page logic runs in
+tests (every bus job reports back, strict confirmation, ABORT in any state, stable
+configuration numbers) drive fake station runs / rig checks instead of captures; the page
+logic runs in
 node on the real quick.js with a tiny fake DOM."""
 
 import json
@@ -111,7 +112,7 @@ def test_quick_page_is_served_and_linked(quick):
         assert r.returncode == 0, r.stderr
 
 
-def test_work_states_are_the_station_configs(quick):
+def test_station_configurations_are_listed(quick):
     c, _ = quick
     _, d = c.get("/api/stations")
     by = {s["config"]: s for s in d["stations"]}
@@ -120,13 +121,13 @@ def test_work_states_are_the_station_configs(quick):
     _, b = c.get("/api/cmd/state")
     # every config keeps its number (an invalid one is listed and marked unusable, so it
     # never shifts the others); the first usable one is selected at start-up
-    assert b["workstates"] == ["broken.json", "flat_check.json"] and b["state"] == "READY"
-    assert b["workstate"] == "flat_check.json" and list(b["unusable"]) == ["broken.json"]
-    status, r = c.post("/api/cmd/workstate", {"workstate": "broken.json"})
+    assert b["station_configs"] == ["broken.json", "flat_check.json"] and b["state"] == "READY"
+    assert b["station_config"] == "flat_check.json" and list(b["unusable"]) == ["broken.json"]
+    status, r = c.post("/api/cmd/config", {"config": "broken.json"})
     assert status == 409 and not r["accepted"] and "not usable" in r["message"]
-    assert c.post("/api/cmd/workstate", {"workstate": 1})[0] == 409
-    status, r = c.post("/api/cmd/workstate", {"workstate": 2})
-    assert status == 200 and r["bus"]["workstate"] == "flat_check.json"
+    assert c.post("/api/cmd/config", {"config": 1})[0] == 409
+    status, r = c.post("/api/cmd/config", {"config": 2})
+    assert status == 200 and r["bus"]["station_config"] == "flat_check.json"
     assert c.post("/api/cmd/teleport", {})[0] == 404
 
 
@@ -195,7 +196,7 @@ def test_trigger_needs_arm(quick):
     assert c.post("/api/cmd/trigger", {})[0] == 409
     status, r = c.post("/api/cmd/arm", {})
     assert status == 200 and r["bus"]["state"] == "ARMED"
-    status, r = c.post("/api/cmd/workstate", {"workstate": "flat_check.json"})   # the same one
+    status, r = c.post("/api/cmd/config", {"config": "flat_check.json"})   # the same one
     assert status == 200 and r["bus"]["state"] == "ARMED"
     status, r = c.post("/api/cmd/disarm", {})
     assert status == 200 and r["bus"]["state"] == "READY"
@@ -283,7 +284,7 @@ class FakeRig:
 
 @pytest.fixture
 def station(tmp_path):
-    """A fresh MOCK server with three work states a / b / c and a FakeRig."""
+    """A fresh MOCK server with three station configurations a / b / c and a FakeRig."""
     stations = tmp_path / "stations"
     stations.mkdir()
     doc = json.loads((ROOT / "stations" / "example_metric_check.json").read_text())
@@ -380,6 +381,40 @@ def test_bus_jobs_are_registered_before_the_worker_can_see_them(station):
     _wait_state(c, {"READY"}, 30)
     assert seen == [("run_station", True), ("rig_check", True)]
     assert not any(h[2] == "JOB_LOST" for h in app.bus.history)
+
+
+def test_reset_and_a_good_home_clear_alarm_over_http(station):
+    """Seen on the rig's operator page: an INVALID cycle (PULL + ALARM), ABORT during HOME ->
+    FAULT, RESET, HOME OK -> READY with the ALARM output still on. RESET clears ALARM; the
+    stale PULL (and its code) stays until the next cycle; PASS never shows."""
+    c, app, _, fake = station
+    fake.fail_run = "no stereo calibration at this geometry"
+    assert c.post("/api/cmd/start", {})[0] == 200
+    b = _wait_state(c, {"READY"}, 30)
+    assert b["last_result"] == "INVALID" and b["signals"]["ALARM"] and b["signals"]["PULL"]
+    fake.fail_run = None
+    _, r = c.post("/api/cmd/home", {})                  # the rig check, aborted while running
+    jid = _jid(r, "home")
+    _until(lambda: _status(c, jid) == "running")
+    assert c.post("/api/cmd/abort", {})[0] == 200
+    b = _wait_state(c, {"FAULT"}, 30)
+    assert b["signals"]["ALARM"] and not b["signals"]["READY"]
+    status, r = c.post("/api/cmd/reset", {})
+    assert status == 200 and "PULL output stays" in r["message"]
+    b = r["bus"]
+    assert b["state"] == "READY" and not b["signals"]["ALARM"] and b["signals"]["READY"]
+    assert b["signals"]["PULL"] and not b["signals"]["PASS"] and b["alarm_acknowledged"]
+    assert b["registers"]["result_code"] == 3           # the stale INVALID code, documented
+    fake.gate.set()
+    _, r = c.post("/api/cmd/home", {})
+    assert _job(c, _jid(r, "home"))["result"]["status"] == "OK"
+    b = _wait_state(c, {"READY"}, 30)
+    assert not b["signals"]["ALARM"] and b["signals"]["PULL"] and not b["signals"]["PASS"]
+    assert c.post("/api/cmd/reset", {})[0] == 409       # nothing left to acknowledge
+    _, r = c.post("/api/cmd/start", {})                 # the next cycle: a clean PASS
+    assert _job(c, _jid(r, "run"))["result"]["result"] == "PASS"
+    b = _wait_state(c, {"READY"}, 30)
+    assert b["signals"]["PASS"] and not b["signals"]["ALARM"] and not b["signals"]["PULL"]
 
 
 def _start_held_abort(c, app, fake, home=None):
@@ -506,32 +541,32 @@ def test_abort_when_idle_stops_direct_runs_the_verdict_and_the_live_view(station
     assert _job(c, run["id"])["result"]["result"] == "ABORTED"
 
 
-def test_station_list_refresh_never_switches_the_selected_work_state(station):
-    """GET /api/stations (any page load) used to replace an invalid selected work state with
+def test_station_list_refresh_never_switches_the_selected_configuration(station):
+    """GET /api/stations (any page load) used to replace an invalid selected configuration with
     the first valid one - without loading its preset, while ARMED with the operator's
-    confirmation - and renumbered the rest, so a PLC's 'work state 2' became another file."""
+    confirmation - and renumbered the rest, so a PLC's 'configuration 2' became another file."""
     c, app, stations, fake = station
     app.bus.require_confirmation = True
     _, b = c.get("/api/cmd/state")
-    assert b["workstates"] == ["a.json", "b.json", "c.json"] and b["workstate"] == "a.json"
-    assert c.post("/api/cmd/workstate", {"workstate": 2})[1]["bus"]["workstate"] == "b.json"
+    assert b["station_configs"] == ["a.json", "b.json", "c.json"] and b["station_config"] == "a.json"
+    assert c.post("/api/cmd/config", {"config": 2})[1]["bus"]["station_config"] == "b.json"
     assert c.post("/api/cmd/arm", {"operator_confirmed": True})[0] == 200
     good = (stations / "b.json").read_text()
     (stations / "b.json").write_text("{ broken")      # mid-save in an editor, say
     assert c.get("/api/stations")[0] == 200
     b = c.get("/api/cmd/state")[1]
-    assert b["state"] == "READY" and b["workstate"] == "b.json" and "b.json" in b["unusable"]
-    assert b["workstates"] == ["a.json", "b.json", "c.json"] and b["registers"]["workstate"] == 2
+    assert b["state"] == "READY" and b["station_config"] == "b.json" and "b.json" in b["unusable"]
+    assert b["station_configs"] == ["a.json", "b.json", "c.json"] and b["registers"]["station_config"] == 2
     assert not app.bus.armed_confirmed
     assert c.post("/api/cmd/trigger", {})[0] == 409
     status, r = c.post("/api/cmd/start", {"operator_confirmed": True})
     assert status == 409 and "not usable" in r["message"], r
     assert r["bus"]["last_result"] == "INVALID" and r["bus"]["signals"]["ALARM"]
-    assert c.post("/api/cmd/workstate", {"workstate": 2})[0] == 409
-    assert c.post("/api/cmd/workstate", {"workstate": 3})[1]["bus"]["workstate"] == "c.json"
+    assert c.post("/api/cmd/config", {"config": 2})[0] == 409
+    assert c.post("/api/cmd/config", {"config": 3})[1]["bus"]["station_config"] == "c.json"
     (stations / "b.json").write_text(good)
     c.get("/api/stations")
-    assert c.post("/api/cmd/workstate", {"workstate": 2})[1]["bus"]["workstate"] == "b.json"
+    assert c.post("/api/cmd/config", {"config": 2})[1]["bus"]["station_config"] == "b.json"
     assert fake.runs == []
     # while a cycle runs the list and its numbers stay as they are
     _, r = c.post("/api/cmd/start", {"operator_confirmed": True})
@@ -540,32 +575,32 @@ def test_station_list_refresh_never_switches_the_selected_work_state(station):
     (stations / "d.json").write_text(good)
     c.get("/api/stations")
     b = c.get("/api/cmd/state")[1]
-    assert b["state"] == "RUNNING" and b["workstate"] == "b.json"
-    assert b["workstates"] == ["a.json", "b.json", "c.json"] and b["registers"]["workstate"] == 2
+    assert b["state"] == "RUNNING" and b["station_config"] == "b.json"
+    assert b["station_configs"] == ["a.json", "b.json", "c.json"] and b["registers"]["station_config"] == 2
     fake.gate.set()
     _wait_state(c, {"READY"}, 30)
     c.get("/api/stations")                             # idle again: the new list
     b = c.get("/api/cmd/state")[1]
-    assert b["workstates"] == ["b.json", "c.json", "d.json"] and b["workstate"] == "b.json"
+    assert b["station_configs"] == ["b.json", "c.json", "d.json"] and b["station_config"] == "b.json"
     assert fake.runs == [{"config": "b.json", "operator_confirmed": True}]
 
 
-def test_changing_the_work_state_while_armed_disarms(station):
-    """The real rig's ARM confirmation used to carry over a work-state change: TRIGGER then
-    ran the new work state with nobody confirming its setup."""
+def test_changing_the_station_configuration_while_armed_disarms(station):
+    """The real rig's ARM confirmation used to carry over a configuration change: TRIGGER then
+    ran the new configuration with nobody confirming its setup."""
     c, app, _, fake = station
     app.bus.require_confirmation = True
     assert c.post("/api/cmd/arm", {"operator_confirmed": True})[0] == 200
-    status, r = c.post("/api/cmd/workstate", {"workstate": "b.json", "source": "plc"})
+    status, r = c.post("/api/cmd/config", {"config": "b.json", "source": "plc"})
     assert status == 200 and "disarmed" in r["message"]
     assert r["bus"]["state"] == "READY" and not app.bus.armed_confirmed
     assert c.post("/api/cmd/trigger", {"source": "plc"})[0] == 409
     assert c.post("/api/cmd/start", {})[0] == 409            # unconfirmed
-    # START / TRIGGER / ARM naming the work state the page shows: refused on a mismatch
-    status, r = c.post("/api/cmd/start", {"operator_confirmed": True, "workstate": "a.json"})
+    # START / TRIGGER / ARM naming the configuration the page shows: refused on a mismatch
+    status, r = c.post("/api/cmd/start", {"operator_confirmed": True, "config": "a.json"})
     assert status == 409 and "b.json" in r["message"] and fake.runs == []
     fake.gate.set()
-    status, r = c.post("/api/cmd/start", {"operator_confirmed": True, "workstate": "b.json"})
+    status, r = c.post("/api/cmd/start", {"operator_confirmed": True, "config": "b.json"})
     assert status == 200
     _wait_state(c, {"READY"}, 30)
     assert fake.runs == [{"config": "b.json", "operator_confirmed": True}]
@@ -686,7 +721,7 @@ const sent = [];
 const stations = (names) => names.map((n) => ({ config: n, station_id: n.replace('.json', ''),
   part_label: 'part ' + n, job_type: 'metric', preset: null }));
 const srv = { stations: stations(['a.json', 'b.json']), refuse: false,
-  bus: { state: 'READY', workstate: 'a.json', workstates: ['a.json', 'b.json'], unusable: {},
+  bus: { state: 'READY', station_config: 'a.json', station_configs: ['a.json', 'b.json'], unusable: {},
          signals: {}, jobs: {}, active_preset: 'loaded_p', run_preset: 'loaded_p' } };
 const sandbox = {
   console, setTimeout, clearTimeout, setInterval, clearInterval,
@@ -728,23 +763,23 @@ const key = (k, target) => {
   run('refreshButtons()');
   out.confirmedStart = el('qStart').disabled;
   // a PLC selects b.json: the page follows it and the confirmation (for a.json) is cleared
-  srv.bus = { ...srv.bus, workstate: 'b.json', run_preset: 'b_preset' };
+  srv.bus = { ...srv.bus, station_config: 'b.json', run_preset: 'b_preset' };
   await run('pollOnce()');
   out.afterPlc = { shown: el('qStation').value, confirm: el('qConfirm').checked,
                    start: el('qStart').disabled, info: el('qStationInfo').textContent,
                    preset: el('qPreset').textContent, loaded: el('qPresetLoaded').textContent };
-  // START sends the work state it shows
+  // START sends the station configuration it shows
   el('qConfirm').checked = true;
   run('refreshButtons()');
   await run("send('start')");
   out.startBody = sentTo('/api/cmd/start').pop().body;
-  // a refused select puts the bus's work state back in the selector
+  // a refused select puts the bus's configuration back in the selector
   srv.refuse = true;
   el('qStation').value = 'a.json';
-  await run("selectWorkstate('a.json')");
+  await run("selectConfig('a.json')");
   out.refused = { shown: el('qStation').value, reason: el('qReason').textContent };
   srv.refuse = false;
-  // the bus marks the shown work state unusable: START off, the reason shown
+  // the bus marks the shown configuration unusable: START off, the reason shown
   srv.bus = { ...srv.bus, unusable: { 'b.json': 'config invalid' } };
   await run('pollOnce()');
   out.unusable = { start: el('qStart').disabled, arm: el('qArm').disabled,
@@ -752,7 +787,7 @@ const key = (k, target) => {
   srv.bus = { ...srv.bus, unusable: {} };
   // a config added while idle: the list is re-read
   srv.stations = stations(['a.json', 'b.json', 'c.json']);
-  srv.bus = { ...srv.bus, workstates: ['a.json', 'b.json', 'c.json'] };
+  srv.bus = { ...srv.bus, station_configs: ['a.json', 'b.json', 'c.json'] };
   await run('pollOnce()');
   out.options = el('qStation').options.map((o) => o.value);
   out.shownAfterReload = el('qStation').value;
@@ -774,11 +809,11 @@ const key = (k, target) => {
 """
 
 
-def test_quick_js_follows_the_bus_work_state_and_leaves_focused_buttons_alone(tmp_path):
+def test_quick_js_follows_the_bus_configuration_and_leaves_focused_buttons_alone(tmp_path):
     """Regressions on the real quick.js (node, fake DOM):
-    - the work-state selector follows the bus (a PLC / another client changed it), clears
-      the operator's confirmation on a change, and START names the work state it shows;
-      a refused select shows the bus's work state again; the preset shown is the one the
+    - the station-configuration selector follows the bus (a PLC / another client changed it),
+      clears the operator's confirmation on a change, and START names the configuration it
+      shows; a refused select shows the bus's configuration again; the preset shown is the one the
       run uses (run_preset);
     - Space / Enter on a focused button, summary or link press that control: they used to
       be swallowed (a keyboard ABORT during a run) or start a cycle."""
@@ -797,7 +832,7 @@ def test_quick_js_follows_the_bus_work_state_and_leaves_focused_buttons_alone(tm
     assert a["shown"] == "b.json" and a["confirm"] is False and a["start"] is True, a
     assert "part b.json" in a["info"] and a["preset"] == "b_preset" and "loaded_p" in a["loaded"]
     assert out["startBody"] == {"source": "quick", "operator_confirmed": True,
-                                "workstate": "b.json"}
+                                "config": "b.json"}
     assert out["refused"]["shown"] == "b.json" and "refused" in out["refused"]["reason"]
     u = out["unusable"]
     assert u["start"] is True and u["arm"] is True and "config invalid" in u["info"], u

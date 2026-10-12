@@ -1,11 +1,17 @@
 // Operator page (/quick). Every button and key sends one command to the station command bus
 // (POST /api/cmd/<name>, engine/control/commands.py), the same path a PLC / HMI gateway uses;
 // the page then follows the bus state and the job it started. No inline handlers (CSP).
+//
+// Words: the STATION CONFIGURATION (stations/*.json) is what the station knows: its parameters
+// and the PROFILE LIBRARY SET it can call on (long tube / short tube). The PROFILE selector
+// picks the part variant. The WORK STATES are the steps of the configuration's flow: what the
+// line's sensor says, what the DLP says, and the permission that lets the line continue.
 'use strict';
 
 const $ = (sel) => document.querySelector(sel);
 const state = { setupBusy: false, mode: null, stations: [], bus: null, runJobId: null, homeJobId: null,
-  shownRun: null, shownHome: null, shownWorkstate: null, loadingStations: false, lampDisp: null };
+  shownRun: null, shownHome: null, shownConfig: null, shownProfile: null, loadingStations: false,
+  lampDisp: null, flowKey: null, mockKey: null, profileKey: null, cycleKey: null, resultShown: false };
 
 async function api(method, path, body) {
   const opt = { method, headers: {} };
@@ -27,9 +33,39 @@ function lamp(text, cls, disp) {
   state.lampDisp = disp || null;
 }
 
+function notice(text) {
+  // the last command the bus refused (or what an accepted one changed): it stays until the
+  // next command is accepted - the polls never overwrite it
+  const el = $('#qNotice');
+  el.textContent = text || '';
+  el.hidden = !text;
+}
+
+function clearChecks() {
+  // nothing of an earlier DLP check stays on the panel (its zones, its picture, what was painted)
+  $('#qFeedback').textContent = '';
+  $('#qZoneList').textContent = '';
+  $('#qZoneList').hidden = true;
+  $('#qFeedbackLink').hidden = true;
+  $('#qPreview').hidden = true;
+}
+
+function clearResult() {
+  // the bus has forgotten the last cycle: neither the lamp nor the panel keeps it
+  for (const id of ['#qVerdict', '#qDisposition', '#qNumber', '#qTime', '#qRunId']) $(id).textContent = '-';
+  $('#qReason').textContent = '';
+  $('#qPull').textContent = '';
+  $('#qPull').hidden = true;
+  $('#qResultLink').hidden = true;
+  clearChecks();
+  steps('', '', '');
+  state.resultShown = false;
+  state.cycleKey = null;
+}
+
 // Dispositions (engine/disposition.py): CONTINUE / REJECT / PULL (quality inspection). A run
 // without a disposition (one that never wrote its result) is a doubt: PULL, never a pass.
-const PULL_TEXT = 'PULL \u2013 quality inspection';
+const PULL_TEXT = 'PULL – quality inspection';
 const DISPOSITIONS = ['CONTINUE', 'REJECT', 'PULL'];
 
 function dispositionOf(job) {
@@ -40,19 +76,22 @@ function dispositionOf(job) {
   return d;
 }
 
+function reasonText(p) {
+  const where = [p.step, p.zone, p.check].filter(Boolean).join('/');
+  return `${where ? where + ': ' : ''}${p.reason}${p.message ? ' (' + p.message + ')' : ''}`;
+}
+
 function pullReasons(job, verdict) {
   // the reasons a PULL names (result.json pull_reasons), else why the run has no result
   const r = job.result || {};
-  const out = (r.pull_reasons || []).map((p) => {
-    const where = [p.zone, p.check].filter(Boolean).join('/');
-    return `${where ? where + ': ' : ''}${p.reason}${p.message ? ' (' + p.message + ')' : ''}`;
-  });
+  const out = (r.pull_reasons || []).map(reasonText);
   if (!out.length) out.push(job.error || r.invalid_reason || `result ${verdict}`);
   return out;
 }
 
 function showDisposition(job, verdict) {
   const d = dispositionOf(job);
+  state.resultShown = true;
   if (d === 'CONTINUE') lamp(verdict, 'pass', d);
   else if (d === 'REJECT') lamp(verdict === 'FAIL' ? 'FAIL' : 'REJECT', 'fail', d);
   else lamp(PULL_TEXT, 'pull', d);
@@ -64,9 +103,15 @@ function showDisposition(job, verdict) {
   return d;
 }
 
+// The cycle of a flow (the bus walks its work states): null for none / a single-job config.
+function flowCycle(b) {
+  const c = b && b.cycle;
+  return c && !c.legacy ? c : null;
+}
+
 // The lamp reads the same signals as the line (the station bus, engine/control/commands.py):
 // whatever a run's job says, the lamp never shows a PASS the bus does not give - an ABORT
-// after the run's verdict, a START refused on an unusable work state, a crashed job, ...
+// after the run's verdict, a START refused on an unusable configuration, a crashed job, ...
 // The bus's disposition of the last cycle, while it is idle (null: none, or busy / FAULT).
 function busDisposition(b) {
   if (!b || !(b.state === 'READY' || b.state === 'ARMED') || !b.last_result) return null;
@@ -74,16 +119,31 @@ function busDisposition(b) {
 }
 
 function busWhy(b) {
-  // why the bus says so: the refused START / TRIGGER that set it, else its last result
+  // why the bus says so: the refused START / TRIGGER that set it, the cycle's own pull
+  // reasons (which work state, what), else its last result
   const h = (b.history || [])[(b.history || []).length - 1];
   if (h && !h[3] && (h[2] === 'START' || h[2] === 'TRIGGER') && h[4]) return `${h[2]} refused: ${h[4]}`;
+  const c = flowCycle(b);
+  if (c && !c.active && (c.pull_reasons || []).length) return c.pull_reasons.map(reasonText).join(' | ');
   return `station: result ${b.last_result}`
     + (b.last_result === 'ABORTED' ? ' (ABORT pressed before the cycle ended)' : '');
 }
 
 function applyBus(b) {
   const d = busDisposition(b);
-  if (d === null || d === state.lampDisp) return;
+  if (d === null) {
+    // idle with no result and no cycle: the bus has forgotten the last one (another profile or
+    // configuration, HOME, ARM, a START / TRIGGER that started nothing). The lamp and the
+    // panel never keep a PASS the outputs no longer give.
+    const idle = b && (b.state === 'READY' || b.state === 'ARMED');
+    if (idle && !b.last_result && !b.cycle && state.resultShown) {
+      lamp(b.state, 'ready');
+      clearResult();
+    }
+    return;
+  }
+  state.resultShown = true;
+  if (d === state.lampDisp) return;
   if (d === 'CONTINUE') {
     // a PASS only when the PASS output is on and the lamp shows no run of its own
     if (state.lampDisp !== null || !(b.signals && b.signals.PASS)) return;
@@ -110,10 +170,12 @@ function refreshButtons() {
   const idle = s === 'READY' || s === 'ARMED';
   const shown = $('#qStation').value;
   const st = state.stations.find((x) => x.config === shown);
+  const c = flowCycle(b);
   // usable = valid when listed, not marked unusable by the bus since, and the one the bus
   // runs (START never runs anything but what this page shows)
   const usable = st && !st.error && !(b.unusable && b.unusable[shown])
-    && (!state.bus || b.workstate === shown);
+    && (!state.bus || b.station_config === shown);
+  const waitStep = s === 'WAITING' && c && c.waiting === 'step';
   $('#qConfirmRow').hidden = state.mode !== 'real';
   $('#qStart').disabled = !idle || !usable || !confirmed();
   $('#qAbort').disabled = false;                       // ABORT is never disabled
@@ -121,8 +183,12 @@ function refreshButtons() {
   $('#qArm').disabled = s === 'ARMED' ? false : (s !== 'READY' || !usable || !confirmed());   // DISARM: always
   $('#qArm').textContent = s === 'ARMED' ? 'DISARM' : 'ARM';
   $('#qArm').classList.toggle('on', s === 'ARMED');
-  $('#qTrigger').disabled = s !== 'ARMED';
+  $('#qTrigger').disabled = !(s === 'ARMED' || waitStep);
+  $('#qStep').disabled = !waitStep;
+  $('#qStep').classList.toggle('on', !!waitStep);
+  $('#qAck').disabled = !(s === 'WAITING' && b.prompt);
   $('#qStation').disabled = !(idle || s === 'FAULT');
+  $('#qProfile').disabled = !(idle || s === 'FAULT');
   $('#qBusState').textContent = s;
   for (const id of ['#qGrid', '#qZones', '#qLive', '#qSignal']) {
     $(id).disabled = !(idle || s === 'FAULT') || state.setupBusy;       // setup only when idle
@@ -137,11 +203,15 @@ function showStation() {
   const st = state.stations.find((s) => s.config === shown);
   const bad = state.bus && state.bus.unusable && state.bus.unusable[shown];
   let txt = '';
-  if (state.bus && state.bus.workstate && !st) txt = `Not usable: ${state.bus.workstate} is not in the station list`;
+  if (state.bus && state.bus.station_config && !st) txt = `Not usable: ${state.bus.station_config} is not in the station list`;
   else if (st && st.error) txt = `Not usable: ${st.error}`;
   else if (bad) txt = `Not usable: ${bad}`;
-  else if (st && st.job_type === 'recipe') {
-    // a recipe work state: zones + the checks recognised there; the recipe pins its preset
+  else if (st && st.job_type === 'flow') {
+    // a configuration with a profile library set and a flow of work states
+    txt = `${st.station_id}: ${(st.profiles || []).length} profile(s) (${(st.profiles || []).map((p) => p.name).join(', ')}), `
+      + `${(st.flow || []).length} work state(s)` + (st.description ? ` - ${st.description}` : '');
+  } else if (st && st.job_type === 'recipe') {
+    // a single-job configuration verified by a recipe: zones + the checks recognised there
     txt = `recipe ${st.recipe}: zones ${(st.zones || []).join(', ')} (${(st.checks || []).join(', ')})`
       + (st.preset ? `, preset ${st.preset}` : '')
       + (st.feedback ? ', verdict projected on the part' : '');
@@ -156,8 +226,8 @@ function showStation() {
 }
 
 async function fetchStations() {
-  // the work-state list (GET /api/stations also re-reads the configs on the server; the bus
-  // never switches its selected work state because of that)
+  // the station configurations (GET /api/stations also re-reads the files on the server; the
+  // bus never switches its selected configuration or profile because of that)
   state.loadingStations = true;
   try {
     const d = await api('GET', '/api/stations');
@@ -171,7 +241,9 @@ async function fetchStations() {
     state.stations.forEach((s, i) => {
       const o = document.createElement('option');
       o.value = s.config;
-      o.textContent = `${i + 1}: ` + (s.error ? `${s.config} (invalid)` : `${s.station_id} - ${s.part_label}`);
+      o.textContent = `${i + 1}: ` + (s.error ? `${s.config} (invalid)`
+        : (s.job_type === 'flow' ? `${s.station_id} - ${(s.flow || []).length} work states`
+          : `${s.station_id} - ${s.part_label}`));
       sel.appendChild(o);
     });
   } finally {
@@ -181,7 +253,7 @@ async function fetchStations() {
 
 function stationListChanged(b) {
   const names = state.stations.map((s) => s.config);
-  return JSON.stringify(b.workstates || []) !== JSON.stringify(names);
+  return JSON.stringify(b.station_configs || []) !== JSON.stringify(names);
 }
 
 async function loadStations() {
@@ -189,36 +261,280 @@ async function loadStations() {
   await pollOnce();
 }
 
-function syncWorkstate(b) {
-  // the selector always shows the bus's work state (a PLC, another page or a key may have
-  // changed it): what the operator confirms and what START runs are the same work state.
-  // A change of work state clears the confirmation (it was for the other one).
+function syncProfile(b) {
+  // the profile selector lists the selected configuration's profile library set and always
+  // shows the bus's active profile
+  const sel = $('#qProfile');
+  const profs = b.profiles || [];
+  const key = JSON.stringify(profs.map((p) => [p.name, p.title]));
+  if (key !== state.profileKey) {
+    state.profileKey = key;
+    sel.textContent = '';
+    profs.forEach((p, i) => {
+      const o = document.createElement('option');
+      o.value = p.name;
+      o.textContent = `${i + 1}: ${p.title || p.name}`;
+      sel.appendChild(o);
+    });
+  }
+  const want = b.profile || '';
+  if (sel.value !== want) sel.value = want;
+}
+
+function syncConfig(b) {
+  // the selectors always show the bus's station configuration and profile (a PLC, another
+  // page or a key may have changed them): what the operator confirms and what START runs are
+  // the same. A change of either clears the confirmation (it was for the other one).
   const sel = $('#qStation');
-  const ws = b.workstate || '';
-  if (sel.value !== ws) sel.value = ws;          // a work state missing from the list shows blank
-  if (ws !== state.shownWorkstate) {
-    if (state.shownWorkstate !== null) $('#qConfirm').checked = false;
-    state.shownWorkstate = ws;
+  const cfg = b.station_config || '';
+  if (sel.value !== cfg) sel.value = cfg;        // a configuration missing from the list shows blank
+  syncProfile(b);
+  const prof = b.profile || '';
+  if (cfg !== state.shownConfig || prof !== state.shownProfile) {
+    if (state.shownConfig !== null) $('#qConfirm').checked = false;
+    state.shownConfig = cfg;
+    state.shownProfile = prof;
   }
   showStation();                                 // its info, usability and the buttons
+}
+
+// ---- work states: the steps of the selected configuration's flow
+
+const OUTCOME_TEXT = { PENDING: '', CONFIRMED: 'CONFIRMED', CORRECTED: 'CORRECTED',
+  NOT_MET: 'NOT MET', DEFECT: 'DEFECT', DOUBT: 'DOUBT', SKIPPED: 'SKIPPED', ABORTED: 'ABORTED' };
+
+function sayBool(v) { return v === true ? 'true' : (v === false ? 'false' : 'unknown'); }
+
+function chip(cls, label, value, extra) {
+  const el = document.createElement('span');
+  el.className = `qchip ${cls}`;
+  const k = document.createElement('i');
+  k.textContent = label;
+  const v = document.createElement('b');
+  v.textContent = value;
+  el.appendChild(k);
+  el.appendChild(v);
+  if (extra) Object.assign(el.dataset, extra);
+  return el;
+}
+
+function flowRows(b) {
+  // the open (or last) cycle's work states when it belongs to what is selected now, else
+  // the flow as the configuration defines it (nothing verified yet)
+  const c = b.cycle;
+  if (c && (c.steps || []).length && c.profile === b.profile
+      && (!c.station_config || c.station_config === b.station_config)) {
+    return c.steps.map((r) => ({ ...r, live: !!c.active && r.index === c.index }));
+  }
+  return (b.flow || []).map((s) => ({ ...s, outcome: 'PENDING', sensor_inputs: {}, observed: {},
+    permission_granted: false, actions: [], message: '', live: false }));
+}
+
+function renderFlow(b) {
+  const rows = flowRows(b);
+  const inputs = b.inputs || {};
+  const perms = b.permissions || {};
+  // MOCK: what the simulated line's sensors say (reported for every cycle); a claim the bus
+  // holds now wins. A claim belongs to one cycle: between cycles a real line's are unknown.
+  const sim = (state.mode === 'mock' && b.mock && b.mock.inputs) || {};
+  const says = (s) => (Object.prototype.hasOwnProperty.call(inputs, s) ? inputs[s] : sim[s]);
+  const key = JSON.stringify([rows, inputs, perms, b.state, sim]);
+  if (key === state.flowKey) return;
+  state.flowKey = key;
+  const ol = $('#qFlow');
+  ol.textContent = '';
+  for (const r of rows) {
+    const li = document.createElement('li');
+    const o = String(r.outcome || 'PENDING');
+    li.className = `qws o-${o.toLowerCase()}${r.live ? ' current' : ''}`;
+    const head = document.createElement('div');
+    head.className = 'qws-head';
+    const n = document.createElement('span');
+    n.className = 'qws-n';
+    n.textContent = String(r.index);
+    const t = document.createElement('b');
+    t.textContent = r.title || r.id;
+    const out = document.createElement('span');
+    out.className = 'qws-out';
+    out.textContent = r.live && o === 'PENDING'
+      ? (b.state === 'RUNNING' ? 'VERIFYING' : 'waits for STEP') : (OUTCOME_TEXT[o] || o);
+    head.appendChild(n);
+    head.appendChild(t);
+    head.appendChild(out);
+    li.appendChild(head);
+    const chips = document.createElement('div');
+    chips.className = 'qchips';
+    const expects = r.expects || {};
+    const names = Object.keys(expects);
+    const verified = o !== 'PENDING' && o !== 'SKIPPED';
+    if (names.length) {
+      for (const s of names) {
+        // what the sensor said when the scan started; before that, what it says now
+        const said = verified ? (r.sensor_inputs || {})[s] : says(s);
+        const seen = (r.observed || {})[s];
+        const bad = verified && said !== seen;
+        chips.appendChild(chip(`sensor${bad ? ' bad' : ''}`, 'sensor says', `${s} ${sayBool(said)}`));
+        chips.appendChild(chip(`dlp${bad ? ' bad' : ''}`, 'DLP says', verified ? `${s} ${sayBool(seen)}` : '-'));
+      }
+    } else {
+      chips.appendChild(chip('sensor none', 'sensor says', '-'));
+      const d = r.dlp_result || {};
+      chips.appendChild(chip('dlp', 'DLP says', verified ? (d.result || '-') : '-'));
+    }
+    if (r.permit) {
+      const on = perms[r.permit] === true;
+      chips.appendChild(chip(`permit ${on ? 'on' : 'off'}`, 'permission', `${r.permit} ${on ? 'GRANTED' : 'withheld'}`));
+    } else chips.appendChild(chip('permit none', 'permission', '-'));
+    li.appendChild(chips);
+    const acts = (r.actions || []).map((a) => a.action + (a.disposition ? ' ' + a.disposition : '')
+      + (a.action === 'prompt' ? (a.acknowledged ? ' (acknowledged)' : ' (waits for ACK)') : '')).join(' → ');
+    // why a CONFIRMED work state's permission is not (or no longer) granted
+    const note = r.permit && r.permission_note ? `${r.permit} ${r.permission_note}` : '';
+    const msg = [r.message, note, acts].filter(Boolean).join(' | ');
+    if (msg) {
+      const m = document.createElement('div');
+      m.className = 'qws-msg small';
+      m.textContent = msg;
+      li.appendChild(m);
+    }
+    ol.appendChild(li);
+  }
+  // the line's sensor claims (POST /api/io/inputs); MOCK: click one to toggle the simulated sensor
+  const box = $('#qInputs');
+  box.textContent = '';
+  const sigs = b.signal_names || [];
+  for (const s of sigs) {
+    box.appendChild(chip(`sensor${state.mode === 'mock' ? ' toggle' : ''}`, s, sayBool(says(s)),
+      { signal: s, value: String(says(s) === true) }));
+  }
+  if (!sigs.length) box.appendChild(chip('sensor none', 'none', 'this flow expects no sensor'));
+  // the permissions as the line reads them (PERMIT_<NAME> outputs)
+  const pbox = $('#qPermits');
+  pbox.textContent = '';
+  for (const name of Object.keys(perms)) {
+    const el = document.createElement('span');
+    el.textContent = `PERMIT_${name}`;
+    el.className = perms[name] === true ? 'on' : '';
+    el.dataset.sig = `PERMIT_${name}`;
+    pbox.appendChild(el);
+  }
+}
+
+function renderPrompt(b) {
+  const p = b.prompt || null;
+  $('#qPrompt').hidden = !p;
+  $('#qPromptTitle').textContent = p ? `${p.index}. ${p.title}:` : '';
+  $('#qPromptMsg').textContent = p ? p.message : '';
+  $('#qPromptDetail').textContent = p ? [p.outcome, p.detail].filter(Boolean).join(' - ') : '';
+}
+
+function renderMock(b) {
+  // MOCK only: the simulated line (what the simulated human places, what the sensors say)
+  const m = b.mock || null;
+  $('#qMock').hidden = !m || !(m.cases || []).length;
+  if (!m) return;
+  const key = JSON.stringify([m.cases, m.case, m.scene]);
+  if (key === state.mockKey) return;
+  state.mockKey = key;
+  const sel = $('#qMockCase');
+  sel.textContent = '';
+  const first = document.createElement('option');
+  first.value = '';
+  first.textContent = m.scene ? `scene ${m.scene}` : '(default case)';
+  sel.appendChild(first);
+  for (const c of m.cases || []) {
+    const o = document.createElement('option');
+    o.value = c.name;
+    o.textContent = c.name;
+    o.title = c.description || '';
+    sel.appendChild(o);
+  }
+  sel.value = m.case || '';
+}
+
+function showCycle(b) {
+  // a flow's cycle: the lamp shows where it is; its end (PASS / FAIL / PULL) comes from the
+  // bus outputs (applyBus), never from a single work state's own verdict
+  const c = flowCycle(b);
+  if (!c) return false;
+  state.resultShown = true;
+  const ck = c.cycle_id || c.started || '';
+  if (ck !== state.cycleKey) {                   // another cycle: nothing of the last one's checks
+    state.cycleKey = ck;
+    clearChecks();
+  }
+  const n = (c.steps || []).length;
+  const row = (c.steps || [])[c.index - 1] || {};
+  if (c.active) {
+    const at = `${c.index}/${n}`;
+    if (b.state === 'ABORTING') lamp('ABORTING', 'running');
+    else if (b.state === 'RUNNING') lamp(`VERIFYING ${at}`, 'running');
+    else if (c.waiting === 'ack') lamp('ACK NEEDED', 'invalid');
+    else lamp(`STEP ${at}`, 'wait');
+    $('#qDisposition').textContent = '-';
+    $('#qPull').hidden = true;
+  }
+  $('#qVerdict').textContent = c.result || (c.active ? 'cycle open' : '-');
+  if (!c.active && c.disposition) {
+    $('#qDisposition').textContent = c.disposition === 'PULL' ? 'PULL (quality inspection)' : c.disposition;
+  }
+  $('#qNumLabel').textContent = 'Work state';
+  $('#qNumber').textContent = row.id ? `${c.index}/${n} ${row.title || row.id}: ${OUTCOME_TEXT[row.outcome] || 'pending'}` : '-';
+  $('#qTime').textContent = String(c.finished || c.started || '-').replace('T', ' ');
+  $('#qRunId').textContent = c.cycle_id || '-';
+  const k = c.kickout;
+  // how the cycle ended: a kickout action, or the cycle itself (unconfirmed, timeout, abort)
+  $('#qReason').textContent = k
+    ? `${k.by && k.by !== 'kickout' ? `ended ${k.disposition} (${k.by})` : `kickout ${k.disposition}`}: ${k.reason}`
+      + (k.detail && k.detail !== k.reason && !String(k.reason).includes(k.detail) ? ` - ${k.detail}` : '')
+    : (row.message || '');
+  const lc = b.last_cycle;
+  const a = $('#qResultLink');
+  const link = lc && lc.cycle_id === c.cycle_id && lc.links ? lc.links.result_json : null;
+  a.hidden = !link;
+  if (link) a.href = link;
+  return true;
+}
+
+function showStepJob(job) {
+  // the DLP check of one work state: its zones, its picture and the fault image - never the lamp
+  const r = job.result || {};
+  showZones(r, r.disposition);
+  // what was painted on the part is the cycle's project_fault action, not the check's own verdict
+  const c = flowCycle(state.bus) || {};
+  const row = (c.steps || []).find((s) => s.id === (r.job || {}).work_state) || {};
+  const pf = (row.actions || []).find((a) => a.action === 'project_fault');
+  $('#qFeedback').textContent = !pf ? ''
+    : (pf.requested ? 'Fault sent to the projector: painted on the part (the next verify, HOME or ABORT clears it)'
+      : `Not painted: ${pf.why || 'nothing to paint'}`);
+  const links = job.links || {};
+  const fl = $('#qFeedbackLink');
+  fl.hidden = !links.feedback;
+  if (links.feedback) fl.href = links.feedback;
+  const img = $('#qPreview');
+  img.hidden = !links.preview;
+  if (links.preview) img.src = `${links.preview}?t=${Date.now()}`;
 }
 
 async function send(name, extra) {
   const body = { source: 'quick', ...(extra || {}) };
   if (['start', 'trigger', 'arm'].includes(name)) {
     body.operator_confirmed = confirmed();
-    body.workstate = $('#qStation').value;       // refused if the bus has another selected
+    body.config = $('#qStation').value;          // refused if the bus has another selected
+    if ($('#qProfile').value) body.profile = $('#qProfile').value;
   }
   try {
     const r = await api('POST', `/api/cmd/${name}`, body);
     state.bus = r.bus;
     trackJobs(r.jobs);
-    syncWorkstate(r.bus);
+    syncConfig(r.bus);
+    renderCycle(r.bus);
+    notice(r.accepted ? '' : `${r.command}: ${r.message}`);
     if (!r.accepted) {
+      applyBus(r.bus);                           // e.g. a refused START: the bus PULLs, or forgets a PASS
       $('#qReason').textContent = `${r.command}: ${r.message}`;
-      applyBus(r.bus);                           // e.g. a refused START: the bus PULLs
     }
-    else if (name === 'start' || name === 'trigger') {
+    else if ((name === 'start' || name === 'trigger') && !flowCycle(r.bus)) {
       lamp('RUNNING', 'running');
       steps('active', '', '');
       $('#qReason').textContent = '';
@@ -231,6 +547,13 @@ async function send(name, extra) {
     $('#qConn').hidden = false;
   }
   refreshButtons();
+}
+
+function renderCycle(b) {
+  renderFlow(b);
+  renderPrompt(b);
+  renderMock(b);
+  return showCycle(b);
 }
 
 function trackJobs(jobs) {
@@ -246,6 +569,7 @@ function fmtNum(v, unit) {
 
 function showRun(job) {
   const r = job.result || {};
+  state.resultShown = true;
   const verdict = job.status === 'error' ? (/Cancelled/.test(job.error_type || '') ? 'ABORTED' : 'INVALID')
     : (r.result || '-');
   const disp = showDisposition(job, verdict);   // the lamp: PASS / FAIL / PULL (amber)
@@ -321,7 +645,7 @@ function showWarnings(b) {
 }
 
 function showPreset(b) {
-  // the preset START runs: the work state's own, else the loaded one (run_preset)
+  // the preset START runs: the configuration's / profile's own, else the loaded one (run_preset)
   const run = b.run_preset || b.active_preset;
   $('#qPreset').textContent = run || 'none loaded';
   $('#qPresetLoaded').textContent = run && b.active_preset && b.active_preset !== run
@@ -331,18 +655,23 @@ function showPreset(b) {
 async function pollOnce() {
   const b = await api('GET', '/api/cmd/state');
   state.bus = b;
+  if (b.mode) state.mode = b.mode;
   if (!state.loadingStations && (b.state === 'READY' || b.state === 'FAULT') && stationListChanged(b)) {
     await fetchStations();                         // configs added / removed / renamed
   }
-  syncWorkstate(b);
+  syncConfig(b);
   showPreset(b);
   showWarnings(b);
   trackJobs(b.jobs);
+  const inFlow = renderCycle(b);
   if (state.runJobId && state.shownRun !== state.runJobId) {
     const j = await api('GET', `/api/jobs/${state.runJobId}`);
     const ended = j.status === 'done' || j.status === 'error';
-    // a run is shown once the bus has heard it end (an ABORT may still turn it ABORTED)
-    if (j.status === 'running' || (ended && (b.state === 'RUNNING' || b.state === 'ABORTING'))) {
+    if (inFlow) {
+      // one work state's DLP check: its zones and picture; the lamp follows the cycle
+      if (ended) { showStepJob(j); state.shownRun = j.id; }
+    } else if (j.status === 'running' || (ended && (b.state === 'RUNNING' || b.state === 'ABORTING'))) {
+      // a run is shown once the bus has heard it end (an ABORT may still turn it ABORTED)
       lamp('RUNNING', 'running');
       steps('done', 'active', '');
     } else if (ended) { showRun(j); state.shownRun = j.id; }
@@ -401,7 +730,7 @@ async function projectGrid() {
 
 async function showZone() {
   const st = state.stations.find((x) => x.config === $('#qStation').value);
-  if (!st || !st.zone) { $('#qSetupMsg').textContent = 'this work state uses the whole field (no job.zone)'; return; }
+  if (!st || !st.zone) { $('#qSetupMsg').textContent = 'this station configuration uses the whole field (no job.zone)'; return; }
   $('#qSetupMsg').textContent = `zone ${st.zone}: lighting it is a placeholder; use Grid & zones in the advanced UI`;
 }
 
@@ -454,31 +783,96 @@ function onKey(ev) {
   else if (k === 'h' || k === 'H') send('home');
   else if (k === 't' || k === 'T') send('trigger');
   else if (k === 'a' || k === 'A') send(s === 'ARMED' ? 'disarm' : 'arm');
-  else if (/^[1-9]$/.test(k)) selectWorkstate(Number(k));
+  else if (k === 'n' || k === 'N') { if (!$('#qStep').disabled) send('step'); }   // the next work state
+  else if (k === 'k' || k === 'K') { if (!$('#qAck').disabled) send('ack'); }     // acknowledge the prompt
+  else if (k === 'p' || k === 'P') nextProfile();
+  else if (/^[1-9]$/.test(k)) selectConfig(Number(k));
   else handled = false;
   if (handled) ev.preventDefault();
 }
 
-async function selectWorkstate(arg) {
+async function selectConfig(arg) {
   try {
-    const r = await api('POST', '/api/cmd/workstate', { workstate: arg, source: 'quick' });
+    const r = await api('POST', '/api/cmd/config', { config: arg, source: 'quick' });
     state.bus = r.bus;
-    $('#qReason').textContent = r.accepted ? (/disarmed/.test(r.message) ? r.message : '')
-      : `${r.command}: ${r.message}`;
-    syncWorkstate(r.bus);              // accepted or refused: show the bus's work state
+    syncConfig(r.bus);                 // accepted or refused: show the bus's configuration
     showPreset(r.bus);
+    renderCycle(r.bus);
+    applyBus(r.bus);                   // another configuration: the last cycle is forgotten
+    const said = r.accepted ? (/disarmed/.test(r.message) ? r.message : '') : `${r.command}: ${r.message}`;
+    if (said || !flowCycle(r.bus)) $('#qReason').textContent = said;
+    notice(said);                      // (the cycle's own line is redrawn by every poll)
   } catch (e) {
     $('#qConn').hidden = false;
   }
   showStation();
 }
 
+async function selectProfile(arg) {
+  try {
+    const r = await api('POST', '/api/cmd/profile', { profile: arg, source: 'quick' });
+    state.bus = r.bus;
+    syncConfig(r.bus);                 // accepted or refused: show the bus's profile
+    showPreset(r.bus);
+    renderCycle(r.bus);
+    applyBus(r.bus);                   // another profile: the last cycle is forgotten
+    const said = r.accepted ? (/disarmed/.test(r.message) ? r.message : '') : `${r.command}: ${r.message}`;
+    if (said || !flowCycle(r.bus)) $('#qReason').textContent = said;
+    notice(said);
+  } catch (e) {
+    $('#qConn').hidden = false;
+  }
+  refreshButtons();
+}
+
+function nextProfile() {
+  const b = state.bus || {};
+  const names = (b.profiles || []).map((p) => p.name);
+  if (names.length < 2) return;
+  selectProfile(names[(names.indexOf(b.profile) + 1) % names.length]);
+}
+
+async function setInput(signal, value) {
+  // MOCK only: the operator page sets the SIMULATED line's sensor, which reports for every
+  // cycle (the real rig's claims come from the line: POST /api/io/inputs from its gateway,
+  // for every part)
+  if (state.mode !== 'mock') return;
+  try {
+    const r = await api('POST', '/api/mock/case', { inputs: { [signal]: value } });
+    state.bus = r.bus;
+    renderCycle(r.bus);
+  } catch (e) {
+    $('#qFlowMsg').textContent = String(e.message || e);
+  }
+}
+
+async function setMockCase(name) {
+  try {
+    const r = await api('POST', '/api/mock/case', name ? { case: name } : {});
+    state.bus = r.bus;
+    $('#qFlowMsg').textContent = name ? `simulated line: ${name}` : '';
+    renderCycle(r.bus);
+  } catch (e) {
+    $('#qFlowMsg').textContent = String(e.message || e);
+  }
+}
+
+function onInputClick(ev) {
+  const el = ev.target && ev.target.closest ? ev.target.closest('[data-signal]') : null;
+  if (el) setInput(el.dataset.signal, el.dataset.value !== 'true');
+}
+
 document.addEventListener('DOMContentLoaded', () => {
-  $('#qStation').addEventListener('change', () => selectWorkstate($('#qStation').value));
+  $('#qStation').addEventListener('change', () => selectConfig($('#qStation').value));
+  $('#qProfile').addEventListener('change', () => selectProfile($('#qProfile').value));
+  $('#qMockCase').addEventListener('change', () => setMockCase($('#qMockCase').value));
+  $('#qInputs').addEventListener('click', onInputClick);
   $('#qConfirm').addEventListener('change', refreshButtons);
   $('#qStart').addEventListener('click', () => send('start'));
   $('#qAbort').addEventListener('click', () => send('abort'));
   $('#qHome').addEventListener('click', () => send('home'));
+  $('#qStep').addEventListener('click', () => send('step'));
+  $('#qAck').addEventListener('click', () => send('ack'));
   $('#qTrigger').addEventListener('click', () => send('trigger'));
   $('#qArm').addEventListener('click', () => send(state.bus && state.bus.state === 'ARMED' ? 'disarm' : 'arm'));
   $('#qGrid').addEventListener('click', projectGrid);

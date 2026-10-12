@@ -21,6 +21,23 @@ Schema 0.3 (extends 0.2, every key kept, `result` unchanged): `disposition` (CON
 REJECT / PULL: what happens to the part, engine/disposition.py) and `pull_reasons` ([{zone?,
 check?, reason, message}]: every doubt found). write_result never writes a run without a
 disposition, nor a CONTINUE that is not a doubt-free PASS (fail closed).
+
+Schema 0.4 (extends 0.3, every key kept): the work states. `station_config` (the station
+configuration file the run belongs to, else null), `profile` (the active profile of that
+configuration, else null), `steps` (the work states of the cycle, in flow order: id, title,
+expects, sensor_inputs, dlp_result, outcome CONFIRMED / CORRECTED / NOT_MET / DEFECT / DOUBT
+(or SKIPPED / ABORTED / PENDING), sensor_mismatch, permit, permission_granted (it still
+stood when the cycle ended: the same as `permissions`), permission_note (why a CONFIRMED work
+state's permission was withheld or dropped), actions, disposition), `permissions` (name ->
+still granted when the cycle ended) and `cycle` (how a flow's cycle ended: ended_by, kickout
+{step, disposition, reason, detail, by} for every cycle that did not CONTINUE,
+sensor_mismatch (a sensor and the DLP disagreed at any verify, also one put right since),
+sensor_mismatch_open, sensor_mismatches [{step, attempt, signal, sensor, dlp, expected}],
+unconfirmed [{step, outcome, required}]; null for a single job). A single
+job (a station config with one job, a recipe run) is ONE implicit work state "run", whose
+outcome is the job's own disposition (CONTINUE -> CONFIRMED, REJECT -> DEFECT, anything
+else DOUBT). A cycle of a flow (engine/flow/) is CONTINUE only when every required work
+state was CONFIRMED; its `pull_reasons` may carry `step` (the work state they belong to).
 """
 
 from __future__ import annotations
@@ -35,7 +52,7 @@ from typing import Optional
 
 from . import disposition as D
 
-RESULT_SCHEMA_VERSION = "0.3"
+RESULT_SCHEMA_VERSION = "0.4"
 RESULTS = ("PASS", "FAIL", "INVALID", "ABORTED")
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ROOT = Path(__file__).resolve().parents[1]
@@ -112,7 +129,8 @@ def software_info() -> dict:
 
 def empty_result(*, run_id: str, run_folder: str, mock: bool, operator_confirmed: bool,
                  station: str, job: dict, part: dict, threshold_mm: Optional[float] = None,
-                 zone=None) -> dict:
+                 zone=None, station_config: Optional[str] = None,
+                 profile: Optional[str] = None) -> dict:
     """The result skeleton: the same keys every run, filled in as the job goes."""
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -146,10 +164,33 @@ def empty_result(*, run_id: str, run_folder: str, mock: bool, operator_confirmed
         "recipe": None,
         "zones": [],
         "feedback": None,
+        # the work states (schema 0.4): a flow's cycle fills them in; a single job gets its
+        # one implicit work state when the result is written (write_result)
+        "station_config": station_config,
+        "profile": profile,
+        "steps": [],
+        "permissions": {},
+        "cycle": None,
         "software": software_info(),
         "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "finished": None,
     }
+
+
+def implicit_step(result: dict) -> dict:
+    """The one work state of a single job (no flow): its outcome is the job's own
+    disposition - CONTINUE (a doubt-free PASS) is CONFIRMED, REJECT (a definite FAIL) is
+    DEFECT, anything else DOUBT (ABORTED as such). It expects no sensor, grants no
+    permission."""
+    from .flow.cycle import job_outcome
+    job = result.get("job") or {}
+    res, disp = result.get("result"), result.get("disposition")
+    return {"id": "run", "title": f"{job.get('type') or 'single'} job", "index": 1,
+            "required": True, "expects": {}, "sensor_inputs": {},
+            "dlp_result": {"result": res, "disposition": disp, "run_id": result.get("run_id")},
+            "outcome": job_outcome(res, disp), "sensor_mismatch": [], "permit": None,
+            "permission_granted": False, "permission_note": None, "actions": [],
+            "disposition": disp}
 
 
 def write_result(run_dir: Path, result: dict) -> Path:
@@ -159,6 +200,11 @@ def write_result(run_dir: Path, result: dict) -> Path:
     if result.get("result") not in RESULTS:
         raise ValueError(f"result must be one of {RESULTS}")
     D.ensure(result)
+    for key, empty in (("station_config", None), ("profile", None), ("permissions", {}),
+                       ("cycle", None)):
+        result.setdefault(key, empty)
+    if not result.get("steps"):             # a single job: one implicit work state
+        result["steps"] = [implicit_step(result)]
     result["finished"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     out = Path(run_dir) / "result.json"
     with open(out, "x", encoding="utf-8") as f:

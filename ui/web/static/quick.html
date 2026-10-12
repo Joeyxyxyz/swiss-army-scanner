@@ -18,22 +18,44 @@
 </header>
 <div id="qConn" class="banner warn" hidden>Lost contact with the UI server. Is it still running?</div>
 <div id="qWarn" class="banner warn" hidden></div>
+<div id="qPrompt" class="qprompt" hidden>
+  <div class="qprompt-text">
+    <b id="qPromptTitle"></b>
+    <span id="qPromptMsg"></span>
+    <div id="qPromptDetail" class="small"></div>
+  </div>
+  <button id="qAck" class="qbtn2 qack" title="Acknowledge: I did what the prompt asks (key K)">ACK</button>
+</div>
 
 <main class="qmain">
   <section class="qleft">
-    <label class="qfield"><span>Work state (station config)</span>
-      <select id="qStation"></select></label>
+    <div class="qselect">
+      <label class="qfield" title="What the station is and knows: its parameters and the profile library set it can call on"><span>Station configuration</span>
+        <select id="qStation"></select></label>
+      <label class="qfield" title="Which part variant of the configuration's profile library set the work states check"><span>Profile</span>
+        <select id="qProfile"></select></label>
+    </div>
     <div id="qStationInfo" class="qinfo muted"></div>
     <div class="qinfo">Preset START runs: <b id="qPreset">-</b> <span id="qPresetLoaded" class="muted small"></span></div>
+
+    <div class="qflowhead"><b>Work states</b> <span class="muted small">the steps and permissions
+      that let the line continue: the sensor claims, the DLP confirms or corrects</span></div>
+    <div class="qinputs"><span class="muted small">Line sensors say</span>
+      <span id="qInputs" class="qchips"></span>
+      <span id="qMock" class="qmock" hidden><span class="muted small">Simulated line (MOCK)</span>
+        <select id="qMockCase" title="MOCK only: what the simulated human places and what the simulated sensors say"></select></span>
+    </div>
+    <ol id="qFlow" class="qflow"></ol>
+    <div id="qFlowMsg" class="qreason"></div>
 
     <div class="qpanels">
       <details class="qpanel" id="qLights">
         <summary><b>1 Lights</b> set up the illumination</summary>
         <p class="muted small">Projector / LEDs ready, aim the grid, assign the areas. Active zone:
-          <b id="qZone">-</b> (from the work state's <code>job.zone</code>).</p>
+          <b id="qZone">-</b> (from the station configuration's <code>job.zone</code>).</p>
         <div class="qrow">
           <button id="qGrid" class="qbtn2">Project grid</button>
-          <button id="qZones" class="qbtn2" title="Placeholder: lights the work state's zone">Show zone</button>
+          <button id="qZones" class="qbtn2" title="Placeholder: lights the station configuration's zone">Show zone</button>
         </div>
         <img id="qGridImg" class="qpreview" alt="grid photo" hidden>
       </details>
@@ -47,7 +69,7 @@
         <img id="qLiveImg" class="qpreview" alt="camera" hidden>
         <div id="qCamMsg" class="qreason"></div>
       </details>
-      <div class="qpanel qaction"><b>3 Action</b> run the cycle: scan, measure, verdict (START)</div>
+      <div class="qpanel qaction"><b>3 Action</b> run the cycle: START, then each work state is verified (STEP)</div>
     </div>
     <div id="qSetupMsg" class="qreason"></div>
 
@@ -56,12 +78,14 @@
       <span>I confirm the setup: part placed, rig untouched since base / calibration</span>
     </label>
 
+    <div id="qNotice" class="qnotice" role="status" hidden></div>
     <div class="qbuttons">
       <button id="qStart" class="qbtn qstart">START</button>
       <button id="qAbort" class="qbtn qabort">ABORT</button>
       <button id="qHome" class="qbtn qhome">HOME</button>
     </div>
     <div class="qbuttons2">
+      <button id="qStep" class="qbtn2 qstep" title="Verify the current work state (key N)">STEP</button>
       <button id="qArm" class="qbtn2">ARM</button>
       <button id="qTrigger" class="qbtn2">TRIGGER</button>
       <span class="qstate">state <b id="qBusState">-</b></span>
@@ -70,7 +94,10 @@
       <span data-sig="READY">READY</span><span data-sig="BUSY">BUSY</span>
       <span data-sig="PASS">PASS</span><span data-sig="FAIL">FAIL</span>
       <span data-sig="ALARM">ALARM</span><span data-sig="PULL">PULL</span>
+      <span data-sig="KICKOUT">KICKOUT</span><span data-sig="PROMPT">PROMPT</span>
+      <span data-sig="SENSOR_MISMATCH">SENSOR_MISMATCH</span>
     </div>
+    <div class="qsignals qpermits" id="qPermits"></div>
 
     <ol class="qsteps" id="qSteps">
       <li id="qStepLights"><b>Lights</b><span>projector ready</span></li>
@@ -79,8 +106,13 @@
     </ol>
     <div class="qlegend muted small">Keys: <kbd>Space</kbd>/<kbd>Enter</kbd> START (unless a button
       or link has the focus: then they press it),
-      <kbd>Esc</kbd> ABORT, <kbd>H</kbd> HOME, <kbd>T</kbd> TRIGGER, <kbd>A</kbd> ARM / DISARM,
-      <kbd>1</kbd>-<kbd>9</kbd> work state. Also POST /api/cmd/&lt;start|abort|home|trigger|arm|disarm|workstate&gt;.</div>
+      <kbd>Esc</kbd> ABORT, <kbd>H</kbd> HOME, <kbd>N</kbd> STEP (verify the next work state),
+      <kbd>K</kbd> ACK, <kbd>T</kbd> TRIGGER, <kbd>A</kbd> ARM / DISARM, <kbd>P</kbd> next profile,
+      <kbd>1</kbd>-<kbd>9</kbd> station configuration. Also POST
+      /api/cmd/&lt;start|abort|home|trigger|step|ack|retry|skip|arm|disarm|reset|config|profile&gt;
+      (reset acknowledges ALARM / FAULT; a good HOME does too) and POST /api/io/inputs
+      {"&lt;signal&gt;": true} for the line's sensor claims (for every part: a claim belongs
+      to one cycle).</div>
   </section>
 
   <section class="qright">

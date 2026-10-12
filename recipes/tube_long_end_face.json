@@ -1,0 +1,86 @@
+{
+  "_comment": "Example recipe (built-in, read-only) of the long-tube profile of stations/example_tube_line.json: is a tube on the seat at all (zone `seat`, `presence`: anything 10 mm above the seat plane - what the line's part-present sensor claims), then the tube's end face must be there (an empty seat is never a clean face) and free of dents (the MF-CFAR end-face detector, self-referenced). A dented face turns RED with a cross on the dent. Mock: scene:tube_long (good), scene:tube_long:dent.",
+  "name": "tube_long_end_face",
+  "description": "Long tube (60 mm): end face there, no dents",
+  "schema_version": 1,
+  "preset": "bench_9in_metric_bright",
+  "scan": {
+    "kind": "fast",
+    "axis": "xy",
+    "zone": null,
+    "average": null
+  },
+  "part": {
+    "label": "tube_long",
+    "frame": {
+      "reference": "dominant_plane"
+    },
+    "mock_scene": "scene:tube_long"
+  },
+  "zones": [
+    {
+      "id": "seat",
+      "label": "tube seat",
+      "shape": "circle",
+      "units": "part_mm",
+      "coords": {
+        "center": [
+          0,
+          0
+        ],
+        "radius": 14.0
+      },
+      "checks": [
+        {
+          "type": "presence",
+          "params": {
+            "min_height_mm": 10.0,
+            "min_area_pct": 35.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "end_face",
+      "label": "end face",
+      "shape": "circle",
+      "units": "part_mm",
+      "coords": {
+        "center": [
+          0,
+          0
+        ],
+        "radius": 10.5
+      },
+      "checks": [
+        {
+          "type": "presence",
+          "params": {
+            "min_height_mm": 52.0,
+            "min_area_pct": 60.0
+          }
+        },
+        {
+          "type": "defect",
+          "params": {
+            "depth_mm": 0.15,
+            "mode": "face",
+            "sign": "dent"
+          }
+        }
+      ]
+    }
+  ],
+  "feedback": {
+    "enabled": true,
+    "hold_s": 5.0
+  },
+  "outputs": {
+    "runs_dir": null,
+    "overlay": true
+  },
+  "pull": {
+    "guard_band_pct": 10,
+    "invalid_reasons_to_reject": []
+  }
+}

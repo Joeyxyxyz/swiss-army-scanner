@@ -576,19 +576,27 @@ def run_recipe(s, recipe, preset, *, runs_dir, operator_confirmed: bool = False,
                project_feedback: bool = True, scan=None, hold_s: Optional[float] = None,
                run_name: Optional[str] = None, mock_place: Optional[Callable] = None,
                pattern_mode_ack: bool = False, label: Optional[str] = None,
-               tier: Optional[str] = None) -> dict:
+               tier: Optional[str] = None, station: Optional[str] = None,
+               context: Optional[dict] = None) -> dict:
     """One recipe run in a NEW run folder -> {run_id, run_dir, result, exit_code}. On the real
     rig it needs operator_confirmed, except an offline re-check: a stored `scan` with no
     projected feedback captures and projects nothing (the rig is never opened). exit_code:
     the disposition's (CONTINUE 0, REJECT 1, PULL 5); refused 2, crashed 4, ABORTED 1 keep
-    theirs (disposition PULL)."""
+    theirs (disposition PULL). station / context: a work state's check (engine/flow/
+    verify.py) names its station and adds {station_config, profile, job: {config,
+    work_state}} to the result."""
+    ctx = dict(context or {})
     run_id, run_dir = R.new_run(runs_dir, run_name or recipe.name)
     res = R.empty_result(run_id=run_id, run_folder=str(run_dir), mock=s.mock,
-                         operator_confirmed=operator_confirmed, station=run_name or recipe.name,
+                         operator_confirmed=operator_confirmed,
+                         station=station or run_name or recipe.name,
                          job={"type": "recipe", "recipe": recipe.name, "base": None,
-                              "zone": recipe.scan["zone"], "config": None},
+                              "zone": recipe.scan["zone"], "config": None,
+                              **(ctx.pop("job", None) or {})},
                          part={"role": "test", "label": label or recipe.part.get("label")
-                               or recipe.name}, zone=recipe.scan["zone"])
+                               or recipe.name}, zone=recipe.scan["zone"],
+                         station_config=ctx.pop("station_config", None),
+                         profile=ctx.pop("profile", None))
     log = R.RunLog(Path(run_dir) / "run.log.jsonl", run_id)
     state = {}
     code = 5

@@ -1,0 +1,63 @@
+{
+  "_comment": "Example FLOW: the work states of a tube line (referenced by stations/example_tube_line.json; a flow may also be written inline in the station configuration). Each step is one work state: `expects` = what the line's own sensors claim, `verify` = the DLP check that confirms or corrects it (a recipe KEY of the active profile, so the same flow runs for long and short tubes; `observe` names the check whose answer IS the sensor's signal - here every recipe's seat/presence, so a tube that went missing at any step is a missing tube, never a dent), `permit` = the permission granted when it is CONFIRMED (bus output PERMIT_<NAME>). Outcomes: CONFIRMED (permission, next work state) | CORRECTED (the DLP disagrees with a sensor: on_mismatch) | NOT_MET (sensor and DLP agree, but not on what this step needs: on_not_met, default on_mismatch) | DEFECT (the part is there, a check fails: on_defect) | DOUBT (the DLP cannot tell: PULL, never a permission). Actions: project_fault | prompt <message> | hold | retry | kickout REJECT|PULL | goto <step>.",
+  "schema_version": 2,
+  "name": "example_tube_line",
+  "description": "Tube loaded? -> Tube aligned? -> End face OK?",
+  "steps": [
+    {
+      "id": "loaded",
+      "title": "Tube loaded?",
+      "expects": {"part_present": true},
+      "verify": {"recipe": "presence", "observe": {"part_present": "seat/presence"}},
+      "permit": "LOAD_DONE",
+      "on_confirm": "next",
+      "on_mismatch": [
+        "project_fault",
+        {"prompt": "no tube found: load or clear the sensor", "when_dlp": {"part_present": false}},
+        {"prompt": "a tube is on the seat but the sensor says none: check the sensor", "when_dlp": {"part_present": true}},
+        "hold"
+      ],
+      "on_defect": [
+        "project_fault",
+        "prompt the tube on the seat is not the selected profile's: change the tube or the profile",
+        "hold"
+      ]
+    },
+    {
+      "id": "aligned",
+      "title": "Tube aligned?",
+      "expects": {"part_present": true},
+      "verify": {"recipe": "alignment", "observe": {"part_present": "seat/presence"}},
+      "permit": "CLAMP",
+      "on_mismatch": [
+        "project_fault",
+        {"prompt": "no tube found: load or clear the sensor", "when_dlp": {"part_present": false}},
+        {"prompt": "a tube is on the seat but the sensor says none: check the sensor", "when_dlp": {"part_present": true}},
+        "hold"
+      ],
+      "on_defect": [
+        "project_fault",
+        "prompt tube off its seat: re-seat it",
+        "retry"
+      ],
+      "retries": 2
+    },
+    {
+      "id": "end_face",
+      "title": "End face OK?",
+      "expects": {"part_present": true},
+      "verify": {"recipe": "end_face", "observe": {"part_present": "seat/presence"}},
+      "permit": "TRANSFER",
+      "on_mismatch": [
+        "project_fault",
+        {"prompt": "no tube found: load or clear the sensor", "when_dlp": {"part_present": false}},
+        {"prompt": "a tube is on the seat but the sensor says none: check the sensor", "when_dlp": {"part_present": true}},
+        "hold"
+      ],
+      "on_defect": [
+        "project_fault",
+        "kickout REJECT end face not OK"
+      ]
+    }
+  ]
+}

@@ -41,7 +41,7 @@ def test_abort_wins_and_home_only_when_idle_or_after_abort():
     bus, calls, _ = _bus()
     bus.command("START")
     assert not bus.command("HOME").accepted and bus.state == "RUNNING"
-    assert not bus.command("SELECT_WORKSTATE", arg="b.json").accepted
+    assert not bus.command("SELECT_CONFIG", arg="b.json").accepted
     assert not bus.command("TRIGGER").accepted
     r = bus.command("ABORT", "key")
     assert r.accepted and bus.state == "ABORTING" and calls[-1] == ("abort",)
@@ -90,14 +90,14 @@ def test_trigger_only_when_armed_and_stays_armed():
     assert bus.state == "READY"                                  # an abort disarms
 
 
-def test_workstate_by_name_or_index_and_refusals():
+def test_config_by_name_or_index_and_refusals():
     bus, calls, _ = _bus()
-    assert bus.command("SELECT_WORKSTATE", arg=2).accepted and bus.workstate == "b.json"
-    assert bus.command("SELECT_WORKSTATE", arg="1").accepted and bus.workstate == "a.json"
-    assert not bus.command("SELECT_WORKSTATE", arg=9).accepted
-    assert not bus.command("SELECT_WORKSTATE", arg="nope.json").accepted
+    assert bus.command("SELECT_CONFIG", arg=2).accepted and bus.config == "b.json"
+    assert bus.command("SELECT_CONFIG", arg="1").accepted and bus.config == "a.json"
+    assert not bus.command("SELECT_CONFIG", arg=9).accepted
+    assert not bus.command("SELECT_CONFIG", arg="nope.json").accepted
     assert not bus.command("TELEPORT").accepted
-    empty = C.CommandBus(workstates=[])
+    empty = C.CommandBus(configs=[])
     assert not empty.command("START").accepted and empty.state == "READY"
 
 
@@ -158,14 +158,14 @@ def test_bad_io_config_refused(tmp_path):
 
 # ------------------------------------------------------------ review regressions
 
-def _owner(confirm=False, workstates=("a.json", "b.json", "c.json")):
+def _owner(confirm=False, configs=("a.json", "b.json", "c.json")):
     """A bus whose owner tracks its jobs: pending() says whether one will report back."""
     calls, jobs = [], []
     h = C.Handlers(start=lambda ws, ok: (calls.append(("start", ws, ok)), jobs.append("run")),
                    abort=lambda: calls.append(("abort",)) or ["j1"],
                    home=lambda: (calls.append(("home", dict(bus.home_args))), jobs.append("home")),
                    pending=lambda: bool(jobs))
-    bus = C.CommandBus(h, list(workstates), require_confirmation=confirm)
+    bus = C.CommandBus(h, list(configs), require_confirmation=confirm)
     return bus, calls, jobs
 
 
@@ -249,16 +249,16 @@ def test_only_a_real_true_confirms():
     assert bus.command("ARM", confirmed=True).accepted and bus.armed_confirmed
 
 
-def test_a_work_state_change_while_armed_disarms():
+def test_a_station_configuration_change_while_armed_disarms():
     bus, calls, _ = _owner(confirm=True)
     assert bus.command("ARM", confirmed=True).accepted
-    r = bus.command("SELECT_WORKSTATE", arg="a.json")             # the same one: stays armed
+    r = bus.command("SELECT_CONFIG", arg="a.json")             # the same one: stays armed
     assert r.accepted and bus.state == "ARMED" and bus.armed_confirmed
-    r = bus.command("SELECT_WORKSTATE", arg="b.json")
+    r = bus.command("SELECT_CONFIG", arg="b.json")
     assert r.accepted and "disarmed" in r.message
     assert bus.state == "READY" and not bus.armed_confirmed
     assert not bus.command("TRIGGER").accepted and calls == []
-    # START / TRIGGER / ARM naming the expected work state: refused on a mismatch
+    # START / TRIGGER / ARM naming the expected configuration: refused on a mismatch
     assert not bus.command("START", arg="a.json", confirmed=True).accepted
     assert not bus.command("ARM", arg=1, confirmed=True).accepted and calls == []
     assert bus.command("START", arg=2, confirmed=True).accepted
@@ -273,30 +273,120 @@ def test_a_cancelled_triggered_cycle_does_not_rearm():
     assert bus.state == "READY" and bus.last_result == "ABORTED"
 
 
-def test_work_state_updates_never_switch_the_selection_or_renumber_mid_cycle():
+def test_config_updates_never_switch_the_selection_or_renumber_mid_cycle():
     bus, calls, jobs = _owner(confirm=True)
     out = C.SimulatedOutput()
     bus.outputs.append(out)
-    bus.command("SELECT_WORKSTATE", arg=2)
+    bus.command("SELECT_CONFIG", arg=2)
     bus.command("ARM", confirmed=True)
-    bus.update_workstates(["a.json", "b.json", "c.json"], unusable={"b.json": "bad JSON"})
-    assert bus.state == "READY" and bus.workstate == "b.json" and not bus.armed_confirmed
-    assert bus.history[-1][2] == "DISARM" and bus.registers()["workstate"] == 2
+    bus.update_configs(["a.json", "b.json", "c.json"], unusable={"b.json": "bad JSON"})
+    assert bus.state == "READY" and bus.config == "b.json" and not bus.armed_confirmed
+    assert bus.history[-1][2] == "DISARM" and bus.registers()["station_config"] == 2
     r = bus.command("START", confirmed=True)
     assert not r.accepted and "bad JSON" in r.message and calls == []
     assert bus.last_result == "INVALID" and out.current["ALARM"]
-    assert not bus.command("SELECT_WORKSTATE", arg=2).accepted
-    assert bus.command("SELECT_WORKSTATE", arg=3).accepted and bus.workstate == "c.json"
-    bus.update_workstates(["a.json", "b.json", "c.json"])
+    assert not bus.command("SELECT_CONFIG", arg=2).accepted
+    assert bus.command("SELECT_CONFIG", arg=3).accepted and bus.config == "c.json"
+    bus.update_configs(["a.json", "b.json", "c.json"])
     bus.command("START", confirmed=True)
-    bus.update_workstates(["b.json", "c.json", "d.json"])           # a.json removed mid-run
-    assert bus.workstates == ["a.json", "b.json", "c.json"] and bus.workstate == "c.json"
+    bus.update_configs(["b.json", "c.json", "d.json"])           # a.json removed mid-run
+    assert bus.configs == ["a.json", "b.json", "c.json"] and bus.config == "c.json"
     assert bus.unusable == {"a.json": "its station config is gone"}
     bus.job_finished("run", "PASS")
-    bus.update_workstates(["b.json", "d.json"])                     # c.json gone while READY
-    assert bus.workstate == "c.json" and bus.workstates == ["b.json", "d.json"]
+    bus.update_configs(["b.json", "d.json"])                     # c.json gone while READY
+    assert bus.config == "c.json" and bus.configs == ["b.json", "d.json"]
     r = bus.command("START", confirmed=True)
     assert not r.accepted and "gone" in r.message
-    fresh = C.CommandBus(workstates=[])                             # first list: first usable
-    fresh.update_workstates(["x.json", "y.json"], unusable={"x.json": "bad"})
-    assert fresh.workstate == "y.json"
+    fresh = C.CommandBus(configs=[])                             # first list: first usable
+    fresh.update_configs(["x.json", "y.json"], unusable={"x.json": "bad"})
+    assert fresh.config == "y.json"
+
+
+# ------------------------------------------------------------ rig findings: ALARM and RESET
+
+def _spy(bus):
+    """Every published signal set, in order (what a PLC output module would see)."""
+    seen = []
+    bus.outputs.append(type("Spy", (C.OutputBackend,), {
+        "publish": lambda self, sig: seen.append(dict(sig)),
+        "publish_registers": lambda self, regs: None})())
+    return seen
+
+
+def test_reset_then_a_good_home_clears_alarm_but_not_the_pull():
+    """Seen on the rig: an INVALID cycle (PULL + ALARM), ABORT during HOME (FAULT), RESET, a
+    good HOME -> READY, and ALARM stayed on for ever (it followed the stale INVALID result).
+    RESET clears ALARM / FAULT; the stale PULL lamp and its code stay until the next cycle;
+    a PASS never comes back."""
+    bus, calls, out = _bus()
+    seen = _spy(bus)
+    bus.command("START")
+    bus.job_finished("run", "INVALID", disposition="PULL")
+    assert out.current["ALARM"] and out.current["PULL"] and out.current["READY"]
+    bus.command("HOME")
+    bus.command("ABORT")
+    bus.job_finished("home", None, error="Cancelled: aborted")
+    assert bus.state == "FAULT" and out.current["ALARM"] and not out.current["READY"]
+    r = bus.command("RESET")
+    assert r.accepted and bus.state == "READY" and bus.fault is None
+    assert not out.current["ALARM"] and out.current["READY"]        # cleared by RESET itself
+    assert out.current["PULL"] and "PULL output stays" in r.message  # documented: stale PULL
+    assert out.registers["result_code"] == C.RESULT_CODES["INVALID"]
+    bus.command("HOME")
+    bus.job_finished("home", "OK")
+    assert bus.state == "READY" and not out.current["ALARM"] and out.current["PULL"]
+    assert not any(s["PASS"] for s in seen)                         # never a PASS in all this
+    # the next cycle starts clean; a new INVALID raises ALARM again
+    bus.command("START")
+    assert not any(out.current[k] for k in ("ALARM", "PULL", "PASS", "FAIL"))
+    bus.job_finished("run", "INVALID", disposition="PULL")
+    assert out.current["ALARM"] and not bus.alarm_acknowledged
+
+
+def test_reset_acknowledges_an_idle_alarm_and_a_good_home_does_too():
+    bus, calls, out = _bus()
+    assert not bus.command("RESET").accepted                        # nothing to acknowledge
+    bus.command("START")
+    bus.job_finished("run", None, error="crashed")
+    assert bus.state == "READY" and out.current["ALARM"]
+    r = bus.command("RESET")                                        # READY, ALARM on: accepted
+    assert r.accepted and "acknowledged" in r.message and not out.current["ALARM"]
+    assert out.current["PULL"] and bus.last_result == "INVALID"     # the result is not rewritten
+    assert bus.snapshot()["alarm_acknowledged"] is True
+    assert not bus.command("RESET").accepted                        # already acknowledged
+    # a good HOME alone acknowledges too (the operator page has no RESET button)
+    bus.command("START")
+    bus.job_finished("run", "INVALID")
+    assert out.current["ALARM"]
+    bus.command("HOME")
+    bus.job_finished("home", "REFERENCE_SET")
+    assert bus.state == "READY" and not out.current["ALARM"] and out.current["PULL"]
+    # a rig check that fails is a FAULT: ALARM on again, whatever was acknowledged before
+    bus.command("HOME")
+    bus.job_finished("home", "MOVED")
+    assert bus.state == "FAULT" and out.current["ALARM"]
+    assert bus.command("RESET").accepted and not out.current["ALARM"]
+    # the ALARM of a START refused on an unusable configuration: RESET acknowledges it too
+    bus.update_configs(["a.json", "b.json"], unusable={"a.json": "config invalid"})
+    assert not bus.command("START").accepted and out.current["ALARM"]
+    assert bus.command("RESET").accepted and not out.current["ALARM"] and out.current["PULL"]
+
+
+def test_reset_never_brings_a_pass_back_and_a_fail_lamp_stays():
+    bus, calls, out = _bus()
+    seen = _spy(bus)
+    bus.command("START")
+    bus.job_finished("run", "PASS", disposition="CONTINUE")
+    assert out.current["PASS"]
+    bus.command("HOME")
+    bus.job_finished("home", "MOVED")
+    assert bus.state == "FAULT" and out.current["ALARM"] and not out.current["PASS"]
+    assert bus.command("RESET").accepted
+    assert not out.current["ALARM"] and not out.current["PASS"] and out.current["READY"]
+    assert out.registers["result_code"] == 0 and [s["PASS"] for s in seen].count(True) == 1
+    bus.command("START")
+    bus.job_finished("run", "INVALID", disposition="REJECT")       # a doubt the line rejects
+    assert out.current["FAIL"] and out.current["ALARM"]
+    r = bus.command("RESET")
+    assert r.accepted and "FAIL output stays" in r.message
+    assert out.current["FAIL"] and not out.current["ALARM"]

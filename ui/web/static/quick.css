@@ -86,3 +86,66 @@ kbd { font: 12px var(--mono); padding: 1px 5px; border: 1px solid var(--line2); 
 .qzonelist li.z-fail { border-color: #d0352c; background: rgba(179, 38, 30, .18); }
 .qzonelist li.z-invalid { border-color: #e0a100; }
 .qzonelist li.z-pull { border-color: #ffa630; background: rgba(232, 137, 12, .16); }
+/* station configuration + profile selectors (top) */
+.qselect { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px;
+  align-items: end; }
+.qselect .qfield select { width: 100%; min-width: 0; }
+@media (max-width: 520px) { .qselect { grid-template-columns: minmax(0, 1fr); } }
+/* the prompt banner: a work state waits for the operator (ACK) */
+.qprompt { display: flex; align-items: center; gap: 16px; padding: 12px 20px; font-size: 18px;
+  background: #e8890c; color: #1f1200; border-bottom: 2px solid #ffa630;
+  /* always in view, with its ACK button, wherever the page is scrolled */
+  position: sticky; top: 0; z-index: 20; }
+/* the last command the bus refused: stays until the next accepted one */
+.qnotice { margin: 0 0 10px; padding: 8px 12px; border: 2px solid var(--warn);
+  border-radius: var(--r); background: var(--warn-bg); font-size: 14px; overflow-wrap: anywhere; }
+.qprompt-text { flex: 1; overflow-wrap: anywhere; }
+.qprompt-text b { margin-right: 8px; }
+.qack { min-width: 140px; background: #1f1200; color: #fff; border-color: #1f1200; }
+/* work states: the step flow, one row per work state */
+.qflowhead { margin: 4px 0 6px; }
+.qflowhead b { font-size: 16px; margin-right: 8px; }
+.qinputs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.qmock { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.qmock select { font-size: 14px; padding: 6px; min-height: 36px; background: var(--panel2);
+  color: var(--text); border: 1px solid var(--line2); border-radius: var(--r); }
+.qflow { list-style: none; padding: 0; margin: 0 0 14px; display: grid; gap: 6px; }
+.qws { padding: 8px 10px; border: 1px solid var(--line2); border-left-width: 6px;
+  border-radius: var(--r); background: var(--panel); }
+.qws.current { border-color: var(--accent); background: var(--info-bg); }
+.qws.o-confirmed { border-left-color: #23a866; }
+.qws.o-corrected, .qws.o-not_met, .qws.o-doubt, .qws.o-aborted { border-left-color: #ffa630; }
+.qws.o-defect { border-left-color: #d0352c; }
+.qws.o-skipped { border-left-color: var(--faint); }
+.qws-head { display: flex; align-items: center; gap: 10px; }
+.qws-head b { font-size: 17px; flex: 1; }
+.qws-n { display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 28px; height: 28px; border-radius: 50%; background: var(--panel2);
+  border: 1px solid var(--line2); font: 700 14px var(--mono); }
+.qws.current .qws-n { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.qws-out { font: 700 12px var(--mono); letter-spacing: .04em; color: var(--muted); }
+.qws.o-confirmed .qws-out { color: #23a866; }
+.qws.o-defect .qws-out { color: #ff6464; }
+.qws.o-corrected .qws-out, .qws.o-not_met .qws-out, .qws.o-doubt .qws-out { color: #ffa630; }
+.qws-msg { margin-top: 4px; color: var(--muted); overflow-wrap: anywhere; }
+.qchips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.qinputs .qchips { margin-top: 0; }
+.qchip { display: inline-flex; gap: 6px; align-items: baseline; padding: 3px 9px; border-radius: 12px;
+  border: 1px solid var(--line2); font-size: 13px; background: var(--panel2); }
+.qchip i { font-style: normal; color: var(--muted); font-size: 11px; text-transform: uppercase;
+  letter-spacing: .04em; }
+.qchip.bad { border-color: #ffa630; background: rgba(232, 137, 12, .16); }
+.qchip.permit.on { border-color: #23a866; background: #1d8f55; color: #fff; }
+.qchip.permit.on i { color: #d9f5e6; }
+.qchip.none { opacity: .55; }
+.qchip.toggle { cursor: pointer; }
+.qchip.toggle:hover { border-color: var(--accent); }
+/* permissions as the line reads them (PERMIT_<NAME> outputs) */
+.qpermits { margin-top: 6px; }
+.qsignals span.on[data-sig^="PERMIT_"] { color: #fff; background: #1d8f55; border-color: #23a866; }
+.qsignals span.on[data-sig="KICKOUT"] { color: #fff; background: #b3261e; border-color: #d0352c; }
+.qsignals span.on[data-sig="PROMPT"], .qsignals span.on[data-sig="SENSOR_MISMATCH"] {
+  color: #1f1200; background: #e8890c; border-color: #ffa630; }
+.qstep.on { border-color: var(--accent); background: var(--info-bg); }
+/* a cycle that waits for STEP: not READY, not running */
+.lamp-wait { background: var(--info-bg); color: var(--text); border-color: var(--accent); font-size: 38px; }

@@ -3,8 +3,10 @@
 The scanner is a DMD projector + a camera + this engine. Nothing in the engine is tied to one
 part, one station or one vendor's hardware: the part knowledge lives in **recipes** (zones +
 checks + tolerances, `recipes/README.md`), the rig knowledge in **presets** (geometry +
-capture settings) and their **calibrations**, the line integration in the **command bus** and
-its I/O backends. Porting = five adapters and one validation procedure:
+capture settings) and their **calibrations**, the station knowledge in a **station
+configuration** (its parameters, its profile library set, its work states), the line
+integration in the **command bus** and its I/O backends. Porting = six adapters and one
+validation procedure:
 
 | layer | what you provide | where |
 |---|---|---|
@@ -12,7 +14,36 @@ its I/O backends. Porting = five adapters and one validation procedure:
 | camera | four methods: exposure, flush, grab, close | `engine/capture/camera.py`, interface CameraDriver |
 | geometry + calibration | a preset per rig geometry, its stereo calibration | `presets/`, `scan preset-add`, `scan calibrate-stereo` |
 | recipe | the part's zones, checks, tolerances, feedback | `recipes/`, `scan recipe-add` |
-| I/O | start / abort / home / trigger / work state in; ready / busy / pass / fail / alarm / pull + result code out | `engine/control/commands.py` |
+| station configuration | the station's parameters, its profiles (one per part variant: which recipes say what it looks like) and its work states (the step flow: sensor claim, DLP check, permission) | `stations/`, `flows/`, `scan flow-show` |
+| I/O | start / abort / home / trigger / step / ack, station configuration + profile numbers, the line's sensor claims in; ready / busy / pass / fail / alarm / pull / kickout / prompt / sensor mismatch, one permit per permission, result + work-state codes out | `engine/control/commands.py` |
+
+## Terminology
+
+**Station configuration / parameters** (what the station is and knows) -> **profiles** (the
+profile library set: what each part variant looks like) -> **work states** (the step flow and
+its permissions) -> **checks** (what the DLP measures) -> **dispositions** (what happens to
+the part).
+
+- A **station configuration** (`stations/*.json`) holds the parameters (rig preset, library,
+  run folders, the sensor inputs of the line, defaults) and the profile library set. It is
+  selected with `SELECT_CONFIG`. It is **not** a work state.
+- A **profile** is one part variant the station can be told to expect (long tube / short
+  tube): its recipes (zones + checks), preset, named zones, golden. The operator, the PLC or
+  HTTP selects the active one with `SELECT_PROFILE`; refused while a cycle runs.
+- A **work state** is one step of the flow: what the line's own sensors claim (`expects`),
+  the DLP check that confirms or corrects that claim (`verify`), and the permission granted
+  when it is confirmed (`permit`). The work states are the steps and permissions that let
+  the line continue to the next thing.
+- A **check** is what the DLP measures (a recipe of the active profile, or inline zone
+  checks); a **disposition** is CONTINUE / REJECT / PULL.
+
+**The DLP confirms or corrects the sensor.** A sensor says a part is there when it should
+not be - or says nothing is there when a part is. The DLP checks against that sensor: is
+the part really there, or not? is that tube there, is that dent there? Sensor and DLP agree
+and the checks pass -> CONFIRMED, the permission is granted. They disagree -> CORRECTED:
+`SENSOR_MISMATCH`, the permission withheld, the fault painted on the part, the operator or
+the line prompted to load / remove the part or to kick it out. The DLP cannot tell -> DOUBT:
+PULL, never a permission.
 
 Then prove the numbers on site (the last section) before anybody trusts a PASS.
 
@@ -111,18 +142,100 @@ tolerances: nothing is captured or projected, so the real rig needs no operator 
 for it. Without `--no-feedback` the verdict would be painted on whatever is in front of the
 projector now, so that form needs `--operator-confirmed` like a live run.
 
-## 5. I/O
+## 5. Station configuration, profiles, work states
 
-One state machine (`engine/control/commands.py`) takes START / ABORT / HOME / TRIGGER / ARM /
-DISARM / RESET / work-state commands from every source (the operator page, keys, HTTP
-`POST /api/cmd/*`, hardware inputs) and publishes READY / BUSY / PASS / FAIL / ALARM / PULL
-plus three registers: `result_code` (the recipe's `outputs.result_codes`: PASS 1, FAIL 2,
+Write one station configuration per station (`stations/README.md`; copy
+`stations/example_tube_line.json` and `flows/example_tube_line.json`):
+
+1. **Parameters**: the rig preset, the library and run folders, and `io.inputs`: the sensor
+   signals of the line the work states refer to (`part_present`, `clamp_closed`, ...).
+2. **Profiles**: one per part variant. Each names the recipes that say what that part looks
+   like, under keys the flow uses (`presence`, `alignment`, `end_face`): the same flow then
+   runs for every profile. Make a golden per profile where a recipe compares with the good
+   part (`scan recipe-golden <recipe>`).
+3. **Flow**: the work states, in order. Per step: `expects` (what the line's sensors claim),
+   `verify` (the recipe key, or inline zone checks, and `observe`: for every expected signal
+   the check whose answer IS that signal - nothing is guessed), `permit` (the permission),
+   and what to do when it is not confirmed: `on_mismatch` (the DLP disagrees with a sensor;
+   one prompt per direction with `when_dlp`), `on_not_met` (they agree, on the wrong thing),
+   `on_defect` (a check fails), `on_doubt` (the DLP can't tell; default kickout PULL) - lists
+   of `project_fault`, `prompt <message>`, `hold`, `retry`, `kickout REJECT|PULL`,
+   `goto <step>`. Expect the part-present signal at every step that needs the part there:
+   then a part that went missing is a missing part, never a defect. At least one work state
+   must be required; one left in DOUBT or CORRECTED is never passed over.
+
+`scan flow-show stations/my_line.json` validates it (every problem listed: an unknown
+recipe, a signal no check observes, a work state that can never be confirmed, a flow with no
+required work state) and prints the profiles, the work states - each with the check that
+observes its sensor signals - and the permissions. `scan run stations/my_line.json --profile P
+--input part_present=true` runs one whole cycle in line; the operator page and the PLC walk
+the same cycle step by step.
+
+## 6. I/O
+
+One state machine (`engine/control/commands.py`) takes START / ABORT / HOME / TRIGGER / STEP /
+ACK / RETRY / SKIP / ARM / DISARM / RESET / SELECT_CONFIG / SELECT_PROFILE from every source
+(the operator page, keys, HTTP `POST /api/cmd/*`, hardware inputs) and the line's sensor
+claims (`POST /api/io/inputs`), and publishes READY / BUSY / PASS / FAIL / ALARM / PULL /
+KICKOUT / PROMPT / SENSOR_MISMATCH and one `PERMIT_<NAME>` per permission, plus six
+registers: `result_code` (the recipe's `outputs.result_codes`: PASS 1, FAIL 2,
 INVALID 3, ABORTED 4, PULL 5 by default; 0 = none yet), `state_code` (index of READY, ARMED,
-RUNNING, ABORTING, HOMING, FAULT) and `workstate` (1-based): the position among ALL station
-configs in file-name order, invalid ones included (marked unusable, START / TRIGGER on them
-refused with result INVALID). The number never shifts because a config broke, and the list is frozen while
-ARMED or busy; adding or removing config files while idle does renumber, so keep the station
-config file names stable on a line driven by a PLC.
+RUNNING, ABORTING, HOMING, FAULT, WAITING), `station_config` (1-based): the position among
+ALL station configs in file-name order, invalid ones included (marked unusable, START /
+TRIGGER on them refused with result INVALID), `profile` (1-based within the configuration),
+`work_state` (1-based: the current / last work state of the cycle, 0 = no cycle yet) and
+`work_state_code` (its outcome: 0 not verified yet, CONFIRMED 1, CORRECTED 2, NOT_MET 3,
+DEFECT 4, DOUBT 5, SKIPPED 6, ABORTED 7). The configuration number never shifts because a
+config broke, and the list is frozen while ARMED or in a cycle; adding or removing config
+files while idle does renumber, so keep the station config file names stable on a line driven
+by a PLC.
+
+**How a PLC wires its sensors in and reads the permissions.**
+
+- **Sensor claims in.** Whatever the line's own sensors say goes to the scanner as named
+  booleans: over HTTP `POST /api/io/inputs {"part_present": true}` (a gateway; `null` forgets
+  one; `GET /api/io/inputs` reads them back), or through an input backend's `signals` map
+  (`stations/io_example.json`: an input line / coil / node / tag whose LEVEL is the claim;
+  the hardware backends are placeholders). Only JSON booleans count, and only signals a
+  station configuration declares (`parameters.io.inputs`); anything else is a 400 and nothing
+  of that request is applied. **Report the sensors for every part**: a claim belongs to one
+  cycle and is forgotten when the cycle ends (and on ABORT, HOME, FAULT, a configuration /
+  profile change), so a gateway or sensor that went silent is a DOUBT at the next part,
+  never an old claim read as "sensor and DLP agree". Write the bits before START / TRIGGER
+  (or before the STEP that needs them); `parameters.io.max_age_s` also limits how old a
+  claim may be when a scan starts. The claims are read when a work state's scan starts and
+  again when it ends: one that changed meanwhile - even back to where it started - is a
+  DOUBT, and so is a signal a work state expects that nobody reported.
+- **The handshake per work state.** PLC: part in place, sensor bits written -> `STEP` (or
+  TRIGGER) -> **the command is accepted** (HTTP 200 with `accepted: true`; on a fieldbus the
+  BUSY bit rises) -> BUSY while the DLP scans -> BUSY falls -> read `work_state_code` and the
+  `PERMIT_<NAME>` bit: only a set PERMIT bit lets the line do the next thing (close the
+  clamp, transfer). Never read a result without the BUSY edge of your own command: a STEP /
+  TRIGGER / START the bus refused (409: not armed, another configuration selected, no
+  operator confirmation) scanned nothing. The bus backs this up: a START / TRIGGER that
+  starts no cycle while none is open drops every PERMIT bit and forgets a PASS, its result
+  code and the work-state registers of the part before, so nothing of the last part is left
+  to be read as the new one's (ARM and DISARM do the same). No
+  PERMIT bit: read `PROMPT` (an operator must act, then `ACK`), `SENSOR_MISMATCH` (the DLP
+  corrected a sensor: check it), `KICKOUT` + PULL / FAIL (the cycle ended and its part leaves
+  the line: `KICKOUT` is on with every FAIL and every PULL, kickout action or not).
+- **Permissions out.** `PERMIT_<NAME>` is true only while its work state is CONFIRMED in the
+  current cycle and every required work state before it is. They all drop when a new cycle
+  starts, when the cycle ends anything but CONTINUE, on ABORT, FAULT, HOME, ARM, DISARM, a
+  START / TRIGGER that starts no cycle, a configuration / profile change, a flow edited on
+  disk, and (a step's `revoke`) when a later work state is not confirmed. The permissions of
+  a configuration that was deselected, renamed or broke stay published as **false** (a
+  backend that writes one coil per signal never keeps one latched).
+  Nothing grants one on a doubt: treat a missing PERMIT as "do not continue", always. A
+  permission says what the DLP confirmed when its work state was verified; a sensor that
+  changes afterwards is seen at the next work state that expects it, not before.
+- **Results.** Every cycle writes a cycle folder: `result.json` (schema 0.4: `station_config`,
+  `profile`, `steps[]` with `expects`, `sensor_inputs`, `dlp_result`, `outcome`,
+  `sensor_mismatch`, `permission_granted` (it still stood when the cycle ended),
+  `permission_note`, `actions`, `disposition`; `permissions`; `cycle`: `ended_by`, `kickout`,
+  every sensor mismatch the cycle saw, the work states left unconfirmed; the overall
+  `disposition`: CONTINUE only when every required work state was CONFIRMED and none was left
+  in DOUBT or CORRECTED), `run.log.jsonl` and `steps/<one run folder per DLP check>`.
 
 Backends are config-driven (`stations/io_example.json`); the hardware ones are
 **placeholders** with the intended mapping in their docstrings and errors:
@@ -132,19 +245,36 @@ Backends are config-driven (`stations/io_example.json`); the hardware ones are
 | `camera_gpio` | Line0 trigger, Line3 abort (camera inputs only: never Line2, the 3.3 V output) | Line1 busy |
 | `serial_io` | text tokens START / TRIG / STOP / HOME | - |
 | `digital_io` | DI0..DI15 rising edges | DO0..DO15 |
-| `modbus_tcp` | coils / discrete inputs -> commands, a holding register -> work state | coils <- signals, holding registers <- result / state / work state |
-| `opc_ua` | Boolean nodes (subscription) -> commands, an Int node -> work state | Boolean nodes <- signals, Int nodes <- registers |
-| `ethernet_ip` | BOOL tags / input-assembly bits -> commands, a DINT tag -> work state | BOOL tags / output bits <- signals, DINT tags <- registers |
+| `modbus_tcp` | coils / discrete inputs -> commands and sensor claims, holding registers -> station configuration / profile | coils <- signals (PERMIT bits included), holding registers <- result / state / station configuration / profile / work state |
+| `opc_ua` | Boolean nodes (subscription) -> commands and sensor claims, Int nodes -> station configuration / profile | Boolean nodes <- signals, Int nodes <- registers |
+| `ethernet_ip` | BOOL tags / input-assembly bits -> commands and sensor claims, DINT tags -> station configuration / profile | BOOL tags / output bits <- signals, DINT tags <- registers |
 
 Implement `start(bus)` (deliver `bus.command(name, source=...)`) for an input and
 `publish(signals)` / `publish_registers(registers)` for an output with your site's stack,
-register the class under its kind, enable it in the I/O config. A typical handshake:
-PLC sets the work state -> ARM -> part in place -> TRIGGER -> BUSY -> PASS / FAIL / PULL +
+register the class under its kind, enable it in the I/O config. A typical handshake for a
+single-job configuration:
+PLC selects the station configuration (and profile) -> ARM -> part in place -> TRIGGER ->
+BUSY -> PASS / FAIL / PULL +
 result code -> the PLC acts (and the operator sees red on the part where it failed, or an
-amber frame when it is pulled). START / TRIGGER / ARM may carry the work state the sender
-expects (`{"workstate": ...}` over HTTP): refused when another one is selected. Changing the work state while ARMED disarms (ARM
+amber frame when it is pulled); for a flow, TRIGGER / STEP per work state and a PERMIT bit
+per step, as above. START / TRIGGER / ARM may carry the station configuration and profile
+the sender expects (`{"config": ..., "profile": ...}` over HTTP; a JSON number is the 1-based position, a text
+is the name - also a name made of digits): refused when another one is
+selected. Changing either forgets the last cycle (no PASS, FAIL or PULL of the other one is
+left on the outputs) and, while ARMED, disarms (ARM
 again). Over HTTP, `operator_confirmed` must be a JSON boolean (only `true` confirms; any
 other type is a 400 on START / TRIGGER / ARM); ABORT, DISARM, HOME and RESET ignore it.
+`SELECT_WORKSTATE` / `/api/cmd/workstate` / `{"workstate": ...}` are the deprecated old names
+of `SELECT_CONFIG` / `/api/cmd/config` / `{"config": ...}` (a station configuration was never
+a work state); still accepted, the reply says so.
+
+**ALARM and RESET.** ALARM is on in FAULT (a failed rig check, a job that could not start)
+and while idle after an INVALID cycle, until it is acknowledged: RESET (accepted in FAULT
+and while idle with the ALARM on) or a good HOME switches it off; the next INVALID result
+or FAULT raises it again. RESET never touches the cycle's result: the PULL / FAIL bit and
+the result code of the last cycle stay until the next cycle starts, so a PLC must read
+PULL as "this part goes to quality inspection" and ALARM / READY for the station's own
+state. A PASS is never handed back.
 
 **Routing PULL to a quality-inspection lane.** Every cycle ends in exactly one of three
 dispositions (`README.md`, *Dispositions*): CONTINUE (PASS output), REJECT (FAIL output) or
@@ -173,7 +303,7 @@ doubt (e.g. a missing label = `code_unreadable`) lists it in the recipe's
 `pull.invalid_reasons_to_reject`; that is a line decision to make with quality, not a
 default.
 
-## 6. Validation: prove the numbers on your site
+## 7. Validation: prove the numbers on your site
 
 Do this per rig geometry, after every calibration, and keep the records with the line's
 quality documents. Recipe runs write everything needed (`result.json` per run; the values

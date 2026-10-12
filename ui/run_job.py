@@ -5,7 +5,13 @@ Flow-ready job runner: one station config file in, one run folder out.
 
 A station config (JSON, or YAML when PyYAML is installed) holds every
 station parameter: station id, preset, job type, thresholds, zone, where
-run folders go. Nothing station-specific lives in code. Each run gets a NEW
+run folders go. Nothing station-specific lives in code. This module reads the
+SINGLE-JOB form (station_id, preset, job, part): one job, which the engine
+treats as a station configuration with one implicit profile ("default") and a
+one-step flow (its one work state is that job; engine/flow/schema.py
+lift_legacy). A station configuration with a profile library set and a flow of
+work states (profiles + flow keys) is read by engine/flow/schema.py and run by
+engine/flow/verify.py; `scan run` takes both. Each run gets a NEW
 folder (never an existing one) with
 
     result.json      the machine-readable result (RESULT_SCHEMA_VERSION)
@@ -28,7 +34,7 @@ Job types and the calibration each needs:
                        golden metric scan
     recipe             stereo calibration: a recipe (engine/recipes/, recipes/*.json or a
                        library recipe) - its preset, scan, zones, checks, projected feedback
-                       and outputs; the work state then IS that recipe
+                       and outputs; the config's one work state is verified by that recipe
 
 This module only builds the config; the run folder, the log and the result document come
 from engine/runs.py (shared with api.recipe_run). The measurement itself goes through
@@ -48,6 +54,8 @@ from typing import Optional
 
 from engine import disposition as _disp
 from engine import runs as _runs
+from engine.flow import schema as _flow
+from engine.flow.schema import StationConfigError  # noqa: F401  (one class for both forms)
 from engine.runs import RESULT_SCHEMA_VERSION, RESULTS, RunLog, software_info  # noqa: F401
 from engine.runs import write_result  # noqa: F401  (re-exported: callers use run_job.*)
 
@@ -67,10 +75,6 @@ METRIC_MIN_VALID_PCT = 30.0     # plane: decoded share of the roi below this -> 
 METRIC_MIN_COVERAGE_PCT = 95.0  # golden: surface agreeing within threshold, each direction
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ROOT = Path(__file__).resolve().parents[1]
-
-
-class StationConfigError(ValueError):
-    """The station config is missing, unreadable or invalid (exit 2: refused)."""
 
 
 @dataclass
@@ -165,6 +169,10 @@ def load_station_config(path) -> StationConfig:
     if not path.is_file():
         raise StationConfigError(f"station config not found: {path}")
     doc = _read_doc(path)
+    if not _flow.is_legacy(doc):
+        raise StationConfigError(
+            f"{path.name} is a station configuration with profiles and a flow, not a single "
+            "job: `scan run` runs its work states (engine/flow/schema.load reads it)")
     base_dir = path.resolve().parent
     sid = str(doc.get("station_id") or "").strip()
     if not _ID.fullmatch(sid):
@@ -357,4 +365,7 @@ def empty_result(cfg: StationConfig, run_id: str, run_folder: str, mock: bool,
     return _runs.empty_result(run_id=run_id, run_folder=run_folder, mock=mock,
                               operator_confirmed=operator_confirmed, station=cfg.station_id,
                               job=job, part={"role": cfg.part_role, "label": cfg.part_label},
-                              threshold_mm=cfg.threshold_mm, zone=cfg.zone)
+                              threshold_mm=cfg.threshold_mm, zone=cfg.zone,
+                              # a single job: the configuration's one implicit profile
+                              station_config=str(cfg.source.name) if cfg.source else None,
+                              profile=_flow.LEGACY_PROFILE)

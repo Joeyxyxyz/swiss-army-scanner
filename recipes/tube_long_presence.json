@@ -1,0 +1,65 @@
+{
+  "_comment": "Example recipe (built-in, read-only) of the long-tube profile of stations/example_tube_line.json: is a tube on its seat, and is it this profile's tube? `presence` answers the line's part-present sensor (anything 10 mm above the seat plane is a part); `profile_height` then holds its end face to 62 +- 2 mm, so the other profile's tube is there but FAILs. Mock: scene:tube_long (present), scene:tube_long:absent.",
+  "name": "tube_long_presence",
+  "description": "Long tube (60 mm) on its seat: present, and this profile's",
+  "schema_version": 1,
+  "preset": "bench_9in_metric_bright",
+  "scan": {
+    "kind": "fast",
+    "axis": "xy",
+    "zone": null,
+    "average": null
+  },
+  "part": {
+    "label": "tube_long",
+    "frame": {
+      "reference": "dominant_plane"
+    },
+    "mock_scene": "scene:tube_long"
+  },
+  "zones": [
+    {
+      "id": "seat",
+      "label": "tube seat",
+      "shape": "circle",
+      "units": "part_mm",
+      "coords": {
+        "center": [
+          0,
+          0
+        ],
+        "radius": 14.0
+      },
+      "checks": [
+        {
+          "type": "presence",
+          "params": {
+            "min_height_mm": 10.0,
+            "min_area_pct": 35.0
+          }
+        },
+        {
+          "type": "height",
+          "id": "profile_height",
+          "params": {
+            "nominal_mm": 62.0,
+            "tol_mm": 2.0,
+            "min_height_mm": 10.0
+          }
+        }
+      ]
+    }
+  ],
+  "feedback": {
+    "enabled": true,
+    "hold_s": 5.0
+  },
+  "outputs": {
+    "runs_dir": null,
+    "overlay": true
+  },
+  "pull": {
+    "guard_band_pct": 10,
+    "invalid_reasons_to_reject": []
+  }
+}

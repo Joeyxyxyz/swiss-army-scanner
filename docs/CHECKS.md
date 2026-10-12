@@ -54,6 +54,24 @@ geometry) or a metric scan named by its exact id. Never the scan being checked, 
 metric scan matched by label (an earlier run's test scan carries the part's label), never
 one made at other geometry-bound settings or with another stereo calibration: INVALID.
 
+## Checks and work states: what the DLP saw
+
+A work state of a station configuration's flow (`stations/README.md`) may `expect` a signal of
+the line's own sensors (`part_present`) and names the check that observes it (`verify.observe`:
+`"<zone>/<check>"`, required for every expected signal: no check is picked by default). What
+that check **saw** is compared with what the sensor says: the DLP confirms or corrects the
+sensor.
+
+- `presence` reports what it saw whatever it expected: `details.present` (true / false) on a
+  PASS or a FAIL. An INVALID presence (unseen, too few points) saw nothing: unknown.
+- Any other check observes "true" when it PASSes and "false" when it FAILs (`"invert": true`
+  flips it); INVALID, or a FAIL / PASS carrying a `pull` reason, is unknown.
+- A reading the run itself holds in doubt (a value in the recipe's guard band) is unknown too.
+
+Unknown is never a sensor mismatch and never a confirmation: the work state is a DOUBT (PULL).
+A plugin check needs nothing special for this; set `details["present"]` only if you write
+another presence-like check under the type id `presence`.
+
 ## The context a check reads
 
 | | |

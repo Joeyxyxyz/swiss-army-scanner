@@ -33,6 +33,11 @@ Doubt (`pull_reasons`, [{zone?, check?, reason, message}]; `reason` is one of RE
                      text is not engine wording)
   aborted            the cycle was ABORTED
   guard_band         a PASS value within guard_band_pct of a tolerance limit
+  sensor_mismatch    a work state: a line sensor and the DLP disagree (engine/flow/cycle.py)
+  sensor_unknown     a work state: a sensor it expects never reported, or changed mid-scan
+  not_confirmed      a work state was not confirmed (not met, a defect the line pulls,
+                     skipped, never reached)
+  timeout            a work state was not confirmed in time (nobody acknowledged)
 
 A PASS check whose own tolerances do not hold it up is a doubt (`invalid`), guard band or
 not: a value that is missing or not a finite number, or outside its own limits (the verdict
@@ -49,7 +54,8 @@ with no span) cannot clear any value: every PASS of that tolerance is PULLed.
 recipe pull.invalid_reasons_to_reject (default []: every doubt is a PULL): reasons from
 REJECTABLE the line rejects instead of pulling (e.g. code_unreadable: no label, no part).
 `aborted`, `guard_band`, `refused` and `error` are never rejectable (they say nothing
-about the part), and a run that was refused or crashed is never rejected through the list.
+about the part), nor are the work-state reasons (a cycle's own kickout action decides), and
+a run that was refused or crashed is never rejected through the list.
 
 Exit codes (run, recipe-run, station-check, face-check): CONTINUE 0, REJECT 1, PULL 5
 (refused 2, crashed 4 and ABORTED 1 keep their documented codes; their disposition is
@@ -85,8 +91,15 @@ REASONS = {
     "error": "the run crashed",
     "aborted": "the cycle was aborted",
     "guard_band": "a passing value within the guard band of its limit",
+    "sensor_mismatch": "a line sensor and the DLP disagree",
+    "sensor_unknown": "a sensor the work state expects did not report",
+    "not_confirmed": "a work state was not confirmed",
+    "timeout": "a work state was not confirmed in time",
 }
-NOT_REJECTABLE = ("aborted", "guard_band", "refused", "error")
+# never rejectable through a recipe's list: they say nothing definite about the part (the
+# work-state reasons belong to a cycle, whose own kickout action decides REJECT / PULL)
+NOT_REJECTABLE = ("aborted", "guard_band", "refused", "error", "sensor_mismatch",
+                  "sensor_unknown", "not_confirmed", "timeout")
 REJECTABLE = tuple(r for r in REASONS if r not in NOT_REJECTABLE)
 UNFINISHED = ("refused", "error")       # the run never finished: PULL, whatever it recorded
 MAX_GUARD_BAND_PCT = 100.0          # exclusive: 100 % would pull every pass

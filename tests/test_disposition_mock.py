@@ -399,7 +399,7 @@ def _run(recipe, scan, tmp_path, **kw):
 def test_continue_and_reject_with_their_codes_and_fields(eng, tmp_path):
     s, scans = eng
     out, res, _, ev = _run("box_lid", scans["good"], tmp_path)
-    assert res["schema_version"] == "0.3" and res["result"] == "PASS"
+    assert res["schema_version"] == "0.4" and res["result"] == "PASS"
     assert res["disposition"] == "CONTINUE" and res["pull_reasons"] == [] and out["exit_code"] == 0
     assert res["recipe"]["result_code"] == 1 and res["recipe"]["pull"]["guard_band_pct"] == 10
     verdict = next(e for e in ev if e["event"] == "verdict")
@@ -676,7 +676,7 @@ def _only_run(tmp_path) -> tuple:
 @pytest.mark.parametrize("what", ["crash", "abort"])
 def test_station_recipe_run_after_its_verdict_never_keeps_the_pass_code(tmp_path, monkeypatch,
                                                                         what):
-    """`scan run` (and the operator page's run_station) on a recipe work state: the
+    """`scan run` (and the operator page's run_station) on a recipe station config: the
     runner's own settle already wrote the PASS code (1); a crash after it (a failed output
     listing) is INVALID / PULL with INVALID's code (3), an ABORT up to result.json is
     ABORTED / PULL with ABORTED's code (4). The --json error output names the disposition."""
@@ -851,7 +851,11 @@ def test_station_metric_job_dispositions_and_exit_codes(tmp_path, monkeypatch, f
     assert got == code, out
     (run_dir,) = [d for d in (tmp_path / "runs").iterdir() if d.is_dir()]
     res = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
-    assert res["schema_version"] == "0.3" and res["disposition"] == disp
+    assert res["schema_version"] == "0.4" and res["disposition"] == disp
+    # the job's one implicit work state says the same: only CONTINUE is CONFIRMED
+    assert res["steps"][0]["outcome"] == ("ABORTED" if reason == "aborted" else {
+        "CONTINUE": "CONFIRMED", "REJECT": "DEFECT"}.get(disp, "DOUBT"))
+    assert res["steps"][0]["permission_granted"] is False and res["permissions"] == {}
     assert [p["reason"] for p in res["pull_reasons"]] == ([reason] if reason else [])
     end = json.loads((run_dir / "run.log.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert end["event"] == "run_end" and end["disposition"] == disp and end["exit_code"] == code
@@ -925,7 +929,7 @@ def _bus(info=None):
     out = C.SimulatedOutput({"PULL": "DO5"})
     bus.outputs.append(out)
     if info:
-        bus.update_workstates(["a.json", "b.json"], info=info)
+        bus.update_configs(["a.json", "b.json"], info=info)
     return bus, out
 
 
@@ -962,12 +966,12 @@ def test_bus_pull_output_and_result_code():
     bus.job_finished("run", "PASS", disposition="CONTINUE")    # aborted: PULL whatever it says
     assert bus.last_result == "ABORTED" and bus.signals()["PULL"] and not bus.signals()["PASS"]
     assert bus.registers()["result_code"] == 4
-    # while busy every result output is off; a never-started cycle (unusable work state) pulls
+    # while busy every result output is off; a never-started cycle (unusable config) pulls
     bus.command("START")
     assert not any(bus.signals()[k] for k in ("PASS", "FAIL", "PULL"))
     bus.job_finished("run", "PASS")                            # no disposition: as the verdict
     assert bus.signals()["PASS"] and bus.registers()["result_code"] == 1
-    bus.update_workstates(["a.json", "b.json"], unusable={"a.json": "config invalid"})
+    bus.update_configs(["a.json", "b.json"], unusable={"a.json": "config invalid"})
     assert not bus.command("START").accepted
     assert bus.signals()["PULL"] and bus.last_disposition == "PULL"
 
@@ -1259,14 +1263,14 @@ const show = vm.runInContext('showRun', sandbox);
 
 def _bus_state(state, result=None, disp=None, jobs=None, history=None, sig=None):
     return {"state": state, "last_result": result, "last_disposition": disp,
-            "jobs": jobs or {}, "workstates": [], "workstate": None, "unusable": {},
+            "jobs": jobs or {}, "station_configs": [], "station_config": None, "unusable": {},
             "signals": sig or {}, "history": history or [], "warnings": []}
 
 
 def test_quick_lamp_follows_the_bus_and_never_shows_a_pass_it_does_not_give(tmp_path):
     """The lamp reads the same signals as the line: a run's CONTINUE is shown only once the
     bus has heard it end, and a bus PULL (ABORT after the verdict, a START refused on an
-    unusable work state) replaces a green PASS on the lamp."""
+    unusable station configuration) replaces a green PASS on the lamp."""
     node = shutil.which("node")
     if node is None:
         pytest.skip("node not installed; quick.js logic not checked")
@@ -1277,14 +1281,15 @@ def test_quick_lamp_follows_the_bus_and_never_shows_a_pass_it_does_not_give(tmp_
         {"bus": _bus_state("ABORTING", jobs={"j1": "run"}), "job": cont},
         # the bus settled: ABORTED / PULL, whatever the job said
         {"bus": _bus_state("READY", "ABORTED", "PULL", sig={"PULL": True}), "job": cont},
-        # a fresh CONTINUE cycle (shown), then a START refused on an unusable work state
+        # a fresh CONTINUE cycle (shown), then a START refused on an unusable configuration
         {"show": cont, "bus": _bus_state("READY", "PASS", "CONTINUE", sig={"PASS": True}),
          "job": cont},
-        {"send": "start", "accepted": False, "message": "work state a.json is not usable: "
-                                                        "bad JSON",
+        {"send": "start", "accepted": False, "message": "station configuration a.json is "
+                                                        "not usable: bad JSON",
          "bus": _bus_state("READY", "INVALID", "PULL", sig={"PULL": True, "ALARM": True},
                            history=[["t", "quick", "START", False,
-                                     "work state a.json is not usable: bad JSON"]])},
+                                     "station configuration a.json is not usable: bad "
+                                     "JSON"]])},
         # a bus CONTINUE never turns a run shown as PULL green
         {"show": {"id": "j2", "status": "done", "result": {"result": "PASS",
                                                            "disposition": "PULL"}},

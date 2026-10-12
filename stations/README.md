@@ -1,4 +1,233 @@
-# Station configs
+# Station configurations
+
+A file here is a **station configuration**: what one station is and knows. It is **not** a
+work state.
+
+| word | what it is |
+|---|---|
+| **Station configuration / parameters** | the station's parameters (rig preset, library, run folders, the line's sensor inputs, defaults) and the **profile library set** it can call on |
+| **Profile** | one part variant of that set (long tube / short tube): what the part **looks like** - its recipes (zones + checks), preset, named zones, golden. Selected by the operator, a PLC or HTTP (`SELECT_PROFILE`) |
+| **Work state** | one **step** of the flow: a claim of the line's own sensors, the DLP check that confirms or corrects it, the permission that lets the line continue |
+| **Check** | what the DLP measures to verify a work state (`recipes/README.md`, `docs/CHECKS.md`) |
+| **Disposition** | CONTINUE / REJECT / PULL: what happens to the part (`README.md` *Dispositions*) |
+
+Two forms load:
+
+- **profiles + flow** (`example_tube_line.json`): the configuration, its profile library set
+  and its work states. Below.
+- **a single job** (`example_cell_station.json`, `example_metric_check.json`,
+  `example_recipe_box_lid.json`): the older form, still read and run exactly as before. It is
+  a configuration with one implicit profile (`default`) and a one-step flow (its job). See
+  *Single-job station configs*.
+
+`scan run <config>` runs either; `scan flow-show <config>` prints and validates either.
+`io_*.json` files here are command I/O mappings (`io_example.json`), not stations.
+
+## Profiles and work states
+
+```json
+{
+  "schema_version": 2,
+  "station_id": "example_tube_line",
+  "parameters": {
+    "preset": "bench_9in_metric_bright",
+    "library": null, "mock_library": "../library_mock", "runs_dir": "../runs",
+    "default_profile": "long_tube",
+    "io": {"inputs": {"part_present": {"description": "the seat's part-present sensor"}}},
+    "defaults": {"retries": 1, "timeout_s": null, "trigger": "step"}
+  },
+  "profiles": {
+    "long_tube":  {"title": "Long tube (60 mm)",
+                   "recipes": {"presence": "tube_long_presence", "alignment": "tube_long_alignment",
+                               "end_face": "tube_long_end_face"}},
+    "short_tube": {"title": "Short tube (38 mm)",
+                   "recipes": {"presence": "tube_short_presence", "alignment": "tube_short_alignment",
+                               "end_face": "tube_short_end_face"}}
+  },
+  "flow": "../flows/example_tube_line.json"
+}
+```
+
+### `parameters`
+
+| Key | Meaning |
+|---|---|
+| `preset` | the rig preset every profile scans with (a profile's own `preset` wins; `null`: each recipe's pinned preset) |
+| `library`, `mock_library`, `runs_dir`, `operator_confirmed` | as in a single-job config (below); paths are relative to this file |
+| `default_profile` | the profile selected when the configuration is (default: the first) |
+| `io.inputs` | the sensor signals of the line the work states may `expect`: `{"<signal>": {"description", "source"}}` (or a list of names). A work state naming another signal is refused, and so is a claim for a name no configuration declares. The claims arrive at run time: `POST /api/io/inputs {"<signal>": true}`, `scan run --input <signal>=true`, an input backend's `signals` map. **A claim belongs to one cycle**: every claim is forgotten when a cycle ends (and on ABORT, HOME, FAULT, a configuration / profile change), so the line reports its sensors for every part |
+| `io.max_age_s` | optional: the oldest a claim may be (seconds) when a work state's scan starts; an older one is unknown (DOUBT). `null` (default): no limit beyond "reported for this cycle" |
+| `defaults` | `retries` (1), `timeout_s` (null), `trigger` (`step`) for work states that do not say |
+
+### `profiles` (the profile library set)
+
+One entry per part variant. Every profile must be able to verify every work state.
+
+| Key | Meaning |
+|---|---|
+| `title`, `description` | shown on the operator page |
+| `preset` | this profile's rig preset (`null`: `parameters.preset`, else each recipe's own) |
+| `recipes` | `{"<key>": "<recipe>"}`: what this part looks like, under the keys the flow's work states verify with. A recipe is a name (`scan recipe-list`), a recipe file (relative to this config) or a recipe mapping |
+| `zones`, `scan`, `part`, `golden`, `feedback`, `pull` | for work states with **inline checks**: the profile's named zones `{"<id>": {shape, units, coords}}` and the recipe sections (as in a recipe) they are scanned with |
+| `mock_scene` | MOCK only: the good part of this profile (`scene:<name>`) |
+
+### `flow` (the work states)
+
+A list of steps, `{"steps": [...]}`, or a file relative to this config (`flows/README.md`).
+Each step is one work state:
+
+| Key | Meaning |
+|---|---|
+| `id`, `title` | the work state ("Tube loaded?") |
+| `expects` | `{"<signal>": true \| false}`: what the line's sensors claim at this step (may be empty: the DLP alone decides) |
+| `verify` | the DLP check: `{"recipe": "<key of the profile's recipes>"}`, or inline `{"checks": [{"zone": "<profile zone>", "type": "presence", "params": {...}}]}`. `"observe": {"<signal>": "<zone>/<check>"}` names the check whose answer IS that signal (`{"zone", "check", "invert": true}` flips it). **Required for every expected signal**: nothing is guessed - a signal no check was named for is refused (a door switch is never "confirmed" by a part-presence check because it was the only one) |
+| `permit` | the permission granted when the work state is CONFIRMED: bus output `PERMIT_<NAME>` |
+| `on_confirm` | `next` (default), `done`, or a step id |
+| `on_mismatch`, `on_not_met`, `on_defect`, `on_doubt` | action lists (below). `on_not_met` defaults to the `on_mismatch` list, `on_doubt` to `kickout PULL` (a doubt list takes no `goto` and no `kickout REJECT`) |
+| `retries` | re-scans the `retry` action / the RETRY command may use (default 1) |
+| `timeout_s` | the longest the work state may wait for STEP, or for an ACK (each wait counted from its start; the scan itself is not counted); then its cycle ends PULL (`null`: no limit) |
+| `trigger` | `step` (verified on STEP / TRIGGER) or `auto` (verified as soon as it is the current one) |
+| `required`, `allow_skip` | `required: false` work states do not count for CONTINUE and may `allow_skip` (SKIP never grants the permission). At least one work state must be required. One left in DOUBT or CORRECTED is never passed over or skipped, required or not |
+| `revoke` | permissions of other work states dropped when this one is not confirmed (a list, or `"all"`) |
+
+**Outcomes.** Per expected signal three values meet: what the work state expects, what the
+sensor says, what the DLP saw.
+
+| outcome | when | permission | actions |
+|---|---|---|---|
+| `CONFIRMED` | sensor and DLP agree, on what the work state expects, and every check passes with no doubt | granted | `on_confirm` |
+| `CORRECTED` | the DLP disagrees with a sensor: `sensor_mismatch` `[{signal, sensor, dlp, expected}]` | withheld | `on_mismatch` |
+| `NOT_MET` | sensor and DLP agree, on something the work state does not expect | withheld | `on_not_met` |
+| `DEFECT` | the part is there, a check definitely fails | withheld | `on_defect` |
+| `DOUBT` | INVALID / unmeasured / a guard band / a sensor that never reported or changed during the scan / a crashed check | withheld | `on_doubt` |
+
+**Actions** (a short text, or a mapping; `"when_dlp": {"<signal>": true}` limits one to what
+the DLP saw):
+
+| action | what it does |
+|---|---|
+| `project_fault` | paints the fault / the missing-part zone on the part (the recipe's projected feedback). Recorded as `requested` (the cycle asked for it; `scan run` adds `shown`: what the projector did); nothing is painted when every check passed (`why`) |
+| `prompt <message>` | a message to the operator / system (`PROMPT` on, the banner on `/quick`); the list waits for **ACK** |
+| `hold` | waits for ACK (the prompt before it, else its own), then verifies the work state again |
+| `retry` | verifies again at once, up to `retries`; then the list goes on |
+| `kickout REJECT\|PULL [reason]` | ends the cycle with that disposition (REJECT only on a definite finding: under DOUBT it is a PULL). The cycle's `kickout` records the reason and, as `detail`, what the DLP found |
+| `goto <step id>` | makes another work state the current one (never out of a DOUBT). A work state reached by jumping ahead grants no permission while a required work state before it is unconfirmed |
+
+A required work state whose list ends without confirming it ends the cycle **PULL** (fail
+closed), and so does any work state left in DOUBT or CORRECTED - required or not: the line
+never continues past an open question. A work state that is not required may be left
+unconfirmed only on a definite finding the sensor agrees with (NOT_MET / DEFECT): the flow
+goes on, its permission stays withheld, `cycle.unconfirmed` lists it. The cycle is
+**CONTINUE only when every required work state was CONFIRMED** (and at least one is).
+`KICKOUT` is on with FAIL or PULL: every cycle that does not CONTINUE says in `cycle.kickout`
+where and why its part leaves the line, kickout action or not.
+
+**A sensor says a part is there when it should not be.** The same three values, with
+`expects` false: a work state that needs the seat EMPTY, verified by a presence check that
+expects `absent` (here inline, on a zone of the profile):
+
+```json
+{"id": "clear", "title": "Seat clear?",
+ "expects": {"part_present": false},
+ "verify": {"checks": [{"zone": "seat", "type": "presence",
+                        "params": {"expect": "absent", "min_height_mm": 10}}],
+            "observe": {"part_present": "seat/presence"}},
+ "permit": "LOAD_OK",
+ "on_mismatch": [
+   {"prompt": "the sensor says a part is there, the seat is empty: check the sensor",
+    "when_dlp": {"part_present": false}},
+   {"prompt": "a part is on the seat and the sensor missed it: take it off and check the sensor",
+    "when_dlp": {"part_present": true}},
+   "hold"],
+ "on_not_met": ["project_fault", "prompt a part is on the seat: take it off", "hold"]}
+```
+
+A sensor mismatch has two directions; `when_dlp` gives each its own prompt (one prompt for
+both would tell the operator the seat is empty while a part sits on it).
+
+| the sensor says | the DLP says | outcome | then |
+|---|---|---|---|
+| no part | no part | `CONFIRMED` | `LOAD_OK` granted |
+| a part | no part | `CORRECTED` (`sensor_mismatch`) | the sensor is wrong: its prompt, hold |
+| a part | a part | `NOT_MET`: it really is there | the unexpected part is painted on the seat, the operator is prompted to take it off (or `kickout PULL`) |
+| no part | a part | `CORRECTED` (`sensor_mismatch`) | the sensor missed it: the other prompt, hold |
+
+**Permissions.** `PERMIT_<NAME>` is true only while its work state is CONFIRMED in the
+current cycle and every required work state before it is. All drop when a new cycle starts,
+when the cycle ends anything but CONTINUE, on ABORT, FAULT, HOME, ARM, DISARM, a
+configuration / profile change, a flow edited on disk - and on a START / TRIGGER that starts
+no cycle (refused, or ignored because the station is not armed): that part was announced and
+not checked, so the last cycle's permissions, its PASS and its work-state registers never
+stand in for it. A permission of a configuration that is no longer selected stays published
+as false. Nothing grants one on a doubt.
+
+**The cycle folder** (`<runs_dir>/<UTC timestamp>_<station_id>_<8 hex>/`): `result.json`
+(the run schema below, 0.4: `station_config`, `profile`, `steps`, `permissions`, `cycle`),
+`run.log.jsonl` (cycle_start, work_state, prompt, ack, permission, cycle_end) and
+`steps/<one run folder per DLP check>` (each a normal recipe run: result.json, overlay,
+fault image). One step:
+
+```json
+{"id": "loaded", "title": "Tube loaded?", "index": 1, "required": true,
+ "expects": {"part_present": true}, "sensor_inputs": {"part_present": true},
+ "dlp_result": {"result": "FAIL", "disposition": "REJECT", "observed": {"part_present": false},
+                "run_id": "...", "recipe": "tube_long_presence", "zones": [...]},
+ "outcome": "CORRECTED",
+ "sensor_mismatch": [{"signal": "part_present", "sensor": true, "dlp": false, "expected": true}],
+ "permit": "LOAD_DONE", "permission_granted": false, "permission_note": null,
+ "actions": [{"action": "project_fault", "requested": true},
+             {"action": "prompt", "message": "no tube found: load or clear the sensor",
+              "acknowledged": true}],
+ "attempts": 1, "disposition": null, "message": "sensor part_present says true, the DLP says false"}
+```
+
+`permission_granted` says whether the permission still stood when the cycle ended (the same
+as `permissions`); `permission_note` says why a CONFIRMED work state's permission was dropped
+or withheld. `cycle` holds how it ended: `ended_by`, `kickout` (`{step, disposition, reason,
+detail, by}`; null only for CONTINUE), `sensor_mismatch` (a sensor and the DLP disagreed at
+any verify, also one put right since), `sensor_mismatches` (each one: step, attempt, signal,
+both values), `unconfirmed` (the work states that are not CONFIRMED).
+
+**Running it.**
+
+```bat
+scan.bat flow-show stations\example_tube_line.json
+scan.bat --mock run stations\example_tube_line.json --profile short_tube
+scan.bat --mock run stations\example_tube_line.json --mock-case sensor_true_part_absent
+scan.bat run stations\my_line.json --profile long --input part_present=true --operator-confirmed
+```
+
+`scan run` walks one whole cycle in line: `--input SIGNAL=true|false` are the sensor claims
+(a work state that expects a signal nobody gave is a DOUBT); a prompt nobody acknowledges
+ends the cycle PULL (`--acknowledge` answers every prompt, `--interactive` asks; a prompt is
+answered at most `retries` + 1 times per work state, then the unattended cycle ends PULL
+rather than acknowledge for ever). Exit codes:
+0 CONTINUE, 1 REJECT, 5 PULL, 2 refused. The operator page (`/quick`) and a PLC walk the same
+cycle step by step through the command bus: START, STEP, ACK, `POST /api/io/inputs`.
+`flow-show` prints, per work state, the check that observes each sensor signal.
+
+**MOCK.** `mock.cases` name the simulated line: the scene the simulated human places (the
+profile's `mock_scene`, its `:<variant>`, an explicit `scene`) and what the simulated sensors
+say; `--mock-case NAME`, or the case selector on `/quick`. The simulated sensors report for
+every cycle, as a line's gateway must; a signal posted to `POST /api/io/inputs` is the line's
+own from then on (the simulated sensor of that name goes quiet until a case is chosen
+again), so a gateway tested against the mock server has to report for every part too. The
+example ships `all_good`,
+`sensor_true_part_absent` (CORRECTED), `sensor_false_part_present` (CORRECTED), `misaligned`
+(DEFECT at *Tube aligned?*) and `dented` (DEFECT at *End face OK?*, kicked out). Once per mock
+library:
+
+```bat
+scan.bat --mock --library library_mock --preset bench_9in_metric_bright calibrate-stereo --mock-poses 12
+scan.bat --mock --library library_mock recipe-golden tube_long_alignment
+scan.bat --mock --library library_mock recipe-golden tube_short_alignment
+```
+
+Built and mock-tested (`tests/test_flow_mock.py`, `tests/test_flow_ui_mock.py`); not yet run on the real rig. Hardware
+input backends are placeholders: on a line, the sensor claims come in over HTTP from a
+gateway until one is implemented.
+
+## Single-job station configs
 
 `scan run <config>` runs one job from a station config and writes a new run folder:
 
@@ -82,7 +311,8 @@ on numbers the job marks untrusted.
 
 Recipe job (`example_recipe_box_lid.json`): `"job": {"type": "recipe", "recipe": "box_lid"}`
 runs a recipe (`recipes/README.md`: its preset, scan, zones, checks, projected feedback);
-`preset: null` = the recipe's own preset. The work state then IS the recipe: result.json
+`preset: null` = the recipe's own preset. The config's one work state is verified by that
+recipe: result.json
 adds `zones` (per zone: verdict, checks with values / limits / fault points), `recipe` (name,
 preset, part frame, result code) and `feedback` (what the projector painted); the run folder
 also holds `overlay.png`, `feedback_dmd.png` and `feedback_photo.png`. After result.json is
@@ -91,11 +321,12 @@ skip it; the operator page shows it as its own job, cleared by the next command)
 `mock_part` (MOCK only) is what the simulated human places, e.g. `scene:box_lid:ajar`
 (`--mock-part` wins).
 
-The operator page (`/quick`) lists every `*.json` here as a work state (`io_*.json` are
-command I/O mappings, see `io_example.json`, not stations). Work states are numbered 1..n in
-file-name order, invalid configs included: an invalid one keeps its number and is shown as
-unusable, so a PLC work-state number never shifts because another config broke; adding or
-removing files while idle does renumber. A config with `preset: null` that is not a recipe
+The operator page (`/quick`) lists every `*.json` here as a station configuration
+(`io_*.json` are command I/O mappings, see `io_example.json`, not stations). Configurations
+are numbered 1..n in file-name order, invalid configs included: an invalid one keeps its
+number and is shown as unusable, so a PLC's configuration number (the `station_config`
+register) never shifts because another config broke; adding or removing files while idle
+does renumber. A config with `preset: null` that is not a recipe
 runs the preset currently loaded in the web UI (refused if none is loaded); when the
 library's selected preset no longer exists (deleted, renamed) the web UI loads none in its
 place (and shows why), and such a run is refused (INVALID, naming it) until a preset is
@@ -131,7 +362,7 @@ this file.
 
 ```json
 {
-  "schema_version": "0.3",
+  "schema_version": "0.4",
   "run_id": "20261001T120000Z_example_cell_station_1a2b3c4d",
   "run_folder": "runs/20261001T120000Z_example_cell_station_1a2b3c4d",
   "mode": "MOCK",
@@ -159,6 +390,16 @@ this file.
   "recipe": null,
   "zones": [],
   "feedback": null,
+  "station_config": "example_cell_station.json",
+  "profile": "default",
+  "steps": [{"id": "run", "title": "inspect job", "index": 1, "required": true, "expects": {},
+             "sensor_inputs": {}, "dlp_result": {"result": "PASS", "disposition": "CONTINUE",
+                                                 "run_id": "..."},
+             "outcome": "CONFIRMED", "sensor_mismatch": [], "permit": null,
+             "permission_granted": false, "permission_note": null, "actions": [],
+             "disposition": "CONTINUE"}],
+  "permissions": {},
+  "cycle": null,
   "software": {"package_version": "0.1.0", "git_commit": null},
   "started": "...", "finished": "..."
 }
@@ -169,7 +410,13 @@ Schema 0.2 added `recipe`, `zones` and `feedback` (null / [] for the other job t
 `outlier_pct` / `dense_strays` (metric jobs; null for the others); every 0.1 key is
 unchanged. Schema 0.3 added `disposition` (CONTINUE / REJECT / PULL) and `pull_reasons`
 (`[{zone?, check?, reason, message}]`: every doubt found, also under REJECT); `result` and
-every 0.2 key are unchanged.
+every 0.2 key are unchanged. Schema 0.4 added the work states: `station_config`, `profile`,
+`steps`, `permissions` and `cycle` (every 0.3 key unchanged). A single job is ONE implicit
+work state `run` whose outcome is the job's own disposition (CONTINUE -> `CONFIRMED`, REJECT
+-> `DEFECT`, anything else `DOUBT`), with no sensor claim and no permission; a cycle of a
+flow lists every work state (*Profiles and work states* above), `cycle` says how it ended
+(`ended_by`, `kickout`, `sensor_mismatch`, `sensor_mismatches`, `unconfirmed`) and its
+`pull_reasons` may carry `step`.
 
 `INVALID` means the numbers cannot be trusted (no mm calibration at this geometry,
 an INDETERMINATE engine verdict, a refused or crashed run). Never report an

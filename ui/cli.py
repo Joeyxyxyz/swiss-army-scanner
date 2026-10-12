@@ -38,7 +38,7 @@ Exit codes let a script or an agent branch without parsing the text:
      an unreadable code): never a pass, never a reject
 `run <station config>` is the flow-ready entry point: one job, a new run
 folder with result.json + run.log.jsonl (ui/run_job.py). `recipe-run <recipe>` runs a
-recipe (work-state check: zones, checks, projected verdict) the same way. Their exit code
+recipe (the check of a work state: zones, checks, projected verdict) the same way. Their exit code
 is the disposition (engine/disposition.py): 0 CONTINUE, 1 REJECT, 5 PULL; refused 2,
 crashed 4 and ABORTED 1 keep their codes (disposition PULL in result.json).
 --json prints one JSON document per command instead of tables.
@@ -837,7 +837,7 @@ def cmd_preset_show(ctx):
     return EXIT_OK, {"preset": r}
 
 
-# ------------------------------------------------------------ recipes (work-state checks)
+# ------------------------------------------------------------ recipes (what verifies a work state)
 
 def cmd_recipes(ctx):
     items = api.recipe_list()
@@ -4112,10 +4112,181 @@ def _run_capture(ctx, cfg, p, base, log, res):
     return scan
 
 
+def _flow_inputs(items) -> dict:
+    """--input SIGNAL=true|false (repeatable) -> the sensor claims {signal: bool}."""
+    out = {}
+    for it in items or []:
+        key, sep, val = str(it).partition("=")
+        val = val.strip().lower()
+        if not sep or not key.strip() or val not in ("true", "false"):
+            raise CLIError(f"--input {it!r}: write SIGNAL=true or SIGNAL=false (what the "
+                           "line's sensor says)")
+        out[key.strip()] = val == "true"
+    return out
+
+
+def _flow_table(ctx, res: dict) -> None:
+    """The work states of a cycle: what the sensor said, what the DLP said, the outcome."""
+    def says(d: dict) -> str:
+        return ", ".join(f"{k}={'?' if v is None else str(v).lower()}"
+                         for k, v in (d or {}).items()) or "-"
+    rows = []
+    for s in res.get("steps") or []:
+        dlp = s.get("dlp_result") or {}
+        seen = says(s.get("observed")) if s.get("expects") else (dlp.get("result") or "-")
+        # GRANTED only when it still stands at the end of the cycle (what `permissions` says)
+        note = str(s.get("permission_note") or "")
+        perm = "-" if not s.get("permit") else f"{s['permit']} " + (
+            "GRANTED" if s.get("permission_granted") else
+            "dropped" if note.startswith("dropped") else "withheld")
+        rows.append([str(s.get("index")), s.get("id"), says(s.get("sensor_inputs")), seen,
+                     s.get("outcome"), perm, _one_line(s.get("message") or "")[:70]])
+    ctx.table(["#", "work state", "sensor says", "DLP says", "outcome", "permission", ""], rows)
+    for s in res.get("steps") or []:
+        for act in s.get("actions") or []:
+            bits = [f"{k}={v}" for k, v in act.items() if k != "action" and v not in (None, "")]
+            ctx.say(f"    {s.get('id')}: {act.get('action')}"
+                    + (f" ({_one_line(', '.join(bits))[:110]})" if bits else ""))
+
+
+def cmd_flow_show(ctx):
+    """A station configuration as the engine reads it: parameters, profiles, work states."""
+    a = ctx.args
+    chk = api.flow_check(a.config)
+    if not chk["valid"]:
+        if ctx.json:
+            return EXIT_REFUSED, {"valid": False, "problems": chk["problems"],
+                                  "config": chk["config"]}
+        raise CLIError(f"{a.config}: {len(chk['problems'])} problem(s):\n  - "
+                       + "\n  - ".join(chk["problems"]))
+    c = chk["config"]
+    ctx.say(f"Station configuration {c['station_id']}"
+            + (" (a single-job config: one implicit profile, a one-step flow)"
+               if c["legacy"] else "") + (f": {c['description']}" if c["description"] else ""))
+    ctx.kv([["preset", c["preset"] or "(each recipe's own / the selected one)"],
+            ["sensor inputs", ", ".join(c["signals"]) or "none"],
+            ["permissions", ", ".join("PERMIT_" + p for p in c["permissions"]) or "none"],
+            ["flow", c["flow_source"] or "inline"]])
+    ctx.say("", "Profiles (the profile library set):")
+    ctx.table(["profile", "title", "preset", "recipes"],
+              [[p["name"] + (" *" if p["name"] == c["default_profile"] else ""), p["title"],
+                p["preset"] or "-", ", ".join(f"{k}={v}" for k, v in p["recipes"].items()) or "-"]
+               for p in c["profiles"]])
+    ctx.say("", "Work states (the flow):")
+    ctx.table(["#", "id", "title", "expects", "observed by", "verify", "permit", "trigger"],
+              [[str(s["index"]), s["id"], s["title"],
+                ", ".join(f"{k}={str(v).lower()}" for k, v in s["expects"].items()) or "-",
+                # the check whose answer IS that sensor signal (verify.observe)
+                ", ".join(f"{k} <- {v}" for k, v in (s.get("observe") or {}).items()) or "-",
+                s["verify"] + ("" if s.get("required", True) else " (not required)"),
+                s["permit"] or "-", s["trigger"]] for s in c["flow"]])
+    for s in c["flow"]:
+        for key in ("on_mismatch", "on_not_met", "on_defect", "on_doubt"):
+            if s[key]:
+                ctx.say(f"    {s['id']}.{key}: " + " -> ".join(_one_line(x) for x in s[key]))
+    return EXIT_OK, {"valid": True, "problems": [], "config": c}
+
+
+def _run_flow(ctx):
+    """`scan run` on a station configuration with profiles + a flow: one whole cycle, in
+    line - every work state is verified in turn against the sensor claims (--input), its
+    actions run, a new cycle folder is written (result.json: station config, profile, steps,
+    permissions, disposition). The operator page and a PLC walk the same cycle step by step
+    through the command bus."""
+    from engine.flow import schema as FS
+    from engine.flow import verify as FV
+    a = ctx.args
+    try:
+        cfg = FS.load(a.config)
+    except FS.StationConfigError as e:
+        raise CLIError(str(e)) from e
+    params = cfg.parameters
+    lib = FS.rel_path(cfg.source.parent, params["mock_library"] if (
+        ctx.mock and params["mock_library"] is not None) else params["library"])
+    if lib is not None and not a.library:           # --library on the command line wins
+        ctx.session = api.configure(lib.resolve(), mock=ctx.mock)
+        ctx._outputs_before = len(ctx.session.store.outputs())
+    probs = FV.check_config(cfg)
+    if probs:
+        raise CLIError(f"station configuration {cfg.station_id}: {len(probs)} problem(s):\n  - "
+                       + "\n  - ".join(probs))
+    profile = a.profile or cfg.default_profile
+    if profile not in cfg.profiles:
+        raise CLIError(f"--profile {profile!r}: station configuration {cfg.station_id} has "
+                       f"profiles {', '.join(cfg.profiles)}")
+    inputs = _flow_inputs(a.input)
+    scene = None
+    if ctx.mock:
+        try:
+            case = cfg.mock_case(a.mock_case, profile)
+        except FS.StationConfigError as e:
+            raise CLIError(f"--mock-case: {e}") from e
+        scene = case["scene"]
+        inputs = {**case["inputs"], **inputs}       # --input wins over the case's sensors
+        if getattr(a, "mock_part_given", False):
+            scene = a.mock_part
+            if scene != "none" and not scene.startswith("scene:"):
+                raise CLIError(f"--mock-part {scene}: a flow's work states scan the metric "
+                               "bench: use scene:<name>[:<variant>] or none")
+    elif a.mock_case:
+        raise CLIError("--mock-case is MOCK ONLY: on the real rig a human places the part and "
+                       "the sensors are the line's own (--input)")
+    unknown = sorted(set(inputs) - set(cfg.signals))
+    if unknown:
+        raise CLIError(f"--input {', '.join(unknown)}: not a sensor signal of this configuration "
+                       f"({', '.join(cfg.signals) or 'it expects none'})")
+    confirmed = bool(a.operator_confirmed or params["operator_confirmed"])
+    if not ctx.mock and not confirmed:
+        raise CLIError("the real rig needs a human to confirm the physical setup first (part "
+                       "placed, rig untouched since the calibration): pass --operator-confirmed, "
+                       "or set parameters.operator_confirmed in the station configuration")
+
+    def on_prompt(p: dict) -> bool:
+        if a.acknowledge:
+            ctx.say("    acknowledged (--acknowledge)")
+            return True
+        if not ctx.interactive:
+            return False
+        return _prompt(ctx, f"    {p.get('title')}: {p.get('message')} - done? [y/N] ",
+                       WIZARD_TIMEOUT_S).strip().lower() in ("y", "yes")
+
+    ctx.say(f"[{'MOCK' if ctx.mock else 'REAL RIG'}] station configuration {cfg.station_id}, "
+            f"profile {profile}: {len(cfg.flow)} work state(s)"
+            + (f"; mock: {scene or 'the empty wall'}" if ctx.mock else ""))
+    out = FV.run_cycle(cfg, profile, inputs=inputs, operator_confirmed=confirmed,
+                       mock_scene=scene, on_prompt=on_prompt, project=not a.no_feedback,
+                       say=ctx.say)
+    res = out["result"]
+    ctx.say(f"Cycle {out['cycle_id']}: {res['result']}"
+            + (f"  ({_one_line(res['invalid_reason'])})" if res["invalid_reason"] else ""))
+    ctx.say(f"  disposition: {_one_line(D.summary(res))}")
+    _flow_table(ctx, res)
+    on = [k for k, v in (res.get("permissions") or {}).items() if v]
+    ctx.kv([["station", cfg.station_id], ["profile", profile],
+            ["permissions", ", ".join(on) or "none granted"],
+            ["result.json", str(Path(out["cycle_dir"]) / "result.json")],
+            ["log", str(Path(out["cycle_dir"]) / "run.log.jsonl")]])
+    return out["exit_code"], {"run_id": out["cycle_id"], "run_dir": str(out["cycle_dir"]),
+                              "result": res}
+
+
 def cmd_run(ctx):
-    """One job from a station config -> a new run folder with result.json + run.log.jsonl."""
+    """One job from a station config -> a new run folder with result.json + run.log.jsonl.
+    A station configuration with profiles + a flow runs one whole cycle (_run_flow)."""
+    from engine.flow import schema as FS
     from ui import run_job as RJ
     a = ctx.args
+    try:
+        is_flow = not FS.is_legacy(FS.read_doc(a.config))
+    except FS.StationConfigError:
+        is_flow = False                 # missing / unreadable: load_station_config says why
+    if is_flow:
+        return _run_flow(ctx)
+    for opt, given in (("--profile", a.profile), ("--input", a.input),
+                       ("--mock-case", a.mock_case), ("--acknowledge", a.acknowledge)):
+        if given:
+            raise CLIError(f"{opt} is for a station configuration with profiles and a flow; "
+                           f"{Path(a.config).name} is a single-job station config")
     try:
         cfg = RJ.load_station_config(a.config)
     except RJ.StationConfigError as e:
@@ -4536,7 +4707,8 @@ flow-ready job (one station config in, one run folder out; see stations/):
                                          (quality inspection: INVALID, guard band, ...),
                                          2 refused, 4 crashed (both PULL in result.json)
 
-recipes (work-state checks: preset -> zones -> checks -> verdict painted on the part):
+recipes (what the DLP checks to verify a work state: preset -> zones -> checks -> verdict
+painted on the part):
   scan recipe-list                       built-in (recipes/, read-only) + user recipes
   scan recipe-checks                     check types: presence, position, height, flatness,
                                          defect, edge, code (+ plugins)
@@ -4546,7 +4718,18 @@ recipes (work-state checks: preset -> zones -> checks -> verdict painted on the 
                                          (quality inspection), 2 refused, 4 crashed; red on
                                          the part at the fault, an amber frame for PULL
   scan recipe-add|recipe-select|recipe-delete|recipe-show|recipe-validate
-  station configs: job.type recipe + job.recipe NAME (the work state is the recipe)
+  station configs: job.type recipe + job.recipe NAME (a single job verified by the recipe),
+      or profiles + a flow (each work state verifies with a recipe of the active profile)
+
+station configuration -> profiles -> work states (stations/README.md):
+  scan flow-show stations/example_tube_line.json     parameters, profiles (the profile library
+                                         set), work states (the flow: with the check that
+                                         observes each sensor signal), permissions; validates
+  scan run stations/example_tube_line.json [--profile NAME] [--input SIGNAL=true|false ...]
+                                         one whole cycle in line: every work state is verified
+                                         (the DLP confirms or corrects the sensor claims), exit
+                                         0 CONTINUE (every required work state CONFIRMED), 1
+                                         REJECT (a kickout), 5 PULL; MOCK: --mock-case NAME
 
 library: bases | scans | calibrations | calib-poses | readings | materials | banks | maps |
          sensors | outputs;  bank-remove <scan> --bank NAME drops one bank member.
@@ -4558,7 +4741,9 @@ mock: --mock-part H,W,L[,albedo] is what the simulated human places for scan,
       wizard and check-presence (the bench is albedo 0.6; 'none' = empty);
       --mock-part cylinder[:R,H,dent_mm] places a standing cylinder; qr:TEXT a QR
       label for codes; scene:<name>[:<variant>] a recipe scene (tube[:misaligned],
-      endfaces[:dent|proud], box_lid[:ajar|missing], plate[:bump|burr]).
+      endfaces[:dent|proud], box_lid[:ajar|missing], plate[:bump|burr], tube_long /
+      tube_short[:absent|misaligned|dent]). A station configuration with a flow names its
+      simulated line as cases: run CONFIG --mock-case NAME (the scene + the sensor claims).
 
 ids: a full id, a label (newest wins), 'latest', or any unique piece of the id.
 exit codes: 0 ok | 1 not ok (verdict/signal/cancel/unexpected) | 2 refused (rule,
@@ -4597,7 +4782,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--set", action="append", metavar="KEY=VALUE",
                    help="override a field, e.g. camera.exposure_us=33333, projection.duty=0.8, "
                         "projection.invert=false (repeatable; values parse as JSON when they can)")
-    p.add_argument("--geometry", metavar="ID", help="new geometry_id (a new rig profile: starts "
+    p.add_argument("--geometry", metavar="ID", help="new geometry_id (a new rig geometry: starts "
                    "UNCALIBRATED)")
     p.add_argument("--desc", metavar="TEXT", help="description (what part / line it is for)")
     p.add_argument("--replace", action="store_true",
@@ -4617,7 +4802,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = cmd("preset-show", cmd_preset_show, "show one preset (tier, calibration, JSON)",
             "preset show")
     p.add_argument("name")
-    cmd("recipe-list", cmd_recipes, "list recipes (work-state checks): built-in + user (tier, "
+    cmd("recipe-list", cmd_recipes, "list recipes (the checks of a work state): built-in + user (tier, "
                                     "preset, zones, checks, golden)")
     p = cmd("recipe-show", cmd_recipe_show, "show one recipe (tier, preset, JSON)", "recipe show")
     p.add_argument("name")
@@ -5295,15 +5480,37 @@ def build_parser() -> argparse.ArgumentParser:
                         "projector moved, the motion is > ~5 px or badly registered. Absolute "
                         "depth may keep a small offset: a full calibration is the reference")
     p = cmd("run", cmd_run, "flow-ready job: run a station config, write result.json + "
-                            "run.log.jsonl in a new run folder (exit 0 PASS, 1 FAIL, "
-                            "2 refused, 4 crashed, 5 INVALID)", "the station job")
+                            "run.log.jsonl in a new run folder (exit 0 CONTINUE, 1 REJECT, "
+                            "2 refused, 4 crashed, 5 PULL). A single-job config runs its job; a "
+                            "station configuration with profiles + a flow runs one whole cycle "
+                            "of its work states", "the station job")
     p.add_argument("config", help="station config .json (or .yaml with PyYAML), "
-                                  "e.g. stations/example_cell_station.json")
+                                  "e.g. stations/example_cell_station.json, "
+                                  "stations/example_tube_line.json")
     p.add_argument("--operator-confirmed", action="store_true",
                    help="a human confirmed the physical setup (required on the real rig)")
     p.add_argument("--no-feedback", action="store_true",
-                   help="recipe jobs: do not project the verdict on the part")
+                   help="do not project the verdict / the faults on the part")
+    p.add_argument("--profile", metavar="NAME",
+                   help="flow: the profile of the configuration's profile library set to check "
+                        "against (default: its default_profile)")
+    p.add_argument("--input", action="append", metavar="SIGNAL=true|false",
+                   help="flow: what a line sensor says for THIS cycle (repeatable), e.g. "
+                        "part_present=true; a work state that expects a signal nobody gave is "
+                        "a DOUBT (PULL)")
+    p.add_argument("--mock-case", metavar="NAME",
+                   help="flow, MOCK only: a case of the configuration's simulated line (the "
+                        "scene placed + what the sensors say); default: its default_case")
+    p.add_argument("--acknowledge", action="store_true",
+                   help="flow: acknowledge every prompt as an operator would (default: a prompt "
+                        "nobody acknowledges ends the cycle PULL; --interactive asks). A work "
+                        "state's prompts are answered at most retries + 1 times, then the "
+                        "cycle ends PULL")
     p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a FAIL verdict (1)
+    p = cmd("flow-show", cmd_flow_show, "show + validate a station configuration: parameters, "
+            "profiles (the profile library set), work states (the flow), permissions; exit 2 "
+            "lists every problem", "the station configuration")
+    p.add_argument("config", help="station config .json (or .yaml with PyYAML)")
 
     # virtual sensors
     at_help = ("grid cell H8 (H8@96 pins the 96 px grid), zone G7:H9 (presence only), "

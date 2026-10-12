@@ -259,9 +259,11 @@ def active(store: LibraryStore, builtin: Path) -> Optional[str]:
 
 
 def station_refs(stations_dir: Optional[Path], name: str) -> list:
-    """Station configs (stations/*.json|yaml) whose job.recipe is `name`, read as run_job
-    reads it (stripped); a YAML one that can't be parsed here (PyYAML is optional): whose
-    text mentions the name - never skipped, never guessed at by a pattern for its keys."""
+    """Station configs (stations/*.json|yaml) that run recipe `name`: a single job's
+    job.recipe (read as run_job reads it: stripped), or a recipe of one of a configuration's
+    profiles; a YAML one that can't be parsed here (PyYAML is optional): whose text mentions
+    the name - never skipped, never guessed at by a pattern for its keys."""
+    from ..flow.schema import references
     d = Path(stations_dir) if stations_dir else None
     if d is None or not d.is_dir():
         return []
@@ -276,9 +278,8 @@ def station_refs(stations_dir: Optional[Path], name: str) -> list:
         if doc is None:
             hit = _presets.mentions(text, name)
         else:
-            job = doc.get("job")
-            r = job.get("recipe") if isinstance(job, dict) else None
-            hit = isinstance(r, str) and r.strip() == name      # as run_job reads job.recipe
+            hit = any(r["ref"] == name for r in references(doc)["recipes"]
+                      if isinstance(r["ref"], str))
         if hit:
             out.append(f.name)
     return out

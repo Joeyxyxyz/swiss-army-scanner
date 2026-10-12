@@ -104,7 +104,7 @@ Written by the engine. Nothing here is overwritten; "delete" moves entries to tr
 | sensors/<geometry_id>/<name>/ | taught virtual sensors (part present, alignment) |
 | output/sensors/ | sensor checks: spot photos + .json verdicts |
 | presets/ | USER PRESETS (part recipes): presets/<name>/preset.json + meta.json (author, description, copied from); presets/active.jsonl records the selected preset (last line wins) |
-| recipes/ | USER RECIPES (work-state checks: preset -> zones -> checks -> projected feedback): recipes/<name>/recipe.json + meta.json; recipes/active.jsonl records the selected recipe (last line wins) |
+| recipes/ | USER RECIPES (the checks that verify a work state: preset -> zones -> checks -> projected feedback): recipes/<name>/recipe.json + meta.json; recipes/active.jsonl records the selected recipe (last line wins) |
 | runs/ | recipe run folders (api.recipe_run): result.json + run.log.jsonl + overlay / feedback images, one NEW folder per run |
 | sessions/ | log.jsonl - every action, success or failure |
 | trash/ | deleted entries (recoverable - move back to restore) |

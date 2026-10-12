@@ -1,0 +1,68 @@
+{
+  "_comment": "Example recipe (built-in, read-only) of the short-tube profile of stations/example_tube_line.json: is a tube on the seat at all (`presence`: anything 10 mm above the seat plane - what the line's part-present sensor claims), and its position on its seat against a GOOD part (golden). A tube off its seat turns the seat RED with a cross where it is furthest off. Make the golden with `scan recipe-golden tube_short_alignment` on a good part. Mock: scene:tube_short (good), scene:tube_short:misaligned.",
+  "name": "tube_short_alignment",
+  "description": "Short tube (38 mm): position on its seat vs the good part",
+  "schema_version": 1,
+  "preset": "bench_9in_metric_bright",
+  "scan": {
+    "kind": "fast",
+    "axis": "xy",
+    "zone": null,
+    "average": null
+  },
+  "part": {
+    "label": "tube_short",
+    "frame": {
+      "reference": "dominant_plane"
+    },
+    "mock_scene": "scene:tube_short"
+  },
+  "golden": {
+    "scan": "tube_short_alignment_golden"
+  },
+  "zones": [
+    {
+      "id": "seat",
+      "label": "tube seat",
+      "shape": "circle",
+      "units": "part_mm",
+      "coords": {
+        "center": [
+          0,
+          0
+        ],
+        "radius": 18.0
+      },
+      "checks": [
+        {
+          "type": "presence",
+          "params": {
+            "min_height_mm": 10.0,
+            "min_area_pct": 20.0
+          }
+        },
+        {
+          "type": "position",
+          "params": {
+            "tol_mm": 1.5,
+            "tol_deg": 5.0,
+            "min_height_mm": 30.0,
+            "min_points": 200
+          }
+        }
+      ]
+    }
+  ],
+  "feedback": {
+    "enabled": true,
+    "hold_s": 5.0
+  },
+  "outputs": {
+    "runs_dir": null,
+    "overlay": true
+  },
+  "pull": {
+    "guard_band_pct": 10,
+    "invalid_reasons_to_reject": []
+  }
+}

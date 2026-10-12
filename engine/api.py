@@ -166,6 +166,9 @@ def _loggable(v):
     log's deep copy can't take) is recorded as its state."""
     if callable(getattr(v, "is_set", None)) and callable(getattr(v, "wait", None)):
         return f"<cancel event, set={v.is_set()}>"
+    if type(v).__name__ == "StationConfiguration" and hasattr(v, "station_id"):
+        src = getattr(v, "source", None)        # a loaded configuration: named, not dumped
+        return f"<station configuration {v.station_id}" + (f" ({src.name})>" if src else ">")
     return v
 
 
@@ -345,7 +348,10 @@ def preset_delete(name: str, reason: str, force: bool = False,
 
 
 # ------------------------------------------------------- recipes (work-state checks)
-# preset (profile) -> recipe -> zones -> checks -> projected feedback -> outputs. Built-in
+# A recipe is WHAT the DLP checks to verify a work state (engine/flow/): where the zones are
+# and what is recognised in them. A station configuration's profiles name the recipes of
+# each part variant; its flow's work states name which one verifies them.
+# preset (rig) -> recipe -> zones -> checks -> projected feedback -> outputs. Built-in
 # recipes (the repo's recipes/ folder) are read-only here; user recipes live in the library
 # (<library>/recipes/<name>/) and are added / selected / deleted like user presets.
 
@@ -555,6 +561,89 @@ def recipe_feedback(run, preset: Optional[Preset] = None, hold_s: Optional[float
     out.pop("photo", None)
     return {**out, "run_id": doc.get("run_id"), "verdict": doc.get("result"),
             "disposition": doc.get("disposition")}
+
+
+# ------------------------------------- station configuration -> profiles -> work states
+# engine/flow/: a station configuration (stations/*.json) holds the station's parameters and
+# its PROFILE LIBRARY SET; the work states are the steps of its flow. The operator page and a
+# PLC walk them through the command bus (engine/control/commands.py); these verbs are the
+# same thing for scripts.
+
+def flow_load(config):
+    """A station configuration (a file path, or one already loaded) -> StationConfiguration
+    (engine/flow/schema.py; StationConfigError lists every problem). An old single-job
+    station config loads as one implicit profile ("default") and a one-step flow."""
+    from .flow import schema as flow_schema
+    if isinstance(config, flow_schema.StationConfiguration):
+        return config
+    return flow_schema.load(config)
+
+
+def flow_check(config) -> dict:
+    """Validate a station configuration without running it -> {valid, problems, config (what
+    the operator page shows: profiles, work states, permissions) | None}: the schema (every
+    expected signal names the check that observes it, at least one work state is required,
+    ...), then what needs the recipe library (every profile's recipes resolve, the named
+    checks exist in them, every work state can be confirmed at all)."""
+    from .flow import schema as flow_schema
+    from .flow import verify as flow_verify_mod
+    try:
+        cfg = flow_load(config)
+    except flow_schema.StationConfigError as e:
+        return {"valid": False, "problems": list(e.problems), "config": None}
+    probs = flow_verify_mod.check_config(cfg)
+    return {"valid": not probs, "problems": probs, "config": cfg.public()}
+
+
+@_verb
+def flow_verify(config, profile: Optional[str], step: str,
+                runs_dir: Union[str, Path, None] = None, operator_confirmed: bool = False,
+                mock_scene: Optional[str] = None, scan=None) -> dict:
+    """The DLP check of ONE work state of a station configuration, for the given profile
+    (None: its default): scan with the profile's preset, run the checks of the recipe that
+    work state verifies with, write a NEW run folder (nothing is projected). The cycle
+    (engine/flow/cycle.py) compares the answer with what the line's sensors claim.
+    -> {dlp: {result, disposition, observed: {signal: true | false | null}, run_id, zones,
+    ...}, run_id, run_dir, result (the run's result.json), exit_code}. runs_dir default: the
+    configuration's (parameters.runs_dir / $SCANNER_RUNS_DIR). The real rig needs
+    operator_confirmed (not a stored `scan`: nothing is captured). mock_scene (MOCK only):
+    'scene:<name>[:<variant>]' or 'none', placed first."""
+    from .flow import verify as flow_verify_mod
+    s = _engine()
+    cfg = flow_load(config)
+    name = cfg.default_profile if profile is None else profile
+    if not s.mock and not operator_confirmed and scan is None:
+        raise rules.RuleViolation("the real rig needs a human to confirm the physical setup "
+                                  "first (part placed, rig untouched): operator_confirmed")
+    return flow_verify_mod.verify_step(
+        cfg, name, step, runs_dir=runs_dir or flow_verify_mod.runs_dir_for(cfg),
+        operator_confirmed=bool(operator_confirmed), mock_scene=mock_scene, scan=scan)
+
+
+@_verb
+def flow_run(config, profile: Optional[str] = None, inputs: Optional[dict] = None,
+             runs_dir: Union[str, Path, None] = None, operator_confirmed: bool = False,
+             mock_scene=None, scans: Optional[dict] = None, acknowledge: bool = False,
+             project_faults: bool = True, hold_s: Optional[float] = None) -> dict:
+    """One whole cycle of a station configuration's flow, in line: every work state is
+    verified in turn against `inputs` (the sensor claims {signal: true | false}), its
+    actions run (project_fault paints the fault on the part), and a NEW cycle folder is
+    written: result.json (station config, profile, steps [{id, expects, sensor_inputs,
+    dlp_result, outcome, permission_granted, actions, disposition}], permissions, the
+    overall disposition - CONTINUE only when every required work state was CONFIRMED) +
+    run.log.jsonl + steps/<one run folder per DLP check>. acknowledge: ACK every prompt as
+    an operator would (default False: a prompt nobody acknowledges ends the cycle PULL); a
+    work state's prompts are answered at most retries + 1 times, then the cycle ends PULL.
+    mock_scene (MOCK only): the scene placed before each scan, or {step id: scene}. scans:
+    {step id: stored metric scan} checked instead of capturing.
+    -> {cycle_id, cycle_dir, result (the document), exit_code (CONTINUE 0, REJECT 1, PULL
+    5), record}"""
+    from .flow import verify as flow_verify_mod
+    return flow_verify_mod.run_cycle(
+        flow_load(config), profile, inputs=inputs, runs_dir=runs_dir,
+        operator_confirmed=bool(operator_confirmed), mock_scene=mock_scene, scans=scans,
+        on_prompt=(lambda p: True) if acknowledge else None, project=bool(project_faults),
+        hold_s=hold_s)
 
 
 # ------------------------------------------------------------------ verbs

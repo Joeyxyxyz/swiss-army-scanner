@@ -146,6 +146,9 @@ class Presence(Check):
         return CheckResult(
             verdict="PASS" if ok else "FAIL", values=values, key="part_pct",
             limit=p["min_area_pct"], fault_points=faults, tolerances=tols,
+            # what the check SAW, whatever it expected: a work state compares it with the
+            # line's own part-present sensor (engine/flow/verify.py)
+            details={"present": bool(present)},
             message=(f"part {state}: {part_pct:.1f} % of the zone >= {p['min_height_mm']:g} mm "
                      f"above the reference (expected {p['expect']})"))
 

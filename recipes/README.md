@@ -1,13 +1,20 @@
-# Recipes (work-state checks)
+# Recipes (the checks that verify a work state)
 
-A recipe is one work-state check: which preset (profile) to scan with, where the zones are,
+A recipe is **what the DLP checks**: which rig preset to scan with, where the zones are,
 which checks run in each zone, and what the projector paints on the part after the verdict.
 It is data (JSON, or YAML with PyYAML), versioned by `schema_version`, so the same engine
 runs any part on any line with a DMD projector + a camera.
 
 ```
-preset (profile) -> recipe -> zones -> checks -> verdict -> feedback (projected) -> outputs (I/O)
+preset (the rig) -> recipe -> zones -> checks -> verdict -> feedback (projected) -> outputs (I/O)
 ```
+
+Where a recipe sits (`stations/README.md`): a **station configuration** holds the station's
+parameters and its **profile library set**; each **profile** (a part variant: long tube /
+short tube) names the recipes that say what that part looks like; each **work state** (a
+step of the configuration's flow) is verified with one of them; the outcome grants or
+withholds that work state's permission. A recipe is not a work state and not a profile: it
+is the check a work state runs for the active profile.
 
 The files here are the **built-in** recipes: read-only for the recipe commands (never edited
 or deleted by them). User recipes live in the library (`<library>/recipes/<name>/recipe.json`
@@ -24,7 +31,7 @@ user presets:
 | select (the default) | `scan recipe-select NAME` | `api.recipe_select(name)`, `api.recipe_active()` | verb `recipe_select` |
 | delete (to trash) | `scan recipe-delete NAME --reason TEXT [--force]` | `api.recipe_delete(name, reason)` | verb `recipe_delete` (`confirm=true`) |
 | golden (a GOOD part) | `scan recipe-golden NAME` | `api.recipe_golden(r)` | verb `recipe_golden` |
-| run | `scan recipe-run NAME [--scan ID] [--no-feedback] [--hold S]` | `api.recipe_run(r, ...)` | verb `recipe_run`; work state (below) |
+| run | `scan recipe-run NAME [--scan ID] [--no-feedback] [--hold S]` | `api.recipe_run(r, ...)` | verb `recipe_run`; a station configuration (below) |
 
 `--set` keys walk into sections and lists: `feedback.hold_s=10`,
 `zones.0.checks.1.params.tol_mm=0.4`, `golden.scan=my_good_part`. A user recipe is validated
@@ -32,11 +39,19 @@ like a built-in one and its preset must exist; a built-in name is refused, an ex
 name too unless `--replace` (the old one moves to `trash/recipes/`). Delete refuses built-ins,
 the selected recipe and a recipe a station config's `job.recipe` names (`--force` overrides).
 
-**Work states.** A station config with `"job": {"type": "recipe", "recipe": "box_lid"}` IS
-that recipe on the operator page (`/quick`) and the command bus: selecting it loads the
-recipe's preset (the station's own `preset` wins when set), START / TRIGGER run it, the
-outputs carry PASS / FAIL / ALARM and the recipe's result code. See
-`stations/example_recipe_box_lid.json`.
+**In a station configuration.** Two ways (`stations/README.md`):
+
+- A single-job station config with `"job": {"type": "recipe", "recipe": "box_lid"}`: its one
+  work state is verified by that recipe. On the operator page (`/quick`) and the command bus,
+  selecting the configuration loads the recipe's preset (the station's own `preset` wins when
+  set), START / TRIGGER run it, the outputs carry PASS / FAIL / ALARM and the recipe's result
+  code. See `stations/example_recipe_box_lid.json`.
+- A configuration with profiles and a flow: each profile lists its recipes under keys
+  (`"recipes": {"presence": "tube_long_presence", ...}`) and each work state verifies with
+  one key (`"verify": {"recipe": "presence"}`). A presence check also tells the cycle what
+  the DLP **saw** (`details.present`), which is compared with what the line's part-present
+  sensor says: the DLP confirms or corrects the sensor. See
+  `stations/example_tube_line.json` (`tube_long_*` / `tube_short_*` here are its recipes).
 
 ## Example (the minimum)
 
@@ -65,7 +80,7 @@ of the scan (the fixture), the verdict projected for 5 s.
 | `schema_version` | required, `1` |
 | `name` | required, `[A-Za-z0-9_.-]`; a built-in's file name and a user recipe's folder name |
 | `description` | text |
-| `preset` | required: the preset (profile) the recipe pins - rig geometry + capture settings; its stereo calibration gives the mm |
+| `preset` | required: the rig preset the recipe pins - rig geometry + capture settings; its stereo calibration gives the mm (a station configuration's profile may scan with its own) |
 | `scan.kind` | `fast` (HDMI fast scan, default), `metric` (both axes, the preset's full set), `trigger` (hardware-triggered flash pack: `scan.pack`, and `recipe-run --pattern-mode-set-by-human`) |
 | `scan.axis` | `xy` (default; projected feedback and projector-px zones need both DMD axes) or `x` |
 | `scan.zone` | light only these grid cells (`F10:J12`, `F10:J12@96`) or an atlas region; null = whole field |

@@ -16,11 +16,14 @@ typing Protocols the existing drivers already satisfy; nothing here opens hardwa
                     hardware trigger adds TriggerMode / TriggerSource / LineSelector nodes
                     (engine/reconstruct/trigger_scan.py).
     IO backends     engine/control/commands.py: InputBackend.start(bus) delivers commands
-                    (START / ABORT / HOME / TRIGGER / ARM / work state), OutputBackend
-                    .publish(signals) drives READY / BUSY / PASS / FAIL / ALARM and
-                    .publish_registers(registers) the result_code / state_code / workstate
-                    numbers. Placeholders: camera GPIO, serial, 24 V digital I/O, Modbus TCP,
-                    OPC UA, EtherNet/IP.
+                    (START / ABORT / HOME / TRIGGER / STEP / ACK / ARM, the station
+                    configuration and profile) and the line's sensor claims
+                    (bus.set_inputs), OutputBackend.publish(signals) drives READY / BUSY /
+                    PASS / FAIL / ALARM / PULL / KICKOUT / PROMPT / SENSOR_MISMATCH and one
+                    PERMIT_<NAME> per permission, .publish_registers(registers) the
+                    result_code / state_code / station_config / profile / work_state /
+                    work_state_code numbers. Placeholders: camera GPIO, serial, 24 V digital
+                    I/O, Modbus TCP, OPC UA, EtherNet/IP.
 
 The rig (engine/session.py ScanSession.rig) owns them: camera first, then the projector,
 the machine-wide rig lock around both, every part released on the way out.
@@ -89,4 +92,5 @@ class OutputDriver(Protocol):
         """READY / BUSY / PASS / FAIL / ALARM booleans, on every bus change."""
 
     def publish_registers(self, registers: dict) -> None:
-        """result_code / state_code / workstate integers, on every bus change."""
+        """result_code / state_code / station_config / profile / work_state /
+        work_state_code integers, on every bus change."""

@@ -1,6 +1,6 @@
 """Preset library (part recipes), MOCK only: built-in presets are read-only, user
 presets live in the library and are added / selected / deleted (to trash/) through
-api, the CLI and the web server; work states pin their own preset."""
+api, the CLI and the web server; station configurations pin their own preset."""
 
 import json
 import threading
@@ -172,16 +172,16 @@ def test_cli_add_select_show_delete(tmp_path, capsys):
 
 # ------------------------------------------------------------------ bus
 
-def test_select_workstate_reports_its_preset():
+def test_select_config_reports_its_preset():
     seen = []
     bus = CommandBus(Handlers(select=lambda ws, p: seen.append((ws, p))),
-                     workstates=["a.json", "b.json"])
-    bus.workstate_presets = {"a.json": "part_a", "b.json": None}
-    r = bus.command("SELECT_WORKSTATE", arg="a.json")
+                     configs=["a.json", "b.json"])
+    bus.config_presets = {"a.json": "part_a", "b.json": None}
+    r = bus.command("SELECT_CONFIG", arg="a.json")
     assert r.accepted and "part_a" in r.message and seen == [("a.json", "part_a")]
-    assert bus.snapshot()["workstate_preset"] == "part_a"
+    assert bus.snapshot()["config_preset"] == "part_a"
     bus.state = "RUNNING"
-    assert not bus.command("SELECT_WORKSTATE", arg="b.json").accepted
+    assert not bus.command("SELECT_CONFIG", arg="b.json").accepted
     assert seen == [("a.json", "part_a")]
 
 
@@ -243,16 +243,16 @@ def test_server_preset_endpoints(web):
     assert status == 403
 
 
-def test_quick_page_shows_active_preset_and_workstate_selects_it(web):
+def test_quick_page_shows_active_preset_and_config_selects_it(web):
     c, app, _ = web
     status, raw, _ = c.request("GET", "/quick")
     assert status == 200 and 'id="qPreset"' in raw.decode()
     _, st = c.get("/api/cmd/state")
     assert st["active_preset"] == PRESET
     c.get("/api/stations")
-    status, r = c.post("/api/cmd/workstate", {"workstate": "line_a.json"})
+    status, r = c.post("/api/cmd/config", {"config": "line_a.json"})
     assert status == 200 and BUILTIN in r["message"]
-    assert r["bus"]["workstate_preset"] == BUILTIN
+    assert r["bus"]["config_preset"] == BUILTIN
     t0 = time.monotonic()
     while c.get("/api/cmd/state")[1]["active_preset"] != BUILTIN:
         assert time.monotonic() - t0 < 60

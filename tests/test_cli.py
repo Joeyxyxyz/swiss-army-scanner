@@ -391,6 +391,8 @@ def test_presence_sensor_needs_the_empty_field_confirmed(tmp_path, capsys, monke
     assert code == 1 and len(prompts) == 1 and "Not taught" in out
     code, out, _ = cli_run(capsys, lib, "--json", *teach)
     assert code == 2 and "--empty-confirmed" in json.loads(out)["error"]["message"]
+    code, out, _ = cli_run(capsys, lib, *teach, "--field-empty", "no")
+    assert code == 1 and "Not taught" in out
     assert len(prompts) == 1 and not (lib / "sensors").exists()
     answer(monkeypatch, {"EMPTY": "y"}, prompts)
     code, out, _ = cli_run(capsys, lib, "--interactive", *teach)

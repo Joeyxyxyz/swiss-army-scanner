@@ -391,6 +391,29 @@ def test_web_face_jobs_take_library_ids_only(synth, tmp_path):
         assert j["status"] == "done", j.get("error")
         assert j["result"]["verdict"] == "FAIL" and j["result"]["triggers"][0]["zone"] == "face"
         assert j["result"]["detector"] == "mf_fir" and j["result"]["triggers"][0]["depth_mm"] > 0.15
+        # the disposition and its reasons are at the top of the result (never only in stats),
+        # with the size check, the rim outline and the radii the check used
+        assert j["result"]["disposition"] == "REJECT" and j["result"]["pull_reasons"] == []
+        st = j["result"]["stats"]
+        assert st["disposition"] == "REJECT" and st["size_check"]["status"] == "not_checked"
+        assert st["rim_outline"]["status"] == "not_measured" and st["radii"]["inspect_r_mm"] > 9
+        assert st["centre_check"]["status"] == "not_checked"
+        # the options the engine added reach it through the job arguments
+        j = job("check_face", {"facescan_id": fs["g1"], "size_tol_pct": 0, "rim_tol_mm": 0.3})
+        assert j["status"] == "done", j.get("error")
+        assert j["result"]["params"]["size_tol_pct"] == 0 and j["result"]["params"]["rim"]["tol_mm"] == 0.3
+        assert any("known-size check is OFF" in w for w in j["result"]["warnings"])
+        j = job("face_golden", {"facescan_ids": [fs[k] for k in ("g1", "g2", "g3")],
+                                "label": "webgold_r", "synthetic": False, "inspect_r_mm": 9.5,
+                                "rim_r_mm": 8.8, "rim_tol_mm": 0.5, "size_tol_pct": 6})
+        assert j["status"] == "done", j.get("error")
+        prm = j["result"]["params"]
+        assert prm["radii"]["inspect_r_mm"] == 9.5 and prm["radii"]["rim_r_mm"] == 8.8
+        assert prm["radii"]["given"] == ["inspect_r_mm", "rim_r_mm"]
+        assert prm["rim"]["tol_mm"] == 0.5 and prm["size_tol_pct"] == 6
+        j = job("face_golden", {"facescan_ids": [fs[k] for k in ("g1", "g2", "g3")],
+                                "label": "webgold_bad", "synthetic": False, "rim_r_mm": 10.2})
+        assert j["status"] == "error" and "outside the inspected zone" in j["error"]
         j = job("check_face", {"facescan_id": fs["bad"], "detector": "band"})
         assert j["status"] == "done" and j["result"]["detector"] == "band", j.get("error")
         j = job("check_face", {"facescan_id": fs["bad"], "detector": "nope"})
@@ -399,6 +422,20 @@ def test_web_face_jobs_take_library_ids_only(synth, tmp_path):
                                  "face_id": synth["faces"]["g5"].id, "label": "web_g5"})
         assert j["status"] == "done", j.get("error")
         assert j["result"]["stats"]["flatness_rms_mm"] < 0.03
+        assert j["result"]["stats"]["r_flat_mm"] == pytest.approx(9.0)      # 0.855 x 10.525
+        assert j["result"]["stats"]["centre"]["source"] == "located circle"
+        j = job("face_profile", {"metric_ids": list(synth["pl"]["g5"][1]),
+                                 "face_id": synth["faces"]["g5"].id, "label": "web_g5_r8",
+                                 "r_flat_mm": 8.0})
+        assert j["status"] == "done" and j["result"]["stats"]["r_flat_mm"] == 8.0, j.get("error")
+        # the live face verbs are jobs too (documented for agents; they hold the rig)
+        for v in ("locate_scan", "locate_face_live", "face_exposure"):
+            assert v in ui_server.VERBS and v not in ui_server.RIG_FREE_VERBS
+            assert callable(getattr(app, f"_v_{v}"))
+        assert "size_tol_pct" in ui_server.VERBS["check_face"][1]
+        assert "auto_exposure" in ui_server.VERBS["targeted_face_scan"][1]
+        assert "silhouette_diameter_mm" in ui_server.VERBS["locate_face"][1]
+        assert "ExposureNotFound" in ui_server.VERBS["targeted_face_scan"][1]["auto_exposure"]
         j = job("check_face", {"facescan_id": str(lib / "facescans" / S.GEO / fs["bad"])})
         assert j["status"] == "error" and j["error_type"] == "EntryNotFound"
     finally:
@@ -416,7 +453,9 @@ REFL_K_MM = 0.15            # height error = k x d log(reflectance) / d x_cam (~
 @pytest.fixture(scope="module")
 def synth_refl(tmp_path_factory):
     """4 good placements + a clean and a dented test placement, each with its own reflectance
-    texture: the flood pair shows it, every repeat carries the height error it causes."""
+    texture: the flood pair shows it, every repeat carries the height error it causes. The
+    flood is what a targeted scan shows: the lit face on a dark surround (its rim outline is
+    there, so the golden learns it too)."""
     lib = tmp_path_factory.mktemp("faces_refl") / "library"
     lib.mkdir()
     rg = S.rig()
@@ -427,14 +466,16 @@ def synth_refl(tmp_path_factory):
     cases["dent"] = ((-5.5, 4.0, 780.2), (12, 6))
     try:
         for i, (name, (c, (tx, ty))) in enumerate(cases.items()):
-            refl = S.refl_texture(100 + i)
-            loc, reps = S.placement(lib, rg, cal, f"r{name}", c, S.normal_from_tilt(tx, ty),
+            n, box = S.normal_from_tilt(tx, ty), S.crop_box(rg, c)
+            refl = S.face_refl(rg, S.refl_texture(100 + i), c, n, box)
+            loc, reps = S.placement(lib, rg, cal, f"r{name}", c, n,
                                     dents=[{**DENT, "depth_mm": 0.12, "size_mm": 2.0}]
                                     if name == "dent" else (), seed=20 + i, refl=refl,
                                     refl_k_mm=REFL_K_MM)
             face = api.locate_face(loc, S.DIAMETER, f"r{name}_face")
+            lit = S.flood_image(rg, c, n, box, level_dn=90.0, dark_dn=6.0, noise_dn=0.0)
             fs = S.write_facescan(lib, f"20260101T0400{i:02d}_000000_fs_r{name}", face.id, reps,
-                                  refl=refl, box=S.crop_box(rg, c))
+                                  refl=refl, box=box, flood=lit)
             prof[name] = api.face_profile(fs, label=f"r{name}")
         gold = api.face_golden([prof[k] for k in ("g1", "g2", "g3", "g4")], "refl4",
                                synthetic=False)
@@ -469,21 +510,30 @@ def test_fir_learns_and_removes_the_reflectance_height_error(synth_refl):
     zf = max(x["z"] for x in d_fir.triggers)
     zm = max([x["z"] for x in d_mf.triggers], default=d_mf.stats["max_z"])
     assert zf > zm                                       # the FIR makes the dent more significant
-    # a profile without the flood pair against a FIR golden: checked as 'mf', warned
+    # the floods show the faces' outlines: the golden learned the rim, the good face's is ok
+    assert g.meta["rim_outline"] is not None and ok_fir.stats["rim_outline"]["status"] == "ok"
+    assert ok_fir.stats["size_check"]["status"] == "ok" and ok_fir.disposition == "CONTINUE"
+    # a profile without the flood pair against a FIR golden: checked as 'mf', warned - no
+    # dent found, but its rim cannot be judged and this golden holds one: never passed
     nof = dataclasses.replace(prof["g5"], label="nof", _pixels=mfcfar.Pixels(
         **{k: getattr(prof["g5"]._pixels, k) for k in ("iy", "ix", "U", "V", "H", "cam_mask")}))
     r = api.check_face(nof, g, "nof")
-    assert r.verdict == "PASS" and not r.stats["fir_applied"]
-    assert any("no flood pair" in w for w in r.warnings)
+    assert r.n_triggers == 0 and not r.stats["fir_applied"]
+    assert any("no flood pair" in w and "'mf'" in w for w in r.warnings)
+    assert r.verdict == "INCOMPLETE" and r.disposition == "PULL"
+    assert [p["reason"] for p in r.pull_reasons] == ["incomplete"]
+    assert "the golden checks it" in r.pull_reasons[0]["message"]
     # an over-exposed flood (clipped at 255 over > 2 % of the face): no FIR for it, warned
+    # (and no rim outline in a clipped flood: not passed either)
     px = prof["g5"]._pixels
     on = np.clip(px.flood_on * 3.0, 0, 255)
-    hot = dataclasses.replace(prof["g5"], label="hot", _pixels=mfcfar.Pixels(
-        px.iy, px.ix, px.U, px.V, px.H, px.cam_mask, on, px.flood_off, on >= 254.5))
+    hot = dataclasses.replace(prof["g5"], label="hot", _pixels=dataclasses.replace(
+        px, flood_on=on, flood_sat=on >= 254.5, outline=None))
     assert mfcfar.saturated_pct(hot._pixels) > 2.0
     r = api.check_face(hot, g, "hot")
-    assert r.verdict == "PASS" and not r.stats["fir_applied"]
+    assert r.n_triggers == 0 and not r.stats["fir_applied"]
     assert any("saturates" in w and "auto_intensity" in w for w in r.warnings)
+    assert r.verdict == "INCOMPLETE" and [p["reason"] for p in r.pull_reasons] == ["incomplete"]
 
 
 def test_face_partly_off_the_dmd_is_measured():
@@ -500,7 +550,7 @@ def test_mfcfar_unit_edges():
     """The MF-CFAR pieces on bare arrays: an all-NaN map, a map with too few points, and a
     clean map with one paraboloid dent (depth, width and place recovered)."""
     g = np.arange(-44, 45) * 0.25
-    prm = mfcfar.mf_params()
+    prm = mfcfar.mf_params(radius_mm=S.RADIUS)
     r = mfcfar.detect(np.full((len(g), len(g)), np.nan), None, g, prm)
     assert r["triggers"] == [] and r["coverage_pct"] == 0 and r["max_z"] is None
     sparse_map = np.full((len(g), len(g)), np.nan)

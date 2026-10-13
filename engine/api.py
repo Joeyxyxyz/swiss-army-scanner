@@ -2095,16 +2095,22 @@ def detect_dents(dentset, metric_scans: Optional[list] = None,
 #
 # A cylinder lying with its END FACE toward the camera + projector (bench: 21.05 mm face ~795 mm
 # away, tilted 7-23 deg). locate_face finds the face in a metric scan (depth, the true rim
-# against far background, fixed-radius circle, camera -> DMD affine on the decoded face),
-# aim_ring / check_ring project its ring + cross (placement guide / check), auto_intensity
-# picks projection.duty, targeted_face_scan lights only the face (N repeats + polar set),
-# face_profile maps it in mm, face_golden / check_face compare a placement with good ones.
+# against far background, fixed-radius circle, camera -> DMD affine on the decoded face;
+# locate_face_live scans it first, at the exposure the face needs), aim_ring / check_ring
+# project its ring + cross (placement guide / check), auto_intensity picks projection.duty,
+# face_exposure a frame-locked camera exposure, targeted_face_scan lights only the face (N
+# repeats + polar set, auto exposure), face_profile maps it in mm, face_golden / check_face
+# compare a placement with good ones. The face diameter is the BRIGHT FLAT's (not the
+# cylinder's): every detector radius derives from it, its flood outline is held to it (known
+# size: more than size_tol_pct off = size_mismatch, a PULL) and judged for edge dents.
 # mm only with the stereo calibration the scans were made with, still current (rule 6);
 # targets, scans and goldens are bound to the geometry + fingerprint (rule 5).
 
 @_verb
 def locate_face(scan, face_diameter_mm: float = 21.05, label: str = "face", roi=None,
-                params: Optional[dict] = None, flood=None):
+                params: Optional[dict] = None, flood=None,
+                size_tol_pct: Optional[float] = None,
+                silhouette_diameter_mm: Optional[float] = None):
     """Locate a circular end face in a metric scan (both axes decoded; scan_metric with
     method='plane' and a zone around the face) -> FaceTarget in faces/<geometry>/: face plane,
     centre, fixed-radius rim circle (face_diameter_mm), rim residual, tilt, the camera face
@@ -2118,10 +2124,84 @@ def locate_face(scan, face_diameter_mm: float = 21.05, label: str = "face", roi=
     that plane; if the depth rim test still fails, the face outline in `flood` (None = the
     scan's own flood pair, else its decode modulation; an array / file / another metric scan)
     is used (meta rim_source; a warning says so). Refused without the scan's stereo
-    calibration (rule 6). Never touches the rig."""
+    calibration (rule 6). Never touches the rig.
+    face_diameter_mm is the diameter of the bright FLAT the flood shows. When the rim around
+    it returns depth points the depth silhouette is the part's larger outer circle: give it
+    (silhouette_diameter_mm, e.g. 21.05 for a 19.5 mm flat) or leave it to be found from the
+    rim points (params silhouette_auto); the rim circle is then fitted at that radius, the
+    face keeps its own diameter. Known size: the face's flood outline against
+    face_diameter_mm, more than size_tol_pct (default 4; 0 = off, with a warning) off is a
+    size mismatch - meta size_check, disposition PULL, pull_reasons (size_mismatch); meta
+    centre_check says how far the outline's centre is from the located one."""
     from .measure.endface import verbs as face_verbs
-    return face_verbs.locate_face(_engine(), scan, float(face_diameter_mm), label, roi, params,
-                                  flood)
+    prm = dict(params or {})
+    if silhouette_diameter_mm is not None:
+        prm["silhouette_diameter_mm"] = float(silhouette_diameter_mm)
+    return face_verbs.locate_face(_engine(), scan, float(face_diameter_mm), label, roi,
+                                  prm or None, flood, size_tol_pct)
+
+
+@_verb
+def locate_scan(zone: Optional[str] = None, preset: Optional[Preset] = None,
+                label: str = "face_locate", steps: Optional[int] = None,
+                periods: Optional[list] = None, exposure_us: Optional[float] = None):
+    """The scan locate_face wants, made now: the both-axis multifreq set, ray-plane
+    triangulated, lit through `zone` (grid cells / an atlas region / a zone set; None = the
+    whole field), with its flood pair kept (the size check and the outline need it) -> a
+    metric scan. exposure_us: a per-capture camera exposure (the preset is not edited).
+    Refused before the rig without a stereo calibration (rule 6)."""
+    from .measure.endface import verbs as face_verbs
+    return face_verbs.locate_scan(_engine(), _preset(preset), zone, label, steps, periods,
+                                  exposure_us)
+
+
+@_verb
+def locate_face_live(zone: Optional[str] = None, preset: Optional[Preset] = None,
+                     face_diameter_mm: float = 21.05, label: str = "face",
+                     steps: Optional[int] = None, periods: Optional[list] = None, roi=None,
+                     params: Optional[dict] = None, size_tol_pct: Optional[float] = None,
+                     auto_exposure: Optional[bool] = None, exposure_us: Optional[float] = None,
+                     exposure_target_dn: Optional[float] = None, exposure_range_us=None,
+                     max_clipped_pct: Optional[float] = None,
+                     silhouette_diameter_mm: Optional[float] = None):
+    """Scan (locate_scan) and locate the face in one go, at the exposure the face needs:
+    with auto exposure (None = on when the preset's exposure is whole video frames) the
+    zone is scanned again at another frame-locked exposure when no face is found or the
+    located face is too dark / clipped in the scan's own flood, and the face located on all
+    the scans of the seating merged per pixel (at most 3 scans; the scans and merged entries
+    stay in the library, named in the face target's meta locate_scan). exposure_us forces
+    one exposure (one scan). The rest as locate_face -> FaceTarget."""
+    from .measure.endface import verbs as face_verbs
+    prm = dict(params or {})
+    if silhouette_diameter_mm is not None:
+        prm["silhouette_diameter_mm"] = float(silhouette_diameter_mm)
+    kw = {k: v for k, v in (("exposure_target_dn", exposure_target_dn),
+                            ("exposure_range_us", exposure_range_us),
+                            ("max_clipped_pct", max_clipped_pct)) if v is not None}
+    return face_verbs.locate_face_live(_engine(), _preset(preset), zone, float(face_diameter_mm),
+                                       label, steps, periods, roi, prm or None, size_tol_pct,
+                                       auto_exposure, exposure_us, **kw)
+
+
+@_verb
+def face_exposure(face=None, preset: Optional[Preset] = None, target_dn: Optional[float] = None,
+                  exposure_range_us=None, max_clipped_pct: Optional[float] = None,
+                  margin_dmd_px: float = 6.0, label: str = "auto_exposure",
+                  duty: Optional[float] = None) -> dict:
+    """The frame-locked camera exposure for THIS seating of a located face: flood shots lit
+    only through the face's DMD mask, the p95 inside 0.8 x the face radius brought near
+    target_dn (170) with less than max_clipped_pct (0.5) of the face clipped, among the
+    whole 60 Hz video-frame exposures in exposure_range_us (16.7 - 100 ms) -> {ok,
+    exposure_us, p95_dn, clipped_pct, shots, why, ...} (+ output/tuning JSON); ok False
+    (disposition PULL, never an exception) when none fits: too dark, clipped, or a mirror.
+    The preset is not edited and the LED currents are never touched; targeted_face_scan
+    does this itself by default."""
+    from .measure.endface import verbs as face_verbs
+    kw = {k: v for k, v in (("target_dn", target_dn), ("exposure_range_us", exposure_range_us),
+                            ("max_clipped_pct", max_clipped_pct)) if v is not None}
+    return face_verbs.face_exposure(_engine(), _preset(preset), face,
+                                    margin_dmd_px=float(margin_dmd_px), label=label, duty=duty,
+                                    **kw)
 
 
 @_verb
@@ -2168,7 +2248,11 @@ def targeted_face_scan(face=None, preset: Optional[Preset] = None, label: str = 
                        repeats: int = 3, margin_dmd_px: float = 6.0, polar: bool = True,
                        duty: Optional[float] = None, steps: Optional[int] = None,
                        periods: Optional[list] = None, polar_steps: int = 8,
-                       mode: str = "multifreq", code_bits: int = 5):
+                       mode: str = "multifreq", code_bits: int = 5,
+                       auto_exposure: Optional[bool] = None,
+                       exposure_us: Optional[float] = None,
+                       exposure_target_dn: Optional[float] = None, exposure_range_us=None,
+                       max_clipped_pct: Optional[float] = None):
     """Targeted end-face scan: the DMD lights only the face ellipse (+ margin_dmd_px); per
     repeat the multifreq depth set (x + y) triangulated ray-plane (column axis; the calibration's
     row axis is not trusted) -> a metric scan, and (polar) concentric rings (0.08 / 0.25 rim
@@ -2177,6 +2261,14 @@ def targeted_face_scan(face=None, preset: Optional[Preset] = None, label: str = 
     facescans/<geometry>/ naming its repeat metric scans. duty overrides
     projection.duty for this scan only (auto_intensity). Refused before the rig without a
     stereo calibration (rule 6) or with a face target of another geometry (rule 5).
+    Camera exposure, per capture (the preset is not edited): auto_exposure None = ON when
+    the preset's exposure is a whole number of video frames - a few flood shots through the
+    face mask pick the frame-locked exposure (exposure_range_us, default 16.7 - 100 ms) that
+    brings the face's p95 near exposure_target_dn (170) with less than max_clipped_pct (0.5)
+    clipped; when none fits the face is NOT scanned
+    (engine.measure.endface.exposure.ExposureNotFound, its .report has every shot: PULL the
+    part / re-seat it). exposure_us forces one; auto_exposure False keeps the preset's. The
+    exposure used and how it was chosen are in the face scan's meta.
     mode='tilephase' (EXPERIMENTAL): the depth set is one fine phase level (steps, default 12, at
     periods = [8] DMD px) + code_bits (5) Gray tile-code planes per axis: 36 frames instead of
     74, about 2x faster. Limits: the fringe order is unique only inside a 2 ** (code_bits - 1)
@@ -2184,33 +2276,46 @@ def targeted_face_scan(face=None, preset: Optional[Preset] = None, label: str = 
     planes are more sensitive to blur, tilt and glints, only a two-code consistency check, and
     motion during the code frames corrupts the order (engine/bases/tilephase.py)."""
     from .measure.endface import verbs as face_verbs
+    kw = {k: v for k, v in (("exposure_target_dn", exposure_target_dn),
+                            ("exposure_range_us", exposure_range_us),
+                            ("max_clipped_pct", max_clipped_pct)) if v is not None}
     return face_verbs.targeted_face_scan(_engine(), _preset(preset), face, label, int(repeats),
                                          float(margin_dmd_px), bool(polar), duty, steps, periods,
-                                         int(polar_steps), mode=mode, code_bits=int(code_bits))
+                                         int(polar_steps), mode=mode, code_bits=int(code_bits),
+                                         auto_exposure=auto_exposure, exposure_us=exposure_us,
+                                         **kw)
 
 
 @_verb
 def face_profile(scans, face=None, label: Optional[str] = None, grid_mm: float = 0.25,
-                 r_flat_mm: float = 9.0, stl: bool = True):
+                 r_flat_mm: Optional[float] = None, stl: bool = True,
+                 size_tol_pct: Optional[float] = None):
     """Height map of one placement in the face frame (u ~ camera right, v ~ camera down, h +
     toward the camera, mm on a grid_mm grid) from a FaceScan (or its repeat metric scans + a
-    face target) -> FaceProfile: flatness (RMS, p2-p98 inside r_flat_mm), per-point
+    face target) -> FaceProfile: flatness (RMS, p2-p98 inside r_flat_mm: None = 0.855 x the
+    face radius, 9.0 mm on a 21.05 mm face; a value given is used as given), per-point
     repeatability across the repeats, tilt, radial profile, horizontal / vertical sections;
-    PNG + CSV + JSON + NPZ in output/profiles and an open-surface STL of the face (mm, face
-    frame) in output/pointclouds. mm only with the scans' stereo calibration, still current
-    (rule 6)."""
+    the rim outline in the targeted scan's flood pair (stats rim_outline: diameter,
+    roundness) with the known-size check against the face diameter (stats size_check,
+    size_tol_pct default 4; 0 = off, with a warning); the face frame is centred on that
+    outline when the whole of it shows (stats centre). PNG + CSV + JSON + NPZ in
+    output/profiles and an open-surface STL of the face (mm, face frame) in
+    output/pointclouds. mm only with the scans' stereo calibration, still current (rule 6)."""
     from .measure.endface import verbs as face_verbs
     return face_verbs.face_profile(_engine(), scans, face, label, float(grid_mm),
-                                   float(r_flat_mm), bool(stl))
+                                   None if r_flat_mm is None else float(r_flat_mm), bool(stl),
+                                   size_tol_pct)
 
 
 @_verb
 def face_golden(placements: list, label: str = "golden", k_sigma: float = 4.0,
-                floor_mm: float = 0.10, smooth_cells: int = 5, rim_r_mm: float = 9.75,
+                floor_mm: float = 0.10, smooth_cells: int = 5,
+                rim_r_mm: Optional[float] = None,
                 rim_factor: float = 2.0, rim_min_mm: float = 0.3, height_smooth_mm: float = 0.25,
                 min_area_mm2: float = 0.25, synthetic=True, detector: str = "mf_fir",
                 z_thresh: float = 5.5, min_depth_mm: float = 0.0, fir: bool = True,
-                mf_params: Optional[dict] = None):
+                mf_params: Optional[dict] = None, radii: Optional[dict] = None,
+                rim: Optional[dict] = None, size_tol_pct: Optional[float] = None):
     """Golden end face from >= 2 (3+ for leave-one-out) GOOD placements (FaceProfiles,
     face-profile .npz files or FaceScans) -> FaceGolden in face_golden/<geometry>/
     (append-only), bound to geometry + fingerprint, face diameter, grid and stereo
@@ -2218,43 +2323,67 @@ def face_golden(placements: list, label: str = "golden", k_sigma: float = 4.0,
     'mf_fir' (default): MF-CFAR - a dent-shaped matched filter bank (1 / 1.5 / 2 / 3 mm) on
     the deviation from the placements' median RADIAL profile, z against the face's own robust
     noise, trigger at z >= z_thresh (5.5 ~ 1e-3 false per good face, 5.0 ~ 1e-2) and depth >=
-    min_depth_mm, r <= 9.75 mm; with the reflectance FIR (fir: 7x7 camera-px kernel from the
-    targeted scans' flood pair, fitted on these placements, its coefficients stored here);
+    min_depth_mm (the 3 x 3 centre average: depth_centre_mm), inside the inspected zone; with
+    the reflectance FIR (fir: 7x7 camera-px kernel from the targeted scans' flood pair,
+    fitted on these placements, its coefficients stored here);
     'mf': the same without the FIR; 'band': median map + max(k_sigma x sigma (median over
     smooth_cells), floor_mm), rim zone r > rim_r_mm x rim_factor (min rim_min_mm), maps
     Gaussian-smoothed height_smooth_mm, triggers >= min_area_mm2. mf_params: other MF-CFAR
     settings (engine.measure.endface.mfcfar.MF_DEFAULTS). Records leave-one-out false triggers
     of every detector and the synthetic-dent set of the default one (synthetic: True, False
-    or {depths_mm, widths_mm, positions, seed}; dents injected per camera pixel)."""
+    or {depths_mm, widths_mm, positions, seed}; dents injected per camera pixel).
+    Radii: every one is a fraction of the face radius (inspect 0.926 R = 9.75 mm on a 21.05
+    mm face, rim / plane 0.855 R = 9.0) unless given: radii {inspect_r_mm, rim_r_mm,
+    plane_r_mm, ...} (engine.measure.endface.radii.KEYS), or rim_r_mm here - ONE rim radius
+    for every detector. A radius given is used as given or refused (off the face, a rim
+    radius outside the inspected zone): never dropped, never clamped. rim: the rim outline
+    settings {tol_mm 0.4, min_arc_mm 1.5, guard_band_pct 20, k_sigma 4} (edge dents: the
+    golden learns the outline's per-angle median and spread). size_tol_pct (4): a placement
+    whose flood outline is further off the face diameter is refused; 0 = off, with a
+    warning in the golden and in every check against it."""
     from .measure.endface import verbs as face_verbs
     mf = dict(mf_params or {})
     mf.update(z_thresh=float(z_thresh), min_depth_mm=float(min_depth_mm))
-    return face_verbs.face_golden(_engine(), list(placements), label,
-                                  {"k_sigma": k_sigma, "floor_mm": floor_mm,
-                                   "smooth_cells": int(smooth_cells), "rim_r_mm": rim_r_mm,
-                                   "rim_factor": rim_factor, "rim_min_mm": rim_min_mm,
-                                   "height_smooth_mm": height_smooth_mm,
-                                   "min_area_mm2": min_area_mm2},
+    band = {"k_sigma": k_sigma, "floor_mm": floor_mm, "smooth_cells": int(smooth_cells),
+            "rim_factor": rim_factor, "rim_min_mm": rim_min_mm,
+            "height_smooth_mm": height_smooth_mm, "min_area_mm2": min_area_mm2}
+    if rim_r_mm is not None:
+        band["rim_r_mm"] = float(rim_r_mm)
+    return face_verbs.face_golden(_engine(), list(placements), label, band,
                                   synthetic if isinstance(synthetic, dict) else bool(synthetic),
-                                  detector, bool(fir), mf)
+                                  detector, bool(fir), mf, radii, rim, size_tol_pct)
 
 
 @_verb
 def check_face(placement, golden=None, label: Optional[str] = None,
                min_area_mm2: Optional[float] = None, detector=None,
-               z_thresh: Optional[float] = None, min_depth_mm: Optional[float] = None):
+               z_thresh: Optional[float] = None, min_depth_mm: Optional[float] = None,
+               rim_tol_mm: Optional[float] = None, rim_min_arc_mm: Optional[float] = None,
+               rim_guard_band_pct: Optional[float] = None,
+               size_tol_pct: Optional[float] = None):
     """A placement (FaceProfile, face-profile .npz or FaceScan) vs a golden face (default: the
     newest matching geometry, face diameter, grid and stereo calibration) -> FaceCheck
-    PASS / FAIL / INCOMPLETE (< 90 % of the inspected face measured: never passed) with the
-    triggers (zone face / rim, r, theta, u, v (face frame, mm), dev_mm (- = below: a dent),
-    area_mm2; MF: depth_mm (+ = a dent), width_mm, z), overlay PNG + JSON + maps NPZ in
-    output/defects. detector: None = the golden's default, 'mf_fir' | 'mf' | 'band', or a
+    PASS / FAIL / INCOMPLETE with the triggers (zone face / rim: r, theta, u, v (face frame,
+    mm), dev_mm (- = below: a dent), area_mm2; MF: depth_mm = depth_centre_mm (+ = a dent,
+    the 3 x 3 centre average), depth_min_mm, width_half_depth_mm, z; zone rim_outline: a
+    notch / bulge of the flood outline, depth_mm + = moved in, arc_mm), overlay PNG + JSON +
+    maps NPZ in output/defects. stats (and the top of the JSON) carry the disposition
+    CONTINUE / REJECT / PULL and its pull_reasons, the radii used, size_check, rim_outline
+    and centre_check. INCOMPLETE (never passed, a PULL): < 90 % of the inspected face
+    measured; a size mismatch (the outline more than size_tol_pct off the golden's face
+    diameter: not its FAILs either); a rim outline within the guard band, or one that could
+    not be judged all the way round; a profile not centred on its outline.
+    detector: None = the golden's default, 'mf_fir' | 'mf' | 'band', or a
     callable(dev_map, band, params) replacing the band's trigger function
     (engine.measure.endface.golden.detect_face_triggers). z_thresh / min_depth_mm /
-    min_area_mm2 override the golden's trigger settings for this check."""
+    min_area_mm2 / rim_tol_mm / rim_min_arc_mm / rim_guard_band_pct / size_tol_pct override
+    the golden's settings for this check (size_tol_pct 0 = off, with a warning)."""
     from .measure.endface import verbs as face_verbs
     over = {k: float(v) for k, v in (("min_area_mm2", min_area_mm2), ("z_thresh", z_thresh),
-                                     ("min_depth_mm", min_depth_mm)) if v is not None}
+                                     ("min_depth_mm", min_depth_mm), ("rim_tol_mm", rim_tol_mm),
+                                     ("rim_min_arc_mm", rim_min_arc_mm),
+                                     ("rim_guard_band_pct", rim_guard_band_pct),
+                                     ("size_tol_pct", size_tol_pct)) if v is not None}
     return face_verbs.check_face(_engine(), placement, golden, label, over or None, detector)
 
 

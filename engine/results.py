@@ -299,7 +299,12 @@ class FaceTarget:
     """Handle to a located end face (library/faces/<geometry>/<entry>): the face plane,
     centre and fixed-radius rim circle in mm (camera frame, from the locate metric scan's
     stereo calibration), the camera face mask / ellipse (px) and the camera -> DMD affine
-    fitted on the decoded face pixels, with the aim ring in native DMD (col, row) px."""
+    fitted on the decoded face pixels, with the aim ring in native DMD (col, row) px.
+    face_diameter_mm is the bright flat's. meta: size_check (the flood outline vs that
+    diameter; a mismatch adds disposition 'PULL' + pull_reasons [size_mismatch]),
+    centre_check (the outline's centre vs the located one), silhouette_diameter_mm (the
+    depth silhouette when it is the part's larger outer circle), locate_scan (how the scan
+    was made: scans, exposures)."""
     id: str
     label: str
     geometry_id: str
@@ -375,7 +380,10 @@ class FaceScan:
 class FaceProfile:
     """face_profile: height map of one placement in the face frame (u camera right, v camera
     down, h + toward the camera; mm on a grid_mm grid), radial profile, sections, flatness and
-    repeatability across the repeat scans. The arrays are in files['npz']."""
+    repeatability across the repeat scans. The arrays are in files['npz']. stats also holds
+    rim_outline (the flood outline: diameter, roundness), size_check (it against the face
+    diameter) and centre (what the face frame is centred on: the flood outline when the
+    whole of it shows, else the located circle; how far apart the two were)."""
     label: str
     geometry_id: str
     calibration_id: str
@@ -427,9 +435,23 @@ class FaceGolden:
 @dataclass
 class FaceCheck:
     """check_face: triggers = dents found by the detector (mf_fir / mf: z >= z_thresh, with
-    depth_mm (+ = a dent), width_mm, z; band: outside the tolerance band) with zone face |
-    rim, r / theta / u / v in the face frame, dev_mm signed (- = below the golden), area_mm2.
-    FAIL when any trigger; INCOMPLETE when too little of the face was measured to pass it."""
+    depth_mm = depth_centre_mm (+ = a dent: the 3 x 3 grid-cell average at its deepest place;
+    thresholds apply to it), depth_min_mm (the deepest single point: over-reads),
+    width_half_depth_mm, depth_fit_mm, width_mm, z; band: outside the tolerance band) with
+    zone face | rim, r / theta / u / v in the face frame, dev_mm signed (- = below the
+    golden), area_mm2; and edge dents, zone 'rim_outline': a notch / bulge of the flood
+    outline (depth_mm + = the outline moved in, arc_mm along the rim, at_least when the
+    depth is a lower bound). FAIL when any trigger on a trusted measurement; INCOMPLETE
+    when the face cannot be passed: too little of it measured, a size mismatch, a rim
+    outline in its guard band or not judged all the way round, a profile off its outline's
+    centre.
+    disposition: CONTINUE (PASS, no doubt) | REJECT (a definite FAIL) | PULL (anything
+    else: quality inspection), with pull_reasons [{reason, message}] (size_mismatch,
+    guard_band, incomplete, invalid). stats: the detector's numbers, radii (the radii
+    used, mm), size_check {status ok | mismatch | not_checked, measured_mm, deviation_pct,
+    ...}, rim_outline {status ok | fail | marginal | incomplete | not_measured, findings,
+    marginal, unjudged, rms_mm, max_abs_mm, arc_peak_mm, ...}, centre_check, disposition and
+    pull_reasons again (as stored in the JSON)."""
     verdict: str                    # "PASS" | "FAIL" | "INCOMPLETE"
     triggers: list
     n_triggers: int
@@ -441,6 +463,8 @@ class FaceCheck:
     units: dict = field(default_factory=dict)
     files: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
+    disposition: str = "PULL"       # "CONTINUE" | "REJECT" | "PULL" (never CONTINUE by default)
+    pull_reasons: list = field(default_factory=list)
 
 
 @dataclass

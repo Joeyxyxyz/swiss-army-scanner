@@ -34,6 +34,17 @@ Locate a circular end face in a metric scan (the bench prototype ring_check2, pr
      squares (f_scale 0.3 mm) on the rim points, at R - half a pixel footprint (rim points
      are pixel centres just inside the silhouette; the rim arc is one-sided because the
      projector shadows the far side, so an uncorrected fit slides ~0.15 mm).
+     SILHOUETTE LARGER THAN THE FACE: the face diameter is the bright flat's; when the rim
+     around it (rounded, chamfered) returns depth points, the depth silhouette is the
+     part's OUTER circle (a 19.5 mm flat on a 21.05 mm cylinder), and a 19.5 mm circle
+     fitted to it slides until it touches one side - the centre lands (D_outer - D) / 2
+     off, 0.8 mm there. So the rim circle is fitted at the silhouette's own radius: the
+     one given (silhouette_diameter_mm), else - when the rim points cover at least
+     silhouette_min_arc_deg and lie on a clean circle 2 .. 20 % larger than the face - the
+     free-radius circle through them. The face stays the diameter given: the camera mask,
+     the DMD ring and every radius derive from it; only the CENTRE comes from the
+     silhouette. (A silhouette smaller than the face, or far larger, is not this: the
+     fixed fit stands and its misfit says so.)
   5. the 3-D circle projected into the camera (K_cam, dist_cam): the camera face mask and
      its ellipse.
   6. camera -> DMD AFFINE fitted on the decoded face pixels (corr_x / corr_y of the scan;
@@ -74,6 +85,12 @@ class LocateParams:
     populated_span_mm: float = 2.0  # nearest depth with >= min_face_px points within this
     min_rim_points: int = 12
     min_rim_arc_deg: float = 60.0   # rim points must span at least this arc around the centre
+    silhouette_diameter_mm: Optional[float] = None  # the part's OUTER diameter when its depth
+                                    # silhouette is larger than the face (a flat inside a
+                                    # rounded rim that decodes); None = found from the rim
+    silhouette_auto: bool = True    # ... points when they cover silhouette_min_arc_deg and
+    silhouette_min_arc_deg: float = 150.0   # lie on a clean circle this much larger than the
+    silhouette_max_grow: float = 0.20       # face at most (and at least 2 % / 0.25 mm)
     min_aspect: float = 0.35        # minor / major spread of a face component (round-ish)
     max_rim_rms_mm: float = 1.0     # a worse fixed-radius fit is not this face
     f_scale_mm: float = 0.3         # soft-L1 scale of the circle fit
@@ -149,6 +166,52 @@ def _circle_fit(ub: np.ndarray, radius: float, f_scale: float) -> tuple:
                       ub.mean(0), loss="soft_l1", f_scale=f_scale).x
     res = np.hypot(ub[:, 0] - q[0], ub[:, 1] - q[1]) - radius
     return q, res
+
+
+SILHOUETTE_MIN_GROW = 0.02          # a silhouette this much larger than the face (and
+SILHOUETTE_MIN_GROW_MM = 0.25       # this many mm in radius) is the part's outer circle
+SILHOUETTE_MAX_RMS_MM = 0.3         # ... when its points lie on that circle this well
+
+
+def _free_circle(ub: np.ndarray, f_scale: float) -> Optional[tuple]:
+    """Free-radius circle through rim points (algebraic start, soft-L1 refinement) ->
+    (centre (2,), radius, residuals) or None."""
+    from scipy.optimize import least_squares
+    if len(ub) < 12:
+        return None
+    A = np.c_[2 * ub, np.ones(len(ub))]
+    s = np.linalg.lstsq(A, (ub ** 2).sum(1), rcond=None)[0]
+    r0 = float(np.sqrt(max(s[2] + s[0] ** 2 + s[1] ** 2, 0.0)))
+    if not np.isfinite(r0) or r0 <= 0:
+        return None
+    x = least_squares(lambda p: np.hypot(ub[:, 0] - p[0], ub[:, 1] - p[1]) - p[2],
+                      [s[0], s[1], r0], loss="soft_l1", f_scale=f_scale).x
+    return x[:2], float(x[2]), np.hypot(ub[:, 0] - x[0], ub[:, 1] - x[1]) - float(x[2])
+
+
+def _silhouette_radius(ub: np.ndarray, q: np.ndarray, res: np.ndarray, radius: float,
+                       inset: float, prm: "LocateParams") -> Optional[float]:
+    """The radius of the depth silhouette when it is a clean circle LARGER than the face
+    (the rim beyond the flat returns depth points), else None: the rim points cover enough
+    arc, their free-radius circle is 2 .. silhouette_max_grow larger than the face, fits
+    them well, and clearly better than the face's own radius does."""
+    if not prm.silhouette_auto or _arc_deg(ub, q) < prm.silhouette_min_arc_deg:
+        return None
+    free = _free_circle(ub, prm.f_scale_mm)
+    if free is None:
+        return None
+    qf, rf, resf = free
+    r_sil = rf + inset
+    grow = r_sil / radius - 1.0
+    rms_f = float(np.sqrt(np.mean(resf ** 2)))
+    rms_0 = float(np.sqrt(np.mean(res ** 2)))
+    if not (max(SILHOUETTE_MIN_GROW, SILHOUETTE_MIN_GROW_MM / radius) < grow
+            <= prm.silhouette_max_grow):
+        return None
+    if rms_f > SILHOUETTE_MAX_RMS_MM or rms_f > 0.6 * rms_0 \
+            or _arc_deg(ub, qf) < prm.silhouette_min_arc_deg:
+        return None
+    return float(r_sil)
 
 
 def _arc_deg(ub: np.ndarray, q: np.ndarray) -> float:
@@ -276,29 +339,65 @@ def _try_component(comp, X3, Z, zmin, radius, prm: LocateParams, far=None) -> tu
     # fixed circle through them at R - inset (else its centre slides away from the rim arc,
     # which is one-sided: the projector shadows the far side)
     inset = float(prm.rim_inset_px) * _footprint_mm(X3, m)
-    ub = np.c_[(Rm - c) @ e1, (Rm - c) @ e2]
-    q, res = _circle_fit(ub, radius - inset, prm.f_scale_mm)
-    for _ in range(int(prm.refine_iters)):
-        # the depth face also holds the cell's side wall (within near_band_mm): refit the
-        # plane on the face only (inside the circle, MAD-trimmed), then the circle again
-        C3 = c + q[0] * e1 + q[1] * e2
-        w = P - C3
-        inner = np.hypot(w @ e1, w @ e2) < radius - prm.refine_margin_mm
-        if inner.sum() < max(prm.min_face_px, 10):
-            break
-        c, n = _robust_plane(P[inner])
+    c0, n0 = c, n
+    # the circle the rim points lie on: the face's (its diameter is known), unless the
+    # depth silhouette is the part's larger outer circle (given, or found from the points)
+    fit_r = radius if prm.silhouette_diameter_mm is None else float(prm.silhouette_diameter_mm) / 2
+    sil_src = None if prm.silhouette_diameter_mm is None else "given"
+    for attempt in range(2):
+        c, n = c0, n0
         e1, e2 = face_axes(n)
         ub = np.c_[(Rm - c) @ e1, (Rm - c) @ e2]
-        q, res = _circle_fit(ub, radius - inset, prm.f_scale_mm)
+        q, res = _circle_fit(ub, fit_r - inset, prm.f_scale_mm)
+        for _ in range(int(prm.refine_iters)):
+            # the depth face also holds the cell's side wall (within near_band_mm): refit
+            # the plane on the face only (inside the circle, MAD-trimmed), then the circle
+            C3 = c + q[0] * e1 + q[1] * e2
+            w = P - C3
+            inner = np.hypot(w @ e1, w @ e2) < radius - prm.refine_margin_mm
+            if inner.sum() < max(prm.min_face_px, 10):
+                break
+            c, n = _robust_plane(P[inner])
+            e1, e2 = face_axes(n)
+            ub = np.c_[(Rm - c) @ e1, (Rm - c) @ e2]
+            q, res = _circle_fit(ub, fit_r - inset, prm.f_scale_mm)
+        if attempt or sil_src is not None:
+            break
+        r_sil = _silhouette_radius(ub, q, res, radius, inset, prm)
+        if r_sil is None:
+            break
+        fit_r, sil_src = r_sil, "rim points"
     rms = float(np.sqrt(np.mean(res ** 2)))
     arc = _arc_deg(ub, q)
     if rms > prm.max_rim_rms_mm:
-        return None, f"rim misfits a {2 * radius:g} mm circle (rms {rms:.2f} mm)"
+        return None, (f"rim misfits a {2 * fit_r:g} mm circle (rms {rms:.2f} mm)"
+                      + _other_size(ub, fit_r, inset, arc))
     if arc < prm.min_rim_arc_deg:
         return None, f"rim covers only {arc:.0f} deg"
     return {"depth_face": m, "plane_c": c, "n": n, "e1": e1, "e2": e2, "q": q, "rim_px": rim_px,
             "rim_res": res, "rim_rms_mm": rms, "rim_arc_deg": arc, "aspect": aspect,
-            "rim_inset_mm": inset, "n_contour": int(len(cnt)), "zmin": float(zmin)}, "ok"
+            "rim_inset_mm": inset, "n_contour": int(len(cnt)), "zmin": float(zmin),
+            "silhouette_diameter_mm": None if sil_src is None else 2.0 * float(fit_r),
+            "silhouette_source": sil_src}, "ok"
+
+
+def _other_size(ub: np.ndarray, radius: float, inset: float, arc: float) -> str:
+    """A rim that misfits the diameter given but is a clean circle of ANOTHER size: say so
+    (a scan that reads the wrong size - a lens zoomed after the calibration makes every
+    lateral size small - or simply not this face). '' when the rim is no circle either."""
+    if len(ub) < 12 or arc < 120.0:
+        return ""
+    A = np.c_[2 * ub, np.ones(len(ub))]
+    s = np.linalg.lstsq(A, (ub ** 2).sum(1), rcond=None)[0]
+    r = float(np.sqrt(max(s[2] + s[0] ** 2 + s[1] ** 2, 0.0)))
+    rms = float(np.sqrt(np.mean((np.hypot(ub[:, 0] - s[0], ub[:, 1] - s[1]) - r) ** 2)))
+    d = 2.0 * (r + inset)
+    pct = 100.0 * (d / (2.0 * radius) - 1.0)
+    if rms > 0.3 or abs(pct) <= 4.0:
+        return ""
+    return (f"; it is a circle {d:.1f} mm across (rms {rms:.2f} mm): {abs(pct):.0f} % "
+            f"{'smaller' if pct < 0 else 'larger'} than the diameter given - a size mismatch "
+            "(calibration or lens suspect: run rig-check / recalibrate) or not this face")
 
 
 def _footprint_mm(X3: np.ndarray, m: np.ndarray) -> float:
@@ -529,6 +628,13 @@ def locate(xyz, mask, corr_x, corr_y, field_mask, K_cam, dist_cam,
     if not (face_diameter_mm and face_diameter_mm > 0):
         raise ValueError(f"face_diameter_mm must be > 0, got {face_diameter_mm!r}")
     radius = float(face_diameter_mm) / 2
+    sd = prm.silhouette_diameter_mm
+    if sd is not None:
+        if isinstance(sd, bool) or not isinstance(sd, (int, float)) or not np.isfinite(sd) \
+                or not float(face_diameter_mm) <= sd <= 1.5 * float(face_diameter_mm):
+            raise ValueError(f"silhouette_diameter_mm {sd!r} must be the part's outer diameter: "
+                             f"between the face diameter {float(face_diameter_mm):g} mm and 1.5 x "
+                             "it (the depth silhouette of a flat face inside a rounded rim)")
     if flood is not None and np.shape(flood) != np.shape(mask):
         raise ValueError(f"flood {np.shape(flood)} and scan {np.shape(mask)} differ in size: the "
                          "flood-outline fallback needs the scan's camera frame")
@@ -567,8 +673,17 @@ def locate(xyz, mask, corr_x, corr_y, field_mask, K_cam, dist_cam,
         warnings.append(f"no depth rim (the face merges with its surroundings in depth): the rim is "
                         f"the face outline in the flood (outline {f['flood_outline_diameter_mm']:.2f} mm "
                         f"across, {f['flood_edges_used']} edge points); check the ring with check_ring")
+    if f.get("silhouette_source") == "rim points":
+        warnings.append(f"the depth silhouette is {f['silhouette_diameter_mm']:.2f} mm across, "
+                        f"larger than the {float(face_diameter_mm):g} mm face given (the rim "
+                        "around the flat returns depth points - or the scan reads large: see "
+                        "the size check): the face is centred on the silhouette and keeps the "
+                        "diameter given (the part's outer diameter can be given: "
+                        "silhouette_diameter_mm / --outer-diameter)")
     return {"radius_mm": radius, "face_diameter_mm": float(face_diameter_mm),
             "rim_source": src, "flood_outline_diameter_mm": f.get("flood_outline_diameter_mm"),
+            "silhouette_diameter_mm": f.get("silhouette_diameter_mm"),
+            "silhouette_source": f.get("silhouette_source"),
             "centre_mm": C3, "normal": n, "e1": e1, "e2": e2, "plane_point": c,
             "tilt_deg": tilt, "rim_rms_mm": f["rim_rms_mm"], "rim_inset_mm": f["rim_inset_mm"],
             "n_rim": int(len(f["rim_px"])),

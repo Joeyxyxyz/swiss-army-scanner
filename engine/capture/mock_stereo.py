@@ -33,10 +33,15 @@ aimed at the wall 823 mm away (triangulation angle ~18.8 deg), throw ratio
 Rendering, per camera pixel: the camera ray hits the nearest surface at X;
 X is lit when the projector sees it first (shadow test by a second ray
 cast from the projector), and the pixel reads
-    ambient + gain * albedo * cos(incidence) * pattern(u, v) / 255
+    ambient + gain * (albedo * cos(incidence) + specular lobe) * pattern(u, v) / 255
 with the pattern sampled bilinearly between rows and, inside a row,
 bilinearly between the (parity-shifted) mirrors. The board texture is
 pre-filtered to the camera footprint so corners are anti-aliased.
+
+Specular lobe (a shape with specular > 0; default 0 = matt): specular * (n . h) ** shininess,
+h = the bisector of the directions to the projector and to the camera - a bare-metal face
+that MIRRORS the projector into the camera when its normal is that bisector (saturated at
+any exposure), and is dim a few degrees off it. A low albedo alone is a dim face.
 """
 
 from __future__ import annotations
@@ -205,6 +210,8 @@ class StereoRig:
 
 class StereoShape:
     albedo: float = 0.7
+    specular: float = 0.0               # mirror lobe gain (x a perfect white matt surface)
+    shininess: float = 200.0            # lobe exponent: (n . h) ** shininess
 
     def intersect(self, o: np.ndarray, d: np.ndarray):
         """Rays (o: (3,) or (N, 3), d: (N, 3)) -> (t (N,), normal (N, 3)); t = inf on a miss."""
@@ -436,6 +443,12 @@ class EndFace(StereoShape):
         depth * 0.5 * (1 + cos(pi q)), q = distance / (size / 2).
     chamfer_mm / chamfer_depth_mm: the outer chamfer_mm of the radius recede linearly to
         chamfer_depth_mm at the edge (a grazing rim, like the bench cells).
+    rim_notches: [{theta_deg, depth_mm, arc_mm}] edge dents: the OUTLINE moves in by depth_mm
+        (a notch; negative = out, a bulge) over arc_mm of rim centred at theta_deg (atan2(v,
+        u): 0 = camera right, 90 = camera down), flat over the middle 60 % of the arc with
+        cosine flanks.
+    albedo / specular / shininess: a dim face is a low albedo; a bare-metal face that mirrors
+        the projector is specular > 0 (StereoShape; the module doc).
     Place a MetricCylinder behind it (center - n * L / 2, axis n, height L) for the body."""
     center: tuple = (0.0, 0.0, 780.0)
     normal: tuple = (0.0, 0.0, -1.0)
@@ -444,6 +457,9 @@ class EndFace(StereoShape):
     chamfer_mm: float = 0.0
     chamfer_depth_mm: float = 0.0
     albedo: float = 0.7
+    rim_notches: list = field(default_factory=list)
+    specular: float = 0.0
+    shininess: float = 200.0
 
     def frame(self):
         n = np.asarray(self.normal, float)
@@ -470,6 +486,18 @@ class EndFace(StereoShape):
         """Nominal-plane height of the surface (mm, + toward the camera: a dent is negative)."""
         return -self.recess(np.asarray(u, float), np.asarray(v, float))
 
+    def rim_radius(self, theta) -> np.ndarray:
+        """The outline's radius (mm) at face angle theta (rad): radius less the notches."""
+        theta = np.asarray(theta, float)
+        r = np.full(theta.shape, float(self.radius))
+        for nt in self.rim_notches:
+            half = float(nt["arc_mm"]) / 2.0
+            d = np.angle(np.exp(1j * (theta - math.radians(float(nt.get("theta_deg", 0.0))))))
+            q = np.abs(d) * self.radius / half
+            flank = 0.5 * (1 + np.cos(np.pi * np.clip((q - 0.6) / 0.4, 0, 1)))
+            r = r - float(nt["depth_mm"]) * np.where(q < 1, flank, 0.0)
+        return r
+
     def intersect(self, o, d):
         c, n, e1, e2 = self.frame()
         o2 = np.broadcast_to(o, d.shape)
@@ -482,8 +510,10 @@ class EndFace(StereoShape):
                 delta = self.recess(w @ e1, w @ e2)
                 t = ((c - delta[:, None] * n - o2) @ n) / den
         w = o2 + np.where(np.isfinite(t), t, 0)[:, None] * d - c
-        r = np.hypot(w @ e1, w @ e2)
-        hit = (np.abs(den) > 1e-12) & np.isfinite(t) & (t > 1e-6) & (r <= self.radius)
+        wu, wv = w @ e1, w @ e2
+        r = np.hypot(wu, wv)
+        edge = self.rim_radius(np.arctan2(wv, wu)) if self.rim_notches else self.radius
+        hit = (np.abs(den) > 1e-12) & np.isfinite(t) & (t > 1e-6) & (r <= edge)
         return np.where(hit, t, np.inf), np.broadcast_to(n, d.shape)
 
 
@@ -585,12 +615,20 @@ class StereoScene:
         lit &= (Xp[:, 2] > 0) & (u >= 0) & (u <= Wp - 1) & (v >= 0) & (v <= Hp - 1)
         cosi = np.abs(np.einsum("ij,ij->i", nrm, -dirp))
         alb = np.zeros(d.shape[0], np.float32)
+        spec = np.zeros(d.shape[0], np.float32)
         shapes = self.all_shapes()
         for i, s in enumerate(shapes):
             m = idx == i
             if m.any():
                 alb[m] = s.albedo_at(X[m])
+                if getattr(s, "specular", 0.0) > 0:      # the mirror lobe about the bisector
+                    view = -d[m] / np.linalg.norm(d[m], axis=1, keepdims=True)
+                    hv = view - dirp[m]
+                    hv /= np.maximum(np.linalg.norm(hv, axis=1, keepdims=True), 1e-12)
+                    nh = np.clip(np.abs(np.einsum("ij,ij->i", nrm[m], hv)), 0.0, 1.0)
+                    spec[m] = float(s.specular) * nh ** float(s.shininess)
         self._geo = {"X": X.reshape(H, W, 3), "albedo": alb.reshape(H, W),
+                     "spec": np.where(lit, spec, 0).astype(np.float32).reshape(H, W),
                      "shade": np.where(lit, cosi, 0).astype(np.float32).reshape(H, W),
                      "u": u.reshape(H, W), "v": v.reshape(H, W),
                      "lit": lit.reshape(H, W), "hit": hit.reshape(H, W),
@@ -616,7 +654,8 @@ class StereoScene:
             lit = g["lit"]
             g["lit_idx"] = np.flatnonzero(lit)
             g["taps"] = self.rig.projector.taps(g["u"][lit], g["v"][lit])
-            g["scale"] = (self.gain / 255.0 * g["albedo"] * g["shade"]).reshape(-1)[g["lit_idx"]]
+            g["scale"] = (self.gain / 255.0 * (g["albedo"] * g["shade"] + g["spec"])
+                          ).reshape(-1)[g["lit_idx"]]
         flat = frame.reshape(-1)
         flat[g["lit_idx"]] += g["scale"] * apply_taps(pat, *g["taps"])
         self._last = (key, frame)

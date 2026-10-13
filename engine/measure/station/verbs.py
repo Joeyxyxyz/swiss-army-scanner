@@ -157,7 +157,8 @@ def _report(r: dict, ms: MetricScan, cal, geo, fp, prm, fsrc, label, warnings) -
                       "tilt_vs_common_deg": _r(f["tilt_vs_common_deg"], 3),
                       "centre_method": f["centre_method"],
                       "outline_diameter_mm": _r((f["outline"] or {}).get("diameter_mm"), 3),
-                      "outline_rms_mm": _r((f["outline"] or {}).get("rms_mm"), 3)})
+                      "outline_rms_mm": _r((f["outline"] or {}).get("rms_mm"), 3),
+                      "size_check": f.get("size_check")})
     pairs = [{k: _r(v, 4) for k, v in p.items()} for p in r["pairs"]]
     fr = r["frame"]
     zones = [{k: _r(v, 4) for k, v in z.items()} for z in r["zones"]]
@@ -417,7 +418,8 @@ def _plain(d) -> dict:
 
 STRICT_KEYS = ("strict", "max_outline_rms_mm", "strict_min_coverage",
                "strict_partial_outline_rms_mm", "max_pair_dz_diam", "max_pair_spacing_diam",
-               "min_pair_spacing_diam")
+               "min_pair_spacing_diam", "size_tol_pct")
+SIZE_STATUS = "size_mismatch"       # a compared item's status: its face is not the known size
 
 
 def _gates(params: dict) -> Optional[dict]:
@@ -587,6 +589,14 @@ def station_golden(s, measurements: list, label: str = "golden", limits: Optiona
     # a measurement made without the strict gates is re-measured with them (or refused)
     gparams, ms_list, mix = _alike_params(s, ms_list)
     ref = ms_list[0]
+    # the known size: a golden is never built on an end face that reads the wrong size (a
+    # measurement made without the strict gates can carry one)
+    for m in ms_list:
+        for c in m.cells:
+            sc = c.get("size_check") or {}
+            if sc.get("status") == "mismatch":
+                raise ValueError(f"station_golden: end face {c['name']} of measurement "
+                                 f"{m.label}: {sc.get('message')} - not a GOOD measurement")
     # the measurements' own warnings (e.g. cells found on the decode modulation, a borrowed
     # flood) stay visible on the golden
     warnings = [f"measurement {m.label}: {w}" for m in ms_list for w in (m.warnings or [])]
@@ -726,6 +736,19 @@ def compare(m: StationMeasurement, g: StationGolden) -> list:
         v = (float(np.linalg.norm(np.subtract(q["centre_mm"], c["centre_mm"])))
              if q is not None and q.get("centre_mm") is not None else None)
         items.append(_item(f"{c['name']} position", "face_position", v, 0.0, [0.0, ptol]))
+    D = float(gprm.face_diameter_mm)
+    for q in m.cells:                           # the known size of every face measured
+        sc = q.get("size_check") or {}
+        if sc.get("status") not in ("ok", "mismatch"):
+            continue
+        t = float(sc.get("tol_pct") or 0.0) / 100.0
+        it = _item(f"{q['name']} size", "face_size", sc.get("measured_mm"), D,
+                   [D * (1 - t), D * (1 + t)],
+                   {"deviation_pct": sc.get("deviation_pct"), "message": sc.get("message")})
+        # never a trigger (a size mismatch is not a bad part: the calibration or the lens is
+        # suspect) and never what makes a PASS: 'info' when it holds, SIZE_STATUS when not
+        it["status"] = "info" if sc["status"] == "ok" else SIZE_STATUS
+        items.append(it)
     for p in g.nominal["pairs"]:
         q = next((x for x in m.pairs if x["pair"] == p["pair"]), None)
         v = q["height_diff_mm"] if q else None
@@ -795,8 +818,16 @@ def station_check(s, scan, golden=None, flood=None, label: Optional[str] = None)
     trig = [it for it in items if it["status"] == "trigger"]
     missing = [it for it in items if it["status"] == "missing"]
     checked = [it for it in items if it["status"] in ("ok", "trigger")]
-    verdict = "FAIL" if trig else ("INCOMPLETE" if missing or not checked else "PASS")
+    wrong_size = [it for it in items if it["status"] == SIZE_STATUS]
+    # a size mismatch: nothing measured on this scan is trusted (not a FAIL either): PULL
+    verdict = "INCOMPLETE" if wrong_size else (
+        "FAIL" if trig else ("INCOMPLETE" if missing or not checked else "PASS"))
     warnings = list(m.warnings)
+    pulls = [{"reason": "size_mismatch", "message": f"{it['item']}: {it.get('message')}"}
+             for it in wrong_size]
+    if wrong_size and trig:
+        warnings.append(f"{len(trig)} item(s) outside their band, but on a mis-scaled "
+                        "measurement: not a definite FAIL (PULL)")
     if missing:
         warnings.append("not measured: " + ", ".join(it["item"] for it in missing)
                         + " (never passed: re-scan with those parts lit and decoded)")
@@ -810,6 +841,8 @@ def station_check(s, scan, golden=None, flood=None, label: Optional[str] = None)
            "golden_label": g.label, "measurement": {"label": m.label, "scan_id": m.scan_id,
                                                    "file": str(m.files.get("json") or "")},
            "limits": g.limits, "items": items, "triggers": trig, "n_triggers": len(trig),
+           "disposition": {"PASS": "CONTINUE", "FAIL": "REJECT"}.get(verdict, "PULL"),
+           "pull_reasons": pulls,
            "units": UNITS, "created": _now(), "mock": bool(s.mock), "warnings": warnings}
     out = s.store.output_path("defects", f"{label}_station_check", ".json")
     s.store.write_json(out, json_safe(rep))

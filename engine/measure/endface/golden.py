@@ -8,21 +8,27 @@ for no better sensitivity.
   band     max(k_sigma x sigma_placement, floor_mm), sigma = the placements' std at the cell
            (x sqrt(n / (n - 1))), median-smoothed over smooth_cells x smooth_cells (few
            samples per cell); the RIM ZONE r > rim_r_mm (a grazing chamfer on the bench
-           cells) gets max(band x rim_factor, rim_min_mm)
+           cells) gets max(band x rim_factor, rim_min_mm). rim_r_mm is the ONE rim radius
+           of every detector (radii.py): 0.855 x the face radius unless given
   check    dev = placement - golden; TRIGGERS = connected regions with |dev| > band of at
            least min_area_mm2 (detect_face_triggers; check_face(detector=fn) swaps it for any
-           callable(dev_map, band, params))
+           callable(dev_map, band, params)); each with its depth_centre_mm / depth_min_mm /
+           width_half_depth_mm (depth.py)
 
 Defaults = the bench's best band trade-off: k_sigma 4, floor 0.10 mm, height maps
-Gaussian-smoothed 0.25 mm, sigma median 5 x 5 cells, rim zone r > 9.75 mm at x2 (min 0.3 mm),
-triggers >= 0.25 mm^2. Leave-one-out, the synthetic set and the images: detectors.py.
+Gaussian-smoothed 0.25 mm, sigma median 5 x 5 cells, rim zone at x2 (min 0.3 mm), triggers
+>= 0.25 mm^2. Leave-one-out, the synthetic set and the images: detectors.py.
 """
 
 from __future__ import annotations
 
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from typing import Optional
+
 import numpy as np
+
+from . import depth as depth_mod
 
 
 @dataclass
@@ -30,7 +36,8 @@ class BandParams:
     k_sigma: float = 4.0
     floor_mm: float = 0.10
     smooth_cells: int = 5           # median filter of sigma (cells; 5 x 0.25 mm = 1.25 mm)
-    rim_r_mm: float = 9.75          # rim zone: r > this
+    rim_r_mm: Optional[float] = None    # rim zone: r > this; None = the face's rim radius
+                                    # (radii.py: 0.855 x the face radius, every detector's)
     rim_factor: float = 2.0
     rim_min_mm: float = 0.3
     height_smooth_mm: float = 0.25  # NaN-aware Gaussian sigma on every height map (0 = off)
@@ -45,6 +52,20 @@ class TriggerParams:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def resolved(prm: BandParams, radii: dict) -> BandParams:
+    """The band settings with the rim radius set (the face's, unless given)."""
+    if prm.rim_r_mm is not None:
+        return prm
+    return replace(prm, rim_r_mm=float(radii["rim_r_mm"]))
+
+
+def _rim(prm: BandParams) -> float:
+    if prm.rim_r_mm is None:
+        raise ValueError("band detector: rim_r_mm is not resolved (golden.resolved(params, "
+                         "radii)): a radius is never assumed")
+    return float(prm.rim_r_mm)
 
 
 def grid_coords(g: np.ndarray) -> tuple:
@@ -96,7 +117,7 @@ def build_golden(H: np.ndarray, g: np.ndarray, radius_mm: float, prm: BandParams
         s2 = sig
     band = np.maximum(prm.k_sigma * s2, prm.floor_mm)
     _, _, R, _ = grid_coords(g)
-    rim = R > prm.rim_r_mm
+    rim = R > _rim(prm)
     band = np.where(rim, np.maximum(band * prm.rim_factor, prm.rim_min_mm), band)
     face = R <= radius_mm
     band = np.where(face & np.isfinite(gold), band, np.nan)
@@ -110,7 +131,9 @@ def detect_face_triggers(dev_map: np.ndarray, band: np.ndarray, params: dict) ->
     params: grid_mm (1-D axis, mm), radius_mm, rim_r_mm, min_area_mm2.
     -> triggers, largest |dev| first: {zone 'face' | 'rim', r_mm, theta_deg, u_mm, v_mm,
     dev_mm (signed peak: - = below the golden, a dent), area_mm2, band_mm (at the peak),
-    excess_mm (|dev| - band at the peak), n_cells}."""
+    excess_mm (|dev| - band at the peak), n_cells, and the depth as every detector reports
+    it (depth.py): depth_centre_mm = depth_mm (+ = a dent; the 3 x 3 centre average against
+    the local background), depth_min_mm (single point, over-reads), width_half_depth_mm}."""
     import cv2
     g = np.asarray(params["grid_mm"], np.float64)
     step = float(g[1] - g[0])
@@ -128,20 +151,32 @@ def detect_face_triggers(dev_map: np.ndarray, band: np.ndarray, params: dict) ->
         k = int(np.nanargmax(np.where(m, np.abs(dev_map), -1.0)))
         y, x = np.unravel_index(k, dev_map.shape)
         r = float(R[y, x])
+        width = 2.0 * float(np.sqrt(area / np.pi))
+        met = depth_mod.dent_metrics(np.where(face, dev_map, np.nan), g, y, x, width,
+                                     1 if dev_map[y, x] < 0 else -1,
+                                     px_mm=params.get("px_mm"))
+        dc = met["depth_centre_mm"]
         trig.append({"zone": "rim" if r > float(params.get("rim_r_mm", np.inf)) else "face",
                      "r_mm": round(r, 2), "theta_deg": round(float(TH[y, x]), 1),
                      "u_mm": round(float(GU[y, x]), 2), "v_mm": round(float(GV[y, x]), 2),
                      "dev_mm": round(float(dev_map[y, x]), 3), "area_mm2": round(area, 2),
                      "band_mm": round(float(band[y, x]), 3),
                      "excess_mm": round(float(abs(dev_map[y, x]) - band[y, x]), 3),
-                     "n_cells": int(m.sum())})
+                     "n_cells": int(m.sum()),
+                     "depth_mm": dc if dc is not None else round(float(-dev_map[y, x]), 3),
+                     "depth_centre_mm": dc, "depth_min_mm": met["depth_min_mm"],
+                     "depth_min_note": met["depth_min_note"],
+                     "width_half_depth_mm": met["width_half_depth_mm"],
+                     "width_note": met["width_note"],
+                     "depth_source": "centre_3x3" if dc is not None else "peak",
+                     "kind": "dent" if dev_map[y, x] < 0 else "bump"})
     trig.sort(key=lambda t: -abs(t["dev_mm"]))
     return trig
 
 
 def trigger_params(g, radius_mm: float, band_prm: BandParams, trig_prm: TriggerParams) -> dict:
     return {"grid_mm": np.asarray(g), "radius_mm": float(radius_mm),
-            "rim_r_mm": float(band_prm.rim_r_mm), **trig_prm.to_dict()}
+            "rim_r_mm": _rim(band_prm), **trig_prm.to_dict()}
 
 
 def check(h: np.ndarray, gold: dict, g, radius_mm: float, band_prm: BandParams,
@@ -152,12 +187,12 @@ def check(h: np.ndarray, gold: dict, g, radius_mm: float, band_prm: BandParams,
     det = detector or detect_face_triggers
     trig = det(dev, gold["band"], trigger_params(g, radius_mm, band_prm, trig_prm))
     _, _, R, _ = grid_coords(np.asarray(g))
-    inner = dev[(R < band_prm.rim_r_mm) & np.isfinite(dev)]
+    inner = dev[(R < _rim(band_prm)) & np.isfinite(dev)]
     stats = {"dev_rms_mm": float(np.std(inner)) if inner.size else None,
              "max_abs_dev_mm": float(np.max(np.abs(inner))) if inner.size else None,
              "compared_pct": round(100.0 * float(np.isfinite(dev[R <= radius_mm]).mean()), 2),
              "n_face": sum(t["zone"] == "face" for t in trig),
-             "n_rim": sum(t["zone"] == "rim" for t in trig), "rim_r_mm": band_prm.rim_r_mm}
+             "n_rim": sum(t["zone"] == "rim" for t in trig), "rim_r_mm": _rim(band_prm)}
     return dev, trig, stats
 
 

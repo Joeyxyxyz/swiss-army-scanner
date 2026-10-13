@@ -17,6 +17,11 @@ check can use any detector; params['detector'] is the default. Every setting is 
 the golden; the trigger settings (z_thresh, min_depth_mm, min_area_mm2) can be overridden
 per check.
 
+Radii (Settings.radii, radii.py): the inspected zone, the rim radius (ONE for every
+detector), the plane region, the noise bands, the FIR's fit radius and the synthetic dents'
+centres are fractions of the face radius unless given; the resolved set is stored with the
+golden (params['radii']) and in every check result (stats['radii']).
+
 Leave-one-out (golden, FIR and noise from the OTHER placements, the held-out one checked) and
 the synthetic-dent set (paraboloid dents injected per camera pixel, integrated over the
 pixel footprint, into every repeat, re-gridded through the same operator: the research's
@@ -38,6 +43,7 @@ import numpy as np
 
 from . import golden as band_mod
 from . import mfcfar
+from . import radii as radii_mod
 from .profile import colour_map
 
 DETECTORS = ("mf_fir", "mf", "band")
@@ -62,11 +68,48 @@ class Settings:
     trig: band_mod.TriggerParams
     mf: dict
     fir: dict
+    radii: Optional[dict] = None            # radii.face_radii (None: a golden stored before)
 
     def to_dict(self, detector: str, use_fir: bool) -> dict:
         return {"detector": detector, "band": self.band.to_dict(), "trigger": self.trig.to_dict(),
                 "mf": {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.mf.items()},
-                "fir": {**self.fir, "used": bool(use_fir)}}
+                "fir": {**self.fir, "used": bool(use_fir)}, "radii": self.radii_public()}
+
+    def radii_public(self) -> dict:
+        """The radii this check / golden uses, as stored: the resolved set, or (a golden
+        stored before the radii were derived from the face) what its detectors hold."""
+        if self.radii is not None:
+            return radii_mod.public(self.radii)
+        return {"face_radius_mm": float(self.radius_mm),
+                **{k: (list(self.mf[k]) if isinstance(self.mf[k], tuple) else self.mf[k])
+                   for k in mfcfar.MF_RADII},
+                "band_rim_r_mm": self.band.rim_r_mm, "fir_r_max_mm": self.fir.get("r_max_mm"),
+                "given": [], "note": "as stored with a golden made before the radii were "
+                                     "derived from the face diameter"}
+
+
+def settings(g, radius_mm: float, band: band_mod.BandParams, trig: band_mod.TriggerParams,
+             mf_over: Optional[dict] = None, fir_over: Optional[dict] = None,
+             radii_over: Optional[dict] = None) -> Settings:
+    """Settings with every radius resolved from the face radius: radii_over (radii.KEYS)
+    and the radii in mf_over are explicit values, the rest are fractions of radius_mm. The
+    band's rim radius is the same rim_r_mm unless its own was given."""
+    mfo = dict(mf_over or {})
+    mfcfar.check_mf_keys(mfo)
+    over = {k: mfo[k] for k in mfcfar.MF_RADII if mfo.get(k) is not None}
+    for k, v in (radii_over or {}).items():
+        if v is None:
+            continue
+        if k in over and over[k] != v:
+            raise ValueError(f"{k} given twice ({over[k]!r} in the MF settings, {v!r} in the "
+                             "radii): give it once")
+        over[k] = v
+    rr = radii_mod.face_radii(radius_mm, over)
+    return Settings(g=np.asarray(g, np.float64), radius_mm=float(radius_mm),
+                    band=band_mod.resolved(band, rr), trig=trig,
+                    mf=mfcfar.mf_params({k: v for k, v in mfo.items()
+                                         if k not in mfcfar.MF_RADII}, radii=rr),
+                    fir=mfcfar.fir_params(fir_over, radii=rr), radii=rr)
 
 
 def check_name(detector) -> str:
@@ -154,7 +197,10 @@ def check(detector: Union[str, Callable], pl: Placement, model: dict, st: Settin
         warn.append("no per-pixel data in this profile (made before the MF detector): the MF runs "
                     "on the gridded median map (no per-repeat plane removal, no FIR)")
     stack, gr = mf_stack(pl, st, coef, extra_px, extra_grid, gridder)
-    res = mfcfar.detect(stack, model["mf"], st.g, st.mf)
+    px_mm = None
+    if gr is not None and gr.n >= 3:
+        px_mm = float(np.sqrt(abs(np.linalg.det(gr.jacobian()))))     # camera px on the face
+    res = mfcfar.detect(stack, model["mf"], st.g, st.mf, px_mm=px_mm)
     dev = res["deviation"]
     GU, GV, R = mfcfar.grid_mesh(st.g)
     inner = dev[(R <= st.mf["inspect_r_mm"]) & np.isfinite(dev)]
@@ -167,6 +213,7 @@ def check(detector: Union[str, Callable], pl: Placement, model: dict, st: Settin
              "inspect_r_mm": st.mf["inspect_r_mm"], "max_z": res["max_z"],
              "z_thresh": st.mf["z_thresh"], "noise_floor_mm": res["noise_floor_mm"],
              "fir_applied": fir_applied, "n_repeats": int(stack.shape[0]),
+             "mm_per_camera_px": round(px_mm, 4) if px_mm else None,
              "flood_saturated_pct": mfcfar.saturated_pct(pl.pixels) if pl.pixels is not None else None}
     sat = stats["flood_saturated_pct"]
     if sat is not None and 1.0 < sat <= st.fir["max_sat_pct"] and fir_applied:
@@ -175,7 +222,7 @@ def check(detector: Union[str, Callable], pl: Placement, model: dict, st: Settin
     return {"detector": name, "dev": dev, "triggers": trig, "stats": stats, "warnings": warn,
             "maps": {"height_mm": res["height"], "z_map": res["z_map"],
                      "depth_map_mm": res["depth_map"], "scale_map_mm": res["scale_map"]},
-            "gridder": gr}
+            "gridder": gr, "candidates": res["candidates"]}
 
 
 def verdict(triggers: list, stats: dict, min_compared_pct: float = MIN_COMPARED_PCT) -> str:
@@ -194,7 +241,8 @@ def battery_spec(synthetic) -> Optional[dict]:
     if not synthetic:
         return None
     d = {"depths_mm": mfcfar.BATTERY_DEPTHS_MM, "widths_mm": mfcfar.BATTERY_WIDTHS_MM,
-         "positions": 6, "seed": 1000, "tol_mm": mfcfar.BATTERY_TOL_MM, "r_mm": mfcfar.BATTERY_R_MM}
+         "positions": 6, "seed": 1000, "tol_mm": mfcfar.BATTERY_TOL_MM,
+         "r_mm": None}                  # None = the face's rim radius (leave_one_out sets it)
     if isinstance(synthetic, dict):
         bad = set(synthetic) - set(d)
         if bad:
@@ -216,6 +264,10 @@ def leave_one_out(placements: list, st: Settings, detector: str, use_fir: bool,
     triggers), dev rms, max z. sensitivity: the battery for `detector` (None without)."""
     n = len(placements)
     rows, sens_rows = [], []
+    if battery and battery.get("r_mm") is None:      # dent centres scale with the face
+        battery = {**battery, "r_mm": float(
+            st.radii["battery_r_mm"] if st.radii is not None else
+            min(st.mf["rim_r_mm"], st.mf["inspect_r_mm"]))}
     if n < 3:
         return rows, None
     for i in range(n):
@@ -377,8 +429,14 @@ def check_png(res: dict, st: Settings, verdict_: str) -> Optional[bytes]:
     for i, t in enumerate(res["triggers"], 1):
         x = int(round(c0 + t["u_mm"] / step * sc))
         y = int(round(c0 + t["v_mm"] / step * sc))
-        rr = max(8, int(round(np.sqrt(t["area_mm2"] / np.pi) / step * sc)) + 6)
-        txt = f"{i}:{t['depth_mm']:.2f}mm z{t['z']:.1f}" if "z" in t else f"{i}:{t['dev_mm']:+.2f}"
+        if t.get("zone") == "rim_outline":           # an edge dent: a mark ON the rim
+            cv2.drawMarker(tiles[1], (x, y), (255, 255, 255), cv2.MARKER_TILTED_CROSS, 14, 2)
+            cv2.putText(tiles[1], f"{i}:{t['kind']} {abs(t['depth_mm']):.2f}mm", (x + 9, y), 0,
+                        0.4, (255, 255, 255), 1)
+            continue
+        rr = max(8, int(round(np.sqrt((t.get("area_mm2") or 0.0) / np.pi) / step * sc)) + 6)
+        txt = (f"{i}:{t['depth_mm']:.2f}mm z{t['z']:.1f}" if t.get("z") is not None
+               else f"{i}:{t['dev_mm']:+.2f}")
         cv2.circle(tiles[1], (x, y), rr, (255, 255, 255), 2)
         cv2.putText(tiles[1], txt, (x + rr, y), 0, 0.4, (255, 255, 255), 1)
     col = (0, 200, 0) if verdict_ == "PASS" else (0, 0, 255)

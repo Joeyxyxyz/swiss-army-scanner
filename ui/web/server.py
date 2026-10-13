@@ -572,9 +572,19 @@ VERBS: dict = {
     "locate_face": ("Locate a circular end face in a metric scan (both axes; scan_metric with "
                     "method plane and a zone around the face): face plane, centre, fixed-radius "
                     "rim circle, tilt, camera face mask and the camera -> DMD affine on the "
-                    "decoded face (residual DMD px; warns > 0.5) -> face target in faces/.",
+                    "decoded face (residual DMD px; warns > 0.5) -> face target in faces/. "
+                    "Known size: the face's flood outline vs face_diameter_mm; more than "
+                    "size_tol_pct off = result.meta.size_check mismatch, disposition PULL, "
+                    "pull_reasons [size_mismatch] (calibration or lens suspect; nothing is "
+                    "rescaled). result.meta.centre_check: the outline's centre vs the located one.",
                     {"metric_id": "metric scan id (the locate scan)",
-                     "face_diameter_mm": "face diameter, mm (default 21.05)", "label": "text",
+                     "face_diameter_mm": "diameter of the bright FLAT the flood shows, mm "
+                                         "(default 21.05; not the cylinder's when the rim is "
+                                         "rounded)",
+                     "silhouette_diameter_mm": "the part's OUTER diameter when its rim returns "
+                                               "depth points (default: found from the rim)",
+                     "size_tol_pct": "known-size tolerance, % (default 4; 0 = off, warned)",
+                     "label": "text",
                      "roi": "[x0, y0, x1, y1] camera px to search (optional)",
                      "near_band_mm": "depth face band (default 12)",
                      "far_gap_mm": "background gap behind the face (default 30)",
@@ -583,6 +593,40 @@ VERBS: dict = {
                      "flood_metric_id": "metric scan whose flood pair outlines the face when "
                                         "the depth rim fails (default: the scan's own, else its "
                                         "decode modulation)"}),
+    "locate_scan": ("The scan locate_face wants, made now: both axes, ray-plane, lit through a "
+                    "zone, its flood pair kept (the size check needs it) -> metric scan.",
+                    {"zone": "grid cells 'H10:I12', atlas:<name>/<region> or zoneset:<set> "
+                             "(default: full field)", "label": "text",
+                     "steps": "phase steps", "periods": "[T, ...] DMD px",
+                     "exposure_us": "camera exposure for this scan only (optional)"}),
+    "locate_face_live": ("Scan and locate an end face in one go, at the exposure the face "
+                         "needs: with auto exposure the zone is scanned again (at most 3 scans, "
+                         "frame-locked exposures) when no face is found or the located face is "
+                         "dark / clipped, and the face located on the scans merged per pixel -> "
+                         "face target (result.meta.locate_scan: scans, exposures, notes); the "
+                         "size and centre checks as locate_face.",
+                         {"zone": "grid cells / atlas region / zone set to scan",
+                          "face_diameter_mm": "diameter of the bright flat, mm (default 21.05)",
+                          "silhouette_diameter_mm": "the part's outer diameter (optional)",
+                          "size_tol_pct": "known-size tolerance, % (default 4; 0 = off)",
+                          "label": "text", "roi": "[x0, y0, x1, y1] camera px (optional)",
+                          "steps": "phase steps", "periods": "[T, ...] DMD px",
+                          "auto_exposure": "bool (default: on when the preset's exposure is "
+                                           "whole video frames)",
+                          "exposure_us": "force one exposure (one scan)",
+                          "exposure_range_us": "[lo, hi] us (default 16667..100000)",
+                          "near_band_mm": "(default 12)", "far_gap_mm": "(default 30)",
+                          "near_gap_mm": "(default 2)"}),
+    "face_exposure": ("The frame-locked camera exposure for this seating of a located face: "
+                      "flood shots through the face mask, p95 inside 0.8 R near target_dn with "
+                      "< max_clipped_pct clipped -> {ok, exposure_us, p95_dn, clipped_pct, "
+                      "shots, why}; ok false = disposition PULL (too dark / clipped / mirror). "
+                      "The preset is not edited, the LED currents are never touched.",
+                      {"face_id": "face target id (default: newest)",
+                       "target_dn": "camera DN (default 170)",
+                       "exposure_range_us": "[lo, hi] us (default 16667..100000)",
+                       "max_clipped_pct": "% of the face (default 0.5)",
+                       "duty": "projection.duty override", "label": "text"}),
     "aim_ring": ("Project a face target's ring + cross and photograph it: the operator's "
                  "placement guide (hold_s keeps it up, pumped hold).",
                  {"face_id": "face target id (default: the newest at the preset's geometry)",
@@ -610,13 +654,29 @@ VERBS: dict = {
                             "polar": "bool: rings + spokes (default true; the flood pair is "
                                      "always captured)", "duty": "projection.duty override",
                             "steps": "depth-set phase steps", "periods": "[T, ...] DMD px",
-                            "polar_steps": "steps per polar family (default 8)"}),
+                            "polar_steps": "steps per polar family (default 8)",
+                            "auto_exposure": "bool (default: on when the preset's exposure is "
+                                             "whole video frames): a frame-locked exposure per "
+                                             "seating; none fits = NOT scanned (job error "
+                                             "ExposureNotFound: PULL / re-seat). "
+                                             "result.meta.exposure_us / exposure_source / "
+                                             "auto_exposure say what was used",
+                            "exposure_us": "force a camera exposure for this scan",
+                            "exposure_target_dn": "face p95 target, DN (default 170)",
+                            "exposure_range_us": "[lo, hi] us (default 16667..100000)",
+                            "max_clipped_pct": "% of the face clipped at most (default 0.5)"}),
     "face_profile": ("Face height map (face frame, mm, 0.25 mm grid), radial profile, sections, "
-                     "flatness, per-point repeatability; PNG + CSV + JSON + NPZ + open STL.",
+                     "flatness, per-point repeatability; the rim outline in the flood pair "
+                     "(result.stats.rim_outline) with the known-size check (stats.size_check) "
+                     "and the centre the profile was computed about (stats.centre: the flood "
+                     "outline's when it shows whole); PNG + CSV + JSON + NPZ + open STL.",
                      {"facescan_id": "face scan id", "metric_ids": "or [metric scan ids] of one "
                       "placement (then face_id)", "face_id": "face target id (default: the face "
                       "scan's)", "label": "text", "grid_mm": "(default 0.25)",
-                      "r_flat_mm": "flatness radius (default 9)", "stl": "bool (default true)"}),
+                      "r_flat_mm": "flatness radius (default 0.855 x the face radius; a value "
+                                   "given is used as given)",
+                      "size_tol_pct": "known-size tolerance, % (default 4; 0 = off, warned)",
+                      "stl": "bool (default true)"}),
     "face_golden": ("Golden end face from GOOD placements (face scans), bound to geometry, face "
                     "diameter, grid and stereo calibration: MF-CFAR (+ the reflectance FIR from the "
                     "flood pair; default detector) and band models, leave-one-out false triggers "
@@ -629,18 +689,35 @@ VERBS: dict = {
                      "fir": "bool: reflectance FIR (default true)",
                      "k_sigma": "band (default 4)", "floor_mm": "band (default 0.10)",
                      "smooth_cells": "band sigma median window (default 5)",
-                     "rim_r_mm": "band rim zone r > (default 9.75)", "rim_factor": "(default 2)",
+                     "rim_r_mm": "rim zone r >, ONE radius for every detector (default "
+                                 "0.855 x the face radius; used as given or refused)",
+                     "inspect_r_mm": "inspected zone r <= (default 0.926 x the face radius)",
+                     "plane_r_mm": "robust plane region (default: the rim radius)",
+                     "rim_factor": "(default 2)",
                      "rim_min_mm": "(default 0.3)", "height_smooth_mm": "(default 0.25)",
                      "min_area_mm2": "band: smallest trigger (default 0.25)",
+                     "rim_tol_mm": "rim outline: a notch / bulge beyond this (default 0.4) ...",
+                     "rim_min_arc_mm": "... over at least this much rim (default 1.5)",
+                     "size_tol_pct": "known size: a placement further off the face diameter is "
+                                     "refused (default 4; 0 = off, warned)",
                      "synthetic": "bool: synthetic-dent set (default true)"}),
     "check_face": ("A placement (face scan) vs the golden face: dents (zone face / rim, r, theta, "
-                   "depth_mm, width_mm, z (MF) or dev_mm (band), area_mm2) -> PASS / FAIL / "
-                   "INCOMPLETE + overlay PNG.",
+                   "depth_mm = depth_centre_mm, depth_min_mm, width_half_depth_mm, z (MF) or "
+                   "dev_mm (band), area_mm2) and edge dents (zone rim_outline: a notch / bulge "
+                   "of the flood outline, depth_mm + = in, arc_mm) -> PASS / FAIL / INCOMPLETE "
+                   "+ overlay PNG. result.disposition CONTINUE / REJECT / PULL with "
+                   "result.pull_reasons [{reason, message}] (size_mismatch, guard_band, "
+                   "incomplete, invalid); result.stats.size_check / rim_outline / centre_check "
+                   "/ radii say why.",
                    {"facescan_id": "face scan id", "golden_id": "golden face id (default: newest "
                     "matching)", "label": "text", "detector": "mf_fir | mf | band (default: the "
                     "golden's)", "z_thresh": "MF trigger z (default: the golden's)",
                     "min_depth_mm": "MF: ignore shallower dents (optional)",
-                    "min_area_mm2": "smallest trigger (optional)"}),
+                    "min_area_mm2": "smallest trigger (optional)",
+                    "rim_tol_mm": "rim outline tolerance, mm (default: the golden's)",
+                    "rim_min_arc_mm": "rim outline minimum arc, mm (default: the golden's)",
+                    "size_tol_pct": "known-size tolerance, % (default: the golden's; 0 = off, "
+                                    "warned)"}),
     # HDMI fast zone scan + station (cylinders with end faces toward the camera + ribbed tube)
     "scan_fast": ("HDMI fast zone scan: the column-axis multifreq set only (default 4 steps x "
                   "8 / 80 / 1280 DMD px + white / black), lit through a zone and / or located "
@@ -948,6 +1025,10 @@ def error_hint(e: BaseException) -> Optional[str]:
         return "The entry may have been deleted or belongs to another geometry: refresh."
     if isinstance(e, ArgError):
         return "Check the inputs for this action."
+    if type(e).__name__ == "ExposureNotFound":
+        return ("No camera exposure shows this seating of the face well enough: it was NOT "
+                "scanned. PULL the part (quality inspection) or re-seat it and scan again; "
+                "an exposure can be forced (exposure_us).")
     if type(e).__name__ == "SequenceError":
         return ("The camera did not see the pack's loop playing in order: in the 4500 MKII GUI "
                 "check Pattern Sequence (Pattern Source Flash, Internal/External, Play Once "
@@ -3067,16 +3148,63 @@ class App:
             raise ArgError("offset_dmd must be [cols, rows] DMD px")
         return off
 
-    def _v_locate_face(self, a):
+    @staticmethod
+    def _locate_args(a: dict) -> tuple:
+        """(roi, LocateParams overrides) of a locate verb."""
         roi = _num_list(a, "roi", int)
         if roi is not None and len(roi) != 4:
             raise ArgError("roi must be [x0, y0, x1, y1] camera px")
         params = _kw(near_band_mm=_num(a, "near_band_mm"), far_gap_mm=_num(a, "far_gap_mm"),
                      near_gap_mm=_num(a, "near_gap_mm"))
+        return roi, params or None
+
+    @staticmethod
+    def _exposure_range(a: dict):
+        rng = _num_list(a, "exposure_range_us")
+        if rng is not None and len(rng) != 2:
+            raise ArgError("exposure_range_us must be [lo, hi] us")
+        return rng
+
+    @staticmethod
+    def _face_result(t):
+        """A face target as a job result: its preview, and the disposition a size mismatch
+        gave it at the top (a PULL is never only inside meta)."""
+        links = ({"preview": Path(t.path) / "preview.png"}
+                 if (Path(t.path) / "preview.png").is_file() else {})
+        return t, links
+
+    def _v_locate_face(self, a):
+        roi, params = self._locate_args(a)
         t = api.locate_face(self._metric(a), _num(a, "face_diameter_mm", 21.05),
-                            _s(a, "label", "face"), roi, params or None, self._flood_metric(a))
-        return t, ({"preview": Path(t.path) / "preview.png"}
-                   if (Path(t.path) / "preview.png").is_file() else {})
+                            _s(a, "label", "face"), roi, params, self._flood_metric(a),
+                            size_tol_pct=_num(a, "size_tol_pct"),
+                            silhouette_diameter_mm=_num(a, "silhouette_diameter_mm"))
+        return self._face_result(t)
+
+    def _v_locate_scan(self, a):
+        ms = api.locate_scan(_s(a, "zone"), self._preset(), _s(a, "label", "face_locate"),
+                             _num(a, "steps", None, int), _num_list(a, "periods"),
+                             _num(a, "exposure_us"))
+        return ms, ({"preview": Path(ms.path) / "preview.png"}
+                    if (Path(ms.path) / "preview.png").is_file() else {})
+
+    def _v_locate_face_live(self, a):
+        roi, params = self._locate_args(a)
+        ae = a.get("auto_exposure")
+        t = api.locate_face_live(_s(a, "zone"), self._preset(),
+                                 _num(a, "face_diameter_mm", 21.05), _s(a, "label", "face"),
+                                 _num(a, "steps", None, int), _num_list(a, "periods"), roi,
+                                 params, size_tol_pct=_num(a, "size_tol_pct"),
+                                 auto_exposure=None if ae is None else _bool(a, "auto_exposure"),
+                                 exposure_us=_num(a, "exposure_us"),
+                                 exposure_range_us=self._exposure_range(a),
+                                 silhouette_diameter_mm=_num(a, "silhouette_diameter_mm"))
+        return self._face_result(t)
+
+    def _v_face_exposure(self, a):
+        return api.face_exposure(self._face_arg(a), self._preset(), _num(a, "target_dn"),
+                                 self._exposure_range(a), _num(a, "max_clipped_pct"),
+                                 label=_s(a, "label", "auto_exposure"), duty=_num(a, "duty"))
 
     def _v_aim_ring(self, a):
         r = api.aim_ring(self._face_arg(a), self._preset(), _hold_s(a), _s(a, "label", "aim"),
@@ -3098,7 +3226,13 @@ class App:
                                     _num(a, "repeats", 3, int), _num(a, "margin_dmd_px", 6.0),
                                     _bool(a, "polar", True), _num(a, "duty"),
                                     _num(a, "steps", None, int), _num_list(a, "periods"),
-                                    _num(a, "polar_steps", 8, int))
+                                    _num(a, "polar_steps", 8, int),
+                                    auto_exposure=(None if a.get("auto_exposure") is None
+                                                   else _bool(a, "auto_exposure")),
+                                    exposure_us=_num(a, "exposure_us"),
+                                    exposure_target_dn=_num(a, "exposure_target_dn"),
+                                    exposure_range_us=self._exposure_range(a),
+                                    max_clipped_pct=_num(a, "max_clipped_pct"))
         return fs, ({"preview": Path(fs.path) / "preview.png"}
                     if (Path(fs.path) / "preview.png").is_file() else {})
 
@@ -3110,7 +3244,8 @@ class App:
             if not scans:
                 raise ArgError("face_profile needs facescan_id or metric_ids")
         pr = api.face_profile(scans, self._face_arg(a), _s(a, "label"), _num(a, "grid_mm", 0.25),
-                              _num(a, "r_flat_mm", 9.0), _bool(a, "stl", True))
+                              _num(a, "r_flat_mm"), _bool(a, "stl", True),
+                              size_tol_pct=_num(a, "size_tol_pct"))
         return pr, {k: v for k, v in pr.files.items() if k in ("png", "json", "csv_radial", "stl")}
 
     def _v_face_golden(self, a):
@@ -3128,7 +3263,12 @@ class App:
                                   height_smooth_mm=_num(a, "height_smooth_mm"),
                                   min_area_mm2=_num(a, "min_area_mm2"),
                                   detector=self._face_detector(a), z_thresh=_num(a, "z_thresh"),
-                                  min_depth_mm=_num(a, "min_depth_mm")),
+                                  min_depth_mm=_num(a, "min_depth_mm"),
+                                  radii=_kw(inspect_r_mm=_num(a, "inspect_r_mm"),
+                                            plane_r_mm=_num(a, "plane_r_mm")) or None,
+                                  rim=_kw(tol_mm=_num(a, "rim_tol_mm"),
+                                          min_arc_mm=_num(a, "rim_min_arc_mm")) or None,
+                                  size_tol_pct=_num(a, "size_tol_pct")),
                             synthetic=_bool(a, "synthetic", True), fir=_bool(a, "fir", True))
         return g, {"preview": g.files.get("png")}
 
@@ -3136,7 +3276,10 @@ class App:
         gid = _s(a, "golden_id")
         golden = None if gid is None else self._entry("face_golden", gid)
         r = api.check_face(self._facescan_arg(a), golden, _s(a, "label"), _num(a, "min_area_mm2"),
-                           self._face_detector(a), _num(a, "z_thresh"), _num(a, "min_depth_mm"))
+                           self._face_detector(a), _num(a, "z_thresh"), _num(a, "min_depth_mm"),
+                           rim_tol_mm=_num(a, "rim_tol_mm"),
+                           rim_min_arc_mm=_num(a, "rim_min_arc_mm"),
+                           size_tol_pct=_num(a, "size_tol_pct"))
         return r, {k: v for k, v in r.files.items() if k in ("png", "json")}
 
     # ------------------------------------------- HDMI fast zone scan + station

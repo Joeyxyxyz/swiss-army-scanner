@@ -39,7 +39,9 @@ Exit codes let a script or an agent branch without parsing the text:
      crash is never read as FLAG (1) or CLEAR (0)
   5  run / recipe-run / quick-check / station-check / face-check: PULL (quality
      inspection) - the job ran but its result is in doubt (INVALID, INCOMPLETE, a
-     guard band, an unreadable code): never a pass, never a reject.
+     guard band, an unreadable code, a size mismatch): never a pass, never a reject.
+     face-locate: the face reads the wrong size (calibration or lens suspect);
+     face-scan: no camera exposure fits this seating (the face is not scanned)
      measure-run: NOT MEASURABLE (no calibration, a mobile rig not verified, too
      few points ...): no number is given - never a px as mm
 `run <station config>` is the flow-ready entry point: one job, a new run
@@ -2706,36 +2708,86 @@ def _roi(text: Optional[str]):
     return None if not text else _numbers(text, 4, "--roi x0,y0,x1,y1 (camera px)", int)
 
 
+def _size_line(sc: Optional[dict]) -> str:
+    """The known-size check of a result, one line."""
+    if not sc:
+        return "-"
+    return {"ok": "ok", "mismatch": "SIZE MISMATCH", "not_checked": "not checked"}.get(
+        sc.get("status"), str(sc.get("status"))) + f": {sc.get('message')}"
+
+
+def _pull(reasons: list) -> dict:
+    """{"disposition": "PULL", "pull_reasons"} of reasons the engine gave ({reason, message})."""
+    return {"disposition": "PULL",
+            "pull_reasons": [{"reason": str(r.get("reason")),
+                              "message": " ".join(str(r.get("message") or "").split())}
+                             for r in reasons]}
+
+
 def _print_face(ctx, t) -> None:
     a, e = t.affine, t.camera_ellipse
+    ls = t.meta.get("locate_scan") or {}
     ctx.say(f"Face target {t.id}  (face {t.face_diameter_mm:g} mm, from metric scan {t.source_scan})")
     ctx.kv([["centre", "(" + ", ".join(f"{v:.2f}" for v in t.centre_mm) + ") mm, camera frame"],
             ["tilt", _u(t.tilt_deg, "deg", 1)],
             ["rim fit", f"{_u(t.rim_rms_mm, 'mm', 3)} rms over {t.n_rim_points} rim points "
-                        f"({t.meta.get('rim_source') or 'depth'})"],
+                        f"({t.meta.get('rim_source') or 'depth'}"
+                        + (f"; depth silhouette {_u(t.meta['silhouette_diameter_mm'], 'mm', 2)} "
+                           f"across, {t.meta.get('silhouette_source')}"
+                           if t.meta.get("silhouette_diameter_mm") else "") + ")"],
+            ["size check", _size_line(t.meta.get("size_check"))],
+            ["centre check", (t.meta.get("centre_check") or {}).get("message") or "-"],
+            *([["locate scan exposure", f"{_u(ls['exposure_us'] / 1000.0, 'ms', 1)} "
+                                        f"({ls.get('exposure_source')})"]]
+              if ls.get("exposure_us") else []),
             ["camera ellipse", f"({e['cx']:.1f}, {e['cy']:.1f}) px, {e['a']:.1f} x {e['b']:.1f} px"],
             ["camera -> DMD affine", f"residual col {_f(a['rms_col_px'], 3)} / row "
                                      f"{_f(a['rms_row_px'], 3)} DMD px over {a['n_px']} face px"],
             ["DMD centre", f"({t.dmd_centre[0]:.1f}, {t.dmd_centre[1]:.1f}) (col, row)"],
             ["stored", str(t.path)]])
+    for n in ls.get("notes") or []:
+        ctx.say(f"  {n}")
     ctx.warn(t.warnings)
+
+
+def _exposure_range(text: Optional[str]):
+    """--exposure-range LO,HI in ms -> [lo, hi] us (None = the engine's 16.7-100 ms)."""
+    if not text:
+        return None
+    lo, hi = _numbers(text, 2, "--exposure-range lo,hi (ms)")
+    return [lo * 1000.0, hi * 1000.0]
 
 
 def cmd_face_locate(ctx):
     a = ctx.args
+    params = _kw(near_band_mm=a.near_band, far_gap_mm=a.far_gap, near_gap_mm=a.near_gap)
     if a.metric:
+        if a.auto_exposure is not None or a.exposure_us is not None:
+            raise CLIError("--auto-exposure / --exposure-us belong to the locate scan "
+                           "(--zone): a stored metric scan was made at its own exposure")
         ms = _find_metric(a.metric)
+        if ms.field.corr_x is None or ms.field.corr_y is None:
+            raise CLIError(f"metric scan {ms.id} has only one decoded axis (x-only); face-locate "
+                           "needs x and y - rescan with `scan-fast --axis xy` (or scan-metric)")
+        t = api.locate_face(ms, a.diameter, a.label, _roi(a.roi), params or None,
+                            _flood_arg(a.flood), size_tol_pct=a.size_tol,
+                            silhouette_diameter_mm=a.outer_diameter)
     elif a.zone:
-        ms = api.scan_metric(ctx.preset(), f"{a.label}_locate", "plane", a.steps, None, None, a.zone)
-        ctx.say(f"Locate scan {ms.id} (zone {a.zone}, ray-plane): {ms.meta['n_points']} points")
+        # the locate scan keeps its flood pair (the size check needs it) and is made at the
+        # exposure the face needs: scanned again when the located face is dark or clipped
+        t = api.locate_face_live(a.zone, ctx.preset(), a.diameter, a.label, a.steps, None,
+                                 _roi(a.roi), params or None, size_tol_pct=a.size_tol,
+                                 auto_exposure=a.auto_exposure, exposure_us=a.exposure_us,
+                                 exposure_range_us=_exposure_range(a.exposure_range),
+                                 silhouette_diameter_mm=a.outer_diameter)
+        ctx.say(f"Locate scan {t.source_scan} (zone {a.zone}, ray-plane, flood pair kept)")
     else:
         raise CLIError("face-locate needs a metric scan (id / label / latest) or --zone to scan one")
-    params = _kw(near_band_mm=a.near_band, far_gap_mm=a.far_gap, near_gap_mm=a.near_gap)
-    if ms.field.corr_x is None or ms.field.corr_y is None:
-        raise CLIError(f"metric scan {ms.id} has only one decoded axis (x-only); face-locate needs "
-                       "x and y - rescan with `scan-fast --axis xy` (or scan-metric)")
-    t = api.locate_face(ms, a.diameter, a.label, _roi(a.roi), params or None, _flood_arg(a.flood))
     _print_face(ctx, t)
+    if t.meta.get("disposition") == "PULL":          # the face reads the wrong size
+        disp = _pull(t.meta.get("pull_reasons") or [])
+        ctx.say(f"  disposition: {_one_line(D.summary(disp))}")
+        return D.exit_code(disp), {"face": t, **disp}
     return EXIT_OK, {"face": t}
 
 
@@ -2803,15 +2855,39 @@ def cmd_face_scan(ctx):
         duty = r["duty"]
         ctx.say(f"auto intensity: duty {duty:g} (face p99 {r['p99_dn']:.0f} DN)")
         ctx.warn(r.get("warnings"))
-    fs = api.targeted_face_scan(face, p, a.label, a.repeats, a.margin, not a.no_polar, duty,
-                                a.steps, _periods(a.periods), a.polar_steps, mode=a.mode,
-                                code_bits=a.code_bits)
+    from engine.measure.endface.exposure import ExposureNotFound
+    try:
+        fs = api.targeted_face_scan(face, p, a.label, a.repeats, a.margin, not a.no_polar,
+                                    duty, a.steps, _periods(a.periods), a.polar_steps,
+                                    mode=a.mode, code_bits=a.code_bits,
+                                    auto_exposure=a.auto_exposure, exposure_us=a.exposure_us,
+                                    exposure_target_dn=a.exposure_target,
+                                    exposure_range_us=_exposure_range(a.exposure_range))
+    except ExposureNotFound as e:
+        # no exposure fits this seating: the face was not scanned - PULL, with every shot
+        rep_ = e.report or {}
+        disp = _pull([{"reason": "exposure", "message": rep_.get("message") or str(e)}])
+        ctx.say(f"Face scan: NOT scanned - {_one_line(rep_.get('message') or e)}",
+                f"  disposition: {_one_line(D.summary(disp))}")
+        ctx.table(["exposure ms", "p95 DN", "clipped %", "ok"],
+                  [[_f(x["exposure_us"] / 1000.0, 1), _f(x["p95_dn"], 0), _f(x["clipped_pct"], 2),
+                    _f(bool(x["ok"]))] for x in rep_.get("shots") or []])
+        return D.exit_code(disp), {"facescan": None, "auto_exposure": rep_,
+                                   "error": {"type": type(e).__name__, "message": str(e)}, **disp}
+    ae = fs.meta.get("auto_exposure") or {}
     ctx.say(f"Face scan {fs.id} (face {fs.face_id}, {len(fs.metric_scan_ids)} repeat(s), polar "
-            f"{'yes' if fs.polar else 'no'}, duty {fs.meta.get('duty'):g}, depth set "
-            f"{a.mode}: {fs.meta.get('depth_frames')} frames)")
+            f"{'yes' if fs.polar else 'no'}, duty {fs.meta.get('duty'):g}, exposure "
+            f"{fs.meta.get('exposure_us', 0) / 1000.0:.1f} ms ({fs.meta.get('exposure_source')}"
+            + (f": face p95 {ae.get('p95_dn'):.0f} DN, {ae.get('clipped_pct'):.2f} % clipped"
+               if ae.get("ok") else "")
+            + f"), depth set {a.mode}: {fs.meta.get('depth_frames')} frames)")
     ctx.table(["repeat", "metric scan", "face decoded", "capture"],
               [[i + 1, r["metric_scan"], _u(r["face_decoded_pct"], "%", 1), _u(r["capture_s"], "s", 1)]
                for i, r in enumerate(fs.repeats)])
+    if ae.get("shots"):
+        ctx.table(["exposure ms", "p95 DN", "clipped %", "ok"],
+                  [[_f(x["exposure_us"] / 1000.0, 1), _f(x["p95_dn"], 0), _f(x["clipped_pct"], 2),
+                    _f(bool(x["ok"]))] for x in ae["shots"]])
     ctx.kv([["stored", str(fs.path)]])
     ctx.warn(fs.warnings)
     return EXIT_OK, {"facescan": fs}
@@ -2827,12 +2903,20 @@ def cmd_face_profile(ctx):
             scans = [_find_metric(a.scans[0])]
     else:
         scans = [_find_metric(k) for k in a.scans]
-    pr = api.face_profile(scans, face, a.label, a.grid, a.r_flat, not a.no_stl)
+    pr = api.face_profile(scans, face, a.label, a.grid, a.r_flat, not a.no_stl,
+                          size_tol_pct=a.size_tol)
     st = pr.stats
+    ro = st.get("rim_outline") or {}
     ctx.say(f"Face profile {pr.label}: {st['n_repeats']} repeat(s), face {pr.face_id} "
             f"({pr.face_diameter_mm:g} mm), grid {pr.grid_mm:g} mm")
     ctx.kv([["flatness (r < %g mm)" % st["r_flat_mm"], f"{_u(st['flatness_rms_mm'], 'mm', 4)} rms, "
                                                         f"{_u(st['flatness_p2_p98_mm'], 'mm', 3)} p2-p98"],
+            ["rim outline", (f"{_u(ro.get('diameter_mm'), 'mm', 3)} across, roundness "
+                             f"{_u(ro.get('rms_mm'), 'mm', 3)} rms / {_u(ro.get('max_abs_mm'), 'mm', 3)} "
+                             f"max ({_f(ro.get('valid_pct'), 0)} % of the rim)")
+             if ro.get("measured") else f"not measured ({ro.get('why') or 'no flood pair'})"],
+            ["size check", _size_line(st.get("size_check"))],
+            ["centre", (st.get("centre") or {}).get("message") or "the located circle's"],
             ["repeatability", f"{_u(st['repeatability_median_mm'], 'mm', 4)} median, "
                               f"{_u(st['repeatability_p90_mm'], 'mm', 4)} p90 (per point, across repeats)"],
             ["tilt", _u(st["tilt_deg"], "deg", 1)],
@@ -2850,22 +2934,38 @@ def cmd_face_golden(ctx):
     a = ctx.args
     places = [_placement(k) for k in a.placements]
     synthetic = False if a.no_synthetic else ({"positions": a.positions} if a.positions else True)
-    g = api.face_golden(places, a.label, **_kw(k_sigma=a.k, floor_mm=a.floor,
-                                               smooth_cells=a.smooth_cells, rim_r_mm=a.rim_r,
-                                               rim_factor=a.rim_factor, rim_min_mm=a.rim_min,
-                                               height_smooth_mm=a.height_smooth,
-                                               min_area_mm2=a.min_area, detector=a.detector,
-                                               z_thresh=a.z, min_depth_mm=a.min_depth),
-                        synthetic=synthetic, fir=not a.no_fir)
+    # every radius derives from the face diameter unless given here; --rim-r is ONE rim
+    # radius for every detector
+    g = api.face_golden(places, a.label,
+                        **_kw(k_sigma=a.k, floor_mm=a.floor, smooth_cells=a.smooth_cells,
+                              rim_factor=a.rim_factor, rim_min_mm=a.rim_min,
+                              height_smooth_mm=a.height_smooth, min_area_mm2=a.min_area,
+                              z_thresh=a.z, min_depth_mm=a.min_depth),
+                        synthetic=synthetic, detector=a.detector or "mf_fir", fir=not a.no_fir,
+                        radii=_kw(inspect_r_mm=a.inspect_r, rim_r_mm=a.rim_r,
+                                  plane_r_mm=a.plane_r) or None,
+                        rim=_kw(tol_mm=a.rim_tol, min_arc_mm=a.rim_arc) or None,
+                        size_tol_pct=a.size_tol)
     sp = g.meta.get("placement_spread") or {}
     prm = g.params
     det = prm.get("detector", "band")
     band, mf, fir = prm.get("band", prm), prm.get("mf") or {}, prm.get("fir") or {}
+    rr, ro = prm.get("radii") or {}, g.meta.get("rim_outline") or {}
     ctx.say(f"Golden face {g.id}: {g.n_placements} placements, face {g.face_diameter_mm:g} mm, "
             f"calibration {g.calibration_id}; default detector {det}")
     fit = fir.get("fit") or {}
     ctx.kv([["placement spread", f"{_u(sp.get('sigma_rms_mm'), 'mm', 4)} sigma rms, pairs "
                                  f"{_u(sp.get('pair_rms_median_mm'), 'mm', 4)} median rms"],
+            ["radii", f"inspect r <= {_u(rr.get('inspect_r_mm'), 'mm', 3)}, rim r > "
+                      f"{_u(rr.get('rim_r_mm'), 'mm', 3)}, plane r <= "
+                      f"{_u(rr.get('plane_r_mm'), 'mm', 3)} ("
+                      + (f"given: {', '.join(rr['given'])}; the rest " if rr.get("given") else "")
+                      + "from the face diameter)"],
+            ["rim outline", (f"learned from {ro.get('n_placements')} placements: "
+                             f"{_u(ro.get('diameter_mm'), 'mm', 3)} across, good parts max "
+                             f"{_f(max(ro.get('max_abs_mm') or [0]), 3)} mm; a notch / bulge > "
+                             f"{_u(ro.get('tol_mm'), 'mm', 2)} over {_u(ro.get('min_arc_mm'), 'mm', 1)} "
+                             "of rim triggers") if ro else "not in this golden (no flood outline)"],
             ["MF-CFAR", f"trigger z >= {_f(mf.get('z_thresh'), 2)}, depth >= "
                         f"{_u(mf.get('min_depth_mm'), 'mm', 3)}, r <= {_u(mf.get('inspect_r_mm'), 'mm', 2)}, "
                         f"dent widths {mf.get('scales_mm')} mm"],
@@ -2900,19 +3000,25 @@ def cmd_face_golden(ctx):
 def cmd_face_check(ctx):
     a = ctx.args
     r = api.check_face(_placement(a.placement), _find_golden(a.golden), a.label, a.min_area,
-                       a.detector, a.z, a.min_depth)
+                       a.detector, a.z, a.min_depth,
+                       **_kw(rim_tol_mm=a.rim_tol, rim_min_arc_mm=a.rim_arc,
+                             size_tol_pct=a.size_tol))
     ctx.say(f"Face check of {r.placement['label']}: {r.verdict} ({r.n_triggers} trigger(s); "
             f"golden {r.golden_id}, detector {r.detector})")
-    disp = _check_disposition(r.verdict, "less than the needed share of the face was measured "
-                              f"({_f((r.stats or {}).get('compared_pct'), 1)} % compared)")
+    disp = _face_disposition(r)
     ctx.say(f"  disposition: {_one_line(D.summary(disp))}")
     st = r.stats
+    ro, rr = st.get("rim_outline") or {}, st.get("radii") or {}
     if r.detector in ("mf", "mf_fir"):
-        ctx.table(["#", "zone", "r mm", "theta deg", "depth mm", "width mm", "z", "dev mm",
-                   "area mm^2"],
+        # depth = depth_centre_mm (the 3 x 3 centre average: THE depth, thresholds apply to
+        # it); deepest pt = the single deepest grid point (over-reads); rim_outline rows: how
+        # far the outline moved (+ in: a notch) and over how much rim
+        ctx.table(["#", "zone", "r mm", "theta deg", "depth mm", "deepest pt mm",
+                   "width@half mm", "z", "area mm^2"],
                   [[i, t["zone"], _f(t["r_mm"], 2), _f(t["theta_deg"], 1), _f(t["depth_mm"], 3),
-                    _f(t["width_mm"], 1), _f(t["z"], 2), _f(t.get("dev_mm"), 3), _f(t["area_mm2"], 2)]
-                   for i, t in enumerate(r.triggers, 1)])
+                    _f(t.get("depth_min_mm"), 3),
+                    _f(t.get("width_half_depth_mm", t.get("arc_mm")), 2), _f(t.get("z"), 2),
+                    _f(t.get("area_mm2"), 2)] for i, t in enumerate(r.triggers, 1)])
         nf = st.get("noise_floor_mm") or {}
         ctx.kv([["dent z", f"max {_f(st.get('max_z'), 2)} (trigger >= {_f(st.get('z_thresh'), 2)})"],
                 ["noise floor (1 sigma depth)", ", ".join(f"{_u(v, 'mm', 3)} at {k} mm"
@@ -2920,14 +3026,45 @@ def cmd_face_check(ctx):
                 ["reflectance FIR", "applied" if st.get("fir_applied") else "not applied"]])
     else:
         ctx.table(["#", "zone", "r mm", "theta deg", "dev mm", "area mm^2", "band mm"],
-                  [[i, t["zone"], _f(t["r_mm"], 2), _f(t["theta_deg"], 1), _f(t["dev_mm"], 3),
-                    _f(t["area_mm2"], 2), _f(t.get("band_mm"), 3)] for i, t in enumerate(r.triggers, 1)])
+                  [[i, t["zone"], _f(t["r_mm"], 2), _f(t["theta_deg"], 1), _f(t.get("dev_mm"), 3),
+                    _f(t.get("area_mm2"), 2), _f(t.get("band_mm"), 3)]
+                   for i, t in enumerate(r.triggers, 1)])
     ctx.kv([["deviation", f"{_u(st['dev_rms_mm'], 'mm', 4)} rms, max |dev| "
                           f"{_u(st['max_abs_dev_mm'], 'mm', 3)} (r < {_f(st.get('dev_r_mm'), 2)} mm)"],
             ["compared", _u(st["compared_pct"], "% of the inspected face", 1)],
+            ["radii", f"inspect r <= {_u(rr.get('inspect_r_mm'), 'mm', 3)}, rim r > "
+                      f"{_u(rr.get('rim_r_mm'), 'mm', 3)} (face "
+                      f"{_u(2 * (rr.get('face_radius_mm') or 0), 'mm', 2)})"],
+            ["rim outline", (f"{ro.get('status')}: roundness {_u(ro.get('rms_mm'), 'mm', 3)} rms / "
+                             f"{_u(ro.get('max_abs_mm'), 'mm', 3)} max, tolerance "
+                             f"{_u(ro.get('tol_mm'), 'mm', 2)} over {_u(ro.get('min_arc_mm'), 'mm', 1)} "
+                             "of rim" + ("" if ro.get("golden") else " (no golden outline)")
+                             + (f"; NOT judged over {len(ro['unjudged'])} stretch(es) of rim"
+                                if ro.get("unjudged") else ""))
+             if ro.get("measured") else
+             f"{ro.get('status') or 'not measured'} ({ro.get('why') or '-'})"],
+            ["size check", _size_line(st.get("size_check"))],
+            ["centre check", (st.get("centre_check") or {}).get("message") or "-"],
             *[[k, str(v)] for k, v in r.files.items() if v is not None]])
     ctx.warn(r.warnings)
     return D.exit_code(disp), {"check": r, **disp}
+
+
+def _face_disposition(r) -> dict:
+    """A face check's disposition: the engine's own (stats: CONTINUE / REJECT / PULL with its
+    pull reasons - size_mismatch, guard_band, incomplete); a result without one is settled
+    from its verdict. Never CONTINUE unless the verdict is PASS."""
+    st = r.stats or {}
+    d = st.get("disposition")
+    if d == "PULL" or (d in D.DISPOSITIONS and r.verdict != "PASS" and d == "CONTINUE"):
+        return _pull(st.get("pull_reasons") or [{"reason": "incomplete",
+                                                 "message": f"verdict {r.verdict}"}])
+    if d == "REJECT" and r.verdict == "FAIL":
+        return {"disposition": "REJECT", "pull_reasons": []}
+    if d == "CONTINUE" and r.verdict == "PASS":
+        return {"disposition": "CONTINUE", "pull_reasons": []}
+    return _check_disposition(r.verdict, "less than the needed share of the face was measured "
+                              f"({_f(st.get('compared_pct'), 1)} % compared)")
 
 
 def _check_disposition(verdict: str, incomplete_why: str) -> dict:
@@ -3023,6 +3160,8 @@ def _station_params(a, band: str = "band", flag: str = "--band") -> dict:
         prm["ct"] = False
     if getattr(a, "no_strict", False):
         prm["strict"] = False
+    if getattr(a, "size_tol", None) is not None:
+        prm["size_tol_pct"] = a.size_tol
     return prm
 
 
@@ -3121,6 +3260,14 @@ def cmd_station_check(ctx):
     try:
         r = api.station_check(_station_item(a.scan), gold, _flood_arg(a.flood), a.label)
     except ValueError as e:                 # StationError is a ValueError
+        if "size mismatch" in str(e):
+            # an end face reads the wrong size (calibration or lens suspect): the strict
+            # gates refuse the measurement, nothing was measured - PULL, said as what it is
+            res = _pull([{"reason": "size_mismatch", "message": str(e)}])
+            ctx.say(f"Station check: not measured ({_one_line(e)})",
+                    f"  disposition: {_one_line(D.summary(res))}")
+            return D.exit_code(res), {"check": None, "error": {"type": type(e).__name__,
+                                                                "message": str(e)}, **res}
         if D.classify(str(e)) != "ambiguous_faces":
             raise
         # which discs are the end faces is in doubt: never measured, never a verdict - PULL
@@ -3136,8 +3283,13 @@ def cmd_station_check(ctx):
     ctx.say(f"Station check of {r.measurement['scan_id']}: {r.verdict} ({r.n_triggers} "
             f"trigger(s); golden {r.golden_id})")
     missing = [it["item"] for it in r.items if it.get("status") == "missing"]
-    disp = _check_disposition(r.verdict, "not every golden item was measured"
-                              + (f" ({', '.join(map(str, missing[:5]))})" if missing else ""))
+    wrong = [it for it in r.items if it.get("status") == "size_mismatch"]
+    if wrong:                               # the scan reads the wrong size: PULL, never a FAIL
+        disp = _pull([{"reason": "size_mismatch", "message": f"{it['item']}: {it.get('message')}"}
+                      for it in wrong])
+    else:
+        disp = _check_disposition(r.verdict, "not every golden item was measured"
+                                  + (f" ({', '.join(map(str, missing[:5]))})" if missing else ""))
     ctx.say(f"  disposition: {_one_line(D.summary(disp))}")
     ctx.table(["item", "value mm", "nominal mm", "band mm", "status"],
               [[it["item"], _f(it["value_mm"], 3), _f(it["nominal_mm"], 3),
@@ -5070,19 +5222,47 @@ dents on shiny cylinders (needs a stereo calibration; the null calibration is th
   scan dentsets                             captured dent sets (legacy folders work too)
 
 end faces (a cylinder lying with its circular end face toward the camera; stereo calibration first):
-  scan --preset P face-locate --zone H10:I12   locate scan (ray-plane) -> face plane, rim circle,
+  scan --preset P face-locate --zone H10:I12 --diameter 19.5
+                                            locate scan (ray-plane, flood pair kept; scanned
+                                            again at a longer / shorter exposure when the face
+                                            is dark / clipped) -> face plane, rim circle,
                                             camera -> DMD affine (or face-locate <metric scan>:
                                             it needs x AND y decoded - scan-fast --axis xy or
-                                            scan-metric; an x-only scan-fast is refused)
+                                            scan-metric; an x-only scan-fast is refused).
+                                            --diameter = the bright flat's own diameter (a 21
+                                            mm class cylinder with a rounded rim: its 19.5 mm
+                                            flat); --outer-diameter 21.05 = the part's outer
+                                            circle when that rim returns depth points (else
+                                            found from the rim). The flood outline is held to
+                                            --diameter: > 4 % off (--size-tol) = size
+                                            mismatch, exit 5 PULL (calibration or lens
+                                            suspect; nothing is rescaled)
   scan face-aim --hold 30                   ring + cross on the face: the placement guide
   scan face-aim --check                     exit 0 ON_FACE, 1 OFF (the part moved: re-locate)
   scan face-intensity                       projection.duty for a ~200 DN face (never the LEDs)
-  scan face-scan c1 --auto-intensity        only the face lit: 3 repeats + polar set
-  scan face-profile c1                      height map, radial, sections, flatness (+ PNG/CSV/STL)
+  scan face-scan c1                         only the face lit: 3 repeats + polar set, at a
+                                            frame-locked camera exposure chosen for THIS
+                                            seating (auto exposure: face p95 ~170 DN, < 0.5 %
+                                            clipped, 16.7-100 ms; the default when the
+                                            preset's exposure is whole video frames; exit 5
+                                            when none fits). --exposure-us N forces one,
+                                            --no-auto-exposure keeps the preset's;
+                                            --auto-intensity tunes the duty first
+  scan face-profile c1                      height map, radial, sections, flatness (+ PNG/CSV/STL),
+                                            centred on the flood outline of the flat
   scan face-golden good1 good2 good3 good4  golden from GOOD placements: MF-CFAR + reflectance
-                                            FIR (default) and band, leave-one-out, synthetic dents
-  scan face-check c7                        exit 0 PASS, 1 FAIL, 5 INCOMPLETE = PULL (quality
-                                            inspection) (dents: depth, width, z; overlay PNG)
+                                            FIR (default) and band, leave-one-out, synthetic
+                                            dents, the rim outline's per-angle spread. Every
+                                            radius derives from the face diameter (inspect
+                                            0.926 R, rim 0.855 R); --inspect-r / --rim-r set them
+  scan face-check c7                        exit 0 PASS, 1 FAIL, 5 PULL (quality inspection:
+                                            INCOMPLETE, a size mismatch, a rim outline in its
+                                            guard band or not judged all the way round, a
+                                            profile off its outline's centre). Dents: depth
+                                            (the 3 x 3 centre average),
+                                            deepest point, width at half depth, z; edge dents:
+                                            zone rim_outline (notch / bulge of the flood
+                                            outline, 0.4 mm over 1.5 mm of rim); overlay PNG
   scan faces                                face targets, face scans, golden faces
 
 HDMI fast zone scan + station (cylinders with end faces toward the camera + a ribbed tube edge):
@@ -5673,7 +5853,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--zone", help="no scan given: scan this zone first (ray-plane), e.g. H10:I12")
     p.add_argument("--steps", type=_positive_int, help="phase steps of that locate scan")
     p.add_argument("--diameter", type=float, default=21.05, metavar="MM",
-                   help="face diameter, mm (default 21.05)")
+                   help="face diameter, mm (default 21.05): the diameter of the bright flat "
+                        "the flood shows (a rounded rim is not part of it)")
+    p.add_argument("--outer-diameter", dest="outer_diameter", type=float, metavar="MM",
+                   help="the part's OUTER diameter when the rim around the flat returns depth "
+                        "points (e.g. 21.05 for a 19.5 mm flat inside a rounded rim): the rim "
+                        "circle is fitted to the depth silhouette at this size, the face keeps "
+                        "--diameter (default: found from the rim points when they cover "
+                        "enough of the circle)")
+    p.add_argument("--size-tol", dest="size_tol", type=float, metavar="PCT",
+                   help="known-size check: the flood outline vs --diameter; further off is a "
+                        "size mismatch, exit 5 PULL (default 4; 0 = off, with a warning)")
+    p.add_argument("--auto-exposure", dest="auto_exposure", action="store_true", default=None,
+                   help="--zone: scan again at the frame-locked exposure the located face "
+                        "needs when it is dark / clipped (default when the preset's exposure "
+                        "is whole video frames)")
+    p.add_argument("--no-auto-exposure", dest="auto_exposure", action="store_false",
+                   help="--zone: scan at the preset's exposure only")
+    p.add_argument("--exposure-us", dest="exposure_us", type=float, metavar="US",
+                   help="--zone: force this camera exposure for the locate scan")
+    p.add_argument("--exposure-range", dest="exposure_range", metavar="LO,HI",
+                   help="auto exposure range, ms (default 16.7,100)")
     p.add_argument("--label", default="face")
     p.add_argument("--roi", metavar="X0,Y0,X1,Y1", help="search only these camera px")
     p.add_argument("--near-band", dest="near_band", type=float, metavar="MM",
@@ -5715,6 +5915,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--duty", type=float, help="projection.duty for this scan only")
     p.add_argument("--auto-intensity", dest="auto_intensity", action="store_true",
                    help="run face-intensity first and scan at its duty")
+    p.add_argument("--auto-exposure", dest="auto_exposure", action="store_true", default=None,
+                   help="choose a frame-locked camera exposure for this seating: face flood p95 "
+                        "near the target with < 0.5 %% clipped (default when the preset's "
+                        "exposure is whole video frames; works with inverted presets; exit 5 "
+                        "and no scan when none fits)")
+    p.add_argument("--no-auto-exposure", dest="auto_exposure", action="store_false",
+                   help="scan at the preset's exposure")
+    p.add_argument("--exposure-us", dest="exposure_us", type=float, metavar="US",
+                   help="force this camera exposure for this scan (the preset is not edited)")
+    p.add_argument("--exposure-target", dest="exposure_target", type=float, metavar="DN",
+                   help="auto exposure: target face p95 (default 170 of 255)")
+    p.add_argument("--exposure-range", dest="exposure_range", metavar="LO,HI",
+                   help="auto exposure range, ms (default 16.7,100)")
     p.add_argument("--steps", type=_positive_int, help="depth-set phase steps (default 12)")
     p.add_argument("--periods", help="depth-set T,T,T DMD px (tilephase: one T, default 8)")
     p.add_argument("--mode", choices=("multifreq", "tilephase"), default="multifreq",
@@ -5731,8 +5944,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--face", help="face target (default: the face scan's own)")
     p.add_argument("--label")
     p.add_argument("--grid", type=float, default=0.25, metavar="MM")
-    p.add_argument("--r-flat", dest="r_flat", type=float, default=9.0, metavar="MM",
-                   help="flatness inside this radius (default 9)")
+    p.add_argument("--r-flat", dest="r_flat", type=float, metavar="MM",
+                   help="flatness inside this radius (default 0.855 x the face radius: 9.0 on "
+                        "a 21.05 mm face; a value given is used as given)")
+    p.add_argument("--size-tol", dest="size_tol", type=float, metavar="PCT",
+                   help="known-size check: the flood outline vs the face diameter (default 4)")
     p.add_argument("--no-stl", dest="no_stl", action="store_true")
     p = cmd("face-golden", cmd_face_golden, "golden end face from GOOD placements: MF-CFAR "
                                             "(+ reflectance FIR) and band models, leave-one-out, "
@@ -5755,7 +5971,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--floor", type=float, metavar="MM", help="band floor (default 0.10)")
     p.add_argument("--smooth-cells", dest="smooth_cells", type=_positive_int,
                    help="sigma median window, cells (default 5)")
-    p.add_argument("--rim-r", dest="rim_r", type=float, metavar="MM", help="rim zone r > (9.75)")
+    p.add_argument("--rim-r", dest="rim_r", type=float, metavar="MM",
+                   help="rim zone r > this, for EVERY detector (default 0.855 x the face "
+                        "radius: 9.0 on a 21.05 mm face)")
+    p.add_argument("--inspect-r", dest="inspect_r", type=float, metavar="MM",
+                   help="inspected zone r <= this (default 0.926 x the face radius: 9.75 on a "
+                        "21.05 mm face); the chamfer / rounded rim beyond is never inspected")
+    p.add_argument("--plane-r", dest="plane_r", type=float, metavar="MM",
+                   help="robust plane region (default: the rim radius)")
+    p.add_argument("--rim-tol", dest="rim_tol", type=float, metavar="MM",
+                   help="rim outline: a notch / bulge beyond this ... (default 0.4)")
+    p.add_argument("--rim-arc", dest="rim_arc", type=float, metavar="MM",
+                   help="... over at least this much rim triggers (default 1.5)")
+    p.add_argument("--size-tol", dest="size_tol", type=float, metavar="PCT",
+                   help="known-size check: a placement whose flood outline is further off the "
+                        "face diameter is refused (default 4)")
     p.add_argument("--rim-factor", dest="rim_factor", type=float, help="rim band x (default 2)")
     p.add_argument("--rim-min", dest="rim_min", type=float, metavar="MM", help="rim band min (0.3)")
     p.add_argument("--height-smooth", dest="height_smooth", type=float, metavar="MM",
@@ -5773,7 +6003,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="default: the golden's (mf_fir for new goldens)")
     p.add_argument("--z", type=float, help="MF: trigger z for this check (default: the golden's)")
     p.add_argument("--min-depth", dest="min_depth", type=float, metavar="MM",
-                   help="MF: ignore dents shallower than this for this check")
+                   help="MF: ignore dents shallower than this (depth_centre_mm) for this check")
+    p.add_argument("--rim-tol", dest="rim_tol", type=float, metavar="MM",
+                   help="rim outline tolerance for this check (default: the golden's, 0.4)")
+    p.add_argument("--rim-arc", dest="rim_arc", type=float, metavar="MM",
+                   help="rim outline minimum arc for this check (default: the golden's, 1.5)")
+    p.add_argument("--size-tol", dest="size_tol", type=float, metavar="PCT",
+                   help="known-size tolerance for this check (default: the golden's, 4)")
     p = cmd("faces", cmd_faces, "list face targets, face scans and golden faces")
     p.add_argument("--geometry", help="only this geometry id")
 
@@ -5817,8 +6053,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-ct", dest="no_ct", action="store_true", help="end faces only")
     p.add_argument("--no-strict", dest="no_strict", action="store_true",
                    help="drop the strict end-face gates (rim outline rms <= 1.0 mm, >= 70 %% of the "
-                        "disc measured - 50-70 %% only with a clean rim circle - and a plausible "
-                        "height / spacing to the other end faces)")
+                        "disc measured - 50-70 %% only with a clean rim circle - a plausible "
+                        "height / spacing to the other end faces, and the known size)")
+    p.add_argument("--size-tol", dest="size_tol", type=float, metavar="PCT",
+                   help="known-size check: an end face whose flood outline is further off "
+                        "--diameter is a size mismatch (default 4; 0 = off)")
     p = cmd("station-golden", cmd_station_golden, "station golden from GOOD measurements (metric "
                                                   "scans or station .json) + limits", "station golden")
     p.add_argument("items", nargs="+", help="metric scans (id / label) or station .json files")
@@ -5850,8 +6089,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--centre", choices=("rim_circle", "ellipse_ray"),
                    help="face centre method (default rim_circle)")
     p.add_argument("--no-ct", dest="no_ct", action="store_true", help="end faces only")
+    p.add_argument("--size-tol", dest="size_tol", type=float, metavar="PCT",
+                   help="known-size check for metric-scan items (default 4; 0 = off)")
     p = cmd("station-check", cmd_station_check, "a metric scan vs the station golden: exit 0 PASS, "
-                                                "1 FAIL, 5 INCOMPLETE / ambiguous = PULL, "
+                                                "1 FAIL, 5 INCOMPLETE / ambiguous / size mismatch = PULL, "
                                                 "2 refused, 4 crashed (+ PNG, JSON, CSV)",
             "the station check")
     p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a FAIL verdict (1)

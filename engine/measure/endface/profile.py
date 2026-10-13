@@ -11,8 +11,9 @@ profile_quick, productised).
   * height map: linear interpolation (scipy griddata) of the face points onto a square
     grid (default 0.25 mm) over |r| <= the face radius
   * radial profile (0.5 mm bins: median height, spread, count), horizontal (v = 0) and
-    vertical (u = 0) sections, flatness (RMS and p2-p98 inside r_flat_mm), per-point
-    repeatability (std across repeats at each face pixel), tilt vs the camera ray
+    vertical (u = 0) sections, flatness (RMS and p2-p98 inside r_flat_mm: 0.855 x the face
+    radius unless given, radii.py - 9.0 mm on a 21.05 mm face), per-point repeatability (std
+    across repeats at each face pixel), tilt vs the camera ray
 """
 
 from __future__ import annotations
@@ -23,10 +24,13 @@ from typing import Optional
 
 import numpy as np
 
+from . import radii as radii_mod
 from .locate import face_axes
 
 GRID_MM = 0.25
-R_FLAT_MM = 9.0
+R_FLAT_MM = None                        # flatness radius: None = 0.855 x the face radius
+BEHIND_MM = 2.0                         # a measured point this far behind the face plane is
+                                        # not the face (background, the part's side wall)
 RADIAL_BIN_MM = 0.5
 MAP_RANGE_MM = 0.4                      # PNG colour range +-
 SECTION_RANGE_MM = 0.5
@@ -68,17 +72,25 @@ def mask_ellipse_centre(face_mask: np.ndarray) -> tuple:
     return float(ex), float(ey)
 
 
+def flat_radius(radius_mm: float, r_flat_mm: Optional[float] = None) -> float:
+    """The flatness radius: the one given (it must lie on the face), else 0.855 x the face
+    radius."""
+    return float(radii_mod.face_radii(radius_mm, {"r_flat_mm": r_flat_mm})["r_flat_mm"])
+
+
 def analyse(X: np.ndarray, K: np.ndarray, face_mask: np.ndarray, origin, cal, radius_mm: float,
-            grid_mm: float = GRID_MM, r_flat_mm: float = R_FLAT_MM, erode_px: int = 5,
-            off_face_mm: float = 2.0, centre_px=None) -> dict:
+            grid_mm: float = GRID_MM, r_flat_mm: Optional[float] = R_FLAT_MM,
+            erode_px: int = 5, off_face_mm: float = 2.0, centre_px=None) -> dict:
     """X (n, h, w, 3) repeat clouds (crop, mm), K (n, h, w) their masks, face_mask (h, w)
     = the located face in the same crop, origin = (x0, y0) of the crop in the camera.
     centre_px: the face centre in crop px (default: the face mask's ellipse centre; pass the
     located circle's when the face leaves the camera frame and the mask is clipped).
-    -> the height map + stats, and 'pixels' (iy, ix, per-repeat U, V, H of the face pixels)."""
+    -> the height map + stats, 'pixels' (iy, ix, per-repeat U, V, H of the face pixels) and
+    'behind' ((h, w) bool: crop pixels measured more than BEHIND_MM behind the face plane)."""
     import cv2
     from scipy.interpolate import griddata
     from ...reconstruct.triangulate import camera_rays
+    r_flat_mm = flat_radius(radius_mm, r_flat_mm)
     fm = np.asarray(face_mask, bool)
     X = np.where(K[..., None], X, np.nan)
     with warnings.catch_warnings():
@@ -152,8 +164,10 @@ def analyse(X: np.ndarray, K: np.ndarray, face_mask: np.ndarray, origin, cal, ra
              "repeatability_median_mm": float(np.median(rep)) if rep.size else None,
              "repeatability_p90_mm": float(np.percentile(rep, 90)) if rep.size else None,
              "tilt_deg": tilt, "plane_points": int(len(P))}
+    with np.errstate(invalid="ignore"):
+        behind = np.isfinite(M[..., 2]) & (((M - C0) @ n) - med < -BEHIND_MM)
     return {"grid_mm": g, "height_mm": Hg, "u": u, "v": v, "h": h, "centre": C0, "normal": n,
-            "e1": e1, "e2": e2, "median_xyz": M, "radial": radial,
+            "e1": e1, "e2": e2, "median_xyz": M, "radial": radial, "behind": behind,
             "sections": {"u_mm": g, "horizontal_mm": Hg[ic, :], "v_mm": g, "vertical_mm": Hg[:, ic]},
             "stats": stats, "pixels": pixels}
 

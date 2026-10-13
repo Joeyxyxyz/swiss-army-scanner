@@ -15,9 +15,13 @@ inside the blur spot): the FIR removes that part.
            face grid, triangles with an edge > max_edge_mm dropped (undecoded holes); each
            repeat gridded through it (its missing pixels filled with the pixel mean)
   FIR      7x7 camera-px kernel on the high-passed (4 px Gaussian) log flood (on - off),
-           ridge least squares on GOOD placements (r < 9.5 mm, unsaturated px), predicting
+           ridge least squares on GOOD placements (r < fir r_max, unsaturated px), predicting
            the high-passed per-repeat-plane-removed height: the predicted reflectance-induced
            height error (mm) is subtracted from every repeat's pixel heights before gridding.
+           The face mask's border (edge_px = 2 camera px) is left out of the log flood: there
+           the flood shows the face's outline (the flat ends, the rim is dark), not its
+           reflectance, and on a small face that edge lies within the kernel of the inspected
+           zone (a 16 mm face: the FIR 'explained' 16 % of pure noise and made rim triggers).
            SATURATED flood pixels are left out of the fit, and a placement whose flood
            saturates more than max_sat_pct (2 %) of its face is not corrected at all: the
            clipped reflectance under-predicts the error there, and those patches then stand out
@@ -35,9 +39,17 @@ inside the blur spot): the FIR removes that part.
            = a dent) and its geometric standard-error factor
   CFAR     z = (depth / factor) / sigma, sigma = 1.4826 MAD of THIS face's own map per radial
            band (dents are sparse; the MAD ignores them)
-  trigger  a connected region with z >= z_thresh (and depth >= min_depth_mm) inside
-           r <= inspect_r_mm (the grazing, pose-dependent chamfer beyond is not inspected);
-           reported with r, theta, u, v, depth_mm, width_mm (best scale), z, area
+  trigger  a connected region with z >= z_thresh inside r <= inspect_r_mm (the grazing,
+           pose-dependent chamfer beyond is not inspected) whose depth_centre_mm (depth.py:
+           the 3 x 3 grid-cell average at its deepest place against the local background) is
+           at least min_depth_mm; reported with r, theta, u, v, depth_centre_mm (= depth_mm,
+           THE depth), depth_min_mm (single point, over-reads), width_half_depth_mm,
+           depth_fit_mm / width_mm (the matched filter's paraboloid: its amplitude and the
+           best diameter of the bank), z, area
+
+Radii: inspect_r_mm, fit_r_mm, rim_r_mm, plane_r_mm and noise_bands_mm are fractions of the
+face radius unless given (radii.py: 0.926 R, 0.926 R, 0.855 R, 0.855 R, bands scaled - on a
+21.05 mm face they stay 9.75 / 9.75 / 9.0 / 9.0 mm); mf_params(over, radius_mm) resolves them.
 
 Research evaluation (4 good placements of 2 cells, leave-one-placement-out, synthetic dents
 injected per camera pixel): 0 false triggers at every z_thresh >= 4.5 (band method: 19);
@@ -54,27 +66,42 @@ from typing import Optional
 
 import numpy as np
 
+from . import depth as depth_mod
+from . import radii as radii_mod
+
 MF_DEFAULTS = {
     "scales_mm": (1.0, 1.5, 2.0, 3.0),       # dent diameters of the matched-filter bank
     "support_factor": 2.0,                   # fit window radius = support_factor x w / 2
-    "noise_bands_mm": (0.0, 3.0, 6.0, 8.0, 9.0, 9.75, 10.25),
+    "noise_bands_mm": None,                  # None = scaled to the face (radii.py; 21.05 mm:
+                                             # 0, 3, 6, 8, 9, 9.75, 10.25)
     "z_thresh": 5.5,                         # ~1e-3 false / good face; 5.0 ~1e-2 (+10 pts)
     "rim_z_thresh": None,                    # separate threshold for r > rim_r_mm (None = z)
-    "min_depth_mm": 0.0,                     # ignore significant dents shallower than this
-    "inspect_r_mm": 9.75,                    # inspected zone r <= this (chamfer beyond)
-    "fit_r_mm": 9.75,                        # data the local fits use
-    "rim_r_mm": 9.0,                         # 'rim' label beyond this (still inspected)
+    "min_depth_mm": 0.0,                     # ignore significant dents whose depth_centre_mm
+                                             # is shallower than this
+    "inspect_r_mm": None,                    # inspected zone r <= this (chamfer beyond);
+                                             # None = 0.926 x the face radius (21.05 mm: 9.75)
+    "fit_r_mm": None,                        # data the local fits use; None = inspect_r_mm
+    "rim_r_mm": None,                        # 'rim' beyond this (still inspected); None =
+                                             # 0.855 x the face radius (21.05 mm: 9.0)
     "sign": "dent",                          # 'dent' (depressions) | 'both' (+ bumps)
     "min_area_mm2": 0.0,
-    "plane_r_mm": 9.0,                       # robust plane region
+    "plane_r_mm": None,                      # robust plane region; None = rim_r_mm
     "max_edge_mm": 1.2,                      # gridding: drop triangles bridging holes
     "cover_frac": 0.6,                       # a depth needs this much of the dent footprint
 }
+MF_RADII = ("inspect_r_mm", "fit_r_mm", "rim_r_mm", "plane_r_mm", "noise_bands_mm")
 FIR_DEFAULTS = {
     "half_px": 3,                            # 7 x 7 camera px kernel
     "hp_sigma_px": 4.0,                      # high-pass of the log flood / the height
     "ridge": 0.1,
-    "r_max_mm": 9.5,                         # fit on face points inside this radius
+    "r_max_mm": None,                        # fit on face points inside this radius; None =
+                                             # 0.974 x inspect_r_mm (21.05 mm: 9.5)
+    "edge_px": 2,                            # the face mask's border pixels are left out of
+                                             # the log flood: there the flood shows the
+                                             # face's OUTLINE (the flat ends, the rim is
+                                             # dark), not its reflectance - on a small face
+                                             # that edge sits within the kernel of the
+                                             # inspected zone and the FIR fitted it
     "sat_dn": 254.5,                         # flood pixels at / above: saturated (no FIR input)
     "max_sat_pct": 2.0,                      # a placement saturated over more of its face is
                                              # checked without the FIR (see fir_usable)
@@ -82,31 +109,59 @@ FIR_DEFAULTS = {
 BATTERY_DEPTHS_MM = (0.10, 0.15, 0.20, 0.30)
 BATTERY_WIDTHS_MM = (1.0, 1.5, 2.0, 3.0)
 BATTERY_TOL_MM = 0.75                         # detected: within w / 2 + this of the centre
-BATTERY_R_MM = 9.0                            # random dent centres r <= this
+BATTERY_R_MM = 9.0                            # random dent centres r <= this on a 21.05 mm
+                                              # face (elsewhere: the face's rim_r_mm)
 Z_REPORT = (4.5, 5.0, 5.5, 6.0)
 
 
-def mf_params(over: Optional[dict] = None) -> dict:
+def check_mf_keys(over: Optional[dict]) -> None:
     bad = set(over or {}) - set(MF_DEFAULTS)
     if bad:
         raise ValueError(f"unknown MF-CFAR params {sorted(bad)} (known: {sorted(MF_DEFAULTS)})")
-    p = {**MF_DEFAULTS, **(over or {})}
+
+
+def mf_params(over: Optional[dict] = None, radius_mm: Optional[float] = None,
+              radii: Optional[dict] = None) -> dict:
+    """The MF-CFAR settings with every radius resolved. radius_mm: the face radius the
+    radii not given in `over` derive from (radii.face_radii); radii: an already resolved set
+    (face_radii's result) to take them from instead. Without either, every radius must be in
+    `over`: a radius is never assumed."""
+    check_mf_keys(over)
+    p = {**MF_DEFAULTS, **dict(over or {})}
     p["scales_mm"] = tuple(float(w) for w in p["scales_mm"])
-    p["noise_bands_mm"] = tuple(float(b) for b in p["noise_bands_mm"])
     if not p["scales_mm"] or min(p["scales_mm"]) <= 0:
         raise ValueError("scales_mm must be dent diameters > 0 mm")
     if not float(p["z_thresh"]) > 0:
         raise ValueError(f"z_thresh must be > 0, got {p['z_thresh']!r}")
     if p["sign"] not in ("dent", "both"):
         raise ValueError("sign must be 'dent' or 'both'")
+    if radii is None and radius_mm is not None:
+        radii = radii_mod.face_radii(radius_mm, {k: p[k] for k in MF_RADII})
+    for k in MF_RADII:
+        if p[k] is None:
+            if radii is None:
+                raise ValueError(f"MF-CFAR: {k} is not given and there is no face radius to "
+                                 "derive it from (mf_params(over, radius_mm)): a radius is "
+                                 "never assumed")
+            p[k] = radii[k]
+    p["noise_bands_mm"] = tuple(float(b) for b in p["noise_bands_mm"])
+    for k in MF_RADII[:-1]:
+        p[k] = float(p[k])
     return p
 
 
-def fir_params(over: Optional[dict] = None) -> dict:
+def fir_params(over: Optional[dict] = None, radii: Optional[dict] = None) -> dict:
+    """The reflectance FIR settings; r_max_mm from the resolved radii when not given."""
     bad = set(over or {}) - set(FIR_DEFAULTS)
     if bad:
         raise ValueError(f"unknown FIR params {sorted(bad)}")
-    return {**FIR_DEFAULTS, **(over or {})}
+    p = {**FIR_DEFAULTS, **(over or {})}
+    if p["r_max_mm"] is None:
+        if radii is None:
+            raise ValueError("the reflectance FIR's r_max_mm is not given and there are no "
+                             "face radii to derive it from")
+        p["r_max_mm"] = float(radii["fir_r_max_mm"])
+    return p
 
 
 def grid_mesh(g: np.ndarray) -> tuple:
@@ -120,7 +175,11 @@ def grid_mesh(g: np.ndarray) -> tuple:
 class Pixels:
     """One placement in camera space (face_profile's crop): face pixels iy, ix (N,), per
     repeat face-frame u, v, h (K, N) mm (NaN = not decoded / off the face), the camera face
-    mask (h, w) and the flood pair (h, w) camera DN (None without a flood pair)."""
+    mask (h, w) and the flood pair (h, w) camera DN (None without a flood pair). origin:
+    the crop's (x0, y0) in the camera frame (None: a profile stored without it); behind:
+    the crop's pixels the scans measured BEHIND the face plane (background, the part's side
+    wall: not the face, whatever the flood shows there); outline: the rim outline measured
+    in the flood pair (outline.measure; None = not measured yet)."""
     iy: np.ndarray
     ix: np.ndarray
     U: np.ndarray
@@ -130,6 +189,9 @@ class Pixels:
     flood_on: Optional[np.ndarray] = None
     flood_off: Optional[np.ndarray] = None
     flood_sat: Optional[np.ndarray] = None
+    origin: Optional[tuple] = None
+    outline: Optional[dict] = None
+    behind: Optional[np.ndarray] = None
 
     @property
     def K(self) -> int:
@@ -143,6 +205,8 @@ class Pixels:
         out = {"px_iy": self.iy.astype(np.int32), "px_ix": self.ix.astype(np.int32),
                "px_u": self.U.astype(np.float32), "px_v": self.V.astype(np.float32),
                "px_h": self.H.astype(np.float32), "px_cam_mask": self.cam_mask.astype(np.uint8)}
+        if self.behind is not None:
+            out["px_behind"] = np.asarray(self.behind, np.uint8)
         if self.has_flood:
             out.update(flood_on=self.flood_on.astype(np.float32),
                        flood_off=self.flood_off.astype(np.float32),
@@ -156,15 +220,26 @@ class Pixels:
         if not {"px_iy", "px_ix", "px_u", "px_v", "px_h", "px_cam_mask"} <= keys:
             return None
         f = (lambda k: np.asarray(z[k], np.float64) if k in keys else None)   # noqa: E731
+        origin = tuple(int(v) for v in np.asarray(z["crop"]).ravel()[:2]) if "crop" in keys \
+            else None
         return cls(iy=np.asarray(z["px_iy"], np.int64), ix=np.asarray(z["px_ix"], np.int64),
                    U=f("px_u"), V=f("px_v"), H=f("px_h"),
                    cam_mask=np.asarray(z["px_cam_mask"], bool), flood_on=f("flood_on"),
                    flood_off=f("flood_off"),
-                   flood_sat=np.asarray(z["flood_sat"], bool) if "flood_sat" in keys else None)
+                   flood_sat=np.asarray(z["flood_sat"], bool) if "flood_sat" in keys else None,
+                   origin=origin,
+                   behind=np.asarray(z["px_behind"], bool) if "px_behind" in keys else None)
 
     def with_heights(self, H: np.ndarray) -> "Pixels":
         return Pixels(self.iy, self.ix, self.U, self.V, np.asarray(H, np.float64), self.cam_mask,
-                      self.flood_on, self.flood_off, self.flood_sat)
+                      self.flood_on, self.flood_off, self.flood_sat, self.origin, self.outline,
+                      self.behind)
+
+    def flood_diff(self) -> Optional[np.ndarray]:
+        """The flood pair's lit - dark image of the crop (NaN where either is unknown)."""
+        if not self.has_flood:
+            return None
+        return np.asarray(self.flood_on, np.float64) - np.asarray(self.flood_off, np.float64)
 
 
 class Gridder:
@@ -276,15 +351,22 @@ def _sat(px: Pixels) -> np.ndarray:
 
 
 def log_flood_hp(px: Pixels, prm: dict) -> np.ndarray:
-    """High-passed log flood (on - off) on the camera face mask (NaN elsewhere). Saturated
+    """High-passed log flood (on - off) on the camera face mask less its edge_px border
+    (NaN elsewhere: the border shows the face's outline, not its reflectance). Saturated
     pixels keep their clipped value: an under-estimate of the reflectance step, still a better
     prediction than none (zeroing the correction near them leaves uncorrected patches that
     stand out against the corrected rest)."""
+    import cv2
     on = np.asarray(px.flood_on, np.float64)
     off = np.asarray(px.flood_off, np.float64)
     with np.errstate(invalid="ignore"):
         L = np.log(np.maximum(np.nan_to_num(on - off, nan=1.0), 1.0))
-    L = np.where(px.cam_mask & np.isfinite(on) & np.isfinite(off), L, np.nan)
+    m = np.asarray(px.cam_mask, bool)
+    k = int(prm.get("edge_px") or 0)
+    if k > 0:
+        m = cv2.erode(m.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8),
+                      borderType=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+    L = np.where(m & np.isfinite(on) & np.isfinite(off), L, np.nan)
     return L - _gs_nan(L, float(prm["hp_sigma_px"]))
 
 
@@ -412,7 +494,12 @@ def placement_maps(px: Optional[Pixels], g, radius_mm: float, prm: dict,
     return gr.repeat_maps(corr), gr
 
 
-def radial_profile(H: np.ndarray, R: np.ndarray, step: float, rmax: float = 10.5) -> tuple:
+def radial_profile(H: np.ndarray, R: np.ndarray, step: float,
+                   rmax: Optional[float] = None) -> tuple:
+    """Median height per ring of width step, out to rmax (default: the grid's own reach - a
+    fixed limit would lump everything beyond it into the last ring on a larger face)."""
+    if rmax is None:
+        rmax = float(R[R.shape[0] // 2].max()) if R.size else 0.0
     rb = np.arange(0, rmax + step, step)
     idx = np.clip(np.round(R / step).astype(int), 0, len(rb) - 1)
     prof = np.full(len(rb), np.nan)
@@ -547,9 +634,13 @@ def _band_sigma(t: np.ndarray, R: np.ndarray, bands, zone) -> tuple:
     return sig, vf
 
 
-def detect(stack, model: Optional[dict], g, prm: dict) -> dict:
+def detect(stack, model: Optional[dict], g, prm: dict, px_mm: Optional[float] = None) -> dict:
     """One placement: (K, G, G) repeat maps (or a (G, G) map) + the golden model -> z map,
-    depth map, triggers (+ deviation, the 1-sigma depth noise floor per dent width)."""
+    depth map, triggers (+ deviation, the 1-sigma depth noise floor per dent width).
+    A significant region (z >= the threshold) is a trigger when its depth_centre_mm
+    (depth.dent_metrics) reaches min_depth_mm and its area min_area_mm2; every significant
+    region, trigger or not, is in 'candidates' (a shallower one tells how close a PASS came).
+    px_mm: the camera's pixel footprint on the face (for the width note)."""
     import cv2
     g = np.asarray(g, np.float64)
     step = float(g[1] - g[0])
@@ -576,27 +667,44 @@ def detect(stack, model: Optional[dict], g, prm: dict) -> dict:
     thr = np.full(R.shape, float(prm["z_thresh"]))
     if prm.get("rim_z_thresh") is not None:
         thr[R > prm["rim_r_mm"]] = float(prm["rim_z_thresh"])
-    hit = zone & np.isfinite(Zb) & (Zb >= thr) & (np.abs(np.nan_to_num(Db)) >= prm["min_depth_mm"])
+    hit = zone & np.isfinite(Zb) & (Zb >= thr)
     n, lab, _, _ = cv2.connectedComponentsWithStats(hit.astype(np.uint8), connectivity=8)
-    trig = []
+    trig, cands = [], []
+    fitted = R <= prm["fit_r_mm"]
+    dev3 = depth_mod.box3(np.where(fitted, dev, np.nan)) if n > 1 else None
     for i in range(1, n):
         m = lab == i
         area = float(m.sum()) * step * step
-        if area < prm["min_area_mm2"]:
-            continue
         k = int(np.nanargmax(np.where(m, Zb, -np.inf)))
         y, x = np.unravel_index(k, m.shape)
-        d = float(Db[y, x])
+        d_fit = float(Db[y, x])
+        w = float(prm["scales_mm"][best[y, x]])
         r = float(R[y, x])
-        trig.append({"zone": "rim" if r > prm["rim_r_mm"] else "face", "r_mm": round(r, 2),
-                     "theta_deg": round(float(np.degrees(np.arctan2(GV[y, x], GU[y, x]))), 1),
-                     "u_mm": round(float(GU[y, x]), 2), "v_mm": round(float(GV[y, x]), 2),
-                     "depth_mm": round(d, 3), "width_mm": float(prm["scales_mm"][best[y, x]]),
-                     "z": round(float(Zb[y, x]), 2),
-                     "dev_mm": round(float(dev[y, x]), 3) if np.isfinite(dev[y, x]) else None,
-                     "area_mm2": round(area, 2), "n_cells": int(m.sum()),
-                     "kind": "dent" if d > 0 else "bump"})
+        met = depth_mod.dent_metrics(np.where(fitted, dev, np.nan), g, y, x, w,
+                                     1 if d_fit > 0 else -1, px_mm=px_mm, dev3=dev3)
+        # THE depth: the 3 x 3 centre average against the local background; the matched
+        # filter's amplitude only where those cells are not measured
+        d = met["depth_centre_mm"] if met["depth_centre_mm"] is not None else d_fit
+        c = {"zone": "rim" if r > prm["rim_r_mm"] else "face", "r_mm": round(r, 2),
+             "theta_deg": round(float(np.degrees(np.arctan2(GV[y, x], GU[y, x]))), 1),
+             "u_mm": round(float(GU[y, x]), 2), "v_mm": round(float(GV[y, x]), 2),
+             "depth_mm": d if met["depth_centre_mm"] is not None else round(d, 3),
+             "depth_centre_mm": met["depth_centre_mm"],
+             "depth_min_mm": met["depth_min_mm"], "depth_min_note": met["depth_min_note"],
+             "width_half_depth_mm": met["width_half_depth_mm"],
+             "width_note": met["width_note"], "depth_fit_mm": round(d_fit, 3),
+             "depth_source": "centre_3x3" if met["depth_centre_mm"] is not None else "fit",
+             "background_mm": met["background_mm"], "width_mm": w,
+             "z": round(float(Zb[y, x]), 2),
+             "dev_mm": round(float(dev[y, x]), 3) if np.isfinite(dev[y, x]) else None,
+             "area_mm2": round(area, 2), "n_cells": int(m.sum()),
+             "kind": "dent" if d_fit > 0 else "bump"}
+        c["trigger"] = bool(area >= prm["min_area_mm2"] and abs(d) >= prm["min_depth_mm"])
+        cands.append(c)
+        if c["trigger"]:
+            trig.append({k_: v for k_, v in c.items() if k_ != "trigger"})
     trig.sort(key=lambda t_: -t_["z"])
+    cands.sort(key=lambda t_: -t_["z"])
     inner = R <= min(prm["rim_r_mm"], prm["inspect_r_mm"])
     floor = {}
     with warnings.catch_warnings():
@@ -606,7 +714,7 @@ def detect(stack, model: Optional[dict], g, prm: dict) -> dict:
             floor[f"{w:g}"] = round(v, 4) if np.isfinite(v) else None
         zmax = float(np.nanmax(np.where(zone, Zb, np.nan))) if np.isfinite(Zb[zone]).any() else None
     cov = float(np.isfinite(dev[zone]).mean()) if zone.any() else 0.0
-    return {"triggers": trig, "z_map": Zb, "depth_map": Db,
+    return {"triggers": trig, "candidates": cands, "z_map": Zb, "depth_map": Db,
             "scale_map": np.asarray(prm["scales_mm"])[best], "deviation": dev, "height": H,
             "noise_floor_mm": floor, "max_z": zmax, "coverage_pct": round(100.0 * cov, 2)}
 

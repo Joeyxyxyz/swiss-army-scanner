@@ -52,6 +52,13 @@ parity) with the rig's R, t (projector 279.4 mm right, wall at 823 mm,
 recover. Placing an orthographic object (Box, Cylinder, Label) switches
 back; every existing test scene is unaffected.
 
+Hooks for the end-face tests (stereo mode): a DIM face is an EndFace with a low albedo, a
+SPECULAR one (bare metal that mirrors the projector into the camera) an EndFace with
+specular > 0 (mock_stereo: a lobe about the projector / camera bisector), an edge dent an
+EndFace with rim_notches; zoom_lens(factor) changes the camera's focal length AFTER a
+calibration was stored - what a lens whose zoom ring was turned looks like to the engine
+(every lateral size reads x factor, nothing else says so).
+
 In mock mode the bench stands in for the human's physical steps: tests
 and agents call `place()` / `clear()` instead of touching real objects.
 Change led_power / base_* before placing objects (the scene is cached
@@ -252,6 +259,23 @@ class MockBench:
     def stereo_truth(self) -> dict:
         """Ground-truth K / distortion / R / t / parity the calibration must recover."""
         return self.rig_model().truth()
+
+    def zoom_lens(self, factor: float) -> None:
+        """Turn the camera's zoom ring: its focal length x factor from now on (the scene is
+        re-rendered; a stereo calibration stored BEFORE still holds the old lens, which is
+        the point: the engine must notice that sizes no longer come out right)."""
+        from .mock_stereo import PinholeCamera, StereoRig
+        factor = float(factor)
+        if not factor > 0:
+            raise ValueError(f"zoom factor must be > 0, got {factor!r}")
+        rig = self.rig_model()
+        K = np.array(rig.camera.K, np.float64, copy=True)
+        K[0, 0] *= factor
+        K[1, 1] *= factor
+        self.stereo_rig = StereoRig(PinholeCamera(K, np.array(rig.camera.dist, copy=True),
+                                                  tuple(rig.camera.size)),
+                                    rig.projector, rig.R, rig.t)
+        self._stereo = None
 
     @property
     def truth(self) -> dict:

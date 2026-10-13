@@ -5,6 +5,26 @@ camera + projector (bench 2026-09-28: a 21.05 mm face ~795 mm away, tilted 7-23 
 auto_intensity, targeted_face_scan, face_profile, face_golden, check_face; the session
 side is verbs.py.
 
+Fixes from the bench of 2026-10-12 (a 21 mm class cylinder whose flat end face is 19.5 mm
+across inside a rounded rim): the face diameter given is the bright FLAT's, and
+    radii.py     every detector radius is a fraction of the face radius (inspect / fit
+                 0.926 R, rim / plane 0.855 R, noise bands scaled), explicit values kept, one
+                 rim radius for every detector, the resolved set stored and reported
+    exposure.py  a frame-locked camera exposure per face (the flood's p95 inside 0.8 R near
+                 170 DN, < 0.5 % clipped, 16.7-100 ms): the targeted scan's default; a
+                 seating no exposure fits is not scanned
+    locate.py    the rim circle is fitted at the depth silhouette's own size when that is
+                 the part's larger outer circle (a rim that returns depth points): given, or
+                 found from the rim points - a face-sized circle slid 0.8 mm on it
+    outline.py   the flood outline of the face on its plane: its size against the known
+                 diameter (> 4 % off = size_mismatch: PULL, never a pass, never a rescale),
+                 its roundness (zone 'rim_outline': edge dents the height map cannot see;
+                 the curve is the one most of the rim lies on, so a wide dent is not
+                 absorbed; rim that cannot be judged is never passed) and its centre, which
+                 face_profile centres the face frame on (the flat, not the silhouette)
+    depth.py     a dent's depth = the 3 x 3 grid-cell average at its deepest place against
+                 the local background (the deepest single point over-reads)
+
     locate.py    face by DEPTH (the nearest depth-continuous surface of a metric scan that
                  is face-shaped), rim = contour points whose outward neighbourhood is far
                  background (the true silhouette, not an undecoded band), fixed-radius circle

@@ -55,6 +55,9 @@ The validity statement replaces the verdict. status MEASURED, or NOT_MEASURABLE 
     incomplete         the number would not be the whole of what it names: the part is cut
                        by the image border or the roi (dims), a patch of it is too far from
                        the golden to be compared (deviation), no rim circle (endface)
+    size_mismatch      endface: a face reads more than 4 % off the diameter given (its flood
+                       outline): the calibration or the lens is suspect, so no mm of this
+                       scan is reported (nothing is rescaled)
     invalid            it is not what was asked for: no cylinder in the region (flat within
                        the noise, or the points do not lie on one), a picked px on an edge
     golden, aborted, refused, error
@@ -115,6 +118,9 @@ HOW_TO_FIX = {
     "golden": ("name a golden metric scan made at this geometry with the calibration in use "
                "(`scan metric` lists them, `scan scan-metric <label>` makes one)"),
     "incomplete": "check the part's placement against the golden, then measure again",
+    "size_mismatch": ("run `scan rig-check` and recalibrate if the lens (zoom / focus) or the "
+                      "rig moved since the calibration; or give the diameter of the bright "
+                      "flat the flood shows (face_diameter_mm), not the cylinder's"),
     "invalid": "measure again; `scan signal` checks the setup",
     "aborted": "measure again",
     "refused": "fix the input the message names",
@@ -664,7 +670,10 @@ def measure_scan(s, preset, spec: Spec, ms, golden=None, warnings: Optional[list
                 s, ms, None, None, {"n_cells": spec.n_faces,
                                     "face_diameter_mm": spec.face_diameter_mm}, write=False)
         except StationError as e:
-            raise V.MeasureError(f"end face: {e}", "incomplete") from None
+            # a face of known size that reads the wrong size: its own reason (the
+            # calibration or the lens, not the part's placement)
+            code = "size_mismatch" if "size mismatch" in str(e) else "incomplete"
+            raise V.MeasureError(f"end face: {e}", code) from None
         warnings += [str(w) for w in m.warnings if "tube" not in str(w).lower()]
         out = V.endfaces(m.cells)
         yy, xx = np.ogrid[:cloud.mask.shape[0], :cloud.mask.shape[1]]

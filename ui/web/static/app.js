@@ -2515,7 +2515,7 @@ async function refreshLog() {
     if (res == null) return '';
     if (typeof res !== 'object') return String(res).slice(0, 160);
     if (Array.isArray(res)) return `${res.length} item(s)`;
-    const keys = ['type', 'id', 'label', 'name', 'verdict', 'result', 'gc_conf', 'valid_pct', 'quality', 'units', 'mm_per_px', 'H', 'W', 'L',
+    const keys = ['type', 'id', 'label', 'name', 'verdict', 'result', 'disposition', 'gc_conf', 'valid_pct', 'quality', 'units', 'mm_per_px', 'H', 'W', 'L',
       'frames', 'focus_peak', 'duration_s'];
     return keys.filter((k) => res[k] != null && typeof res[k] !== 'object').map((k) => `${k}=${typeof res[k] === 'number' ? fmt(res[k], 3) : res[k]}`).join(' · ').slice(0, 220);
   };

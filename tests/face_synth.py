@@ -13,6 +13,11 @@ Optionally a REFLECTANCE texture (refl_texture): the flood pair of the face scan
 each metric scan carries the height error it causes (k x the camera-x gradient of the log
 reflectance: the phase decode is pulled toward the brighter side), identical in every repeat -
 what the MF detector's reflectance FIR learns and removes.
+
+Other faces: shapes / placement take radius= (a 16, 19.5 or 30 mm face) and rim_notches=
+(edge dents: the outline moved in / out); flood_image() renders the targeted scan's flood of
+a face (bright disc, dark surround, anti-aliased) for write_facescan(flood=...), so the rim
+outline (size, roundness) is in the flood pair as on the rig.
 """
 
 from __future__ import annotations
@@ -57,12 +62,14 @@ def normal_from_tilt(tilt_x_deg: float, tilt_y_deg: float) -> np.ndarray:
     return n / np.linalg.norm(n)
 
 
-def shapes(center, normal, dents=(), chamfer=(0.6, 0.15), body_mm: float = 30.0) -> list:
+def shapes(center, normal, dents=(), chamfer=(0.6, 0.15), body_mm: float = 30.0,
+           radius: float = RADIUS, rim_notches=()) -> list:
     c = np.asarray(center, float)
     n = np.asarray(normal, float)
-    face = EndFace(center=tuple(c), normal=tuple(n), radius=RADIUS, dents=list(dents),
-                   chamfer_mm=chamfer[0], chamfer_depth_mm=chamfer[1])
-    body = MetricCylinder(center=tuple(c - n * body_mm / 2), radius=RADIUS, height=body_mm,
+    face = EndFace(center=tuple(c), normal=tuple(n), radius=radius, dents=list(dents),
+                   chamfer_mm=chamfer[0], chamfer_depth_mm=chamfer[1],
+                   rim_notches=list(rim_notches))
+    body = MetricCylinder(center=tuple(c - n * body_mm / 2), radius=radius, height=body_mm,
                           axis=tuple(n))
     return [face, body, Plane()]
 
@@ -113,6 +120,21 @@ def refl_texture(seed: int, sigma_px: float = 1.2, amp: float = 0.35) -> np.ndar
     return np.exp(amp * z / z.std())
 
 
+def face_refl(rg, refl: np.ndarray, center, normal, box, radius: float = RADIUS,
+              keep: float = 0.85, fade_px: float = 2.5) -> np.ndarray:
+    """refl with its texture kept on the face and faded out toward its rim (half of it at
+    keep x radius, ~5 % at the rim, none beyond): the test texture is far stronger than a
+    real face's (the FIR needs something to learn), and near the rim it would notch the
+    flood outline (as it is here the outline of a good face is as rough as on the bench:
+    0.06-0.10 mm rms). -> a full-frame texture, 1 outside the crop `box`."""
+    x0, y0, x1, y1 = box
+    w = flood_image(rg, center, normal, box, radius=keep * radius, level_dn=1.0, dark_dn=0.0,
+                    blur_px=fade_px, noise_dn=0.0)
+    out = np.ones_like(refl)
+    out[y0:y1, x0:x1] = np.exp(w * np.log(refl[y0:y1, x0:x1]))
+    return out
+
+
 def refl_error(refl: np.ndarray, box, k_mm: float) -> np.ndarray:
     """Height error (mm, + toward the camera) in the crop: k_mm x d log(refl) / d x_cam."""
     x0, y0, x1, y1 = box
@@ -152,11 +174,48 @@ def write_metric(lib: Path, rg, objs, box, name: str, seed: int, cal, noise_mm: 
     return name
 
 
+def flood_image(rg, center, normal, box, radius: float = RADIUS, rim_notches=(),
+                level_dn: float = 170.0, dark_dn: float = 8.0, blur_px: float = 0.7,
+                ss: int = 4, noise_dn: float = 1.0, seed: int = 0, glint=None) -> np.ndarray:
+    """The targeted scan's flood of the camera crop `box`: the face disc (radius, with
+    rim_notches as mock_stereo.EndFace takes them) bright at level_dn on a dark surround
+    (only the face is lit), anti-aliased (ss x ss rays per camera pixel through the camera
+    model, so the outline is true to a fraction of a pixel), blurred and noisy.
+    glint: (u_mm, v_mm, radius_mm) a saturated spot on the face."""
+    import cv2
+    x0, y0, x1, y1 = box
+    face = EndFace(center=tuple(center), normal=tuple(normal), radius=radius,
+                   rim_notches=list(rim_notches))
+    c, n, e1, e2 = face.frame()
+    o = (np.arange(ss) + 0.5) / ss - 0.5
+    v, u = np.mgrid[y0:y1, x0:x1].astype(np.float64)
+    cover = np.zeros(u.shape)
+    spot = np.zeros(u.shape)
+    for dy in o:
+        for dx in o:
+            xy = undistort_normalized(np.stack([u + dx, v + dy], -1), rg.camera.K, rg.camera.dist)
+            d = np.concatenate([xy, np.ones(xy.shape[:-1] + (1,))], -1)
+            t = (c @ n) / (d @ n)
+            w = d * t[..., None] - c
+            wu, wv = w @ e1, w @ e2
+            inside = np.hypot(wu, wv) <= face.rim_radius(np.arctan2(wv, wu))
+            cover += inside
+            if glint is not None:
+                spot += inside & (np.hypot(wu - glint[0], wv - glint[1]) <= glint[2])
+    img = dark_dn + (level_dn - dark_dn) * cover / ss ** 2 + 400.0 * spot / ss ** 2
+    if blur_px:
+        img = cv2.GaussianBlur(img, (0, 0), blur_px)
+    rng = np.random.default_rng(seed)
+    return np.clip(img + rng.normal(0, noise_dn, img.shape), 0, 255)
+
+
 def placement(lib: Path, rg, cal, name: str, center, normal, dents=(), repeats: int = 2,
               seed: int = 0, refl=None, refl_k_mm: float = 0.0, **kw) -> tuple:
-    """A locate scan + `repeats` repeat scans of one placement -> (locate id, [repeat ids])."""
+    """A locate scan + `repeats` repeat scans of one placement -> (locate id, [repeat ids]).
+    margin_mm: the camera crop around the centre (default 28: a face up to ~30 mm)."""
+    margin = kw.pop("margin_mm", 28.0)
     objs = shapes(center, normal, dents, **kw)
-    box = crop_box(rg, center)
+    box = crop_box(rg, center, margin)
     loc = write_metric(lib, rg, objs, box, f"20260101T0100{seed % 100:02d}_000000_{name}_locate",
                        seed * 10, cal)
     reps = [write_metric(lib, rg, objs, box, f"20260101T0200{seed % 100:02d}_{k:06d}_{name}_r{k + 1}",
@@ -166,20 +225,29 @@ def placement(lib: Path, rg, cal, name: str, center, normal, dents=(), repeats: 
 
 
 def write_facescan(lib: Path, name: str, face_id: str, metric_ids: list, refl=None, box=None,
-                   flood_dn: float = 90.0, dark_dn: float = 6.0) -> str:
+                   flood_dn: float = 90.0, dark_dn: float = 6.0, flood=None) -> str:
     """A face-scan entry (as targeted_face_scan writes it) naming the repeat metric scans of
     one placement and its face target; with refl + box, polar frames holding only the flood
-    pair (255: flood_dn x the reflectance, 0: dark_dn) of that camera crop."""
+    pair (255: flood_dn x the reflectance, 0: dark_dn) of that camera crop; with flood + box
+    (flood_image()'s picture of the crop: the face's outline) the 255 flood is that image -
+    times the reflectance when refl is given too (the lit face with its texture on a dark
+    surround: what a targeted scan shows; refl alone lights the whole crop, the shadow of
+    the part included)."""
     d = Path(lib) / "facescans" / GEO / name
     d.mkdir(parents=True)
     np.savez_compressed(d / "masks.npz", dmd_mask=np.zeros((1140, 912), bool))
     specs, crop = [], None
-    if refl is not None:
+    if refl is not None or flood is not None:
         specs = [{"kind": "flood", "level": 255}, {"kind": "flood", "level": 0}]
         x0, y0, x1, y1 = crop = [int(v) for v in box]
         rng = np.random.default_rng(len(name))
         for k in range(len(metric_ids)):
-            on = flood_dn * refl[y0:y1, x0:x1] / float(np.mean(refl[y0:y1, x0:x1]))
+            if flood is not None:
+                on = np.asarray(flood, np.float64)
+                if refl is not None:
+                    on = on * refl[y0:y1, x0:x1] / float(np.mean(refl[y0:y1, x0:x1]))
+            else:
+                on = flood_dn * refl[y0:y1, x0:x1] / float(np.mean(refl[y0:y1, x0:x1]))
             on = np.clip(on + rng.normal(0, 0.5, on.shape), 0, 255)
             off = dark_dn + rng.normal(0, 0.5, on.shape)
             np.save(d / f"polar_frames_r{k + 1}.npy", np.stack([on, off]).astype(np.float32))

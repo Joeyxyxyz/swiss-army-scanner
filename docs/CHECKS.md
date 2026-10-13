@@ -12,10 +12,10 @@ its parameters, units and defaults.
 | type | what it measures | key parameters (units in the names) | reuses |
 |---|---|---|---|
 | `presence` | part present / absent: points at least `min_height_mm` above the reference plane cover `min_area_pct` of the zone's whole extent | `expect` present / absent, `min_height_mm`, `min_area_pct`, `min_valid_pct`, `min_points` (an unseen zone is INVALID, never "absent": see coverage below) | the part frame |
-| `position` | alignment vs the golden part: in-plane offset (centroid), rotation about the plane normal (principal axis), height offset | `tol_mm`, `tol_deg`, `tol_height_mm`, `min_height_mm` | the recipe's golden scan |
+| `position` | alignment vs the golden part: in-plane offset (centroid), rotation about the plane normal (principal axis), height offset. On a circle zone also the known size: the round part's flood outline vs the golden part's (and `nominal_diameter_mm`); more than `size_tol_pct` off is INVALID with a size-mismatch pull (see below) | `tol_mm`, `tol_deg`, `tol_height_mm`, `min_height_mm`, `nominal_diameter_mm`, `size_tol_pct` | the recipe's golden scan; `engine/measure/endface/outline.py` |
 | `height` | a statistic of the zone's heights vs the reference plane, or vs another zone (`ref: "zone:<id>"`: a step, the height difference of two faces); headline `deviation_mm` = height - the band's centre, limit = the band's half width | `nominal_mm` + `tol_mm`, or `band_mm` [lo, hi]; `stat` median / mean / p95 / p5 / max / min | |
 | `flatness` | robust plane fit: peak-to-valley between the trimmed percentiles, RMS. "Flat" needs coverage (see below) | `tol_mm`, `rms_tol_mm`, `trim_pct`, `min_height_mm`, `min_valid_pct` | `engine/measure/endface/profile.robust_plane` |
-| `defect` | local dents / bumps. `face` mode (circle zone = an end face): the MF-CFAR matched-filter detector, self-referenced; `local` mode: residual vs the zone's own smooth surface, connected blobs. "No defect" needs coverage (see below) | `depth_mm`, `min_area_mm2`, `mode` auto / face / local, `sign`, `smooth_mm`, `z_thresh`, `min_valid_pct`, `max_gap_mm2` | `engine/measure/endface/mfcfar.py` |
+| `defect` | local dents / bumps. `face` mode (circle zone = an end face): the MF-CFAR matched-filter detector, self-referenced, its radii derived from the zone's radius; a dent's depth is its `depth_centre_mm` (the 3 x 3 grid-cell average at its deepest place; the single deepest point over-reads); plus the flood outline of the face: edge dents (`rim_check`: a notch / bulge beyond `rim_tol_mm` over `rim_min_arc_mm` of rim FAILs) and the known size (see below); `local` mode: residual vs the zone's own smooth surface, connected blobs. "No defect" needs coverage (see below) | `depth_mm`, `min_area_mm2`, `mode` auto / face / local, `sign`, `smooth_mm`, `z_thresh`, `min_valid_pct`, `max_gap_mm2`, `rim_check` auto / on / off, `rim_tol_mm`, `rim_min_arc_mm`, `nominal_diameter_mm`, `size_tol_pct` | `engine/measure/endface/mfcfar.py`, `engine/measure/endface/outline.py` |
 | `edge` | the part's long edge(s): sub-pixel edge in the flood image (or the height map), robust line fit in the part frame; straightness, and position / angle vs the golden (lines compared undirected) | `side` top / bottom / both (every side asked for must be measured, in the scan and the golden), `straightness_tol_mm`, `position_tol_mm`, `angle_tol_deg` | `engine/recipes/checks/builtin.py` `edge_points` (gradient-peak profiles across the part, parabolic sub-pixel) |
 | `code` | a barcode / QR / Data Matrix in the zone: the codes read under DMD light before the scan (`scan.codes: true`), else the zone of the flood image decoded. A code of the expected kind read with the wrong text FAILs (REJECT); nothing of that kind read at all FAILs with `pull: "code_unreadable"` (PULL: unreadable is not wrong) | `expect`, `pattern` (regex), `kind`, `min_count` | `engine/sense/codes.py` |
 
@@ -47,6 +47,36 @@ hold one does not stop a PASS. `flatness` calls a zone flat only with `min_valid
 of that extent measured. Otherwise INVALID; a defect or a warp that was found stays a FAIL.
 So draw a defect zone inside the face it inspects: a zone reaching over a projector shadow
 beside a raised part is INVALID (the shadow could hide a defect).
+
+Known size (`defect` face mode, `position` on a circle zone): a lens zoomed after the
+calibration makes every lateral size read small (0.84 x on the bench: a 19.5 mm face read
+16.3 mm) and nothing else says so. So wherever a nominal size is known - a part_mm circle
+zone's own diameter (`defect` face), `nominal_diameter_mm`, the golden part's outline
+(`position`) - the outline of the bright disc in the scan's flood pair (scan.kind fast keeps
+one) is measured on the part's own plane and held to it: more than `size_tol_pct` (default
+4 %) off is INVALID with pull `size_mismatch` ("part reads N % small / large: calibration
+or lens suspect - run rig-check / recalibrate"), whatever else the check found: never a
+pass, never a definite fail, never a rescale - and never a REJECT: `size_mismatch` cannot
+be listed in `pull.invalid_reasons_to_reject` (it says nothing about the part), and a run
+that carries one is a PULL whatever its other checks say (their FAILs and doubts were
+measured on the same mis-scaled scan). Without a flood pair the size is not checked (a
+warning says so).
+
+`rim_check` judges the same outline's roundness (edge dents: a notch / bulge beyond
+`rim_tol_mm` over `rim_min_arc_mm` of rim FAILs; the curve it is measured against is the
+one most of the rim lies on, so a dent up to ~40 % of the rim wide reads its depth; a chip
+too deep to leave an edge is a notch "at least" as deep as the search reaches). `auto`
+(default): judged whenever the flood shows the face's outline. An outline that shows but
+cannot be judged all the way round - part of it missing, 1.5 mm of rim or more with no edge
+(a glint on the rim, a dark stretch) - is INVALID with pull `incomplete`: never a pass with
+a warning. Only a scan with no outline to judge at all (no flood pair, no bright disc on a
+dark surround) is skipped with a warning; `on` makes that INVALID too; `off` does not look
+at the outline (say so on purpose).
+
+Dent depth: `depth_mm` judges the 3 x 3 grid-cell centre average, which reads a dent about
+1 mm wide roughly 30 % shallower than a paraboloid fit of it did (it averages over 0.75 mm
+of a 1 mm bowl). A recipe written for the former fit amplitude may want a lower `depth_mm`
+for dents that narrow; the detection floor stays about 0.2 mm deep and 1.5 mm wide.
 
 Golden (`golden.scan`, for `position` and the `edge` golden tolerances): a golden recorded
 by `scan recipe-golden` (by its label; `latest` = the newest golden of this recipe at this

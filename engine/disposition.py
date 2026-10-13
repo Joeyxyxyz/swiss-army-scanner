@@ -11,8 +11,10 @@ INVALID); else any doubt -> PULL; else CONTINUE. A doubt never becomes CONTINUE.
 definite only when nothing about it is in doubt: a check FAIL carrying a `pull` reason, or
 a run-level FAIL with a recorded doubt (a metric FAIL on a placement that did not converge),
 is a PULL. A run refused or crashed before it finished (`refused`, `error`) is a PULL
-whatever else it recorded. The verdict (`result`: PASS / FAIL / INVALID / ABORTED) is
-unchanged: the disposition is a second key.
+whatever else it recorded. So is a run whose SCAN is in doubt (`size_mismatch`: a part of
+known size read the wrong size on it): every mm of that scan is suspect, so none of its
+FAILs is definite and none of its doubts is rejected through a recipe's list. The verdict
+(`result`: PASS / FAIL / INVALID / ABORTED) is unchanged: the disposition is a second key.
 
 Doubt (`pull_reasons`, [{zone?, check?, reason, message}]; `reason` is one of REASONS):
   uncalibrated       no stereo / mm calibration at these rig settings
@@ -26,6 +28,12 @@ Doubt (`pull_reasons`, [{zone?, check?, reason, message}]; `reason` is one of RE
   invalid            any other INVALID
   check_crashed      a check raised (a bug is never a verdict)
   code_unreadable    an expected code could not be read at all (unreadable is not wrong)
+  size_mismatch      a part of known size reads more than its tolerance small / large (its
+                     flood outline against the nominal diameter): the calibration or the
+                     lens is suspect - nothing measured on that scan is trusted, nothing is
+                     rescaled (engine/measure/endface/outline.py)
+  exposure           no camera exposure shows the part well enough to scan it (too dark at
+                     the longest, clipped before it is bright enough): it was not scanned
   rig_check          the rig check run before the cycle said MOVED / UNKNOWN; or (Measure,
                      Quick check on a FIXED rig) one on record did and was not answered since
   rig_unverified     a MOBILE rig (preset rig.mount) was not verified in this session: no
@@ -57,8 +65,9 @@ with no span) cannot clear any value: every PASS of that tolerance is PULLed.
 
 recipe pull.invalid_reasons_to_reject (default []: every doubt is a PULL): reasons from
 REJECTABLE the line rejects instead of pulling (e.g. code_unreadable: no label, no part).
-`aborted`, `guard_band`, `refused`, `error` and `rig_unverified` are never rejectable (they
-say nothing about the part), nor are the work-state reasons (a cycle's own kickout action
+`aborted`, `guard_band`, `refused`, `error`, `rig_unverified`, `size_mismatch` and `exposure`
+are never rejectable (they say nothing about the part: a size mismatch is the calibration's
+or the lens's, not the part's), nor are the work-state reasons (a cycle's own kickout action
 decides), and a run that was refused or crashed is never rejected through the list.
 
 Exit codes (run, recipe-run, station-check, face-check): CONTINUE 0, REJECT 1, PULL 5
@@ -98,6 +107,8 @@ REASONS = {
     "invalid": "the numbers cannot be trusted",
     "check_crashed": "a check crashed",
     "code_unreadable": "an expected code could not be read",
+    "size_mismatch": "a part of known size reads the wrong size: calibration or lens suspect",
+    "exposure": "no exposure shows the part well enough to scan it",
     "rig_check": "the rig check before the cycle said MOVED / UNKNOWN",
     "rig_unverified": "a mobile rig was not verified in this session",
     "refused": "the run was refused before a verdict",
@@ -112,9 +123,12 @@ REASONS = {
 # never rejectable through a recipe's list: they say nothing definite about the part (the
 # work-state reasons belong to a cycle, whose own kickout action decides REJECT / PULL)
 NOT_REJECTABLE = ("aborted", "guard_band", "refused", "error", "sensor_mismatch",
-                  "sensor_unknown", "not_confirmed", "timeout", "rig_unverified")
+                  "sensor_unknown", "not_confirmed", "timeout", "rig_unverified",
+                  "size_mismatch", "exposure")
 REJECTABLE = tuple(r for r in REASONS if r not in NOT_REJECTABLE)
 UNFINISHED = ("refused", "error")       # the run never finished: PULL, whatever it recorded
+SCAN_IN_DOUBT = ("size_mismatch",)      # the scan's mm are suspect: none of its FAILs is
+                                        # definite, none of its doubts is rejected
 MAX_GUARD_BAND_PCT = 100.0          # exclusive: 100 % would pull every pass
 
 
@@ -180,6 +194,8 @@ def classify(message, default: str = "invalid") -> str:
         return "check_crashed"
     if "mobile rig not verified" in m:
         return "rig_unverified"
+    if "size mismatch" in m or "calibration or lens suspect" in m:
+        return "size_mismatch"
     if "rig check" in m:
         return "rig_check"
     if (m.startswith("golden") or "golden scan" in m or "no golden" in m
@@ -375,14 +391,17 @@ def zone_doubts(zones: list, pct: float = 0.0) -> tuple:
 
 
 def decide(result: str, definite_fail: bool, reasons: list, reject=()) -> str:
-    """The precedence: ABORTED -> PULL; a definite measured FAIL -> REJECT; a run refused or
-    crashed (a `refused` / `error` reason) -> PULL; a doubt the line rejects (reject) ->
-    REJECT; else any doubt (or a verdict that is not PASS) -> PULL; else CONTINUE."""
+    """The precedence: ABORTED -> PULL; a scan in doubt (a `size_mismatch` reason: its mm
+    are suspect) -> PULL; a definite measured FAIL -> REJECT; a run refused or crashed (a
+    `refused` / `error` reason) -> PULL; a doubt the line rejects (reject) -> REJECT; else
+    any doubt (or a verdict that is not PASS) -> PULL; else CONTINUE."""
     if result == "ABORTED":
         return "PULL"
+    codes = {r.get("reason") for r in reasons}
+    if codes & set(SCAN_IN_DOUBT):      # measured on a scan that reads sizes wrong: no FAIL
+        return "PULL"                   # of it is definite, no doubt of it a reject
     if result == "FAIL" and definite_fail:
         return "REJECT"
-    codes = {r.get("reason") for r in reasons}
     if codes & set(UNFINISHED):         # it never finished: nothing it recorded is a reject
         return "PULL"
     if codes & set(reject):

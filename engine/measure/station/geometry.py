@@ -10,6 +10,17 @@ library side (rules, output bin, goldens).
      the scan: its outline the expected size, its disc measured and flat, and proud of its
      surroundings (a flat patch of a wall is not a face). The flood may be the decode's fringe
      modulation (a stand-in: saturated faces are dim in it, the depth checks sort that out).
+     KNOWN SIZE: the face's flood outline (the rim circle, free radius, on its plane) is held
+     to face_diameter_mm: more than size_tol_pct (4 %) off is a size mismatch ("reads N %
+     small / large: calibration or lens suspect" - a lens zoomed after the calibration makes
+     every lateral size read 0.84 x and nothing else says so). It is checked on the end
+     faces CHOSEN (which discs are the faces is decided by the gates below, as before: a
+     background disc is not told from a face by its size): with the strict gates a face that
+     reads the wrong size refuses the measurement (StationError 'size mismatch': nothing is
+     measured); without them it is measured and flagged (size_check: a PULL downstream).
+     A measurement refused for another reason (too few end faces, an ambiguous set) says so
+     too when a disc that passed every per-disc check reads the wrong size. Nothing is ever
+     rescaled.
   2. face planes: robust plane (3 MAD) of the scan's points inside each disc (shrunk a few px);
      face centre ('rim_circle', default): sub-pixel bright -> dark rim edges on rays from the
      disc centre, back-projected onto that plane, robust circle fitted IN the plane (a dark dent
@@ -44,10 +55,19 @@ from typing import Optional
 import numpy as np
 
 from ...capture.mock_stereo import undistort_normalized
+from ..endface import outline as outline_mod
 
 FACE_DIAMETER_MM = 21.05
 OUTLINE_WARN_MM = 0.6       # warn when a face's flood outline misses its diameter by more (the
                             # bench faces' dark chamfer alone makes it ~0.3 mm small)
+RIM_RAYS = 180              # rim_edges: rays per face
+SIZE_MIN_ARC_PCT = 80.0     # the known-size check needs the outline on this share of the rays,
+SIZE_MAX_GAP_DEG = 40.0     # with no larger gap, and smooth (an ellipse within this rms): a
+SIZE_MAX_RMS_MM = 0.3       # face cut by the zone edge (its outline partly the cut) or a
+                            # ragged outline is not a size reading
+SIZE_AXIS_TOL_FACTOR = 2.0  # the outline's mean diameter is held to size_tol_pct, one axis of
+                            # its ellipse alone to this x it: a disc's plane is fitted on the
+                            # points inside it, and a small tilt of that plane moves one axis
 
 
 @dataclass
@@ -109,6 +129,9 @@ class StationParams:
                                         # (a row of faces may span more; each needs a neighbour,
                                         # and a disc that would continue the row is ambiguous)
     min_pair_spacing_diam: float = 0.9  # ... and to every other face at least this (no overlap)
+    size_tol_pct: float = 4.0           # known size: a disc whose flood outline is further off
+                                        # face_diameter_mm (% of it) is not this end face as
+                                        # calibrated - a size mismatch (0 = not checked)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -165,6 +188,10 @@ class StationParams:
                 raise ValueError(f"{k} must be a number >= 0, got {v!r}")
         if p.min_pair_spacing_diam >= p.max_pair_spacing_diam:
             raise ValueError("min_pair_spacing_diam must be < max_pair_spacing_diam")
+        v = p.size_tol_pct
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not np.isfinite(v) \
+                or not 0 <= v < 50:
+            raise ValueError(f"size_tol_pct must be 0 (off) .. 50 % of the face diameter, got {v!r}")
         return p
 
 
@@ -365,6 +392,34 @@ def circle_in_plane(edge_px: np.ndarray, c, n, K, dist, iters: int = 6, k: float
             break
         keep = new
     return c + q[0] * e1 + q[1] * e2, float(rad), float(np.sqrt(np.mean(res[keep] ** 2))), int(keep.sum())
+
+
+def outline_shape(edge_px: np.ndarray, C, c, n, K, dist) -> Optional[dict]:
+    """The outline's SHAPE on the face plane, for the known-size check: the edge px
+    back-projected onto the plane (c, n), in polar coordinates about the fitted centre C,
+    fitted by r(theta) = r0 + a 1st + a 2nd harmonic (robust: an ellipse - what a residual
+    plane tilt makes of a circle - is followed, a chord where the lit zone cuts the face is
+    not) -> {mean_mm, major_mm, minor_mm (diameters), rms_mm (the rays kept), arc_pct (the
+    share of RIM_RAYS rays kept), max_gap_deg}. None with too few edge points."""
+    if len(edge_px) < 24:
+        return None
+    d = camera_rays(K, dist, edge_px[:, :2])
+    P = d * ((c @ n) / (d @ n))[:, None]
+    e1 = np.cross(n, [0.0, 1.0, 0.0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+    w = P - np.asarray(C, np.float64)
+    th, rho = np.arctan2(w @ e2, w @ e1), np.hypot(w @ e1, w @ e2)
+    co, res, keep = outline_mod._harmonics(th, rho, 2)
+    if keep.sum() < 12:
+        return None
+    a = np.sort(np.degrees(th[keep]))
+    gaps = np.diff(np.concatenate([a, [a[0] + 360.0]]))
+    e = float(np.hypot(co[3], co[4]))
+    return {"mean_mm": 2 * float(co[0]), "major_mm": 2 * float(co[0] + e),
+            "minor_mm": 2 * float(co[0] - e),
+            "rms_mm": float(np.sqrt(np.mean(res[keep] ** 2))),
+            "arc_pct": 100.0 * float(keep.sum()) / RIM_RAYS, "max_gap_deg": float(gaps.max())}
 
 
 MAX_EXAMINED = 60          # strict selection: candidates validated first (brightest), before
@@ -720,10 +775,12 @@ def face_fit(X: np.ndarray, cell: dict, K, dist, disc_px: Optional[float] = None
     C = ray * ((c @ n) / (ray @ n))
     method, outline = "ellipse_ray", None
     if centre_method == "rim_circle":
-        fit = circle_in_plane(np.asarray(cell.get("edge_px", np.zeros((0, 3)))), c, n, K, dist)
+        edges = np.asarray(cell.get("edge_px", np.zeros((0, 3))))
+        fit = circle_in_plane(edges, c, n, K, dist)
         if fit is not None and fit[3] >= 24 and abs(np.linalg.norm(fit[0] - C)) < 2.0:
             C, method = fit[0], "rim_circle"
-            outline = {"diameter_mm": 2 * fit[1], "rms_mm": fit[2], "n_edge_px": fit[3]}
+            outline = {"diameter_mm": 2 * fit[1], "rms_mm": fit[2], "n_edge_px": fit[3],
+                       "shape": outline_shape(edges, C, c, n, K, dist)}
     elif centre_method != "ellipse_ray":
         raise ValueError("centre_method must be 'rim_circle' or 'ellipse_ray'")
     rr = np.linalg.norm((P - C) - np.outer((P - C) @ n, n), axis=1)
@@ -771,11 +828,32 @@ def _over(v: float, lim: float) -> str:
     return repr(float(v))
 
 
+def face_size(f: dict, prm: StationParams) -> dict:
+    """The known-size check of a fitted face (outline.size_check): its flood outline's
+    mean diameter on its plane against face_diameter_mm (size_tol_pct), and each axis of its
+    ellipse (SIZE_AXIS_TOL_FACTOR x that)."""
+    sh = (f.get("outline") or {}).get("shape")
+    od, axes, why = None, None, "no rim circle on its flood outline"
+    if sh is not None:
+        if sh["arc_pct"] < SIZE_MIN_ARC_PCT or sh["max_gap_deg"] > SIZE_MAX_GAP_DEG:
+            # a face cut by the zone edge / a partial outline: what is left is not its size
+            why = (f"its outline shows on {sh['arc_pct']:.0f} % of the rim only (largest gap "
+                   f"{sh['max_gap_deg']:.0f} deg): cut by the lit zone or a poor outline")
+        elif sh["rms_mm"] > SIZE_MAX_RMS_MM:
+            why = f"its outline is ragged (rms {sh['rms_mm']:.2f} mm about its ellipse)"
+        else:
+            od, axes = sh["mean_mm"], (sh["major_mm"], sh["minor_mm"])
+    return outline_mod.size_check(od, prm.face_diameter_mm, prm.size_tol_pct,
+                                  "end face's flood outline", source="flood rim outline",
+                                  why=why, axes=axes, axis_tol_factor=SIZE_AXIS_TOL_FACTOR)
+
+
 def strict_disc_gate(f: dict, prm: StationParams) -> list:
     """The strict per-disc reasons of a fitted face f ([] = passes): its flood outline is
     ragged, or too little of it is measured - a disc measured below strict_min_coverage passes
     only with a clean flood rim circle (rms <= strict_partial_outline_rms_mm): the rim is what
-    shows an end face whose decode dropped out, a background patch has none (or a rough one)."""
+    shows an end face whose decode dropped out, a background patch has none (or a rough one).
+    (The known size is held on the faces chosen, in measure(): face_size.)"""
     why = []
     rms = (f.get("outline") or {}).get("rms_mm")
     if rms is not None and rms > prm.max_outline_rms_mm:
@@ -1177,14 +1255,24 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
 
     # strict: the pair gates are judged over every validated disc (find_cells chooses the
     # set), not against whichever disc was accepted first
-    cells, rejected = find_cells(flood_d, prm, r_exp, validate=validate,
-                                 pair=pair if prm.strict else None)
+    try:
+        cells, rejected = find_cells(flood_d, prm, r_exp, validate=validate,
+                                     pair=pair if prm.strict else None)
+    except StationError as e:
+        # no face set (too few end faces, an ambiguous set): when a disc that passed every
+        # per-disc check reads the wrong size, that is the likelier cause - say so
+        notes = [sc["message"] for sc in (face_size(f, prm) for f in fits.values())
+                 if sc["status"] == "mismatch"]
+        if not notes:
+            raise
+        raise StationError(f"{e}; size mismatch: " + "; ".join(dict.fromkeys(notes))) from None
     faces = [fits[id(c)] for c in cells]
     names = [c["name"] for c in cells]
     warnings = []
     # one face too: the same frame (e1 ~ image right, e2 ~ image down), so s, the zone index
     # and the T1..Tn numbering (left -> right) mean the same thing for n_cells = 1
     O, n, e1, e2 = common_frame(faces)
+    wrong = []
     for c, f in zip(cells, faces):
         f["height_mm"] = float((f["centre"] - O) @ n)
         f["tilt_vs_common_deg"] = angle_deg(f["normal"], n)
@@ -1199,10 +1287,27 @@ def measure(X: np.ndarray, flood_d: np.ndarray, K, dist, prm: StationParams,
                             "ellipse: centre from the rim ellipse (is the face cut by the zone "
                             "edge?) - its spacing is less certain, its height is not affected")
         od = (f["outline"] or {}).get("diameter_mm")
-        if od is not None and abs(od - prm.face_diameter_mm) > OUTLINE_WARN_MM:
+        f["size_check"] = face_size(f, prm)
+        if f["size_check"]["status"] == "mismatch":       # strict off: measured, but flagged
+            warnings.append(f"{c['name']}: size mismatch: {f['size_check']['message']}")
+            wrong.append(f"{f['size_check']['message']} [{c['name']} at camera px "
+                         f"({c['px'][0]:.0f}, {c['px'][1]:.0f})]")
+        elif od is not None and abs(od - prm.face_diameter_mm) > OUTLINE_WARN_MM:
             warnings.append(f"{c['name']}: its flood outline is {od:.2f} mm across (face "
                             f"{prm.face_diameter_mm:g} mm): cut by the zone edge or a poor outline "
                             "- its spacing is less certain, its height is not affected")
+        if f["size_check"]["status"] == "not_checked" and prm.size_tol_pct > 0:
+            # said, never silent: this face's mm were not held to the known size
+            warnings.append(f"{c['name']}: {f['size_check']['message']}")
+    if not prm.size_tol_pct > 0:
+        warnings.append("the known-size check is OFF (size_tol_pct 0): end faces that read "
+                        "the wrong size are not noticed")
+    if wrong and prm.strict:
+        # the known size is a strict gate: an end face that reads the wrong size is not
+        # measured (nothing on this scan is trusted), and never rescaled
+        raise StationError("size mismatch: " + "; ".join(wrong) + " - the end faces are not "
+                           "measured (strict gates: every end face is held to its known "
+                           "size, size_tol_pct)")
     pairs = cell_pairs(faces, names, O, n)
     if rejected:
         warnings.append(f"{len(rejected)} bright disc(s) set aside (e.g. at camera px "

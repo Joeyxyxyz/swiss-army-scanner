@@ -268,6 +268,180 @@ def test_defect_face_mode_mfcfar():
     assert dented.verdict == "FAIL" and dented.values["max_depth_mm"] > 0.15, dented.message
     x, y = dented.fault_points[0]["px"]
     assert abs((x - W / 2) / F * Z0 - 5) < 1.0 and abs((y - H / 2) / F * Z0 + 2) < 1.0
+    # a dent's depth is its centre average (depth_centre_mm), the deepest point is secondary
+    t = dented.details["triggers"][0]
+    assert t["depth_mm"] == t["depth_centre_mm"] and t["depth_min_mm"] >= t["depth_centre_mm"]
+    assert t["depth_min_note"] == "single point, over-reads" and t["width_half_depth_mm"] > 0.8
+    # the detector's radii derive from the zone's radius
+    rr = clean.details["radii"]
+    assert rr["face_radius_mm"] == 10.5 and rr["inspect_r_mm"] == pytest.approx(9.7)
+    assert rr["rim_r_mm"] < rr["inspect_r_mm"] and max(rr["noise_bands_mm"]) < 10.5
+
+
+def test_defect_face_rim_outline_and_known_size():
+    """A face zone also checks the flood outline of the face: its size against the zone's own
+    diameter (a part that reads small is a size mismatch: INVALID + pull, whatever else was
+    found - a lens zoomed after the calibration) and its roundness (an edge dent)."""
+    R0 = 10.5
+    face = lambda u, v: np.where(np.hypot(u - 2, v) <= R0, 25.0, 0.0)  # noqa: E731
+    chk = lambda **p: [{"type": "defect", "params": {"depth_mm": 0.15, "mode": "face",  # noqa: E731
+                                                      "sign": "dent", **p}}]
+    d = doc([zone("f", chk(), shape="circle", coords={"center": [2, 0], "radius": R0})])
+    ok = one(d, view(face, noise=0.015))
+    assert ok.verdict == "PASS" and ok.pull is None, ok.message
+    assert ok.values["outline_diameter_mm"] == pytest.approx(2 * R0, abs=0.3)
+    assert abs(ok.values["size_deviation_pct"]) < 1.5 and ok.values["rim_arc_peak_mm"] < 0.25
+    assert ok.values["n_rim_defects"] == 0 and "rim outline within" in ok.message
+    names = {t["name"] for t in ok.tolerances}
+    assert {"max_depth_mm", "size_deviation_pct", "rim_arc_peak_mm"} <= names
+    assert ok.details["size_check"]["status"] == "ok" and ok.details["rim_outline"]["status"] == "ok"
+    # an edge dent: the bright flat's outline 0.9 mm in over ~5 mm of rim, at 40 deg
+    def notched(u, v, h):
+        r, th = np.hypot(u - 2, v), np.degrees(np.arctan2(v, u - 2))
+        return (h > 1.0) & ~((r > R0 - 0.9) & (np.abs(th - 40) < 14))
+    bad = one(d, view(face, bright=notched, noise=0.015))
+    assert bad.verdict == "FAIL" and bad.key == "rim_arc_peak_mm" and bad.limit == 0.4
+    assert bad.values["n_rim_defects"] == 1 and bad.values["rim_arc_peak_mm"] > 0.6
+    f = bad.details["rim_outline"]["findings"][0]
+    assert f["kind"] == "notch" and abs(f["theta_deg"] - 40) < 10 and f["arc_mm"] >= 1.5
+    (fp,) = [p for p in bad.fault_points if p["label"].startswith("rim notch")]
+    fu, fv = (fp["px"][0] - W / 2) / F * Z0, (fp["px"][1] - H / 2) / F * Z0
+    assert np.hypot(fu - (2 + 0.9 * R0 * np.cos(np.radians(40))),
+                    fv - 0.9 * R0 * np.sin(np.radians(40))) < 3.0     # the mark: at the notch
+    assert one(doc([zone("f", chk(rim_check="off"), shape="circle",
+                         coords={"center": [2, 0], "radius": R0})]),
+               view(face, bright=notched, noise=0.015)).verdict == "PASS"
+    # the part reads 16 % small (its outline 0.84 x the zone's diameter): never judged
+    small = one(d, view(face, bright=lambda u, v, h: np.hypot(u - 2, v) <= 0.84 * R0, noise=0.015))
+    assert small.verdict == "INVALID" and small.pull == "size_mismatch"
+    assert "size mismatch" in small.message and "part reads 16." in small.message
+    assert "calibration or lens suspect - run rig-check / recalibrate" in small.message
+    assert small.details["size_check"]["status"] == "mismatch"
+    assert small.values["size_deviation_pct"] == pytest.approx(-16.0, abs=1.0)
+    assert any("part reads" in w for w in small.warnings)
+    res = {"result": "INVALID", "zones": [{"id": "f", "checks": [{"id": "defect", **small.to_dict()}]}]}
+    from engine import disposition as D
+    assert D.settle(res)["disposition"] == "PULL"
+    assert "part reads 16." in res["pull_reasons"][0]["message"]
+    assert res["pull_reasons"][0]["reason"] == "size_mismatch"
+    # ... and no recipe can turn it into a REJECT: it says the calibration or the lens is
+    # suspect, nothing about the part (a line that rejects every other doubt still pulls it)
+    assert "size_mismatch" in D.NOT_REJECTABLE and "size_mismatch" not in D.REJECTABLE
+    again = {"result": "INVALID", "zones": res["zones"]}
+    assert D.settle(again, reject=D.REJECTABLE)["disposition"] == "PULL"
+    # the scan is in doubt: another check's definite FAIL on it is not a REJECT, and another
+    # check's doubt on it is not rejected through the list either
+    fail = {"id": "height", "verdict": "FAIL", "message": "height 3.2 mm > 2 mm", "pull": None}
+    weak = {"id": "presence", "verdict": "INVALID", "message": "only 12 points", "pull": None}
+    for other, reject in ((fail, ()), (fail, D.REJECTABLE), (weak, D.REJECTABLE)):
+        mixed = {"result": "FAIL" if other is fail else "INVALID",
+                 "zones": [{"id": "f", "checks": [{"id": "defect", **small.to_dict()}]},
+                           {"id": "g", "checks": [dict(other)]}]}
+        assert D.settle(mixed, reject=reject)["disposition"] == "PULL", (other["id"], reject)
+        assert "size_mismatch" in {r["reason"] for r in mixed["pull_reasons"]}
+    # (without the size mismatch the same FAIL is a REJECT, the same doubt rejectable)
+    assert D.settle({"result": "FAIL", "zones": [{"id": "g", "checks": [dict(fail)]}]}
+                    )["disposition"] == "REJECT"
+    assert D.settle({"result": "INVALID", "zones": [{"id": "g", "checks": [dict(weak)]}]},
+                    reject=D.REJECTABLE)["disposition"] == "REJECT"
+    assert D.decide("FAIL", True, [D.reason("size_mismatch", "x")]) == "PULL"
+    with pytest.raises(ValueError, match="size_mismatch never reject"):
+        D.check_reject_list(["invalid", "size_mismatch"])
+    with pytest.raises(schema.RecipeError):
+        schema.validate(dict(d, pull={"invalid_reasons_to_reject": ["size_mismatch"]}))
+    # the reason is also read from the message (a check that gave no pull of its own)
+    assert D.classify("size mismatch on zone f: part reads 16.0 % small") == "size_mismatch"
+    assert D.classify("part reads 5 % large: calibration or lens suspect") == "size_mismatch"
+    # a given nominal diameter wins over the zone's; size_tol_pct 0 turns the check off
+    assert one(doc([zone("f", chk(nominal_diameter_mm=25.0), shape="circle",
+                         coords={"center": [2, 0], "radius": R0})]),
+               view(face, noise=0.015)).verdict == "INVALID"
+    off = one(doc([zone("f", chk(size_tol_pct=0, rim_check="off"), shape="circle",
+                        coords={"center": [2, 0], "radius": R0})]),
+              view(face, bright=lambda u, v, h: np.hypot(u - 2, v) <= 0.84 * R0, noise=0.015))
+    assert off.verdict == "PASS" and "outline_diameter_mm" not in off.values
+    # no flood pair: said, not judged (auto); rim_check on: never passed
+    import dataclasses
+    dark = dataclasses.replace(view(face, noise=0.015), flood_white=None, flood_black=None)
+    auto = one(d, dark)
+    assert auto.verdict == "PASS" and any("size not checked" in w for w in auto.warnings)
+    assert any("rim outline not checked" in w for w in auto.warnings)
+    need = one(doc([zone("f", chk(rim_check="on"), shape="circle",
+                         coords={"center": [2, 0], "radius": R0})]), dark)
+    assert need.verdict == "INVALID" and "rim outline could not be judged" in need.message
+
+
+def test_defect_face_rim_that_cannot_be_judged_all_round_is_never_passed():
+    """A chip out of the rim deep enough to leave no edge, or a face whose outline shows
+    only in part: 'auto' used to skip the outline with a warning and PASS. An outline that
+    shows but cannot be judged all the way round is INVALID (pull incomplete); a chip whose
+    floor is found is a FAIL."""
+    R0 = 10.5
+    face = lambda u, v: np.where(np.hypot(u - 2, v) <= R0, 25.0, 0.0)  # noqa: E731
+    chk = lambda **p: [{"type": "defect", "params": {"depth_mm": 0.15, "mode": "face",  # noqa: E731
+                                                      "sign": "dent", **p}}]
+    d = doc([zone("f", chk(), shape="circle", coords={"center": [2, 0], "radius": R0})])
+
+    def chipped(depth, half_deg):
+        def bright(u, v, h):
+            r, th = np.hypot(u - 2, v), np.degrees(np.arctan2(v, u - 2))
+            return (h > 1.0) & ~((r > R0 - depth) & (np.abs(th - 40) < half_deg))
+        return bright
+    # 2 mm deep over ~4 mm of rim: its floor is inside the edge search - a notch, FAIL
+    bad = one(d, view(face, bright=chipped(2.0, 11), noise=0.015))
+    assert bad.verdict == "FAIL" and bad.values["n_rim_defects"] == 1
+    assert bad.values["rim_arc_peak_mm"] > 1.5
+    # 5 mm deep (half the radius): no edge on those rays - a notch AT LEAST the search deep
+    deep = one(d, view(face, bright=chipped(5.0, 11), noise=0.015))
+    assert deep.verdict == "FAIL", deep.message
+    f = deep.details["rim_outline"]["findings"][0]
+    assert f["kind"] == "notch" and f["at_least"] and abs(f["depth_mm"]) > 2.0
+    # the flood shows half of the face only (cut by the lit zone): an outline is there, it
+    # cannot be judged round - INVALID in auto too, never a pass with a warning
+    half = one(d, view(face, bright=lambda u, v, h: (h > 1.0) & (u > 0.5), noise=0.015))
+    assert half.verdict == "INVALID" and half.pull in ("incomplete", "size_mismatch"), half.message
+    if half.pull == "incomplete":
+        assert "could not be judged all the way round" in half.message
+        res = {"result": "INVALID", "zones": [{"id": "f", "checks": [{"id": "defect",
+                                                                      **half.to_dict()}]}]}
+        from engine import disposition as D
+        assert D.settle(res)["disposition"] == "PULL"
+    # rim_check off is the operator's explicit choice: the outline is not looked at
+    off = one(doc([zone("f", chk(rim_check="off", size_tol_pct=0), shape="circle",
+                        coords={"center": [2, 0], "radius": R0})]),
+              view(face, bright=chipped(5.0, 11), noise=0.015))
+    assert off.verdict == "PASS"
+
+
+def test_position_known_size_on_a_circle_zone():
+    """position on a circle zone: the round part's flood outline against the golden part's
+    (and a nominal diameter): a scan that reads 16 % small is INVALID + pull, not 'aligned'."""
+    disc = lambda r: (lambda u, v: np.where(np.hypot(u - 2, v) <= r, 25.0, 0.0))  # noqa: E731
+    pos = lambda **p: [{"type": "position", "params": {"tol_mm": 1.0, "min_points": 50, **p}}]  # noqa: E731
+    d = doc([zone("seat", pos(), shape="circle", coords={"center": [2, 0], "radius": 16.0})],
+            golden={"scan": "g"})
+    gold = view(disc(10.5))
+    ok = one(d, view(disc(10.5), seed=1), gold)
+    assert ok.verdict == "PASS", ok.message
+    assert ok.values["outline_diameter_mm"] == pytest.approx(21.0, abs=0.3)
+    assert abs(ok.values["size_deviation_pct"]) < 1.5
+    assert "size_deviation_pct" in {t["name"] for t in ok.tolerances}
+    small = one(d, view(disc(0.84 * 10.5), seed=2), gold)
+    assert small.verdict == "INVALID" and small.pull == "size_mismatch"
+    assert "part reads 1" in small.message and "% small" in small.message
+    assert small.values["size_deviation_pct"] == pytest.approx(-16.0, abs=1.0)
+    # a nominal diameter is held too (the golden itself may be the mis-scaled one)
+    dn = doc([zone("seat", pos(nominal_diameter_mm=21.0), shape="circle",
+                   coords={"center": [2, 0], "radius": 16.0})], golden={"scan": "g"})
+    assert one(dn, view(disc(10.5), seed=1), gold).verdict == "PASS"
+    both_small = one(dn, view(disc(0.84 * 10.5), seed=2), view(disc(0.84 * 10.5), seed=3))
+    assert both_small.verdict == "INVALID" and "part reads 1" in both_small.message
+    # a rect zone (not a round part): unchanged; size_tol_pct 0: off
+    dr = doc([zone("z", pos(), coords=(-20, -20, 24, 20))], golden={"scan": "g"})
+    assert "outline_diameter_mm" not in one(dr, view(disc(10.5), seed=1), gold).values
+    doff = doc([zone("seat", pos(size_tol_pct=0), shape="circle",
+                     coords={"center": [2, 0], "radius": 16.0})], golden={"scan": "g"})
+    assert one(doff, view(disc(0.84 * 10.5), seed=2), gold).verdict == "PASS"
 
 
 def test_edge_straightness_and_position():

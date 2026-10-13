@@ -2,12 +2,17 @@
 Built-in recipe checks: thin wrappers over the engine's measurements.
 
   presence   part present / absent: enough of the zone stands above the reference plane
-  position   alignment vs the golden part: in-plane offset (mm), rotation (deg), height
+  position   alignment vs the golden part: in-plane offset (mm), rotation (deg), height;
+             on a circle zone also the part's outline size vs the golden's / a nominal
   height     height (or step) of the zone vs the reference plane or another zone
   flatness   plane fit of the zone's points: peak-to-valley and RMS (mm)
   defect     local dents / bumps: MF-CFAR end-face detector on a circular face zone
-             (engine/measure/endface/mfcfar.py, self-referenced), a local-residual blob
-             finder on any other zone
+             (engine/measure/endface/mfcfar.py, self-referenced; its radii derive from the
+             zone's radius), a local-residual blob finder on any other zone. On a face
+             zone also the RIM OUTLINE in the flood (edge dents: a notch / bulge of the
+             outline, engine/measure/endface/outline.py) and the KNOWN SIZE (the outline's
+             diameter vs the zone's own / a nominal: more than size_tol_pct off = INVALID
+             with pull size_mismatch - calibration or lens suspect, never a pass)
   edge       straightness of the part's edge (sub-pixel edge in the flood image, robust
              line fit in the part frame: mm) and its position / angle vs the golden part
   code       a barcode / QR code read in the zone (engine/sense/codes.py decoders)
@@ -168,6 +173,42 @@ def _wrap90(a: float) -> float:
     return (a + 90.0) % 180.0 - 90.0
 
 
+BEHIND_MM = 2.0                     # measured this far behind a face plane: not the face
+
+
+def _disc_outline(sv, px_xy: np.ndarray, uv: np.ndarray, C0, n, radius_mm: float):
+    """The outline (endface.outline.measure) of the bright disc of about radius_mm around
+    the origin of the in-plane frame (u, v) in the scan's flood image: the plane -> image
+    map is the homography of the disc's own measured points (px_xy (N, 2) camera px, uv
+    (N, 2) mm), so the outline is in the cloud's mm whatever the camera model; points the
+    scan measured more than BEHIND_MM behind the plane (C0, n) are dark to it (a lit
+    background is not the part). -> (outline | None, why not)."""
+    from ...measure.endface import outline as outline_mod
+    flood = sv.flood
+    if flood is None:
+        return None, "the scan kept no flood pair (scan.kind fast keeps one)"
+    to_px = outline_mod.homography_map(px_xy, uv)
+    if to_px is None:
+        return None, "too few measured points to map the face plane into the image"
+    with np.errstate(invalid="ignore"):
+        behind = sv.valid & (((sv.xyz - np.asarray(C0, np.float64)) @ np.asarray(n, np.float64))
+                             < -BEHIND_MM)
+    sat = None if sv.flood_white is None else np.asarray(sv.flood_white, np.float32) >= 254.0
+    o = outline_mod.measure(np.asarray(flood, np.float32), to_px, float(radius_mm), sat=sat,
+                            exclude=behind)
+    return o, o["why"]
+
+
+def _size_invalid(sc: dict, values: dict, zone_id: str, warn: list) -> "CheckResult":
+    """The INVALID of a size mismatch: never a pass, never a definite fail - pull reason
+    size_mismatch, which no recipe can turn into a REJECT (engine/disposition.NOT_REJECTABLE:
+    it says the calibration or the lens is suspect, nothing about the part)."""
+    return CheckResult.invalid(f"size mismatch on zone {zone_id}: {sc['message']}",
+                               values=values, pull="size_mismatch",
+                               warnings=list(warn) + [sc["message"]],
+                               details={"size_check": sc})
+
+
 @register
 class Position(Check):
     """Alignment vs the golden part: the part's points in this zone (>= min_height_mm above
@@ -187,7 +228,69 @@ class Position(Check):
         "min_height_mm": Param("number", 2.0, "mm", min=0,
                                doc="part points: this far above the reference plane"),
         "min_points": Param("int", 200, "count", min=10, doc="fewer part points: INVALID"),
+        "nominal_diameter_mm": Param("number", None, "mm", min=0, open_min=True,
+                                     doc="circle zone: the round part's known diameter (its "
+                                         "flood outline is held to it)"),
+        "size_tol_pct": Param("number", 4.0, "pct", min=0, max=50,
+                              doc="circle zone: the part's flood outline vs the golden part's "
+                                  "(and nominal_diameter_mm): further off = size mismatch "
+                                  "(INVALID, pull size_mismatch); 0 = off"),
     }
+
+    def _outline(self, ctx, golden: bool):
+        """The round part's flood outline in a circle zone (the scan's, or the golden's) ->
+        (outline | None, why)."""
+        from ...measure.endface.profile import robust_plane
+        from ..geometry import face_axes
+        if golden:
+            g = ctx.golden
+            sv, fr, z = g.scan, g.frame, g.zones[ctx.zone.id]
+        else:
+            sv, fr, z = ctx.scan, ctx.frame, ctx.zone
+        m = z.valid & (np.nan_to_num(fr.uvh[..., 2], nan=-1e9) >= self.p["min_height_mm"])
+        ys, xs = np.nonzero(m)
+        if len(xs) < self.p["min_points"]:
+            return None, "too few part points"
+        P = sv.xyz[ys, xs]
+        c, n = robust_plane(P)
+        e1, e2 = face_axes(n)
+        W = P - c
+        u, v = W @ e1, W @ e2
+        on = np.abs(W @ n) <= max(2.0, 10 * 1.4826 * float(np.median(np.abs(W @ n))))
+        if on.sum() < self.p["min_points"]:
+            return None, "too few points on the part's top plane"
+        u, v = u - u[on].mean(), v - v[on].mean()            # about the part's own centre
+        r = self.p["nominal_diameter_mm"] / 2 if self.p["nominal_diameter_mm"] else \
+            2.0 * float(np.sqrt(0.5 * (u[on].var() + v[on].var())))   # a uniform disc: R = 2 sigma
+        C0 = c + float(np.mean((P[on] - c) @ e1)) * e1 + float(np.mean((P[on] - c) @ e2)) * e2
+        return _disc_outline(sv, np.c_[xs[on], ys[on]], np.c_[u[on], v[on]], C0, n, r)
+
+    def _size(self, ctx) -> tuple:
+        """Circle zone: the known-size checks -> ([size_check, ...], values, warnings)."""
+        from ...measure.endface import outline as outline_mod
+        p = self.p
+        if ctx.zone.shape != "circle" or not p["size_tol_pct"]:
+            return [], {}, []
+        o, why = self._outline(ctx, False)
+        if o is None or not o["ok"]:
+            return [], {}, [f"size not checked: the part's flood outline could not be measured "
+                            f"({why})"]
+        vals = {"outline_diameter_mm": round(float(o["diameter_mm"]), 4)}
+        out = []
+        if p["nominal_diameter_mm"]:
+            out.append(outline_mod.outline_size(o, p["nominal_diameter_mm"], p["size_tol_pct"],
+                                                "part's flood outline", source="scan"))
+        og, gwhy = self._outline(ctx, True)
+        if og is not None and og["ok"]:
+            vals["golden_outline_diameter_mm"] = round(float(og["diameter_mm"]), 4)
+            out.append(outline_mod.size_check(o["diameter_mm"], og["diameter_mm"],
+                                              p["size_tol_pct"], "part's flood outline",
+                                              source="vs the golden part's outline"))
+        if not out:
+            return [], vals, [f"size not checked: no nominal_diameter_mm and the golden part's "
+                              f"outline could not be measured ({gwhy})"]
+        vals["size_deviation_pct"] = max((s["deviation_pct"] for s in out), key=abs)
+        return out, vals, []
 
     def run(self, ctx) -> CheckResult:
         p = self.p
@@ -214,6 +317,11 @@ class Position(Check):
                   "dz_mm": round(dh, 4), "offset_mm": round(off, 4),
                   "rotation_deg": round(rot, 3) if rot is not None else None,
                   "n_points": int(len(A))}
+        sizes, svals, swarn = self._size(ctx)
+        values.update(svals)
+        bad_size = next((s for s in sizes if s["status"] == "mismatch"), None)
+        if bad_size is not None:                # the mm of this scan cannot be trusted
+            return _size_invalid(bad_size, values, ctx.zone.id, swarn)
         why = []
         if off > p["tol_mm"]:
             why.append(f"offset {off:.2f} mm > {p['tol_mm']:g} mm")
@@ -223,6 +331,7 @@ class Position(Check):
             why.append(f"height {dh:+.2f} mm > {p['tol_height_mm']:g} mm")
         warn = [] if rot_ok else ["rotation not defined: the part's footprint in this zone is "
                                   "round (no principal axis)"]
+        warn += swarn
         faults = []
         if why:
             from scipy.spatial import cKDTree
@@ -241,8 +350,12 @@ class Position(Check):
             tols.append(tolerance("rotation_deg", float(rot), -p["tol_deg"], p["tol_deg"]))
         if p["tol_height_mm"] is not None:
             tols.append(tolerance("dz_mm", dh, -p["tol_height_mm"], p["tol_height_mm"]))
+        if sizes:
+            tols.append(tolerance("size_deviation_pct", float(values["size_deviation_pct"]),
+                                  -p["size_tol_pct"], p["size_tol_pct"]))
         return CheckResult(verdict="FAIL" if why else "PASS", values=values, key=key,
                            limit=limit, fault_points=faults, warnings=warn, tolerances=tols,
+                           details={"size_check": sizes} if sizes else {},
                            message="; ".join(why) if why else
                            f"aligned: offset {off:.2f} mm" + (f", rotation {rot:+.2f} deg"
                                                               if rot is not None else ""))
@@ -418,7 +531,15 @@ def _nan_blur(a: np.ndarray, sigma: float) -> np.ndarray:
 class Defect(Check):
     """Local dents / bumps. mode 'face' (a circular zone: an end face): the MF-CFAR detector
     of engine/measure/endface (matched dent filters, z against the face's own noise,
-    self-referenced: the face's radial profile), triggers deeper than depth_mm FAIL.
+    self-referenced: the face's radial profile), triggers deeper than depth_mm FAIL; a
+    dent's depth is its depth_centre_mm (the 3 x 3 grid-cell average at its deepest place
+    against the local background; the deepest single point over-reads and is reported as
+    depth_min_mm). The detector's radii derive from the zone's radius (radii.py). On a face
+    zone the flood outline is checked too: its roundness (rim_check: a notch / bulge beyond
+    rim_tol_mm over rim_min_arc_mm of rim FAILs - an edge dent, which the height map cannot
+    show) and its size (the outline's diameter vs nominal_diameter_mm, default a part_mm
+    zone's own diameter: more than size_tol_pct off is a size mismatch - INVALID with pull
+    size_mismatch, whatever else was found: calibration or lens suspect).
     mode 'local' (any zone): heights above the reference plane minus their own smooth
     surface (Gaussian, smooth_mm), connected blobs with |residual| >= depth_mm over at least
     min_area_mm2 FAIL; no blob is a PASS only when at least min_valid_pct of the zone's
@@ -447,6 +568,24 @@ class Defect(Check):
                           doc="face: MF-CFAR z threshold (5.5 ~ 1e-3 false triggers per face)"),
         "rim_margin_mm": Param("number", 0.8, "mm", min=0,
                                doc="face: the outer rim band not inspected (chamfer)"),
+        "rim_check": Param("choice", "auto", choices=("auto", "on", "off"),
+                           doc="face: the flood outline's roundness (edge dents). auto: "
+                               "judged when the flood shows the face's outline (skipped, "
+                               "with a warning, only when the scan kept no flood pair or "
+                               "shows no bright disc on a dark surround); an outline that "
+                               "shows but cannot be judged all the way round is INVALID. "
+                               "on: no outline at all is INVALID too; off"),
+        "rim_tol_mm": Param("number", 0.4, "mm", min=0, open_min=True,
+                            doc="face: a notch / bulge of the outline beyond this ..."),
+        "rim_min_arc_mm": Param("number", 1.5, "mm", min=0, open_min=True,
+                                doc="face: ... over at least this much rim FAILs"),
+        "nominal_diameter_mm": Param("number", None, "mm", min=0, open_min=True,
+                                     doc="face: the face's known diameter (default: a part_mm "
+                                         "circle zone's own diameter)"),
+        "size_tol_pct": Param("number", 4.0, "pct", min=0, max=50,
+                              doc="face: the flood outline's diameter vs the nominal one: "
+                                  "further off = size mismatch (INVALID, pull size_mismatch: "
+                                  "calibration or lens suspect); 0 = off"),
         "min_valid_pct": Param("number", 70.0, "pct", min=0, max=100,
                                doc="a clean reading needs at least this % measured (local: the "
                                    "zone's inspected area; face: the face), else INVALID"),
@@ -568,9 +707,11 @@ class Defect(Check):
         core = cv2.erode(u, disc, borderType=cv2.BORDER_CONSTANT, borderValue=0)
         return largest, bool(core.any())
 
-    # ---- circular end face: MF-CFAR
+    # ---- circular end face: MF-CFAR + the rim outline + the known size
     def _face(self, ctx) -> CheckResult:
         from ...measure.endface import mfcfar
+        from ...measure.endface import outline as outline_mod
+        from ...measure.endface import radii as radii_mod
         from ...measure.endface.profile import grid_axis, robust_plane
         from ..geometry import face_axes
         p, z, sv, fr = self.p, ctx.zone, ctx.scan, ctx.frame
@@ -580,11 +721,14 @@ class Defect(Check):
         P = sv.xyz[ys, xs]
         c, n = robust_plane(P)
         # the face centre: the zone circle's centre on the face plane
+        nominal = p["nominal_diameter_mm"]
         if z.units == "part_mm":
             (cu, cv), radius = z.coords["center"], z.coords["radius"]
             a = fr.to_xyz(cu, cv, 0.0)
             den = float(fr.n @ n)
             C0 = a + fr.n * (float((c - a) @ n) / den if abs(den) > 1e-6 else 0.0)
+            if nominal is None:
+                nominal = 2.0 * float(radius)           # the zone IS the face, in mm
         else:
             if z.units == "camera_px":
                 cpx, rpx = z.coords["center"], z.coords["radius"]
@@ -601,23 +745,24 @@ class Defect(Check):
         good = (np.abs(h - med) <= max(2.0, 10 * 1.4826 * mad)) & (np.hypot(u, v) <= radius + 1.0)
         if good.sum() < p["min_points"]:
             return CheckResult.invalid(f"only {int(good.sum())} points on the face plane")
-        inspect = max(radius - p["rim_margin_mm"], 1.0)
-        s = radius / 10.525
+        # every radius from the zone's: the inspected flat ends rim_margin_mm inside it
+        inspect = min(max(radius - p["rim_margin_mm"], 1.0), radius)
+        try:
+            rr = radii_mod.face_radii(radius, {"inspect_r_mm": inspect})
+        except ValueError as e:
+            return CheckResult.invalid(f"zone {z.id}: {e}")
         prm = mfcfar.mf_params({
-            "z_thresh": p["z_thresh"], "min_depth_mm": p["depth_mm"],
-            "inspect_r_mm": inspect, "fit_r_mm": inspect, "rim_r_mm": max(inspect - 0.75, 0.5),
-            "plane_r_mm": 0.85 * radius, "min_area_mm2": 0.0,
-            "sign": "dent" if p["sign"] == "dent" else "both",
-            "noise_bands_mm": tuple(sorted({0.0, 3.0 * s, 6.0 * s, 8.0 * s, 0.86 * radius,
-                                            inspect, radius - 0.25 * s}))})
+            "z_thresh": p["z_thresh"], "min_depth_mm": p["depth_mm"], "min_area_mm2": 0.0,
+            "sign": "dent" if p["sign"] == "dent" else "both"}, radii=rr)
         px = mfcfar.Pixels(iy=ys[good], ix=xs[good], U=u[good][None], V=v[good][None],
                            H=h[good][None], cam_mask=np.ones((1, 1), bool))
         g = grid_axis(radius, 0.25)
+        mpp = ctx.mm_per_px()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             gr = mfcfar.Gridder(px, g, radius, prm["max_edge_mm"])
             maps = gr.repeat_maps()
-            det = mfcfar.detect(maps, None, g, prm)
+            det = mfcfar.detect(maps, None, g, prm, px_mm=mpp)
         trig = [t for t in det["triggers"] if abs(t["depth_mm"]) >= p["depth_mm"]
                 and (p["sign"] == "both" or t["kind"] == "dent")]
         faults = []
@@ -628,45 +773,102 @@ class Defect(Check):
         # threshold, the counted sign) still under depth_mm - so a PASS reports how close it
         # came to the limit (the recipe's guard band reads it), never a flat 0
         worst = (max(abs(t["depth_mm"]) for t in trig) if trig else
-                 self._face_near(det, g, prm, p["depth_mm"], p["sign"]))
+                 self._face_near(det, p["depth_mm"], p["sign"]))
         values = {"max_depth_mm": round(worst, 4), "n_defects": len(trig),
                   "max_z": det.get("max_z"), "coverage_pct": det.get("coverage_pct"),
                   "face_radius_mm": round(radius, 3), "n_points": int(good.sum())}
+        warn = []
+        tols = [tolerance("max_depth_mm", float(worst), hi=p["depth_mm"])]
+        details = {"triggers": trig[:20], "noise_floor_mm": det.get("noise_floor_mm"),
+                   "radii": radii_mod.public(rr)}
+        # ---- the flood outline: the known size, then edge dents
+        o, o_why = None, "rim_check off and size_tol_pct 0"
+        if p["rim_check"] != "off" or p["size_tol_pct"]:
+            o, o_why = _disc_outline(sv, np.c_[xs[good], ys[good]], np.c_[u[good], v[good]],
+                                     C0 + med * n, n, radius)
+        sc = outline_mod.outline_size(o, nominal, p["size_tol_pct"], "face's flood outline",
+                                      source="scan flood", why=o_why)
+        details["size_check"] = sc
+        if o is not None and o["ok"]:
+            values["outline_diameter_mm"] = round(float(o["diameter_mm"]), 4)
+            values["size_deviation_pct"] = sc.get("deviation_pct")
+        if sc["status"] == "mismatch":          # nothing measured here can be trusted
+            return _size_invalid(sc, values, z.id, warn)
+        if sc["status"] == "not_checked" and p["size_tol_pct"]:
+            warn.append(sc["message"])
+        elif sc["status"] == "ok":
+            tols.append(tolerance("size_deviation_pct", float(sc["deviation_pct"]),
+                                  -p["size_tol_pct"], p["size_tol_pct"]))
+        rim_fail = []
+        if p["rim_check"] != "off":
+            j = outline_mod.judge(o, p["rim_tol_mm"], p["rim_min_arc_mm"], 0.0)
+            details["rim_outline"] = outline_mod.public(o, j) if o is not None else \
+                {"measured": False, "status": j["status"], "why": o_why}
+            if j["status"] == "incomplete" and not trig:
+                # the outline shows, but not all of it could be judged (a chip deep enough
+                # leaves no edge, a glint hides one): never passed, whatever rim_check says
+                why = j.get("why") or (o or {}).get("why") or o_why
+                return CheckResult.invalid(f"the rim outline could not be judged all the way "
+                                           f"round ({why}): edge dents unchecked there, the "
+                                           "face can't pass", values=values, pull="incomplete",
+                                           warnings=warn, details=details)
+            if j["status"] in ("not_measured", "incomplete"):
+                why = j.get("why") or (o or {}).get("why") or o_why
+                if p["rim_check"] == "on" and not trig:
+                    return CheckResult.invalid(f"the rim outline could not be judged ({why}): "
+                                               "edge dents unchecked (rim_check on)",
+                                               values=values, warnings=warn, details=details)
+                warn.append(f"rim outline not checked ({why}): edge dents are not looked for")
+            else:
+                rim_fail = j["findings"]
+                peak = max([float(j["arc_peak_mm"] or 0.0)]
+                           + [abs(f["depth_mm"]) for f in rim_fail])
+                values.update(rim_rms_mm=round(float(j["rms_mm"]), 4),
+                              rim_max_mm=round(float(j["max_abs_mm"]), 4),
+                              rim_arc_peak_mm=round(peak, 4), n_rim_defects=len(rim_fail))
+                tols.append(tolerance("rim_arc_peak_mm", peak, hi=p["rim_tol_mm"]))
+                r0 = float(o["radius_mm"])
+                off = np.asarray(o["centre_offset_mm"], np.float64)
+                for f in rim_fail[:10]:         # the mark sits just inside the rim, on the face
+                    t = math.radians(f["theta_deg"])
+                    X = C0 + med * n + (off[0] + 0.9 * r0 * math.cos(t)) * e1 \
+                        + (off[1] + 0.9 * r0 * math.sin(t)) * e2
+                    faults.append({"px": ctx.px_of(X),
+                                   "label": f"rim {f['kind']} {abs(f['depth_mm']):.2f} mm"})
         cov = det.get("coverage_pct") or 0.0
-        if not trig and cov < p["min_valid_pct"]:
+        if not trig and not rim_fail and cov < p["min_valid_pct"]:
             return CheckResult.invalid(f"only {cov:.0f} % of the face measured (< "
                                        f"{p['min_valid_pct']:g} %): an unmeasured face is never "
-                                       "passed", values=values)
+                                       "passed", values=values, warnings=warn, details=details)
+        bad = bool(trig or rim_fail)
+        msg = []
+        if trig:
+            msg.append(f"{len(trig)} defect(s) on the face, deepest "
+                       f"{abs(trig[0]['depth_mm']):.3f} mm (z {trig[0]['z']:.1f})")
+        if rim_fail:
+            f0 = rim_fail[0]
+            msg.append(f"{len(rim_fail)} rim {f0['kind']}(es): {abs(f0['depth_mm']):.2f} mm over "
+                       f"{f0['arc_mm']:g} mm of rim at {f0['theta_deg']:g} deg")
         return CheckResult(
-            verdict="FAIL" if trig else "PASS", values=values, key="max_depth_mm",
-            limit=p["depth_mm"], fault_points=faults,
-            tolerances=[tolerance("max_depth_mm", float(worst), hi=p["depth_mm"])],
-            details={"triggers": trig[:20], "noise_floor_mm": det.get("noise_floor_mm")},
-            message=(f"{len(trig)} defect(s) on the face, deepest {abs(trig[0]['depth_mm']):.3f} "
-                     f"mm (z {trig[0]['z']:.1f})" if trig else
+            verdict="FAIL" if bad else "PASS", values=values,
+            key="max_depth_mm" if trig or not rim_fail else "rim_arc_peak_mm",
+            limit=p["depth_mm"] if trig or not rim_fail else p["rim_tol_mm"],
+            fault_points=faults, tolerances=tols, warnings=warn, details=details,
+            message=("; ".join(msg) if bad else
                      f"face clear (no dent >= {p['depth_mm']:g} mm at z >= {p['z_thresh']:g}"
-                     + (f"; deepest significant {worst:.3f} mm" if worst > 0 else "") + ")"))
+                     + (f"; deepest significant {worst:.3f} mm" if worst > 0 else "")
+                     + (f"; rim outline within {p['rim_tol_mm']:g} mm"
+                        if "rim_arc_peak_mm" in values else "") + ")"))
 
     @staticmethod
-    def _face_near(det: dict, g, prm: dict, depth_mm: float, sign: str) -> float:
+    def _face_near(det: dict, depth_mm: float, sign: str) -> float:
         """The deepest significant dent (z >= the detector's threshold, in the inspected
-        zone, the counted sign) shallower than depth_mm, from the detector's own maps; 0.0
-        when there is none."""
-        from ...measure.endface import mfcfar
-        Z, Dm = det.get("z_map"), det.get("depth_map")
-        if Z is None or Dm is None:
-            return 0.0
-        _, _, R = mfcfar.grid_mesh(np.asarray(g, np.float64))
-        thr = np.full(R.shape, float(prm["z_thresh"]))
-        if prm.get("rim_z_thresh") is not None:
-            thr[R > prm["rim_r_mm"]] = float(prm["rim_z_thresh"])
-        with np.errstate(invalid="ignore"):
-            sig = (R <= prm["inspect_r_mm"]) & np.isfinite(Z) & np.isfinite(Dm) & (Z >= thr)
-            if sign == "dent":
-                sig &= Dm > 0
-            d = np.abs(Dm[sig])
-        d = d[d < depth_mm]
-        return float(d.max()) if d.size else 0.0
+        zone, the counted sign) shallower than depth_mm - the detector's candidates that
+        did not reach the depth limit (depth_centre_mm, as every depth); 0.0 when none."""
+        # (a depth that rounds up to the limit counts as ON it: inside any guard band)
+        d = [min(abs(c["depth_mm"]), depth_mm) for c in det.get("candidates") or []
+             if not c.get("trigger") and (sign == "both" or c["kind"] == "dent")]
+        return float(max(d)) if d else 0.0
 
 
 # ================================================================== edge

@@ -17,7 +17,9 @@ ZoneView   one zone resolved on the scan: its camera px (mask), the measured px 
 Zone units (said in the recipe, never guessed):
   camera_px     the shape drawn in the camera image
   projector_px  native DMD (col, row) px: camera px whose decoded correspondence falls in it
-                (needs both axes decoded); grid-cells are DMD cells too
+                (needs both axes decoded); grid-cells are DMD cells too, and so is a zone
+                painted on the part (shape "zoneset": engine/zones - the set painted at the
+                scan's geometry, with the same geometry-bound rig settings, or a ZoneError)
   part_mm       mm in the part frame: measured points whose (u, v) falls in it (3-D: a part
                 standing proud of the fixture is still in its zone)
 
@@ -278,9 +280,17 @@ def grid_mask(cells: str) -> np.ndarray:
     return zones_mod.projector_mask(zones_mod.parse_zone(text, grid), grid)
 
 
-def dmd_zone_mask(z) -> np.ndarray:
+def dmd_zone_mask(z, meta: Optional[dict] = None) -> np.ndarray:
+    """The DMD mask of a projector_px zone. meta: the scan's meta (its geometry_id +
+    geometry_fp), which a painted zone (shape "zoneset") is bound to."""
     if z.shape == "grid-cells":
         return grid_mask(z.coords)
+    if z.shape == "zoneset":
+        from ..zones import use as zone_use
+        try:
+            return zone_use.recipe_mask(z, meta)
+        except ValueError as e:              # another geometry / rig settings, unbound, gone
+            raise ZoneError(str(e)) from None
     return _raster(shape_points(z.shape, z.coords), DMD_SHAPE)
 
 
@@ -487,7 +497,10 @@ def resolve_zone(z, sv: ScanView, frame: PartFrame) -> ZoneView:
         outline = [poly]
         cover = _cover_camera(poly, sv.valid)
     elif z.units == "projector_px":
-        dm = dmd_zone_mask(z)
+        dm = dmd_zone_mask(z, sv.meta)
+        if z.shape == "zoneset":
+            from ..zones import use as zone_use
+            warnings += zone_use.recipe_warnings(z, sv.meta)
         mask = _from_dmd(sv, dm)
         outline = _contours(mask)
         cover = _cover_dmd(sv, dm)
@@ -540,7 +553,7 @@ def datum_mask(recipe, sv: ScanView) -> Optional[np.ndarray]:
     z = recipe.zone(ref["zone"])
     if z.units == "camera_px":
         return _raster(shape_points(z.shape, z.coords), sv.shape)
-    return _from_dmd(sv, dmd_zone_mask(z))
+    return _from_dmd(sv, dmd_zone_mask(z, sv.meta))
 
 
 def frame_for(recipe, sv: ScanView) -> PartFrame:

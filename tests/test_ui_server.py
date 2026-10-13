@@ -277,6 +277,9 @@ out.pending = run('S.selectScan');
 out.zones = run(`[zoneForEngine('e6', { grid: { spacing_px: 96 } }), zoneForEngine('C4@64', { grid: { spacing_px: 96 } }),
   zoneForEngine('c4:d6', null), zoneForEngine('B2,E5', { grid: { spacing_px: 64 } }), zoneForEngine('', { grid: { spacing_px: 96 } })]`);
 out.atlasZone = run(`[zoneForEngine(' atlas: cell/cell ', { grid: { spacing_px: 96 } }), ATLAS_RE.test('atlas:cell/cell'), regionArg('720, 768, 768, 1056')]`);
+out.paintedZone = run(`[zoneForEngine(' zoneset: lid_Zones ', { grid: { spacing_px: 96 } }), zoneForEngine('ZoneSet:lid.a-1: Z1, Z3', { grid: { spacing_px: 64 } }),
+  regionArg('zoneset:lid_Zones/Z2'), ZONESET_RE.test('zoneset:lid_Zones'), ZONESET_RE.test('zoneset:lid_Zones:Z1,Z3'), ZONESET_RE.test('zoneset:lid_Zones/Z2'),
+  ZONESET_RE.test('zoneset:two words'), ZONESET_RE.test('zoneset:lid:C4'), ZONE_RE.test('zoneset:lid_Zones')]`);
 
 // virtual sensors: where a spot / sensor goes, as the operator types it
 out.at = run(`[parseAt('h8', { grid: { spacing_px: 96 } }), parseAt('dmd 456,570', null), parseAt('cam 700 500', null),
@@ -345,6 +348,9 @@ def test_app_js_scan_pickers_follow_new_scans_and_zones_pin_the_grid(tmp_path):
     assert out["zones"] == ["E6@96", "C4@64", "C4:D6", "B2,E5@64", ""]
     # Surfer atlas regions go out as typed (never upper-cased or pinned to a grid)
     assert out["atlasZone"] == ["atlas:cell/cell", True, [720, 768, 768, 1056]]
+    # ... and so does a painted zone set (its name keeps its case; no '@96' is added)
+    assert out["paintedZone"] == ["zoneset:lid_Zones", "zoneset:lid.a-1:Z1,Z3", "zoneset:lid_Zones/Z2",
+                                  True, True, True, False, False, False]
     assert out["sent"]["verb"] == "capture_object" and out["sent"]["args"]["zone"] == "E6@96"
     brief = out["brief"]
     assert '"zone":"E6@96"' in brief and '"base_id":"base_1"' in brief, brief

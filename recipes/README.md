@@ -90,7 +90,7 @@ of the scan (the fixture), the verdict projected for 5 s.
 | `preset` | required: the rig preset the recipe pins - rig geometry + capture settings; its stereo calibration gives the mm (a station configuration's profile may scan with its own) |
 | `scan.kind` | `fast` (HDMI fast scan, default), `metric` (both axes, the preset's full set), `trigger` (hardware-triggered flash pack: `scan.pack`, and `recipe-run --pattern-mode-set-by-human`) |
 | `scan.axis` | `xy` (default; projected feedback and projector-px zones need both DMD axes) or `x` |
-| `scan.zone` | light only these grid cells (`F10:J12`, `F10:J12@96`) or an atlas region; null = whole field |
+| `scan.zone` | light only these grid cells (`F10:J12`, `F10:J12@96`), an atlas region, or a painted zone set (`zoneset:<set>`, `zoneset:<set>:Z1,Z3`: `scan zone-paint`); null = whole field |
 | `scan.average`, `scan.steps`, `scan.periods`, `scan.hold_s` | fast-scan settings (null = the engine's defaults) |
 | `scan.codes` | `true`: read codes under bracketed DMD floods before the scan (for `code` checks) |
 | `scan.rig_check` | `true`: the HOME rig check first; MOVED / UNKNOWN -> INVALID |
@@ -121,6 +121,18 @@ still in its zone (3-D membership, no parallax).
 | `circle` | `{"center": [x, y], "radius": r}` | same |
 | `polygon` | `[[x, y], ...]` (>= 3 points) | same |
 | `grid-cells` | `"F10:J12"` / `"F10:J12@96"` (the projected grid's cells) | `projector_px` |
+
+**A zone painted on the part.** `{"id", "label", "ref": "zoneset:<set>/<zone id>", "checks",
+"datum", "feedback"}` refers to a zone of a painted zone set (`scan zone-paint --name <set>`: the
+operator draws it on the part with the projected mouse cursor; README, *Zones: paint them on
+the part*). It gives no `shape` / `units` / `coords` of its own: it is in `projector_px`, and
+its shape is the set's, read when the recipe is loaded - paint the set again and the recipe
+looks at the new shape. The reference is checked when the recipe is loaded (the set and the
+zone id must exist in the library) and bound when it runs: the set painted at the scan's
+`geometry_id`, with the same geometry-bound rig settings, is used; if there is none (painted
+for another rig placement only) the zone is unresolved, its checks are INVALID and the part
+is PULLed. `scan zones <set> --recipe` prints a set as plain `projector_px` zones instead
+(coordinates copied; `--by-ref` as references).
 
 Units are always said: there is no default for `units` (except grid cells). `datum: true` =
 a reference-only zone (no checks: e.g. the plane for `part.frame.reference`);

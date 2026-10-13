@@ -18,6 +18,10 @@ which is nothing but prompts, needs --interactive. With --interactive
 every prompt gives up after --prompt-timeout seconds and the command
 stops with nothing done (exit 1): a script, an agent or a detached
 terminal can never leave a command hanging on a question nobody sees.
+(`zone-paint` is not a prompt but a drawing session on the projector: the
+operator draws zones on the part with the mouse and ends it there with
+Space / Esc; it gives the rig back after --idle-timeout seconds without
+input, nothing saved. With --mock it replays a scripted session.)
 
 The zone workflow is the reason the grid exists. `grid` projects a lettered
 grid and photographs it, a person or an AI agent reads the photo, and
@@ -1470,6 +1474,142 @@ def cmd_grid(ctx):
         "then": [" ".join(h.split()[:4]) for h in howto]}}
 
 
+# ------------------------------------------------------------ painted zone sets
+
+def _zone_rows(zones: list) -> list:
+    return [[z["id"], z.get("name") or "-", z["shape"],
+             " x ".join(f"{v:g}" for v in z["size_px"]) if z.get("size_px") else "-",
+             _f(z.get("rotation_deg"), 1),
+             ",".join(str(v) for v in z["bbox_dmd_px"]) if z.get("bbox_dmd_px") else "-",
+             _f(z.get("area_px"), 0)] for z in zones]
+
+
+_ZONE_HEAD = ["zone", "name", "shape", "size DMD px", "deg", "box col0,row0,col1,row1", "area px"]
+
+
+def _zones_text(spec: str) -> str:
+    """--zones SET[:Z1,Z3] -> the engine's zone text 'zoneset:SET[:Z1,Z3]' (checked here so
+    a typo is refused before anything is loaded)."""
+    from engine.zones import use as zone_use
+    name, ids = zone_use.parse_spec(spec, bare=True)
+    return zone_use.spec_text(name, ids)
+
+
+def cmd_zone_paint(ctx):
+    """The zone painter: draw zones on the part with the mouse (MOCK: a scripted session)."""
+    from engine.zones import painter
+    a = ctx.args
+    events = None
+    if a.events:
+        if not ctx.mock:
+            raise CLIError("--events is MOCK ONLY: on the real rig the operator draws on the part")
+        events = list(painter.DEMO_EVENTS) if a.events == "demo" else painter.load_events(a.events)
+    elif ctx.mock:
+        raise CLIError("MOCK: the painter runs headless from a scripted session: --events "
+                       "FILE.json (a list of painter events), or --events demo")
+    ctx.header()
+    if not ctx.mock:
+        ctx.say("Zone painter: the projector window now takes the mouse. Move the cursor onto",
+                "the part and draw there (the rig is held until Space / Esc, or "
+                f"{a.idle_timeout:g} s without input).")
+        ctx.table(["key / mouse", "does"], [list(k) for k in painter.KEYS])
+    labels = [s.strip() for s in a.labels.split(",")] if a.labels else None
+    out = api.zone_paint(a.name, ctx.preset(), source=a.source, events=events,
+                         replace=a.replace, labels=labels, polarity=a.polarity,
+                         note=a.note or "", idle_timeout_s=a.idle_timeout)
+    ctx.warn(out.get("warnings"))
+    if not out["saved"]:
+        ctx.say(f"Zone set {a.name}: NOT saved - {_one_line(out['reason'])}")
+        return EXIT_NOT_OK, {"zone_paint": out}
+    ctx.say(f"Zone set {out['name']} saved: {out['n_zones']} zone(s), geometry "
+            f"{out['geometry_id']} (projector px, valid at this rig placement)")
+    ctx.table(_ZONE_HEAD, _zone_rows(out["zones"]))
+    ctx.kv([["zones", str(out["zones_json"])], ["masks", str(out["masks"])],
+            ["preview", str(out["preview"])], ["photo", str(out["camera"] or "-")]])
+    ctx.say(f"  Next: scan zone-show {out['name']}   (where the zones land in the camera image)",
+            f"        scan scan-fast LABEL --zones {out['name']}[:Z1,Z3]",
+            f"        scan zones {out['name']} --recipe   (the zones as a recipe's zones)")
+    return EXIT_OK, {"zone_paint": out}
+
+
+def cmd_zones(ctx):
+    """List the painted zone sets, or show one (its zones, a recipe fragment, a scan mask)."""
+    a = ctx.args
+    if not a.set:
+        try:
+            here = ctx.preset().geometry_id
+        except (config.ConfigError, rules.RuleViolation, CLIError):
+            here = None
+        items = [i for i in api.zone_sets(all_geometries=True)
+                 if not a.geometry or i["geometry_id"] == a.geometry]
+        ctx.say(f"Zone sets ({len(items)}; * = painted at this preset's geometry"
+                f"{' ' + here if here else ''}):")
+        ctx.table(["", "name", "geometry", "zones", "created", ""],
+                  [["*" if i["geometry_id"] == here else "", i["name"], i["geometry_id"],
+                    ", ".join(z["id"] + (f" ({z['name']})" if z.get("name") else "")
+                              for z in i["zones"]) or "-",
+                    i.get("created") or "-",
+                    "" if i["valid"] else f"INVALID: {_one_line(i['error'])}"] for i in items])
+        if not items:
+            ctx.say("  none yet - paint one on the part: scan zone-paint --name NAME")
+        return EXIT_OK, {"zone_sets": items}
+    zs = api.zone_set(a.set, ctx.preset())
+    text = _zones_text(a.set)
+    ids = text.split(":")[2].split(",") if text.count(":") > 1 else None
+    summary = zs.summary()
+    chosen = [z for z in summary["zones"] if ids is None or z["id"] in ids]
+    ctx.say(f"Zone set {zs.name}  (geometry {zs.geometry_id}, preset {zs.preset or '?'}, "
+            f"painted {zs.created or '?'})")
+    ctx.table(_ZONE_HEAD, _zone_rows(chosen))
+    ctx.kv([["stored", str(zs.path)], ["use as", f"--zones {zs.name}" + (":" + ",".join(ids)
+                                                                         if ids else "")]])
+    changes = next((i.get("rig_changes") for i in api.zone_sets(ctx.preset())
+                    if i["name"] == zs.name), None) or []
+    if changes:
+        ctx.warn([f"since it was painted the rig-state record has: {'; '.join(changes[:4])} - "
+                  f"check the zones (scan zone-show {zs.name}) or paint the set again"])
+    data = {"zone_set": {**summary, "zones": chosen}, "spec": text, "rig_changes": changes}
+    if a.recipe or a.by_ref:
+        data["recipe_zones"] = api.zone_recipe(a.set, ctx.preset(), by_ref=a.by_ref)
+        ctx.say("", "recipe zones (paste under \"zones\" in a recipe; edit the checks; a "
+                "projector_px zone needs scan.axis xy):",
+                json.dumps(data["recipe_zones"], indent=2))
+    if a.mask_out:
+        try:
+            data["mask"] = str(api.zone_mask(a.set, ctx.preset(), out=a.mask_out))
+        except FileExistsError:
+            raise CLIError(f"--mask-out {a.mask_out}: the file exists (never overwritten)") from None
+        ctx.say(f"  mask written: {data['mask']}  (scan scan-fast LABEL --mask {data['mask']})")
+    return EXIT_OK, data
+
+
+def cmd_zone_show(ctx):
+    """Project a saved zone set, photograph it, report where each zone lands."""
+    ctx.header()
+    a = ctx.args
+    r = api.zone_show(a.set, ctx.preset(), a.hold, a.label)
+    ctx.say(f"Zone set {r['zoneset']}: {sum(z['seen'] for z in r['zones'])} of "
+            f"{len(r['zones'])} zone(s) land in the camera image")
+    ctx.table(["zone", "name", "seen", "camera px", "centre x,y", "box x0,y0,x1,y1", "DMD px"],
+              [[z["id"], z.get("name") or "-", _f(z["seen"]), z["camera_px"],
+                ",".join(_f(v, 0) for v in z["centroid_px"]) if z["centroid_px"] else "-",
+                ",".join(str(v) for v in z["bbox_px"]) if z["bbox_px"] else "-", z["dmd_px"]]
+               for z in r["zones"]])
+    ctx.kv([["camera photo", str(r["camera_png"] or "-")], ["overlay", str(r["overlay_png"] or "-")],
+            ["sent to DMD", str(r["dmd_png"] or "-")], ["record", str(r["json_path"])]])
+    ctx.warn(r["warnings"])
+    return (EXIT_OK if r["all_seen"] else EXIT_NOT_OK), {"zone_show": r}
+
+
+def cmd_zone_delete(ctx):
+    a = ctx.args
+    r = api.zone_delete(a.name, a.reason, ctx.preset(), force=a.force)
+    ctx.say(f"Zone set {r['name']} moved to the library trash: {r['trashed']}")
+    if r["recipes"]:
+        ctx.say(f"  ! recipe(s) {', '.join(r['recipes'])} named it (forced)")
+    return EXIT_OK, {"deleted": r}
+
+
 def _load_patterns(src: str) -> list:
     """DMD images from an .npz (key 'patterns', else its first array) or a folder of PNGs
     (sorted by name; grey stays one channel)."""
@@ -2834,17 +2974,31 @@ def cmd_scan_fast(ctx):
         zone = str(Path(a.mask).resolve())
     faces = [_find_face(f) for f in (a.face or [])] or None
     avg = a.average if a.average is not None else 2
+    zones = None
+    if a.zones:
+        if zone:
+            raise CLIError("give --zones (a painted zone set) or --zone / --mask, not both")
+        zones = _zones_text(a.zones)
+    # a zone set: both DMD axes unless the operator asks for columns only, so every point is
+    # assigned to its zone exactly
+    axis = a.axis or ("xy" if zones else "x")
     ms = api.scan_fast(zone, ctx.preset(), a.label, a.steps, _periods(a.periods), avg, a.hold,
-                       a.axis, faces, a.margin)
+                       axis, faces, a.margin, **({"zones": zones} if zones else {}))
     m = ms.meta
     ctx.say(f"Fast scan {ms.id}: {m['n_points']} points in mm ({m['method']}), zone {m['zone']}")
+    zr = m.get("zones") if zones else None
+    if zr:
+        ctx.table(["zone", "name", "points", "DMD px"],
+                  [[zid, zr["names"].get(zid) or "-", "?" if n is None else n, zr["dmd_px"][zid]]
+                   for zid, n in zr["counts"].items()]
+                  + [["(outside)", "-", zr["outside"], "-"]])
     ctx.kv([["patterns", f"{m['n_patterns']} ({m['steps']} steps x periods "
                          f"{', '.join(f'{p:g}' for p in m['periods_px'])} DMD px + floods)"],
             ["capture", f"{_u(m['capture_s'], 's', 2)} ({_u(m['per_pattern_s'], 's', 3)} per pattern; "
                         f"average {m['average']}, hold {m['min_hold_s']:g} s)"],
             ["valid", f"{m['valid_pct']:.1f} %"], ["flood pair", "kept (flood.npz)"]])
     ctx.warn(m.get("warnings"))
-    return EXIT_OK, {"metric_scan": ms}
+    return EXIT_OK, {"metric_scan": ms, **({"zones": zr} if zr else {})}
 
 
 def _flood_arg(key: Optional[str]):
@@ -4677,9 +4831,14 @@ def cmd_measure_run(ctx):
     if not a.what and not a.spec:
         raise CLIError("what to measure? --what flatness | step | distance | cylinder | endface "
                        "| dims | deviation (or --spec FILE)")
+    zone = a.zone
+    if a.zones:
+        if zone:
+            raise CLIError("give --zones (a painted zone set) or --zone (grid cells), not both")
+        zone = _zones_text(a.zones)
     try:
         spec = api.measure_spec(
-            a.what, a.spec, roi=_roi(a.roi), roi2=_roi(a.roi2), zone=a.zone, zone2=a.zone2,
+            a.what, a.spec, roi=_roi(a.roi), roi2=_roi(a.roi2), zone=zone, zone2=a.zone2,
             p1=_px_point(a.p1, "--p1"), p2=_px_point(a.p2, "--p2"), golden=a.golden,
             radius_mm=a.radius, axis=a.axis, min_height_mm=a.min_height,
             face_diameter_mm=a.diameter, n_faces=a.faces, repeats=a.repeats,
@@ -4846,6 +5005,19 @@ zones ("scan the zone the part is in"):
   scan map                         camera<->projector map (once per rig position)
   scan grid                        project + photograph a lettered grid (A1, B2, ...)
   scan scan part --zone C4:D5      light and measure only those cells
+
+painted zones (draw them ON THE PART: the projector is a second monitor, the mouse cursor
+is projected; zones are projector px, valid at this rig placement):
+  scan zone-paint --name lid       drag = rectangle, E ellipse, P polygon (clicks; Enter or
+                                   double-click closes); click selects, drag inside moves,
+                                   handles resize, wheel / [ ] rotate, N names, Del removes,
+                                   Z undo, G grid; SPACE saves the set, ESC cancels
+  scan zones [lid]                 the saved sets / one set's zones (--recipe, --mask-out)
+  scan zone-show lid               project it, photograph, where each zone lands
+  scan scan-fast part --zones lid[:Z1,Z3]   light + decode only those zones; points per zone
+  scan measure-run P --what flatness --zones lid:Z1   the zone as the measured region
+  recipes: a zone {"id": "lid", "ref": "zoneset:lid/Z1", "checks": [...]}, scan.zone
+      "zoneset:lid"; mock: scan --mock zone-paint --name lid --events demo
 
 virtual sensors (the DMD draws the spot, the camera is the receiver):
   scan spot-size 6.5 [--measured K]      6.5 mm spot -> DMD px (cols x rows), nominal vs
@@ -5254,6 +5426,59 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spacing", type=_positive_int, default=96, help="cell size, DMD px")
     p.add_argument("--label", default="grid")
     p.add_argument("--hold", type=float, default=0.0, help="keep the grid up N s to look at it")
+    p = cmd("zone-paint", cmd_zone_paint,
+            "paint zones ON THE PART: the projector window takes the mouse (its cursor is "
+            "projected), drag rectangles / ellipses (E) / polygons (P) over the areas, move, "
+            "resize, rotate, name (N); Space confirms and saves the zone set, Esc cancels. "
+            "Exit 0 saved, 1 not saved, 2 refused (rig busy, the name exists ...)",
+            "the zone painter")
+    p.add_argument("--name", required=True, metavar="SET",
+                   help="the zone set to save [A-Za-z0-9_.-] (at this preset's geometry)")
+    p.add_argument("--from", dest="source", metavar="SET",
+                   help="start from the zones of a saved set (edit it; with the same --name "
+                        "add --replace)")
+    p.add_argument("--replace", action="store_true",
+                   help="replace an existing set of this name (the old one goes to trash/)")
+    p.add_argument("--events", metavar="FILE|demo",
+                   help="MOCK ONLY: the scripted session, a .json list of painter events "
+                        "({\"type\": \"drag\", \"from\": [c, r], \"to\": [c, r]}, {\"type\": "
+                        "\"key\", \"key\": \"space\"} ...), or `demo` (a built-in one)")
+    p.add_argument("--labels", metavar="A,B,..",
+                   help="the names N cycles through (default part, datum, end face, tube, box, "
+                        "edge, fixture)")
+    p.add_argument("--polarity", choices=("measure", "normal", "inverted"), default="measure",
+                   help="how bright is sent: measure (default: raw black vs raw white, one lit "
+                        "field for one hold before the drawing) | normal | inverted")
+    p.add_argument("--note", metavar="TEXT", help="a note stored with the set")
+    p.add_argument("--idle-timeout", type=float, default=600.0, metavar="S",
+                   help="give the rig back after S seconds without input, nothing saved "
+                        "(default 600)")
+    p = cmd("zones", cmd_zones, "list the painted zone sets; zones SET[:Z1,Z3] shows one (its "
+                                "zones in projector px), --recipe prints it as a recipe's "
+                                "zones, --mask-out writes its scan mask", "the zone sets")
+    p.add_argument("set", nargs="?", metavar="SET[:IDS]", help="a zone set (at this preset's "
+                                                               "geometry), optionally some zones")
+    p.add_argument("--geometry", metavar="ID", help="listing: only this geometry id")
+    p.add_argument("--recipe", action="store_true",
+                   help="print the zones as a recipe's `zones` (projector_px coordinates)")
+    p.add_argument("--by-ref", action="store_true",
+                   help="... as references (\"ref\": \"zoneset:SET/Z1\": a re-painted set "
+                        "updates the recipe)")
+    p.add_argument("--mask-out", metavar="NPY",
+                   help="write the union DMD mask (1140 x 912 .npy) for scan-fast --mask")
+    p = cmd("zone-show", cmd_zone_show, "project a saved zone set on the part, photograph it "
+                                        "and report where each zone lands in the camera image "
+                                        "(exit 0 every zone seen, 1 one is not)",
+            "the zone set projection")
+    p.add_argument("set", metavar="SET[:IDS]", help="zone set, optionally some zones (lid:Z1,Z3)")
+    p.add_argument("--hold", type=float, default=5.0, metavar="S",
+                   help="keep the outlines up S seconds to look at them (default 5)")
+    p.add_argument("--label", help="output label (default zones_<set>)")
+    p = cmd("zone-delete", cmd_zone_delete, "move a zone set to the library trash "
+                                            "(recoverable)", "zone set delete")
+    p.add_argument("name", metavar="SET")
+    p.add_argument("--reason", required=True, help="why (recorded with the trashed set)")
+    p.add_argument("--force", action="store_true", help="delete even when a recipe names it")
     p = cmd("project-capture", cmd_project_capture, "project your own DMD images (1140 x 912 "
                                                     "uint8, <= 256) and photograph each one",
             "the custom pattern capture")
@@ -5559,6 +5784,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("label", nargs="?", default="fast")
     p.add_argument("--zone", help='light only these grid cells ("F10:J12") or atlas:<name>/<region>')
     p.add_argument("--mask", metavar="NPY", help="or a DMD mask (1140 x 912 .npy)")
+    p.add_argument("--zones", metavar="SET[:IDS]",
+                   help="or a painted zone set (scan zone-paint): light and decode only its "
+                        "zones (lid, or lid:Z1,Z3; their union is lit); the result gives the "
+                        "points per zone")
     p.add_argument("--face", action="append", metavar="FACE",
                    help="also light this face target's ellipse (+ --margin); repeatable")
     p.add_argument("--margin", type=float, default=6.0, metavar="DMD_PX")
@@ -5566,8 +5795,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--periods", help="T,T,T DMD px (default 8,80,1280)")
     p.add_argument("--hold", type=float, default=0.12, metavar="S",
                    help="HDMI hold per pattern for this run (default 0.12 s)")
-    p.add_argument("--axis", choices=("x", "xy"), default="x",
-                   help="x (default, enough for station heights) or xy (needed by face-locate)")
+    p.add_argument("--axis", choices=("x", "xy"),
+                   help="x (default, enough for station heights) or xy (needed by face-locate; "
+                        "the default with --zones, so every point is assigned to its zone)")
     station_help = ("station parameters: --band LO,HI (tube edge height band, mm; default auto), "
                     "--roi, --skip-zones L,R, --centre")
     p = cmd("station", cmd_station, "cylinder end faces + tube edge zones of a metric scan: "
@@ -5828,6 +6058,9 @@ def build_parser() -> argparse.ArgumentParser:
                                                   "only them)")
     p.add_argument("--zone2", metavar="ZONE", help="region B as grid cells (needs a projector "
                                                    "map: scan map)")
+    p.add_argument("--zones", metavar="SET[:IDS]",
+                   help="region A as a painted zone set (scan zone-paint): only its zones are "
+                        "lit, and the camera px that decode into them are the region")
     p.add_argument("--p1", metavar="X,Y", help="a picked point, camera px")
     p.add_argument("--p2", metavar="X,Y", help="a second picked point, camera px")
     p.add_argument("--golden", metavar="ID", help="deviation: the golden metric scan (id / label)")

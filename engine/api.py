@@ -108,6 +108,7 @@ def paths() -> dict:
             "spectral": r / "spectral", "banks": r / "banks", "maps": r / "maps",
             "sensors": r / "sensors", "atlases": r / "atlases", "dentsets": r / "dentsets",
             "faces": r / "faces", "facescans": r / "facescans", "face_golden": r / "face_golden",
+            "zones": r / "zones",
             "output": r / "output", "output_index": r / "output" / "index.csv",
             "sessions": r / "sessions", "trash": r / "trash",
             "presets": _engine().presets_dir or config.PRESETS_DIR,
@@ -1317,6 +1318,107 @@ def project_zones(zones: list, preset: Optional[Preset] = None, label: str = "zo
                            cancel=cancel)
 
 
+# ------------------------------------------------ painted zone sets (engine/zones/)
+# The projector is a second monitor: the mouse cursor is projected onto the part, and the
+# operator drags shapes out directly on it. A zone set lives in the library at the geometry
+# it was painted at (zones/<geometry_id>/<name>/) and is named "zoneset:<set>[:Z1,Z3]"
+# wherever a lit zone is named.
+
+def zone_sets(preset: Optional[Preset] = None, all_geometries: bool = False) -> list:
+    """The saved zone sets: at the preset's geometry (default: the loaded preset's), or of
+    every geometry (all_geometries, or when no preset is loaded). Each: name, geometry_id,
+    created, zones [{id, name, shape, bbox_dmd_px, area_px}], preview / camera PNG, valid /
+    error. Never touches the rig."""
+    from .zones import store as zstore
+    s = _engine()
+    p = preset or s.preset
+    if all_geometries or p is None:
+        return zstore.listing(s.store)
+    return zstore.listing(s.store, p.geometry_id)
+
+
+def zone_set(zones: str, preset: Optional[Preset] = None):
+    """A saved zone set ("<set>" or "zoneset:<set>[:ids]") at the preset's geometry ->
+    engine.zones.ZoneSet. Refused (GeometryMismatch) when it was painted at another geometry
+    or other rig settings: zones are projector px at one rig placement."""
+    from .zones import use as zone_use
+    return zone_use.select(_engine().store, _preset(preset), zones, bare=True)[0]
+
+
+def zone_recipe(zones: str, preset: Optional[Preset] = None, by_ref: bool = False,
+                checks: Optional[list] = None) -> list:
+    """The `zones` list of a recipe for a zone set ("<set>" or "<set>:Z1,Z3"), in projector
+    px: an upright rectangle as a rect, a round ellipse as a circle, the rest as polygons;
+    by_ref: each zone refers to the set instead ("ref": "zoneset:<set>/<id>", so a re-painted
+    set updates the recipe). checks: the checks every zone gets (default: presence)."""
+    from .zones import use as zone_use
+    zs, ids, _text = zone_use.select(_engine().store, _preset(preset), zones, bare=True)
+    return zone_use.recipe_zones(zs, ids, checks, by_ref=bool(by_ref))
+
+
+def zone_mask(zones: str, preset: Optional[Preset] = None, out=None):
+    """The DMD mask a scan is lit through for a zone set ("<set>" or "<set>:Z1,Z3"): the
+    union of its zones, bool (1140, 912). out: also write it as a NEW .npy (for `scan
+    scan-fast --mask`; never replaced) -> the mask, or the file's path."""
+    from .zones import use as zone_use
+    zs, ids, _text = zone_use.select(_engine().store, _preset(preset), zones, bare=True)
+    return zone_use.export_mask(zs, out, ids) if out else zone_use.scan_mask(zs, ids)
+
+
+@_verb
+def zone_paint(name: str, preset: Optional[Preset] = None, source: Optional[str] = None,
+               events: Optional[list] = None, replace: bool = False,
+               labels: Optional[list] = None, polarity: str = "measure", note: str = "",
+               idle_timeout_s: float = 600.0, cancel=None) -> dict:
+    """The zone painter: the projector window with mouse handling, so the operator draws
+    zones ON THE PART (drag = rectangle, E ellipse, P polygon; move / resize / rotate; N
+    names; Space confirms and saves, Esc cancels: engine/zones/painter.py KEYS). Saved as the
+    zone set `name` at the preset's geometry (zones.json + masks.npz + preview.png +
+    camera.png); an existing name is refused before the window opens unless replace (the old
+    one goes to trash/). source: a saved set to start from. The real rig: the machine-wide
+    rig lock is taken first (RigBusy otherwise); the painter gives the rig back after
+    idle_timeout_s without input, nothing saved. MOCK: headless, `events` is the scripted
+    session (a list of painter events). polarity: measure (default: raw black vs raw white,
+    one lit field for one hold) | normal | inverted. cancel: a threading.Event that ends it
+    without saving. -> {saved, reason, name, geometry_id, zones [...], preview, camera, ...}"""
+    from .zones import session as zone_session
+    return zone_session.paint(_engine(), _preset(preset), name, source=source, events=events,
+                              replace=bool(replace), labels=labels, polarity=polarity,
+                              note=note, idle_timeout_s=idle_timeout_s, cancel=cancel)
+
+
+@_verb
+def zone_show(zones: str, preset: Optional[Preset] = None, hold_s: float = 5.0,
+              label: Optional[str] = None, cancel=None) -> dict:
+    """Project a saved zone set ("<set>" or "<set>:Z1,Z3") and report where it lands: each
+    zone lit on its own -> its camera px, centroid and box (seen / not seen by the camera),
+    then the outlines + ids held for hold_s (pumped; `cancel` ends it) and photographed ->
+    {zones [...], all_seen, camera_png, overlay_png, dmd_png, json_path, warnings}."""
+    from .zones import session as zone_session
+    from .zones import use as zone_use
+    s, p = _engine(), _preset(preset)
+    zs, ids, _text = zone_use.select(s.store, p, zones, bare=True)
+    return zone_session.show(s, p, zs, ids, hold_s, label, cancel=cancel)
+
+
+@_verb
+def zone_delete(name: str, reason: str, preset: Optional[Preset] = None,
+                force: bool = False) -> dict:
+    """Move the zone set `name` (at the preset's geometry) to trash/zones/ (recoverable).
+    Refused while a recipe names it (zone ref / scan.zone "zoneset:<name>") unless force."""
+    from .zones import store as zstore
+    from .zones import use as zone_use
+    from .zones.model import ZoneError
+    s, p = _engine(), _preset(preset)
+    refs = zone_use.recipe_refs(s.store, _recipes_dir(), name)
+    if refs and not force:
+        raise ZoneError(f"zone set {name!r} is used by recipe(s) {', '.join(refs)}: change them "
+                        "first, or force the delete")
+    dest = zstore.delete(s.store, p.geometry_id, name, reason)
+    return {"name": name, "geometry_id": p.geometry_id, "trashed": dest, "recipes": refs,
+            "forced": bool(refs and force)}
+
+
 # ------------------------------------------------------------ spectral mode
 
 @_verb
@@ -2204,10 +2306,14 @@ def rig_check(preset: Optional[Preset] = None, set_reference: bool = False,
 @_verb
 def scan_fast(zone=None, preset: Optional[Preset] = None, label: str = "fast", steps: int = 4,
               periods: Optional[list] = None, average: int = 2, min_hold_s: float = 0.12,
-              axis: str = "x", faces: Optional[list] = None, margin_dmd_px: float = 6.0):
+              axis: str = "x", faces: Optional[list] = None, margin_dmd_px: float = 6.0,
+              zones: Optional[str] = None):
     """HDMI fast zone scan: the column-axis multifreq set only (steps x periods, default 4 x
     8 / 80 / 1280 DMD px, + the white / black floods) lit through `zone` (grid cells "F10:J12",
-    'atlas:<name>/<region>', a DMD mask array or .npy (1140 x 912), or None = full field) and /
+    'atlas:<name>/<region>', a DMD mask array or .npy (1140 x 912), or None = full field), a
+    painted zone set (`zones`: "<set>" or "<set>:Z1,Z3" - their union is lit, the scan's
+    meta["zones"] and its zones.json carry the points decoded per zone; axis "xy" assigns
+    every point exactly, columns only can't tell zones that share columns apart) and /
     or located end faces (`faces`: face targets, their DMD ellipses + margin_dmd_px), camera
     average and HDMI hold overridden for this run only (the preset file is untouched; average
     < 2 is raised to 2 with a warning: HDMI flicker), ray-plane triangulated -> a metric scan
@@ -2215,6 +2321,14 @@ def scan_fast(zone=None, preset: Optional[Preset] = None, label: str = "fast", s
     average 2, hold 0.12 s = 5.3 s for the whole station scene. Refused before the rig without a
     stereo calibration (rule 6)."""
     from .reconstruct import fast_scan
+    from .zones import use as zone_use
+    if (zones is None or not str(zones).strip()) and zone_use.is_spec(zone):
+        zone, zones = None, zone                # "zoneset:<set>" given as the zone
+    if zones is not None and str(zones).strip():
+        return zone_use.scan_fast(_engine(), _preset(preset), zones, zone=zone, label=label,
+                                  steps=int(steps), periods=periods, average=average,
+                                  min_hold_s=float(min_hold_s), axis=axis, faces=faces,
+                                  margin_dmd_px=float(margin_dmd_px))
     return fast_scan.scan_fast(_engine(), _preset(preset), zone, int(steps),
                                periods or list(fast_scan.FAST_PERIODS), average,
                                float(min_hold_s), axis, label, faces, float(margin_dmd_px))
@@ -2285,6 +2399,7 @@ def list_library(kind: str = "bases", geometry_id: Optional[str] = None) -> list
     'facescans' (targeted end-face scans) | 'face_golden' (golden end faces) |
     'station_golden' (station goldens: cylinders + ribbed tube) |
     'recipe_golden' (recipe goldens recorded by recipe_golden, oldest first) |
+    'zones' (painted zone sets, engine/zones: every geometry, or the one given) |
     'outputs' (the output bin index; the 2nd argument filters by output kind) |
     'incomplete' (half-written base/object entries the listings skip; move
     them to trash/ with delete(path))."""
@@ -2296,6 +2411,9 @@ def list_library(kind: str = "bases", geometry_id: Optional[str] = None) -> list
         raise ValueError(f"geometry_id must be one id [A-Za-z0-9_.-], got {geometry_id!r}")
     if kind == "incomplete":
         return s.store.incomplete_entries()
+    if kind == "zones":
+        from .zones import store as zstore
+        return zstore.listing(s.store, geometry_id)
     if kind == "recipe_golden":
         from .recipes import runner
         geos = [geometry_id] if geometry_id else s.store.geometry_ids(runner.GOLDEN_KIND)

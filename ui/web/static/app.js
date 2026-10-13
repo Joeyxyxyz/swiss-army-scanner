@@ -1218,6 +1218,8 @@ function zoneForEngine(zone, grid) {
   const raw = String(zone || '').trim();
   // Surfer atlas regions ('atlas:part/part') are names, not cells: sent as typed, never pinned
   if (/^atlas:/i.test(raw)) return 'atlas:' + raw.slice(6).trim();
+  // ... and so is a painted zone set ('zoneset:lid_zones', 'zoneset:lid_zones:Z1,Z3')
+  if (/^zoneset:/i.test(raw)) return 'zoneset:' + raw.slice(8).replace(/\s+/g, '');
   const z = raw.toUpperCase();
   if (!z || z.includes('@')) return z;
   const sp = grid && grid.grid && grid.grid.spacing_px;
@@ -1904,6 +1906,7 @@ function gridCells(g) {
 /** Zone text -> set of cell names, blocks expanded (display only; the engine parses for real). */
 function zoneCells(text, spec) {
   const out = new Set();
+  if (/^\s*zoneset:/i.test(String(text || ''))) return out;      // a painted set: its ids (Z1, Z3) are not cells
   const norm = String(text || '').replace(/@\s*\d+\s*$/, '').replace(/\s*:\s*/g, ':');
   for (const part of norm.split(/[,;\s]+/).filter(Boolean)) {
     if (part.toLowerCase() === 'all' && spec) { gridCells({ grid: spec }).forEach((c) => out.add(c)); continue; }
@@ -2022,16 +2025,19 @@ function toggleCell(c) {
 // lenient: a hint only. The engine parses zones and explains what is wrong.
 const ZONE_TOKEN = '(all|[A-Z]{1,3}\\d{1,3}(\\s*:\\s*[A-Z]{1,3}\\d{1,3})?)';
 const ATLAS_RE = /^\s*atlas:\s*[\w.-]+\s*\/\s*[\w.-]+\s*$/i;
+const ZONESET_RE = /^\s*zoneset:\s*[\w.-]+\s*([:\/]\s*Z\d+(\s*,\s*Z\d+)*)?\s*$/i;
 const ZONE_RE = new RegExp(`^\\s*${ZONE_TOKEN}([\\s,;]+${ZONE_TOKEN})*[\\s,;]*(@\\s*\\d+)?\\s*$`, 'i');
 function zoneTextChanged() {
   const v = $('#zoneText').value;
   const atlas = ATLAS_RE.test(v);
-  const ok = !v.trim() || ZONE_RE.test(v) || atlas;
+  const painted = ZONESET_RE.test(v);
+  const ok = !v.trim() || ZONE_RE.test(v) || atlas || painted;
   $('#zoneText').classList.toggle('invalid', !ok);
   $('#zoneCheck').textContent = !v.trim() ? 'Click cells on the photo or under it to build a zone.'
     : atlas ? `Atlas region ${zoneForEngine(v, S.grid)}: the engine resolves it from the imported atlas (Surfer, below).`
+    : painted ? `Painted zone set ${zoneForEngine(v, S.grid)}: the engine lights only its zones (the set painted at this geometry: Paint zones on the operator page, or scan zone-paint).`
     : ok ? `Zone ${zoneForEngine(v, S.grid)}: ${zoneCells(v, S.grid && S.grid.grid).size || '?'} cell(s) of the grid shown. The engine checks that they exist.`
-      : 'Expected something like C4, C4:D6 or B2,E5. The engine will explain what is wrong.';
+      : 'Expected something like C4, C4:D6, B2,E5, atlas:part/part or zoneset:name. The engine will explain what is wrong.';
   updateAgentBrief();
 }
 async function captureMap() {
@@ -2070,7 +2076,7 @@ async function projectGrid() {
 }
 async function scanZone() {
   const zone = $('#zoneText').value.trim();
-  if (!zone) { put($('#zoneOut'), h('div', { class: 'alert warn' }, 'Enter a zone like C4, C4:D6, B2,E5 or atlas:part/part (or click cells on the photo).')); return; }
+  if (!zone) { put($('#zoneOut'), h('div', { class: 'alert warn' }, 'Enter a zone like C4, C4:D6, B2,E5, atlas:part/part or zoneset:name (or click cells on the photo).')); return; }
   await captureObject({ label: $('#zoneLabel').value || 'zone-part', base_id: $('#zoneBase').value, H: $('#zoneH').value, zone,
     btn: $('#zoneScan'), out: $('#zoneOut') });
 }

@@ -9,6 +9,12 @@ typing Protocols the existing drivers already satisfy; nothing here opens hardwa
                     MockWindow. Pattern / trigger modes (an on-board pattern sequence fired
                     by a trigger line) are optional and live outside this path
                     (engine/capture/patternmode.py, flash packs; a human enters them).
+                    Optional, for the zone painter only (engine/zones/: the display is a
+                    second monitor, so the mouse cursor is projected onto the part):
+                    enable_mouse() and poll(wait_ms) -> the mouse / key events since the
+                    last poll in pattern px (a pumped wait like hold(); a key the window's
+                    show() pump received is kept for the next poll, never dropped). A
+                    window without them still scans; the painter refuses it.
     CameraDriver    set the exposure, drop stale frames, grab one frame (H, W) mono, close.
                     Today: RealCamera (the FLIR Spinnaker SDK) and MockCamera. A GenICam
                     camera (GigE Vision, USB3 Vision: exposure = ExposureTime, NewestOnly

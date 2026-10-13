@@ -319,6 +319,89 @@ scan.bat run stations\example_recipe_box_lid.json          :: a single-job stati
 
 Built-in examples (all runnable in `--mock` with `--mock-part scene:...`): `box_lid` (presence, height, flatness per lid half), `flat_plate` (flatness, local defects, edge straightness), `cylinder_end_faces` (end-face dents, height difference between faces), `ribbed_tube_alignment` (section position + edge position vs the golden), and the recipes of the example tube line's two profiles, `tube_long_*` / `tube_short_*` (`_presence`: a tube on the seat and this profile's height; `_alignment`: position vs the golden; `_end_face`: dents; mock scenes `scene:tube_long` / `scene:tube_short` with `:absent`, `:misaligned`, `:dent`). Schema and run folder: [`recipes/README.md`](recipes/README.md). Porting to another line (projector, camera, calibration, recipe, station configuration, I/O, and how to prove the numbers on site: calibration check, known-object check, Gauge R&R): [`docs/PORTING.md`](docs/PORTING.md).
 
+### Zones: paint them on the part
+
+The projector is a second monitor, so the Windows mouse cursor is **projected onto the real part**. The zone painter turns that into a drawing tool: move the cursor onto the part, drag a rectangle (or an ellipse, or click a polygon) over the area that matters, fit it, add more, confirm. The shapes are a **zone set**: where the scanner lights, what a scan counts, where a recipe looks.
+
+**Workflow: paint → confirm → scan → reuse in recipes.**
+
+```bat
+scan.bat --preset bench_9in_metric zone-paint --name lid_zones    :: draw on the part; SPACE saves, ESC cancels
+scan.bat zones                                    :: the saved sets (zones lid_zones: one set's zones)
+scan.bat zone-show lid_zones                      :: project it again, photograph, where each zone lands
+scan.bat scan-fast part7 --zones lid_zones:Z1,Z3  :: light + decode only those zones; points per zone
+scan.bat measure-run bench_9in_metric --what flatness --zones lid_zones:Z1
+scan.bat zones lid_zones --recipe                 :: the zones as a recipe's "zones" (--by-ref: references)
+scan.bat zone-delete lid_zones --reason "fixture changed"         :: to the library trash
+```
+
+1. **Paint.** `zone-paint --name SET` opens the engine's projector window with the mouse enabled (the real rig: the machine-wide rig lock is taken first; `RigBusy` and nothing is shown when another program has the rig). What you see on the part is thin bright outlines, the handles of the selected shape, each zone's id (`Z1`, `Z2`, ...) and name, a crosshair at the cursor and a small legend strip at the bottom edge of the DMD image, on black: never a lit field, so the part stays visible. `--from SET` starts from a saved set.
+2. **Confirm.** `Space` saves the set (`Esc` cancels, nothing is written). One photo of the outlines on the part is stored with it. An existing name is refused before the window opens unless `--replace` (the old set moves to `trash/zones/`).
+3. **Scan.** `scan-fast LABEL --zones SET[:Z1,Z3]` lights only those zones (the lit mask is their union; every other mirror is dark, so less stray light) and reports the points decoded **per zone** (also `zones.json` in the scan's library entry). With `--zones` the scan decodes both DMD axes (`--axis xy`) unless you ask for `--axis x`: with columns only, zones that share DMD columns cannot be told apart, and their counts are reported unknown rather than guessed. `measure-run ... --zones SET:Z1` (Measure mode) takes the zone as the region: only it is lit, and the camera px that decode into it are measured.
+4. **Reuse in recipes.** A recipe zone can refer to a painted zone, and a recipe's scan can be lit through a set:
+
+```json
+{"schema_version": 1, "name": "lid_painted", "preset": "bench_9in_metric",
+ "scan": {"kind": "fast", "axis": "xy", "zone": "zoneset:lid_zones"},
+ "zones": [{"id": "lid", "ref": "zoneset:lid_zones/Z1",
+            "checks": [{"type": "presence", "params": {"min_height_mm": 20}}]}]}
+```
+
+A `ref` stays a reference: paint the set again (`--replace`) and the recipe looks at the new shape. `scan zones SET --recipe` prints the same zones with their coordinates copied instead (`projector_px` rect / circle / polygon), `--mask-out FILE.npy` writes the union as a `scan-fast --mask` file.
+
+| key / mouse | does |
+|---|---|
+| drag on empty space | a new shape with the current tool: rectangle (default), `E` ellipse |
+| `P`, then clicks | polygon: one click per corner; double-click, `Enter` or a click on the first corner closes it |
+| click a shape | select it (the smallest shape under the cursor); `Tab` selects the next one |
+| drag inside / a handle | move / resize (a rectangle: its edges resize too; a polygon: drag a corner). A small shape keeps a middle that moves it (the pick radius of its handles shrinks with it) |
+| wheel, `[` `]`, `{` `}` | rotate the selected shape: 5° a notch (Shift: 1°), 1°, 15° |
+| arrows | nudge the selected shape 1 px |
+| Shift + drag | a new shape even when the drag starts inside one |
+| `R` / `E` / `P` | tool: rectangle / ellipse / polygon |
+| `N` (Shift+`N` back) | cycle the selected zone's name: part, datum, end face, tube, box, edge, fixture, and back to no name (`--labels a,b,c` sets your own: letters, digits, space, `_ . -`, checked before the window opens) |
+| `Delete`, `Backspace` | remove the selected zone (while drawing a polygon: its last corner) |
+| `Z`, `Ctrl+Z` | undo |
+| `G` / `H` | lettered grid underlay (the cells of `scan grid`, at the spacing of the grid last projected for this geometry: the cells `--zone C4` means) / legend strip on, off (a zone or the cursor in the strip's rows is drawn over it) |
+| `Space` | confirm and save |
+| `Esc`, right click | drop the shape being drawn; `Esc` again cancels without saving |
+
+A key or the wheel that edits the selected zone (`N`, `[` `]`, the arrows, `Delete`, `Tab`) while it is being dragged ends the drag where it is; `P` during a drag drops the shape being dragged out (a polygon is clicked). A quick second press (which Windows reports as a double click) is a press: click a zone, then at once drag it.
+
+| | CLI | Python | Web (`/quick`, Lights) |
+|---|---|---|---|
+| paint | `zone-paint --name SET [--from SET] [--replace]` | `api.zone_paint(name, source=None, replace=False)` | **Paint zones** (a new name, or the picked set edited); the page shows the saved photo / preview |
+| list / show | `zones`, `zones SET[:IDS] [--recipe] [--by-ref] [--mask-out F.npy]` | `api.zone_sets()`, `api.zone_set(spec)`, `api.zone_recipe(spec)`, `api.zone_mask(spec)` | the zone-set picker (`GET /api/zonesets`) |
+| project + where it lands | `zone-show SET[:IDS] [--hold S]` (exit 1 when a zone is not seen by the camera) | `api.zone_show(spec, hold_s=5)` | **Show zones** |
+| scan / measure | `scan-fast LABEL --zones SET[:IDS]`, `measure-run P --what ... --zones SET[:IDS]` | `api.scan_fast(zones="SET:Z1,Z3")`, `api.measure_run(..., zone="zoneset:SET:Z1")` | the picked set is the lit + measured region of MEASURE |
+| delete (to trash) | `zone-delete SET --reason TEXT [--force]` | `api.zone_delete(name, reason)` | `zone_delete` job (`confirm=true`) |
+
+Anywhere the engine takes a lit zone as text (`--zone`, a recipe's `scan.zone`, a measurement's `zone`) a set is `zoneset:<set>`, `zoneset:<set>:Z1,Z3` or `zoneset:<set>/Z1`. The advanced web page has no picker for sets yet: type that text into *Grid & zones → Scan this zone* (it is sent as typed, never pinned to a grid).
+
+**What is saved:** `<library>/zones/<geometry_id>/<name>/` with `zones.json` (the shapes: rect / ellipse `center`, `size`, `rotation_deg`; polygon `points`; all in projector px `[col, row]`, plus the geometry and its fingerprint), `masks.npz` (`union`, `ids`, one bool 1140 × 912 mask per zone), `preview.png` (the zones as a DMD-space picture) and `camera.png` (the photo). A mirror belongs to a zone when its centre is inside the shape.
+
+**Mock / scripted sessions.** In `--mock` the painter runs headless from a list of events, so a session can be replayed in tests and docs: `scan.bat --mock --preset bench_9in_metric zone-paint --name demo --events demo` (a built-in session) or `--events session.json`:
+
+```json
+[{"type": "drag", "from": [180, 260], "to": [420, 470]},
+ {"type": "key", "key": "e"}, {"type": "drag", "from": [240, 620], "to": [460, 800]},
+ {"type": "key", "key": "p"}, {"type": "click", "at": [560, 620]}, {"type": "click", "at": [760, 660]},
+ {"type": "dblclick", "at": [720, 840]}, {"type": "key", "key": "space"}]
+```
+
+All of the interaction is a display-free state machine (`engine/zones/painter.py`: `PainterModel` events → state, `render(state)` → the DMD image); the window is a thin shell around it.
+
+**Limits.**
+
+- Zones are in **projector px**: they are valid for the rig placement they were painted at. The set is bound to the preset's `geometry_id` and its geometry fingerprint: a set painted at another geometry or other rig settings is refused (scans), or leaves the recipe zone unresolved (its checks INVALID, the part PULLed) - never used at the wrong placement. What cannot be detected is a rig or a fixture that moved under the same `geometry_id`: **re-paint, or re-home the rig and check with `zone-show`, after the rig moves.**
+- **Camera px are derived per scan.** Which camera px a projector zone covers depends on the depth of what its mirrors hit (parallax between the projector and the camera), so a zone has no fixed camera-px outline: per-zone counts, Measure regions and recipe zones take the camera px whose decoded (col, row) is in the zone, from that scan's own decode (both DMD axes). `zone-show` reports where the zones land for the scene as it is now.
+- The painter holds the rig (and its lock) while it is open. It gives the rig back after `--idle-timeout` (600 s) without input, saving nothing; on the operator page ABORT ends it.
+- Keys go to the projector window: click on it once so it has the keyboard focus. The window must cover the projector display exactly (912 × 1140 at the preset's `monitor_offset`, 100 % display scaling), as for every scan. A key pressed while the picture is being redrawn (the mouse is moving) is kept and handled in order, never dropped.
+- Polarity: like the grid, the painter is sent raw after a raw black vs raw white measurement, so "bright" is physically bright whichever way the HDMI path lands. That measurement shows one lit field for one hold before the drawing starts; `--polarity normal|inverted` skips it. When the measurement cannot tell (white and black look the same to the camera: projector off, not aimed at the scene) the painter does **not** start - on an inverting path a wrong guess would hold a lit field on the part for the whole session: fix the projector, or say the polarity.
+- The picture is lines on black: about 2 % of the mirrors in an ordinary session. It grows with the drawing - the most a set can hold (64 zones that each span the field, grid on) lights about 40 % of the mirrors at half level or more: still outlines, never a filled field.
+- A zone is at least 8 DMD px each way, a set has at most 64 zones, a polygon does not cross itself and has at most 256 corners.
+- **Status: mock-tested only** (`tests/test_zones_*.py`: the state machine, the scripted sessions, scans and recipes on the simulated bench). The painter has not yet been run on a real rig: the first session there should start with `zone-show` on a simple set.
+
 ## Modes (UI tabs ↔ verbs)
 
 | Mode | Verbs | Notes |
@@ -397,6 +480,7 @@ Everything is under `library\` (the default is next to this README; override wit
 | &nbsp;&nbsp;`output\sensors\` | sensor checks |
 | &nbsp;&nbsp;`output\index.csv` | one row per output file: time, kind, label, geometry, source |
 | `recipes\` | user recipes (`<name>\recipe.json` + `meta.json`), `active.jsonl` = the selected recipe |
+| `zones\<geometry>\<name>\` | painted zone sets (`zone-paint`): `zones.json` (shapes in projector px), `masks.npz`, `preview.png`, `camera.png` |
 | `runs\` | recipe run folders from `recipe-run` (`result.json`, `run.log.jsonl`, `overlay.png`, `feedback_dmd.png`, `feedback_photo.png`); measure runs (`result.json`, `values.csv`, `overlay.png`, `scan.ply`, `spec.json`) and quick checks (`result.json`, `run.log.jsonl`, `quick_check.json`) |
 | `sessions\` | `log.jsonl` of every action |
 | `trash\` | "deleted" entries (recoverable) |
@@ -510,6 +594,7 @@ The full suite takes about 35 min. It is mock only, apart from tests that assert
 | Recipes (the checks that verify a work state: zones, checks, verdict painted on the part; `recipe-*`, `run` job.type recipe, result-code register) | ✅ built, mock-tested (`tests/test_recipes_mock.py`, `tests/test_recipe_run_mock.py`: synthetic scans of the mock scenes + the full mock capture path); **not yet run on the rig**: tolerances in the examples are illustrative, prove them on site (`docs/PORTING.md`) |
 | Station configuration → profiles → work states (step flow: sensor claims confirmed or corrected by the DLP, permissions `PERMIT_*`, prompt / ACK / hold / retry / kickout; `run` on a configuration, `flow-show`, `/quick`, `POST /api/io/inputs`, cycle folder `result.json` schema 0.4) | ✅ built, mock-tested (`tests/test_flow_mock.py`, `tests/test_flow_ui_mock.py`: the schema, the cycle state machine, the bus, synthetic scans of the mock tube scenes, the operator page, cycles through the full mock capture path); **not yet run on the rig**; sensor inputs arrive over HTTP only (hardware backends are placeholders) |
 | Operating modes: Measure (`measure-run`: values + uncertainty, NOT_MEASURABLE), Quick check (`quick-check`), Station; preset mount fixed / mobile with the rig-state gate; the mode switch on `/quick` and the bus (`SELECT_MODE`) | ✅ built, mock-tested (`tests/test_modes_measure_mock.py`, `test_modes_quick_mock.py`, `test_modes_rig_mock.py`, `test_modes_ui.py`: synthetic scans with known truth + the full mock capture path); **not yet run on the rig**: the uncertainty is noise only (prove the mm with `accuracy-block`), a mobile rig's rig check needs the reference scene it was stored on (else: calibrate with the fixture), and what a carried rig does to the calibration between two rig checks is only as visible as those checks |
+| Painted zones (`zone-paint`: draw zones on the part with the projected mouse cursor; `zones`, `zone-show`, `scan-fast --zones`, `measure-run --zones`, recipe zone `ref`, `/quick` Lights) | 🧪 built, mock-tested only (`tests/test_zones_*.py`: the painter's state machine, scripted sessions, scans and recipes on the simulated bench); **not yet run on a real rig** |
 | Industrial I/O (Modbus TCP, OPC UA, EtherNet/IP), camera GPIO, serial, digital I/O | placeholders: clean interfaces + intended mapping, not implemented |
 | Hardware-trigger pattern mode (USB, guarded) | future (architecture step 10) |
 | Hardware trigger (full speed): TRIG_OUT_1 → camera, one frame per pattern (`trigger-test`, `scan-trigger`, packs with `--trigger-mode trigout --period-us 10000/5000/4500`) | 🧪 experimental: mock-tested (`tests/test_trigger_fullspeed_mock.py`); **not yet run on the rig**. Bench checklist with wiring: [`docs/TRIGGER_FULLSPEED_TEST.md`](docs/TRIGGER_FULLSPEED_TEST.md) |

@@ -9,7 +9,9 @@ engine/flow/), portable to any DMD projector + camera line:
       -> scan      how to capture (fast | metric | trigger), axis, lit zone
       -> part      the part frame (reference plane, origin) and the scan label
       -> zones     where to look: rect | circle | polygon | grid-cells, in camera px,
-                   projector (DMD) px or part-frame mm (units always said)
+                   projector (DMD) px or part-frame mm (units always said); or a zone painted
+                   on the part: "ref": "zoneset:<set>/<zone id>" (engine/zones, projector px;
+                   the set painted at the run's geometry is used, see _zone_ref)
            -> checks   what is recognised there (presence, position, height, flatness,
                        defect, edge, code, or a plugin), with their tolerances in mm / deg
       -> golden    optional reference scan (position / edge vs the good part): a golden
@@ -67,7 +69,8 @@ OUTPUT_DEFAULTS = {"runs_dir": None, "overlay": True,
 # the disposition on top of the verdict (engine/disposition.py): guard band in % of a
 # tolerance (0 = off) and the doubt reasons this line rejects instead of pulling ([] = none)
 PULL_DEFAULTS = {"guard_band_pct": 0.0, "invalid_reasons_to_reject": []}
-ZONE_KEYS = {"id", "label", "shape", "units", "coords", "checks", "datum", "feedback"}
+ZONE_KEYS = {"id", "label", "shape", "units", "coords", "checks", "datum", "feedback", "ref"}
+REF_SHAPE = "zoneset"                   # the shape of a zone that refers to a painted zone set
 CHECK_KEYS = {"type", "id", "params", "enabled"}
 MAX_HOLD_S = 300.0
 
@@ -101,8 +104,16 @@ class ZoneSpec:
     label: str = ""
     datum: bool = False
     feedback: bool = True
+    # a zone that refers to a painted zone set: {"spec": "zoneset:<set>/<id>", "set", "zone",
+    # "bound": {geometry_id: {...}} | None (validated without a library)}; its shape is
+    # REF_SHAPE, its units projector_px, its coords "<set>/<id>"
+    ref: Optional[dict] = None
 
     def to_dict(self) -> dict:
+        if self.ref:                    # stays a reference (the set may be painted again)
+            return {"id": self.id, "label": self.label, "ref": self.ref["spec"],
+                    "datum": self.datum, "feedback": self.feedback,
+                    "checks": [c.to_dict() for c in self.checks]}
         return {"id": self.id, "label": self.label, "shape": self.shape, "units": self.units,
                 "coords": self.coords, "datum": self.datum, "feedback": self.feedback,
                 "checks": [c.to_dict() for c in self.checks]}
@@ -145,7 +156,8 @@ class Recipe:
                 "scan": dict(self.scan), "golden": self.golden,
                 "pull": copy.deepcopy(self.pull),
                 "zones": [{"id": z.id, "shape": z.shape, "units": z.units,
-                           "checks": [c.type for c in z.checks]} for z in self.zones]}
+                           "checks": [c.type for c in z.checks],
+                           **({"ref": z.ref["spec"]} if z.ref else {})} for z in self.zones]}
 
     def to_dict(self) -> dict:
         """The normalised recipe (every default filled in)."""
@@ -232,8 +244,13 @@ def _section(doc: dict, key: str, defaults: dict, E: _Errors) -> dict:
     return out
 
 
-def validate(doc: dict, source: Optional[Path] = None) -> Recipe:
-    """Raw mapping -> Recipe (defaults filled in), or RecipeError listing every problem."""
+def validate(doc: dict, source: Optional[Path] = None, zonesets=None) -> Recipe:
+    """Raw mapping -> Recipe (defaults filled in), or RecipeError listing every problem.
+    zonesets: the resolver of zone references ("ref": "zoneset:<set>/<id>"), a callable
+    (set, zone id) -> {geometry_id: {...}} that raises LookupError / ValueError when the
+    library has no such set / zone (engine/zones/use.recipe_binder; the recipe library passes
+    it). Without one a reference is only checked for its form and stays unbound: a run then
+    cannot resolve the zone (its checks are INVALID, never a guess)."""
     from . import checks as registry
     E = _Errors()
     if not isinstance(doc, dict):
@@ -284,7 +301,7 @@ def validate(doc: dict, source: Optional[Path] = None) -> Recipe:
     pull = _section(doc, "pull", PULL_DEFAULTS, E)
     _pull_rules(pull, E)
 
-    zones = _zones(doc.get("zones"), scan, E, registry)
+    zones = _zones(doc.get("zones"), scan, E, registry, zonesets)
     ref = part["frame"].get("reference")
     if isinstance(ref, dict):
         z = next((z for z in zones if z.id == ref.get("zone")), None)
@@ -437,7 +454,36 @@ def _pull_rules(pull: dict, E: _Errors) -> None:
         E.add("", str(e))
 
 
-def _zones(v, scan: dict, E: _Errors, registry) -> list:
+def _zone_ref(z: dict, where: str, E: _Errors, zonesets) -> Optional[dict]:
+    """A zone's "ref": "zoneset:<set>/<zone id>" -> its ref record, or None (problem added).
+    The zone takes its shape from the painted set, so it must not give shape / units /
+    coords itself (units other than projector_px would be a contradiction)."""
+    from ..zones import use as zone_use
+    ref = z.get("ref")
+    given = sorted(k for k in ("shape", "coords") if z.get(k) is not None)
+    if z.get("units") not in (None, "projector_px"):
+        given.append("units")
+    if given:
+        E.add(where, f"a zone with ref takes its shape from the zone set: remove "
+                     f"{', '.join(given)} (a painted zone is in projector_px)")
+        return None
+    try:
+        set_name, zone_id = zone_use.parse_ref(ref)
+    except ValueError as e:
+        E.add(where, str(e))
+        return None
+    bound = None
+    if zonesets is not None:
+        try:
+            bound = zonesets(set_name, zone_id)
+        except (LookupError, ValueError) as e:
+            E.add(where, f"ref {ref.strip()}: {str(e).splitlines()[0]}")
+            return None
+    return {"spec": f"zoneset:{set_name}/{zone_id}", "set": set_name, "zone": zone_id,
+            "bound": bound}
+
+
+def _zones(v, scan: dict, E: _Errors, registry, zonesets=None) -> list:
     if not isinstance(v, list) or not v:
         E.add("zones", "at least one zone is required: [{id, shape, units, coords, checks}]")
         return []
@@ -459,18 +505,26 @@ def _zones(v, scan: dict, E: _Errors, registry) -> list:
         unknown = sorted(set(z) - ZONE_KEYS - {"_comment"})
         if unknown:
             E.add(where, f"unknown keys {unknown} (known: {', '.join(sorted(ZONE_KEYS))})")
-        shape = z.get("shape")
-        if shape not in SHAPES:
-            E.add(where, f"shape {shape!r} must be one of {', '.join(SHAPES)}")
-            continue
-        units = z.get("units", "projector_px" if shape == "grid-cells" else None)
-        if units not in UNITS:
-            E.add(where, f"units {units!r} must be one of {', '.join(UNITS)} (say which: camera "
-                  "px, native DMD px, or mm in the part frame)")
-            continue
-        if shape == "grid-cells" and units != "projector_px":
-            E.add(where, "grid-cells are projector (DMD) cells: units projector_px")
-        coords = _coords(shape, z.get("coords"), where, E)
+        ref = None
+        if z.get("ref") is not None:    # a zone painted on the part (engine/zones)
+            ref = _zone_ref(z, where, E, zonesets)
+            if ref is None:
+                continue
+            shape, units, coords = REF_SHAPE, "projector_px", f"{ref['set']}/{ref['zone']}"
+        else:
+            shape = z.get("shape")
+            if shape not in SHAPES:
+                E.add(where, f"shape {shape!r} must be one of {', '.join(SHAPES)} (or give "
+                             "ref: \"zoneset:<set>/<zone id>\" for a painted zone)")
+                continue
+            units = z.get("units", "projector_px" if shape == "grid-cells" else None)
+            if units not in UNITS:
+                E.add(where, f"units {units!r} must be one of {', '.join(UNITS)} (say which: "
+                      "camera px, native DMD px, or mm in the part frame)")
+                continue
+            if shape == "grid-cells" and units != "projector_px":
+                E.add(where, "grid-cells are projector (DMD) cells: units projector_px")
+            coords = _coords(shape, z.get("coords"), where, E)
         datum = z.get("datum", False)
         if not isinstance(datum, bool):
             E.add(where, "datum must be true or false")
@@ -485,7 +539,7 @@ def _zones(v, scan: dict, E: _Errors, registry) -> list:
             label = ""
         checks = _checks(z.get("checks"), where, shape, units, datum, E, registry)
         out.append(ZoneSpec(id=zid, shape=shape, units=units, coords=coords, checks=checks,
-                            label=label, datum=datum, feedback=zfb))
+                            label=label, datum=datum, feedback=zfb, ref=ref))
     return out
 
 

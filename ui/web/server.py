@@ -267,6 +267,38 @@ VERBS: dict = {
                       {"zones": "[{name, polygon [[x,y],...], space, pattern, level}]",
                        "label": "text",
                        "hold_s": f"float, 0..{MAX_HOLD_S:g} s (holds the rig; not interruptible)"}),
+    # painted zone sets (engine/zones): the operator draws on the part with the mouse
+    "zone_paint": ("The zone painter: the projector window takes the mouse (its cursor is "
+                   "projected on the part); the operator drags rectangles / ellipses (E) / "
+                   "polygons (P) over the areas, moves / resizes / rotates and names them; "
+                   "Space saves the zone set (zones/<geometry>/<name>/: zones.json, masks.npz, "
+                   "preview.png, camera.png), Esc cancels. The job holds the rig until then "
+                   "(or until idle_timeout_s without input; cancelling the job ends it, nothing "
+                   "saved). An existing name is refused unless replace. -> {saved, reason, "
+                   "zones, preview, camera}",
+                   {"name": "the zone set to save [A-Za-z0-9_.-]",
+                    "source": "a saved set to start from (edit it)",
+                    "replace": "bool: replace an existing set of this name (old one to trash/)",
+                    "labels": "[names] the N key cycles through (optional)",
+                    "polarity": "measure (default) | normal | inverted",
+                    "note": "text stored with the set",
+                    "idle_timeout_s": "give the rig back after this long without input "
+                                      "(default 600)",
+                    "events": "MOCK ONLY: the scripted session, a list of painter events "
+                              "(default in MOCK: a built-in demo session)"}),
+    "zone_show": ("Project a saved zone set on the part and report where each zone lands in "
+                  "the camera image (camera px, centroid, box; seen or not), outlines + ids "
+                  "photographed and held.",
+                  {"zones": "zone set, optionally some zones: 'lid' or 'lid:Z1,Z3' (GET "
+                            "/api/zonesets)",
+                   "hold_s": f"float, 0..{MAX_HOLD_S:g} s (default 5; cancel the job to end it)",
+                   "label": "text"}),
+    "zone_delete": ("Move a zone set (at the loaded preset's geometry) to the library trash "
+                    "(recoverable). Refused while a recipe names it (unless force). Needs "
+                    "confirm=true.",
+                    {"name": "zone set name (GET /api/zonesets)", "reason": "why (recorded)",
+                     "confirm": "bool: must be true (the operator confirmed the delete)",
+                     "force": "bool: delete even when a recipe names it"}),
     "spectral_capture": ("R/G/B LED reflectance capture.", {"label": "text"}),
     "learn_material": ("Teach a material from a camera ROI of a spectral reading.",
                        {"reading_id": "spectral reading id", "name": "material name",
@@ -616,6 +648,9 @@ VERBS: dict = {
                   "to 2: HDMI flicker) -> metric scan (ray-plane, mm) + its flood pair. Bench: "
                   "5.3 s for the whole station scene. Refused without a stereo calibration.",
                   {"zone": "grid cells 'F10:J12' or atlas:<name>/<region> (default: full field)",
+                   "zones": "or a painted zone set 'lid' / 'lid:Z1,Z3' (GET /api/zonesets): "
+                            "only its zones are lit; result.meta.zones has the points per zone "
+                            "(exact with axis xy)",
                    "face_ids": "[face target ids] also lit (their DMD ellipse + margin)",
                    "margin_dmd_px": "face margin, DMD px (default 6)", "label": "text",
                    "steps": "phase steps (default 4)", "periods": "[T, ...] DMD px",
@@ -763,7 +798,9 @@ VERBS: dict = {
                      "spec": "a measurement spec mapping (the other args override it)",
                      "roi": "[x0, y0, x1, y1] camera px: region A (x1, y1 exclusive)",
                      "roi2": "[x0, y0, x1, y1] camera px: region B (step)",
-                     "zone": "region A as grid cells", "zone2": "region B as grid cells",
+                     "zone": "region A as grid cells, or a painted zone set "
+                             "'zoneset:<set>[:Z1,Z3]' (lit + the px that decode into it)",
+                     "zone2": "region B as grid cells",
                      "p1": "[x, y] camera px: a picked point (distance)",
                      "p2": "[x, y] camera px: the second point",
                      "golden": "deviation: the golden metric scan (id / label)",
@@ -846,7 +883,7 @@ RIG_FREE_VERBS = frozenset({
     "compare_metric", "predict_precision", "export_metric_mesh", "calibrate_dent_null",
     "detect_dents", "locate_face", "face_profile", "face_golden", "check_face",
     "station_measure", "station_golden", "station_check", "preset_add", "preset_delete",
-    "recipe_add", "recipe_select", "recipe_delete"})
+    "recipe_add", "recipe_select", "recipe_delete", "zone_delete"})
 
 # verbs that change which preset is loaded / selected: refused while a station run is busy
 PRESET_CHANGE_VERBS = frozenset({"load_preset", "preset_select", "preset_delete"})
@@ -855,7 +892,8 @@ PRESET_CHANGE_VERBS = frozenset({"load_preset", "preset_select", "preset_delete"
 # running jobs that may be aborted: the engine checks the job's cancel event before every
 # capture (ScanSession.cancel), so the rig is never left mid-sequence
 CANCELLABLE_VERBS = frozenset({"run_station", "rig_check", "recipe_run", "recipe_feedback",
-                               "flow_verify", "flow_run", "measure_run", "quick_check"})
+                               "flow_verify", "flow_run", "measure_run", "quick_check",
+                               "zone_paint", "zone_show"})
 # verbs of an operating mode: accepted only while the bus is in that mode (engine/modes/), so
 # a measurement or a quick check never runs beside a cycle of the line
 MODE_VERBS = {"measure_run": "measure", "quick_check": "quick_check"}
@@ -2632,6 +2670,67 @@ class App:
             zones.append(Zone(**{**z, "polygon": [_point({"p": pt}, "p") for pt in poly]}))
         return api.project_zones(zones, self._preset(), _s(a, "label", "zones"), _hold_s(a))
 
+    # ---- painted zone sets (engine/zones)
+    def zone_sets(self) -> dict:
+        """The painted zone sets at the loaded preset's geometry (files only: answered while
+        a job holds the worker, e.g. the painter itself)."""
+        p = self.session.preset
+        geo = p.geometry_id if p is not None else None
+        items = api.zone_sets(all_geometries=True)
+        return jsonable({"geometry_id": geo, "preset": p.name if p is not None else None,
+                         "sets": [i for i in items if i["geometry_id"] == geo],
+                         "other_geometries": sorted({i["geometry_id"] for i in items} - {geo})},
+                        self.root)
+
+    def _v_zone_paint(self, a):
+        from engine.zones import painter
+        events, note = a.get("events"), None
+        if self.mock:
+            if events is None:          # MOCK: the simulated human draws the demo session
+                events = list(painter.DEMO_EVENTS)
+                note = "MOCK: no events given - the built-in demo session was replayed"
+            elif not isinstance(events, list):
+                raise ArgError("events must be a list of painter events")
+        elif events is not None:
+            raise ArgError("events is MOCK ONLY: on the real rig the operator draws on the part")
+        labels = a.get("labels")
+        if labels is not None and (not isinstance(labels, list)
+                                   or not all(isinstance(x, str) for x in labels)):
+            raise ArgError("labels must be a list of names")
+        try:
+            out = api.zone_paint(_s(a, "name", required=True), self._preset(),
+                                 source=_s(a, "source"), events=events,
+                                 replace=_bool(a, "replace"), labels=labels,
+                                 polarity=_s(a, "polarity", "measure"),
+                                 note=_s(a, "note", "") or "",
+                                 idle_timeout_s=_num(a, "idle_timeout_s", 600.0),
+                                 cancel=self.session.cancel)
+        except ValueError as e:         # a bad name / an existing set / a malformed event
+            raise ArgError(str(e)) from None
+        if note:
+            out = {**out, "note": note}
+        return out, ({"preview": out.get("camera") or out.get("preview")} if out["saved"] else {})
+
+    def _v_zone_show(self, a):
+        h = _num(a, "hold_s", 5.0)
+        if not 0.0 <= h <= MAX_HOLD_S:
+            raise ArgError(f"hold_s must be 0..{MAX_HOLD_S:g} s, got {h:g}")
+        try:
+            out = api.zone_show(_s(a, "zones", required=True), self._preset(), h,
+                                _s(a, "label"), cancel=self.session.cancel)
+        except ValueError as e:
+            raise ArgError(str(e)) from None
+        return out, {"preview": out.get("overlay_png") or out.get("camera_png")}
+
+    def _v_zone_delete(self, a):
+        if not _confirmed(a, "confirm"):
+            raise ArgError("zone_delete needs confirm=true (the operator confirmed the delete)")
+        try:
+            return api.zone_delete(_s(a, "name", required=True), _s(a, "reason", required=True),
+                                   self._preset(), force=_bool(a, "force"))
+        except ValueError as e:
+            raise ArgError(str(e)) from None
+
     def _v_spectral_capture(self, a):
         return api.spectral_capture(self._preset(), _s(a, "label", "spectral"))
 
@@ -3051,10 +3150,11 @@ class App:
         if not isinstance(ids, list):
             raise ArgError("face_ids must be a list of face target ids")
         faces = [self._entry("faces", str(i)) for i in ids] or None
+        zones = _s(a, "zones")
         ms = api.scan_fast(_s(a, "zone"), self._preset(), _s(a, "label", "fast"),
                            _num(a, "steps", 4, int), _num_list(a, "periods"),
                            _num(a, "average", 2, int), _num(a, "min_hold_s", 0.12), axis, faces,
-                           _num(a, "margin_dmd_px", 6.0))
+                           _num(a, "margin_dmd_px", 6.0), **({"zones": zones} if zones else {}))
         return ms, ({"preview": Path(ms.path) / "preview.png"}
                     if (Path(ms.path) / "preview.png").is_file() else {})
 
@@ -4002,6 +4102,7 @@ ROUTES = [
     ("GET", r"/api/presets", "presets"),
     ("POST", r"/api/presets", "preset_save"),
     ("GET", r"/api/presets/(?P<name>[^/]+)", "preset_get"),
+    ("GET", r"/api/zonesets", "zonesets"),
     ("GET", r"/api/recipes", "recipes"),
     ("GET", r"/api/recipes/(?P<name>[^/]+)", "recipe_get"),
     ("POST", r"/api/presets/(?P<name>[^/]+)/load", "preset_load"),
@@ -4379,6 +4480,11 @@ class Handler(BaseHTTPRequestHandler):
         self.app.check_preset_name(name)
         job = self.app.submit("load_preset", {"name": name})
         self._json(self.app.wait(job.id, float(body.get("wait", 30))))
+
+    def r_zonesets(self, q, body):
+        """The painted zone sets (engine/zones) at the loaded preset's geometry: {geometry_id,
+        preset, sets [{name, zones, created, preview, camera, valid}], other_geometries}."""
+        self._json(self.app.zone_sets())
 
     def r_recipes(self, q, body):
         self._json(jsonable({"recipes": api.recipe_list(), "selected": api.recipe_active(),

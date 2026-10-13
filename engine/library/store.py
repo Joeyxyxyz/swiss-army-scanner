@@ -20,6 +20,9 @@ Filesystem library (§5): timestamped, append-only. Nothing overwrites.
                                                     GOOD part's metric scan
     <root>/presets/<name>/                          user presets: preset.json + meta.json;
                                                     presets/active.jsonl = the selected one
+    <root>/zones/<geometry_id>/<name>/              painted zone sets (engine/zones): zones.json
+                                                    (shapes in projector px), masks.npz,
+                                                    preview.png
     <root>/sessions/<ts>/                           log.jsonl
     <root>/readings/<ts>_<label>/                   code-reading frames + codes.json
     <root>/output/<kind>/<ts>_<label>.<ext>         THE OUTPUT BIN — every derived result,
@@ -64,7 +67,7 @@ OUTPUT_KINDS = ("pointclouds", "defects", "measurements", "codes", "spectral", "
 INDEX_FIELDS = ["time", "kind", "label", "geometry_id", "file", "source"]
 ENTRY_KINDS = ("bases", "objects", "calibrations", "readings", "spectral", "banks", "maps",
                "sensors", "atlases", "calib_poses", "metric", "dentsets", "faces", "facescans",
-               "face_golden", "station_golden", "recipe_golden", "presets", "recipes")
+               "face_golden", "station_golden", "recipe_golden", "presets", "recipes", "zones")
 
 LIBRARY_README = """# Swiss Army Scanner library
 
@@ -105,6 +108,7 @@ Written by the engine. Nothing here is overwritten; "delete" moves entries to tr
 | output/sensors/ | sensor checks: spot photos + .json verdicts |
 | presets/ | USER PRESETS (part recipes): presets/<name>/preset.json + meta.json (author, description, copied from); presets/active.jsonl records the selected preset (last line wins) |
 | recipes/ | USER RECIPES (the checks that verify a work state: preset -> zones -> checks -> projected feedback): recipes/<name>/recipe.json + meta.json; recipes/active.jsonl records the selected recipe (last line wins) |
+| zones/<geometry_id>/<name>/ | PAINTED ZONE SETS (scan zone-paint: shapes drawn on the part with the mouse, in projector px, valid at this rig placement): zones.json + masks.npz (union + one DMD mask per zone) + preview.png (+ camera.png, a photo of the zones on the part) |
 | runs/ | recipe run folders (api.recipe_run): result.json + run.log.jsonl + overlay / feedback images, one NEW folder per run |
 | sessions/ | log.jsonl - every action, success or failure |
 | trash/ | deleted entries (recoverable - move back to restore) |
@@ -374,7 +378,7 @@ _ENTRY_DEPTH = {"bases": 3, "objects": 2, "calibrations": 3, "readings": 2,
                 "spectral": 2, "banks": 3, "maps": 3, "sensors": 3, "atlases": 3,
                 "calib_poses": 3, "metric": 3, "dentsets": 3, "faces": 3, "facescans": 3,
                 "face_golden": 3, "station_golden": 3, "recipe_golden": 3, "presets": 2,
-                "recipes": 2}
+                "recipes": 2, "zones": 3}
 _SPECTRAL_SUBDIRS = ("materials", "light")      # spectral/<sub>/<entry>
 _ENTRY_MARKERS = {"bases": ("meta.json", "field.npz"),
                   "objects": ("meta.json", "field.npz", "relief.npz"),
@@ -390,6 +394,7 @@ _ENTRY_MARKERS = {"bases": ("meta.json", "field.npz"),
                   "recipe_golden": ("meta.json",),
                   "presets": ("preset.json", "meta.json"),
                   "recipes": ("recipe.json", "meta.json"),
+                  "zones": ("zones.json", "masks.npz"),
                   "readings": ("codes.json", "full_on.png"),
                   "spectral": ("meta.json", "cube.npz", "*.json"),
                   "banks": ("members.jsonl", "meta.json"),

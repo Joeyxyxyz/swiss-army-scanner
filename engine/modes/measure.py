@@ -585,18 +585,22 @@ def _near_limit(v: dict, prec: dict) -> tuple:
 
 # ------------------------------------------------------------------ one scan
 
-def _regions(s, preset, spec: Spec, shape, warnings: list, lit_zone="?") -> tuple:
+def _regions(s, preset, spec: Spec, shape, warnings: list, lit_zone="?", ms=None) -> tuple:
     """(region A, region B) as camera masks (None = the whole field): the roi, cut to the
     grid zone's camera mask when the zone has one (a projector map). lit_zone: the zone the
     scan was LIT through (its meta; "?" = this run's own scan, lit through spec.zone).
     Without a projector map a zone is only the region when the scan was lit through exactly
     that zone - on any other scan (a stored full-field one) it would silently be the whole
-    field, so it is refused."""
+    field, so it is refused. A painted zone set ("zoneset:<set>[:ids]", engine/zones) is cut
+    from the scan `ms` itself: the camera px whose decoded (col, row) is in its zones."""
     def same(a, b) -> bool:
         return "".join(str(a or "").split()).upper() == "".join(str(b or "").split()).upper()
 
     def zone_mask(text: str, need: bool) -> Optional[np.ndarray]:
         from ..capture import zones as zones_mod
+        from ..zones import use as zone_use
+        if zone_use.is_spec(text):
+            return zone_use.camera_region(s, preset, text, ms, shape, warnings, lit_zone, need)
         _, cam, _ = zones_mod.resolve(s, preset, text)
         if cam is None:
             if need:
@@ -640,7 +644,7 @@ def measure_scan(s, preset, spec: Spec, ms, golden=None, warnings: Optional[list
     warnings = [] if warnings is None else warnings
     cloud = ms.cloud
     a, b = _regions(s, preset, spec, cloud.mask.shape, warnings,
-                    (ms.meta or {}).get("zone") if stored else "?")
+                    (ms.meta or {}).get("zone") if stored else "?", ms)
     if spec.what == "flatness":
         return V.flatness(cloud, a)
     if spec.what == "step":

@@ -221,7 +221,7 @@ function refreshButtons() {
   $('#qStation').disabled = !(idle || s === 'FAULT');
   $('#qProfile').disabled = !(idle || s === 'FAULT');
   $('#qBusState').textContent = s;
-  for (const id of ['#qGrid', '#qZones', '#qLive', '#qSignal']) {
+  for (const id of ['#qGrid', '#qZones', '#qLive', '#qSignal', '#qPaint', '#qZoneShow']) {
     $(id).disabled = !(idle || s === 'FAULT') || state.setupBusy;       // setup only when idle
   }
   for (const el of document.querySelectorAll('#qSignals span')) {
@@ -670,7 +670,10 @@ function syncRigPreset(b) {
   // checks is what the operator sees. A change of it clears the confirmation.
   const loaded = b.active_preset || '';
   if (loaded !== state.shownPreset) {
-    if (state.shownPreset !== null) $('#qConfirm').checked = false;
+    if (state.shownPreset !== null) {
+      $('#qConfirm').checked = false;
+      loadZoneSets('');               // another preset: its geometry's zone sets, none picked
+    }
     state.shownPreset = loaded;
   }
   if (state.opMode === 'station' || state.presetBusy || !loaded) return;
@@ -764,6 +767,8 @@ function measureArgs() {
   }
   const rep = numOrNull($('#qMeasRepeats').value, 'repeats');
   if (rep !== null && rep !== 1) a.repeats = rep;
+  // a painted zone set picked in Lights: only its zones are lit, and they are the region
+  if ($('#qZoneSet').value && what !== 'endface') a.zone = `zoneset:${$('#qZoneSet').value}`;
   if (state.mode === 'mock' && $('#qMockPart').value.trim()) a.mock_scene = $('#qMockPart').value.trim();
   return a;
 }
@@ -1121,10 +1126,10 @@ async function loop() {
 }
 
 // ---- setup helpers (Lights / Camera): ordinary rig jobs, only while the station is idle
-async function setupJob(verb, args, msgEl) {
+async function setupJob(verb, args, msgEl, busyText) {
   state.setupBusy = true;
   refreshButtons();
-  $(msgEl).textContent = `${verb}...`;
+  $(msgEl).textContent = busyText || `${verb}...`;
   try {
     let j = await api('POST', '/api/jobs', { verb, args: args || {} });
     while (j.status === 'queued' || j.status === 'running') {
@@ -1149,6 +1154,87 @@ async function projectGrid() {
   const link = m && !/^[A-Za-z]:|^\//.test(m[1]) ? m[1] : null;     // library-relative only
   img.hidden = !link;
   if (link) img.src = `/files/${link}`;
+}
+
+// ---- painted zone sets (engine/zones): drawn on the part with the mouse, in projector px
+async function loadZoneSets(pick) {
+  // the sets painted at the loaded preset's geometry; `pick`: the one to select afterwards
+  let d;
+  try { d = await api('GET', '/api/zonesets'); } catch (e) { return; }
+  state.zoneSets = d.sets || [];
+  const sel = $('#qZoneSet');
+  const want = pick !== undefined ? pick : sel.value;
+  sel.textContent = '';
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = state.zoneSets.length ? '(none: the whole field)' : '(none painted yet)';
+  sel.appendChild(none);
+  for (const z of state.zoneSets) {
+    const o = document.createElement('option');
+    o.value = z.name;
+    o.textContent = `${z.name} - ${z.n_zones} zone(s)` + (z.valid ? '' : ' (invalid)');
+    sel.appendChild(o);
+  }
+  sel.value = state.zoneSets.some((z) => z.name === want) ? want : '';
+  showZoneSet();
+}
+
+function showZoneSet() {
+  // the picked set: its zones and its picture (the photo of the zones on the part, else the
+  // DMD-space preview)
+  const z = (state.zoneSets || []).find((x) => x.name === $('#qZoneSet').value);
+  const img = $('#qZoneImg');
+  const link = z && (z.camera || z.preview);
+  img.hidden = !link;
+  if (link) img.src = `/files/${link}?t=${encodeURIComponent(z.created || '')}`;
+  $('#qZoneInfo').textContent = !z ? ''
+    : (z.valid ? `${z.name}: ` + (z.zones || []).map((q) => q.id + (q.name ? ` ${q.name}` : '')).join(', ')
+      + ` (painted ${String(z.created || '?').replace('T', ' ')}; projector px, valid at this rig placement). `
+      + 'MEASURE lights and measures only these zones.'
+      + ((z.rig_changes || []).length ? ` CHECK (Show zones) or paint again: since it was painted, ${z.rig_changes.slice(0, 3).join('; ')}.` : '')
+      : `${z.name} is not usable: ${z.error}`);
+  // Measure mode shows what MEASURE will be limited to (the Lights panel may be closed)
+  $('#qMeasZone').textContent = z
+    ? `Zone set ${z.name} is picked (Lights): only its zones are lit and measured.` : '';
+}
+
+async function paintZones() {
+  // a new set (a name typed), or the picked set edited (its zones loaded, the old one to trash)
+  const typed = $('#qZoneName').value.trim();
+  const picked = $('#qZoneSet').value;
+  if (!typed && !picked) {
+    $('#qSetupMsg').textContent = 'name the zone set to paint (New set name), or pick one to edit';
+    return;
+  }
+  const args = typed && typed !== picked ? { name: typed } : { name: picked, source: picked, replace: true };
+  const j = await setupJob('zone_paint', args, '#qSetupMsg',
+    state.mode === 'mock' ? 'painting (MOCK: a scripted demo session)...'
+      : 'painting: draw on the part with the mouse - SPACE saves, ESC cancels (ABORT ends it)');
+  const r = j && j.status === 'done' ? j.result : null;
+  if (!r) return;
+  if (r.saved) {
+    $('#qSetupMsg').textContent = `zone set ${r.name} saved: ${r.n_zones} zone(s)`;
+    $('#qZoneName').value = '';
+    await loadZoneSets(r.name);
+  } else {
+    $('#qSetupMsg').textContent = `zone set ${args.name} not saved: ${r.reason || 'cancelled'}`;
+  }
+}
+
+async function showZonesOnPart() {
+  const name = $('#qZoneSet').value;
+  if (!name) { $('#qSetupMsg').textContent = 'pick a zone set first (or paint one)'; return; }
+  const j = await setupJob('zone_show', { zones: name, hold_s: 5 }, '#qSetupMsg');
+  const r = j && j.status === 'done' ? j.result : null;
+  if (!r) return;
+  const seen = (r.zones || []).filter((z) => z.seen).length;
+  $('#qSetupMsg').textContent = `${name}: ${seen} of ${(r.zones || []).length} zone(s) land in the camera image`
+    + ((r.warnings || []).length ? ` - ${r.warnings.join('; ')}` : '');
+  const link = r.overlay_png || r.camera_png;
+  if (link && !/^[A-Za-z]:|^\//.test(link)) {                      // library-relative only
+    $('#qZoneImg').hidden = false;
+    $('#qZoneImg').src = `/files/${link}`;
+  }
 }
 
 async function showZone() {
@@ -1316,6 +1402,13 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#qArm').addEventListener('click', () => send(state.bus && state.bus.state === 'ARMED' ? 'disarm' : 'arm'));
   $('#qGrid').addEventListener('click', projectGrid);
   $('#qZones').addEventListener('click', showZone);
+  $('#qPaint').addEventListener('click', paintZones);
+  $('#qZoneShow').addEventListener('click', showZonesOnPart);
+  $('#qZoneSet').addEventListener('change', showZoneSet);
+  // zone sets belong to the loaded preset's geometry: re-read when the panel opens, when
+  // another preset is loaded and after painting
+  $('#qLights').addEventListener('toggle', () => { if ($('#qLights').open) loadZoneSets(); });
+  loadZoneSets();
   $('#qLive').addEventListener('click', toggleLive);
   $('#qSignal').addEventListener('click', signalCheck);
   document.addEventListener('keydown', onKey);

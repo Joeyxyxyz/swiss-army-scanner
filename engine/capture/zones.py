@@ -324,10 +324,15 @@ def resolve(session, preset, zone_text: str, pmap=None):
     """-> (projector_mask bool DMD_SHAPE, camera_mask bool camera shape or None,
     cells). camera_mask needs a ProjectorMap (latest for the geometry if pmap
     is None); without one it is None and a warning explains how to make one.
-    'atlas:<name>/<region>' names a region of an imported Surfer atlas."""
+    'atlas:<name>/<region>' names a region of an imported Surfer atlas;
+    'zoneset:<set>[:Z1,Z3]' the zones of a painted zone set (engine/zones: lit through
+    their union; never a camera mask - their camera px are derived per scan)."""
     from . import atlas as _atlas
     if _atlas.is_atlas_spec(zone_text):
         return _atlas.resolve_region(session, preset, zone_text, pmap=pmap)
+    from ..zones import use as _zoneset
+    if _zoneset.is_spec(zone_text):
+        return _zoneset.resolve(session, preset, zone_text)
     text, spacing = _split_spacing(zone_text)
     if spacing is None:
         spacing = last_grid_spacing(session, preset.geometry_id) or DEFAULT_SPACING

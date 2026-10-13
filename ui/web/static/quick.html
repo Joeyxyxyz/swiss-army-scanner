@@ -80,6 +80,7 @@
         </select></label>
       <div id="qMeasHint" class="qreason">Type camera px, or click the picture of the last
         measurement: two clicks are the corners of a region (or the two points of a distance).</div>
+      <div id="qMeasZone" class="qreason"></div>
     </div>
 
     <div id="qPaneQuick" hidden>
@@ -134,6 +135,21 @@
           <button id="qZones" class="qbtn2" title="Placeholder: lights the station configuration's zone">Show zone</button>
         </div>
         <img id="qGridImg" class="qpreview" alt="grid photo" hidden>
+        <p class="muted small">Painted zones: draw them on the part itself. The projector is a
+          second monitor, so its mouse cursor is projected: drag a rectangle (E ellipse, P
+          polygon) over an area, fit it, <kbd>Space</kbd> saves, <kbd>Esc</kbd> cancels.</p>
+        <div class="qselect">
+          <label class="qfield" title="A painted zone set at the loaded preset's geometry. Picked: MEASURE lights and measures only its zones; Paint zones edits it; Show zones projects it"><span>Zone set</span>
+            <select id="qZoneSet"></select></label>
+          <label class="qfield" title="A name for a NEW zone set (letters, digits, _ . -). Empty: Paint zones edits the picked set"><span>New set name</span>
+            <input id="qZoneName" type="text" placeholder="e.g. lid_zones" autocomplete="off"></label>
+        </div>
+        <div class="qrow">
+          <button id="qPaint" class="qbtn2" title="Open the zone painter on the projector: draw with the mouse on the part. It holds the rig until Space / Esc (ABORT ends it, nothing saved)">Paint zones</button>
+          <button id="qZoneShow" class="qbtn2" title="Project the picked zone set on the part and photograph where each zone lands">Show zones</button>
+        </div>
+        <div id="qZoneInfo" class="qreason"></div>
+        <img id="qZoneImg" class="qpreview" alt="the painted zones" hidden>
       </details>
       <details class="qpanel" id="qCamera">
         <summary><b>2 Camera</b> aim the camera, choose what to capture</summary>

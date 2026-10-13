@@ -92,18 +92,25 @@ def raw(store: LibraryStore, builtin: Path, name: str) -> tuple:
     return schema.read_doc(p), tier_of(store, builtin, name), p
 
 
+def _zonesets(store: LibraryStore):
+    """The resolver of a zone's "ref": "zoneset:<set>/<id>" against this library's painted
+    zone sets (engine/zones)."""
+    from ..zones import use as zone_use
+    return zone_use.recipe_binder(store)
+
+
 def resolve(store: LibraryStore, builtin: Path, ref) -> schema.Recipe:
     """A recipe from a name (built-in / user), a .json / .yaml file, a raw dict or a Recipe."""
     if isinstance(ref, schema.Recipe):
         return ref
     if isinstance(ref, dict):
-        return schema.validate(ref)
+        return schema.validate(ref, zonesets=_zonesets(store))
     s = str(ref)
     p = Path(s)
     if p.suffix.lower() in EXTS and (p.is_file() or not _ID.match(s)):
-        return schema.load(p)
+        return schema.validate(schema.read_doc(p), source=p, zonesets=_zonesets(store))
     doc, _tier, path = raw(store, builtin, s)
-    r = schema.validate(doc, source=path)
+    r = schema.validate(doc, source=path, zonesets=_zonesets(store))
     if r.name != s:
         raise RecipeError(f"recipe file {path.name} names itself {r.name!r}: the name inside must "
                           f"be the file / folder name {s!r}")
@@ -198,7 +205,7 @@ def add(store: LibraryStore, builtin: Path, name: str, base=None, overrides: Opt
             src_name = str(base)
     d = apply_overrides(src, overrides)
     d["name"] = name
-    r = schema.validate(d)
+    r = schema.validate(d, zonesets=_zonesets(store))
     if preset_names is not None and r.preset not in preset_names:
         raise RecipeError(f"recipe {name}: preset {r.preset!r} does not exist (built-in or user "
                           "presets: `scan presets`)")

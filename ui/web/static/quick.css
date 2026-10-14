@@ -179,3 +179,55 @@ kbd { font: 12px var(--mono); padding: 1px 5px; border: 1px solid var(--line2); 
 .qvalues tr.near td:first-child { border-left: 4px solid var(--warn); }
 .qvalues tr.note td { color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); }
 .qclick { cursor: crosshair; }
+/* Scan zones: a panel of its own, always open (above 1 Lights): the zone sets of this rig
+   placement, each with an on / off switch and one switch per zone */
+.qzones { display: grid; gap: 8px; }
+.qzhead b { font-size: 16px; margin-right: 8px; }
+/* many sets: the rows scroll in a box of about six rows, the run buttons stay where they are */
+.qzrows { display: grid; gap: 4px; max-height: 15.5em; overflow-y: auto; padding-right: 2px; }
+.qzrows:empty { display: none; }
+.qzrow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 6px 8px;
+  border: 1px solid var(--line2); border-left-width: 6px; border-radius: var(--r);
+  background: var(--panel2); font-size: 14px; }
+.qzrow.on { border-left-color: #23a866; }
+.qzrow.bad { border-color: var(--warn); border-left-color: var(--warn); background: var(--warn-bg); }
+.qzrow.check { border-left-color: var(--warn); }
+.qzrow label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.qzrow input { width: 22px; height: 22px; }
+.qzset b { font-size: 16px; }
+.qzset span { color: var(--muted); font-size: 12px; }
+.qzzones { display: flex; flex-wrap: wrap; gap: 2px 12px; flex: 1; }
+.qzzones label { font-size: 13px; }
+.qzzones input { width: 18px; height: 18px; }
+.qznote { flex-basis: 100%; color: var(--warn); font-size: 12px; overflow-wrap: anywhere; }
+/* what the painter / a zone action did: SAVED, NOT SAVED, shown, deleted (role=status) */
+.qzresult { font-size: 14px; overflow-wrap: anywhere; }
+.qzresult:empty { display: none; }
+.qzresult.qwarn { color: var(--warn); }
+/* an in-page question (paint over a set, delete a set): no browser dialog */
+.qask { display: grid; gap: 8px; padding: 10px 12px; border: 2px solid var(--warn);
+  border-radius: var(--r); background: var(--warn-bg); font-size: 14px; }
+.qyes { border-color: var(--warn); }
+/* the photo of a set: small, opens on click */
+.qthumb { max-height: 96px; width: auto; cursor: zoom-in; }
+.qthumb.big { max-height: none; width: 100%; cursor: zoom-out; }
+/* the notice, the zones a run inspects and the run buttons: one block */
+.qrunblock { background: var(--bg); padding: 8px 0 10px; }
+/* On a screen that is high enough the block stays in view at the bottom. Its two texts are
+   held to a few lines (they scroll inside their own box), so the block has a height limit
+   and the buttons are always in it. On a low screen (a 768 px laptop) it is an ordinary
+   block: stuck to the bottom it would cover the Scan zones panel */
+@media (min-height: 900px) {
+  .qrunblock { position: sticky; bottom: 0; z-index: 10; }
+  .qrunblock .qnotice { max-height: 4.5em; overflow-y: auto; }
+  .qrunblock .qrunzones { max-height: 6.5em; overflow-y: auto; }
+  .qrunblock .qbtn { min-height: 80px; }
+  /* what the page scrolls to (a focused answer, the question of the Scan zones panel, the
+     SAVED / NOT SAVED line) stops above the block, never under it */
+  html { scroll-padding-bottom: 16em; }
+}
+.qrunzones { margin: 0 0 10px; padding: 8px 12px; border: 1px solid var(--line2);
+  border-radius: var(--r); background: var(--panel); font-size: 14px; overflow-wrap: anywhere; }
+.qrunzones b { font-size: 16px; margin-right: 8px; }
+.qrunzones b.qwarn { color: var(--warn); }
+.qrunzones span { color: var(--muted); }

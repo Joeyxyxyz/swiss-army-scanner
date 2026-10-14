@@ -282,6 +282,13 @@ def spec_from(d) -> Spec:
     if what == "endface" and not out.get("face_diameter_mm"):
         bad.append("endface needs face_diameter_mm: the expected diameter (mm; the face is "
                    "searched for within +-25 % of it, its diameter is then measured)")
+    from ..zones import selection as zone_sel
+    from ..zones import use as zone_use
+    if what == "endface" and (zone_use.is_spec(out.get("zone")) or zone_sel.is_word(out.get("zone"))):
+        bad.append("zone: the end-face measurement uses the whole field (it finds the rim on "
+                   "the fully lit part): a zone set or the zone selection is not used for it")
+    if zone_sel.is_word(out.get("zone2")):
+        bad.append("zone2 (region B) names ONE zone (zoneset:<set>/<id>), not the selection")
     for k, only in (("roi2", ("step",)), ("zone2", ("step",)), ("p1", ("distance",)),
                     ("p2", ("distance",)), ("golden", ("deviation",)),
                     ("radius_mm", ("cylinder",)), ("face_diameter_mm", ("endface",))):
@@ -564,7 +571,7 @@ def finish_values(rows: list, prec: dict) -> list:
             notes.append(why)
         v["notes"] = notes
         for k in ("lever_mm", "trim_pct", "n_points_a", "n_points_b", "outline_rms_mm",
-                  "depth_gain", "lateral_gain"):
+                  "depth_gain", "lateral_gain", "zone"):
             if k in first:
                 v[k] = first[k]
         out.append(v)
@@ -644,21 +651,126 @@ def measure_scan(s, preset, spec: Spec, ms, golden=None, warnings: Optional[list
     """The values of ONE metric scan -> {"values", "z_mm", "mask", "details", ...}
     (engine/measure/values.py); MeasureError when this scan cannot give them. stored: the
     scan was not captured by this run (a zone then only cuts it by a projector map, or when
-    the scan itself was lit through that zone)."""
-    from ..measure import metric
-    from ..reconstruct import metric_scan
+    the scan itself was lit through that zone). A zone text that names several painted zones
+    is measured zone by zone (_zone_cut, _per_zone); the result then carries "zone_report"
+    (engine/zones/use.report: the points and coverage per zone)."""
     warnings = [] if warnings is None else warnings
     cloud = ms.cloud
     a, b = _regions(s, preset, spec, cloud.mask.shape, warnings,
                     (ms.meta or {}).get("zone") if stored else "?", ms)
+    cut = _zone_cut(s, preset, spec, ms, warnings)
+    got = _measure_region(s, preset, spec, ms, golden, warnings, cloud, a, b, cut)
+    if cut is not None:
+        got["zone_report"] = cut["report"]
+    return got
+
+
+def several_zones_rule(spec: Spec, text: str, n_zones: int) -> Optional[str]:
+    """Why a measurement cannot be made through a zone text that names several zones (None:
+    it can - flatness and cylinder are then measured PER ZONE, a distance between two points
+    needs no region). A plane, a part or a compare across separate zones is never reported
+    as one number."""
+    if n_zones <= 1:
+        return None
+    what = spec.what
+    if what == "step":
+        return (f"step needs region A and region B, and {text} names {n_zones} zones: name ONE "
+                "zone as the zone (region A) and ONE as zone2 (region B), like zone "
+                "zoneset:SET/Z1 and zone2 zoneset:SET/Z2")
+    if what == "distance" and spec.p2 is None:
+        return (f"the distance from P1 to the plane of the region needs ONE zone, and {text} "
+                f"names {n_zones}: the plane of which one? Name one zone (zoneset:SET/Z1), or "
+                "give a second point")
+    if what == "dims":
+        return (f"the bounding dimensions are of ONE part, and {text} names {n_zones} zones: "
+                "name one zone, or measure the whole field")
+    if what == "deviation":
+        return (f"the deviation from the golden is ONE compare of the part, and {text} names "
+                f"{n_zones} zones: name one zone, or measure the whole field")
+    return None
+
+
+def _zone_cut(s, preset, spec: Spec, ms, warnings: list) -> Optional[dict]:
+    """The zones of the measurement's zone text on this scan: {"picked", "regions" {key:
+    camera mask, cut by the roi}, "report"} - or None when the zone is not a painted zone
+    set (grid cells, an atlas region, no zone) or the scan decoded columns only and the text
+    names one zone (the region is then what it was before: _regions)."""
+    from ..zones import use as zone_use
+    if not zone_use.is_spec(spec.zone) or spec.what == "endface":
+        return None
+    shape = ms.cloud.mask.shape
+    fld = getattr(ms, "field", None)
+    if getattr(fld, "corr_y", None) is None:
+        picked = zone_use.select_multi(s.store, preset, spec.zone)
+        if len(picked.keys) > 1:                # zones can't be told apart: never a guess
+            zone_use.camera_regions(s, preset, spec.zone, ms, shape)
+        return None
+    picked, cam, rep = zone_use.camera_regions(s, preset, spec.zone, ms, shape)
+    roi = V.roi_mask(shape, spec.roi) if spec.roi is not None else None
+    where = f" inside the region {list(spec.roi)}" if roi is not None else ""
+    regions = {}
+    for row in rep["by_zone"]:
+        m = cam[row["key"]] if roi is None else (cam[row["key"]] & roi)
+        n = int((m & ms.cloud.mask).sum())
+        why = zone_use.zone_doubt({**row, "points": n,
+                                   "coverage_pct": row["coverage_pct"] if roi is None else None},
+                                  where=where)
+        if why:
+            raise V.MeasureError(why + " (check the part, the zone and the exposure; `scan "
+                                 f"zone-show {picked.text[len(zone_use.PREFIX):]}` shows "
+                                 "where the zones land)", "too_few_points")
+        if roi is not None:
+            row["points_in_region"] = n
+        regions[row["key"]] = m
+    for w in rep["warnings"]:
+        if w not in warnings:
+            warnings.append(w)
+    return {"picked": picked, "regions": regions, "report": rep}
+
+
+def _per_zone(fn: Callable, regions: dict) -> dict:
+    """One measurement per zone -> their values in one list, each named "<set>/<id>:<name>"
+    (label "<set>/<id> <label>", field `zone`). A zone that cannot be measured makes the
+    whole measurement not measurable, and the message names it."""
+    vals, details, zs, mask = [], {}, [], None
+    for key, m in regions.items():
+        try:
+            one = fn(m)
+        except V.MeasureError as e:
+            raise V.MeasureError(f"zone {key}: {e}", e.code) from None
+        for v in one["values"]:
+            v.update(name=f"{key}:{v['name']}", label=f"{key} {v['label']}", zone=key)
+        vals += one["values"]
+        mask = one["mask"] if mask is None else (mask | one["mask"])
+        details[key] = one.get("details") or {}
+        if one.get("z_mm") is not None:
+            zs.append(float(one["z_mm"]))
+    return {"values": vals, "z_mm": float(np.median(zs)) if zs else None, "mask": mask,
+            "details": {"per_zone": True, "by_zone": details}}
+
+
+def _measure_region(s, preset, spec: Spec, ms, golden, warnings: list, cloud, a, b,
+                    cut: Optional[dict]) -> dict:
+    from ..measure import metric
+    from ..reconstruct import metric_scan
+    several = cut is not None and len(cut["regions"]) > 1
+    if several:
+        why = several_zones_rule(spec, cut["picked"].text, len(cut["regions"]))
+        if why:
+            raise ValueError(why)
     if spec.what == "flatness":
+        if several:
+            return _per_zone(lambda m: V.flatness(cloud, m), cut["regions"])
         return V.flatness(cloud, a)
     if spec.what == "step":
         return V.step(cloud, a, b)
     if spec.what == "distance":
-        has_region = spec.roi is not None or bool(spec.zone)
+        has_region = (spec.roi is not None or bool(spec.zone)) and not several
         return V.distance(cloud, spec.p1, spec.p2, a if has_region else None)
     if spec.what == "cylinder":
+        if several:
+            return _per_zone(lambda m: V.cylinder(cloud, m, spec.radius_mm, spec.axis),
+                             cut["regions"])
         return V.cylinder(cloud, a, spec.radius_mm, spec.axis)
     if spec.what == "dims":
         return V.dims(cloud, a, spec.min_height_mm)
@@ -692,6 +804,54 @@ def measure_scan(s, preset, spec: Spec, ms, golden=None, warnings: Optional[list
     z = cloud.xyz[..., 2][out["mask"]]
     out["z_mm"] = float(np.median(z)) if z.size else None
     return out
+
+
+def _zone_gate(s, preset, spec: Spec, doc: dict, log) -> tuple:
+    """The measurement's zone, resolved before the scan -> (the spec that is run, the
+    resolved zone sets or None). The word `selection` is expanded into its zone text (which
+    spec.json then records: the run can be repeated); a text of painted zone sets is checked
+    against this rig placement; a measurement that has no meaning across several zones is
+    refused with the reason. A run that asked for the selection or for zone sets carries
+    doc["zone_selection"]: what was lit, from where, and (after the scan) the points per
+    zone. Anything that does not resolve ends the run NOT_MEASURABLE (`refused`): never the
+    whole field in its place."""
+    from dataclasses import replace
+    from ..zones import selection as zone_sel
+    from ..zones import use as zone_use
+    from ..zones.model import ZoneError
+    zone, info, picked = spec.zone, None, None
+    if not zone and not spec.zone2:
+        return spec, None
+    try:
+        if zone_sel.is_word(zone):
+            zone, info = zone_sel.expand(s.store, preset, zone)
+            spec = replace(spec, zone=zone)
+        if zone_use.is_spec(zone):
+            picked = zone_use.select_multi(s.store, preset, zone)
+            spec = replace(spec, zone=picked.text)
+            why = several_zones_rule(spec, picked.text, len(picked.keys))
+            if why:
+                raise ZoneError(why)
+        if zone_use.is_spec(spec.zone2) and len(
+                zone_use.select_multi(s.store, preset, spec.zone2).keys) > 1:
+            raise ZoneError(f"zone2 (region B) must name ONE zone, and {spec.zone2} names "
+                            "several: write zoneset:SET/Z2")
+    except (ZoneError, rules.GeometryMismatch) as e:
+        _refuse(doc, "refused", f"{type(e).__name__}: {e}")
+        log.event("not_measurable", level="warning", reason="refused", message=str(e))
+        raise _Stop from None
+    if info is not None or picked is not None:
+        doc["spec"] = spec.to_dict()
+        doc["zone_selection"] = {
+            "text": picked.text if picked is not None else "",
+            "source": "selection" if info is not None else "argument",
+            "selected": (info or {}).get("selected"),
+            "sets": picked.created() if picked is not None else [],
+            "by_zone": [], "outside": None, "points": None, "warnings": []}
+        log.event("zones", text=doc["zone_selection"]["text"] or "(the whole field)",
+                  source=doc["zone_selection"]["source"],
+                  zones=picked.keys if picked is not None else [])
+    return spec, picked
 
 
 def _live_scan(s, preset, spec: Spec, label: str):
@@ -916,6 +1076,16 @@ def run(s, preset, spec: Spec, *, runs_dir, scans: Optional[list] = None,
             except (LookupError, rules.RuleViolation) as e:
                 _refuse(doc, "golden", f"golden scan {spec.golden!r}: {e}")
                 raise _Stop from None
+        # the zone text is resolved in its own gate, before anything is scanned: the word
+        # `selection` becomes the text it stands for, and a set that is gone or was painted
+        # at another rig placement is refused as that (never as a stale calibration)
+        spec, picked = _zone_gate(s, preset, spec, doc, log)
+        if golden is not None and not stored:
+            from ..zones import use as zone_use
+            why = zone_use.golden_mismatch(s, preset, golden, picked)
+            if why:
+                _refuse(doc, "golden", why)
+                raise _Stop
         n = len(stored) if stored else spec.repeats
         doc["repeats"] = n
         rows = []
@@ -945,6 +1115,11 @@ def run(s, preset, spec: Spec, *, runs_dir, scans: Optional[list] = None,
             rows.append(got["values"])
             if one is None:
                 one = got
+                rep = got.get("zone_report")
+                if rep is not None and "zone_selection" in doc:    # what was lit, per zone
+                    doc["zone_selection"].update(
+                        by_zone=rep["by_zone"], outside=rep["outside"], points=rep["points"],
+                        warnings=list(rep["warnings"]))
         prec = precision_of(used[0], cal, preset, one.get("z_mm"))
         doc["precision"] = prec
         doc["values"] = finish_values(rows, prec)

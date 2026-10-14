@@ -19,7 +19,10 @@ and it is used wherever a lit zone is named (text "zoneset:<set>[:Z1,Z3]"): `sca
     session.py   the thin window shell around it (the rig, the rig lock, polarity), and
                  zone-show (project a saved set, report where each zone lands)
     store.py     save / load / list / delete (to trash) in the library
-    use.py       scan masks, per-zone point counts, recipe zones and references, regions
+    use.py       scan masks, per-zone point counts, recipe zones and references, regions;
+                 several sets in one text ("zoneset:<a>+<b>:Z1"), zones keyed "<set>/<id>"
+    selection.py which sets (and zones) are switched on at a rig placement: the stored
+                 selection, the word `selection` wherever a zone text is taken
 
 Limits: zones are PROJECTOR px, valid for the rig placement they were painted at (the same
 geometry_id + fingerprint is enforced; a rig that moved without a new geometry_id cannot be

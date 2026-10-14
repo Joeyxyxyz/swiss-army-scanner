@@ -59,7 +59,7 @@
           <option value="endface">End-face diameter</option>
           <option value="deviation">Deviation vs a golden scan (values only)</option>
         </select></label>
-      <label id="qMeasRoiRow" class="qline" title="Region A: x0,y0,x1,y1 in camera px (empty = the whole field)"><span id="qMeasRoiLabel">Region (camera px)</span>
+      <label id="qMeasRoiRow" class="qline" title="Region A: x0,y0,x1,y1 in camera px (empty = all selected zones, or the whole field when none is on). With zones on, only the part of them inside the region is measured"><span id="qMeasRoiLabel">Region (camera px)</span>
         <input id="qMeasRoi" type="text" placeholder="x0,y0,x1,y1" autocomplete="off"></label>
       <label id="qMeasRoi2Row" class="qline" hidden title="Region B: x0,y0,x1,y1 in camera px"><span>Region B (camera px)</span>
         <input id="qMeasRoi2" type="text" placeholder="x0,y0,x1,y1" autocomplete="off"></label>
@@ -94,7 +94,7 @@
         </select></label>
       <label id="qQuickThresholdRow" class="qline" title="The limit in mm: the largest deviation allowed"><span>Threshold (mm)</span>
         <input id="qQuickThreshold" type="text" inputmode="decimal" placeholder="0.5" autocomplete="off"></label>
-      <label id="qQuickRoiRow" class="qline" title="x0,y0,x1,y1 in camera px (empty = the whole field)"><span>Region (camera px)</span>
+      <label id="qQuickRoiRow" class="qline" title="x0,y0,x1,y1 in camera px (empty = all selected zones, or the whole field when none is on). With zones on, only the part of them inside the region is checked"><span>Region (camera px)</span>
         <input id="qQuickRoi" type="text" placeholder="x0,y0,x1,y1" autocomplete="off"></label>
       <label id="qQuickGoldenRow" class="qline" hidden title="The golden metric scan: its id or label (a GOOD part scanned once)"><span>Golden scan</span>
         <input id="qQuickGolden" type="text" placeholder="id or label" autocomplete="off"></label>
@@ -126,6 +126,40 @@
     </div>
 
     <div class="qpanels">
+      <div class="qpanel qzones" id="qScanZones" tabindex="-1">
+        <div class="qzhead"><b>Scan zones</b> <span class="muted small">where the scanner lights
+          and what a run inspects: paint, name, save, switch on, run</span></div>
+        <div id="qZoneRows" class="qzrows" role="group" aria-label="Zone sets and their switches"></div>
+        <div id="qZoneResult" class="qzresult" role="status"></div>
+        <div id="qZoneGeo" class="qreason"></div>
+        <div class="qrow">
+          <button id="qZoneShow" class="qbtn2" title="Project the outlines of every switched-on zone on the part for 5 s and photograph where each one lands">Show selected zones</button>
+        </div>
+        <p class="muted small">Paint zones on the part itself. The projector is a second monitor,
+          so its mouse cursor is projected: drag a rectangle (E ellipse, P polygon) over an area,
+          fit it, <kbd>Space</kbd> saves, <kbd>Esc</kbd> cancels.</p>
+        <div class="qselect">
+          <label class="qfield" title="The set whose photo is shown, that Paint zones edits and Delete set removes. It does not decide what a run uses: the switches above do"><span>Set to view or edit</span>
+            <select id="qZoneSet"></select></label>
+          <label class="qfield" title="Name a NEW zone set here before painting (letters, digits, _ . -)"><span>New set name</span>
+            <input id="qZoneName" type="text" placeholder="e.g. cells" autocomplete="off"></label>
+        </div>
+        <div class="qrow">
+          <button id="qPaint" class="qbtn2" title="Open the painter on the projector: draw on the part with the mouse. SPACE there saves, ESC cancels, ABORT here ends it with nothing saved. The rig is held until then">Paint zones</button>
+          <button id="qZoneDelete" class="qbtn2" title="Move the set picked under Set to view or edit to the library trash (asks first, needs a reason)">Delete set</button>
+        </div>
+        <div id="qZoneAsk" class="qask" hidden>
+          <div id="qZoneAskText"></div>
+          <label id="qZoneReasonRow" class="qline" hidden><span>Reason</span>
+            <input id="qZoneReason" type="text" placeholder="why (it is recorded)" autocomplete="off"></label>
+          <div class="qrow">
+            <button id="qZoneAskYes" class="qbtn2 qyes">Yes</button>
+            <button id="qZoneAskNo" class="qbtn2">Cancel</button>
+          </div>
+        </div>
+        <div id="qZoneInfo" class="qreason"></div>
+        <img id="qZoneImg" class="qpreview qthumb" alt="the painted zones (click to enlarge)" title="Click to enlarge" hidden>
+      </div>
       <details class="qpanel" id="qLights">
         <summary><b>1 Lights</b> set up the illumination</summary>
         <p class="muted small">Projector / LEDs ready, aim the grid, assign the areas. Active zone:
@@ -135,21 +169,6 @@
           <button id="qZones" class="qbtn2" title="Placeholder: lights the station configuration's zone">Show zone</button>
         </div>
         <img id="qGridImg" class="qpreview" alt="grid photo" hidden>
-        <p class="muted small">Painted zones: draw them on the part itself. The projector is a
-          second monitor, so its mouse cursor is projected: drag a rectangle (E ellipse, P
-          polygon) over an area, fit it, <kbd>Space</kbd> saves, <kbd>Esc</kbd> cancels.</p>
-        <div class="qselect">
-          <label class="qfield" title="A painted zone set at the loaded preset's geometry. Picked: MEASURE lights and measures only its zones; Paint zones edits it; Show zones projects it"><span>Zone set</span>
-            <select id="qZoneSet"></select></label>
-          <label class="qfield" title="A name for a NEW zone set (letters, digits, _ . -). Empty: Paint zones edits the picked set"><span>New set name</span>
-            <input id="qZoneName" type="text" placeholder="e.g. lid_zones" autocomplete="off"></label>
-        </div>
-        <div class="qrow">
-          <button id="qPaint" class="qbtn2" title="Open the zone painter on the projector: draw with the mouse on the part. It holds the rig until Space / Esc (ABORT ends it, nothing saved)">Paint zones</button>
-          <button id="qZoneShow" class="qbtn2" title="Project the picked zone set on the part and photograph where each zone lands">Show zones</button>
-        </div>
-        <div id="qZoneInfo" class="qreason"></div>
-        <img id="qZoneImg" class="qpreview" alt="the painted zones" hidden>
       </details>
       <details class="qpanel" id="qCamera">
         <summary><b>2 Camera</b> aim the camera, choose what to capture</summary>
@@ -170,12 +189,18 @@
       <span>I confirm the setup: part placed, rig untouched since base / calibration</span>
     </label>
 
-    <div id="qNotice" class="qnotice" role="status" hidden></div>
-    <div class="qbuttons">
-      <button id="qMeasure" class="qbtn qmeasure" hidden title="Scan and report the numbers (key M)">MEASURE</button>
-      <button id="qStart" class="qbtn qstart">START</button>
-      <button id="qAbort" class="qbtn qabort">ABORT</button>
-      <button id="qHome" class="qbtn qhome" title="The rig check: has the camera or projector moved? A mobile rig needs it before any mm (key H)">HOME</button>
+    <div id="qRunBlock" class="qrunblock">
+      <div id="qNotice" class="qnotice" role="status" hidden></div>
+      <div id="qRunZones" class="qrunzones" role="status" title="What the run button below inspects, and what it does with the zone sets that are switched on">
+        <b id="qZoneLine">Zones: …</b>
+        <span id="qRunScope"></span>
+      </div>
+      <div class="qbuttons">
+        <button id="qMeasure" class="qbtn qmeasure" hidden title="Scan and report the numbers (key M)">MEASURE</button>
+        <button id="qStart" class="qbtn qstart">START</button>
+        <button id="qAbort" class="qbtn qabort">ABORT</button>
+        <button id="qHome" class="qbtn qhome" title="The rig check: has the camera or projector moved? A mobile rig needs it before any mm (key H)">HOME</button>
+      </div>
     </div>
     <div id="qStationExtras">
       <div class="qbuttons2">
@@ -200,11 +225,14 @@
       </ol>
     </div>
     <div class="qlegend muted small">Keys: <kbd>Space</kbd>/<kbd>Enter</kbd> START (Measure mode:
-      MEASURE; unless a button or link has the focus: then they press it),
+      MEASURE; unless a button, a link or the Scan zones panel has the focus: then they press
+      that, or nothing),
       <kbd>M</kbd> MEASURE (Measure mode),
       <kbd>Esc</kbd> ABORT, <kbd>H</kbd> HOME; in Station mode only: <kbd>N</kbd> STEP (verify
       the next work state), <kbd>K</kbd> ACK, <kbd>T</kbd> TRIGGER, <kbd>A</kbd> ARM / DISARM,
-      <kbd>P</kbd> next profile, <kbd>1</kbd>-<kbd>9</kbd> station configuration. Also POST
+      <kbd>P</kbd> next profile, <kbd>1</kbd>-<kbd>9</kbd> station configuration. While the
+      zone painter is open, or a question of the Scan zones panel waits for an answer, the keys
+      start nothing here (<kbd>Esc</kbd> still sends ABORT). Also POST
       /api/cmd/&lt;start|abort|home|trigger|step|ack|retry|skip|arm|disarm|reset|config|profile|mode&gt;
       (reset acknowledges ALARM / FAULT; a good HOME does too), POST /api/io/inputs
       {"&lt;signal&gt;": true} for the line's sensor claims (for every part: a claim belongs
@@ -226,6 +254,9 @@
         <tbody id="qValuesBody"></tbody>
       </table>
       <div id="qValidity" class="qreason"></div>
+      <div id="qInspected" class="qreason"></div>
+      <ul id="qZoneCounts" class="qzonelist" hidden></ul>
+      <div id="qZoneWarn" class="qreason"></div>
       <ul id="qZoneList" class="qzonelist" hidden></ul>
       <div id="qFeedback" class="qreason"></div>
       <div class="qlinks"><a id="qResultLink" href="#" hidden target="_blank" rel="noopener">result.json</a>

@@ -209,6 +209,32 @@ def config_from_doc(doc: dict, base_dir: Path, source: Optional[Path] = None) ->
         _golden_ref(job.get("golden"), label)
     metric = _metric_keys(job, jt, label)
     rec = _recipe_keys(job, jt, base_dir)
+    zone = job.get("zone") or None
+    if zone is not None and not isinstance(zone, str):
+        raise StationConfigError("job.zone must be text (grid cells, 'zoneset:<set>[:Z1,Z3]', "
+                                 f"'selection') or null, got {zone!r}")
+    if uses_selection(zone):
+        # the operator's zone selection decides what a run lights and judges: accepted where
+        # every selected zone is judged on its own (metric jobs), refused where a zone could
+        # be lit and not judged (inspect / compare: only what a base or golden also covers)
+        if "@" in zone and doc.get("operating_mode") != "quick_check":
+            # a stamp says "exactly the selection I was shown", and with it "nothing switched
+            # on" is the whole field: that is a quick check's own record (its generated
+            # file), never what a station configuration may say
+            raise StationConfigError(
+                f"job.zone {zone!r}: a station configuration says \"selection\" (the zone "
+                "sets switched on when it runs; none switched on = the part is PULLed). The "
+                "form with @ belongs to a quick check started from the operator page")
+        if jt != "metric":
+            raise StationConfigError(
+                f"job.zone {zone!r} (the zone sets switched on at the operator page) is for "
+                f"job.type metric; job.type {jt} "
+                + ("names its zones in its recipe" if jt == "recipe" else
+                   "judges only what its base / golden also covers, so a selected zone could "
+                   "be lit and not inspected") + ": name the zone in the configuration")
+        if metric.get("axis") != "xy" and metric.get("scan") == "fast":
+            raise StationConfigError("job.zone 'selection' needs job.axis xy: with columns "
+                                     "only the selected zones cannot be told apart")
     thr = doc.get("threshold_mm")
     if thr is not None and (not _number(thr) or thr <= 0):
         raise StationConfigError("threshold_mm must be a positive, finite number (mm) or null")
@@ -229,7 +255,7 @@ def config_from_doc(doc: dict, base_dir: Path, source: Optional[Path] = None) ->
         mock_library=_rel(base_dir, doc.get("mock_library")),
         runs_dir=Path(runs_env) if runs_env else (_rel(base_dir, doc.get("runs_dir"))
                                                   or base_dir / "runs"),
-        job_type=jt, base=base, zone=job.get("zone") or None, average=avg,
+        job_type=jt, base=base, zone=zone.strip() if zone else None, average=avg,
         golden=job.get("golden") or None,
         part_role=role, part_label=label,
         threshold_mm=float(thr) if thr is not None else None,
@@ -239,6 +265,15 @@ def config_from_doc(doc: dict, base_dir: Path, source: Optional[Path] = None) ->
         operator_confirmed=_flag(doc, "operator_confirmed", False),
         mock_part=_mock_part(doc.get("mock_part")),
         source=Path(source).resolve() if source else None, raw=doc, **metric, **rec)
+
+
+def uses_selection(zone) -> bool:
+    """Does a job's zone say "the zone sets switched on at the operator page" (the word
+    `selection`, engine/zones/selection.py)? Then the selection decides what the run lights
+    and judges - and only then: a configuration that names its own zone (or none) is never
+    changed by the selection."""
+    from engine.zones import selection
+    return selection.is_word(zone)
 
 
 def _mock_part(v) -> Optional[str]:

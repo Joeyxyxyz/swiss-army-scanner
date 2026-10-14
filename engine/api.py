@@ -747,7 +747,15 @@ def measure_run(what: Optional[str] = None, preset: Optional[Preset] = None, spe
     face_diameter_mm) | dims (L x W x H of the part above the reference plane) | deviation
     (vs the golden metric scan `golden`: values only). Regions: roi / roi2 ([x0, y0, x1,
     y1] camera px) or zone / zone2
-    (grid cells); p1 / p2: [x, y] camera px. spec: a measurement spec (mapping, Spec or
+    (grid cells); p1 / p2: [x, y] camera px. zone also takes painted zone sets
+    ("zoneset:<set>[:Z1,Z3]", several as "zoneset:<a>+<b>") or "selection" (the sets
+    switched on at this rig placement): only they are lit, and a text that names more than
+    one zone is measured PER ZONE (flatness, cylinder: one plane / cylinder per zone, values
+    named "<set>/<id>:<value>"; never one plane across separate zones) or refused before
+    the scan where that has no meaning (step, a distance to "the" plane, dims, deviation).
+    The result's zone_selection {text, source, by_zone [{key, points, coverage_pct}]} says
+    what was lit; a zone that was not seen well enough makes it NOT_MEASURABLE. endface
+    takes no zone set (it finds the rim on the fully lit part). spec: a measurement spec (mapping, Spec or
     .json) the arguments override. repeats: N scans -> each value's mean and its
     repeatability; one scan -> the predicted precision at that distance (or the scan's
     measured noise). scans: stored metric scans (ids / labels / handles) measured instead of
@@ -849,6 +857,7 @@ def capture_base(preset: Preset, label: str, zone: Optional[str] = None) -> Base
     prev = latest_base(p)
     proj_mask = None
     cells = []
+    zone = _expand_zone(p, zone)            # `selection` -> the zone text it stands for
     if zone:
         from .capture import zones as zones_mod
         proj_mask, _cam, cells = zones_mod.resolve(s, p, zone)
@@ -911,6 +920,7 @@ def capture_object(preset: Preset, base: BaseRef, label: str,
     base_age_s = _age_s(base.created)
     proj_mask = cam_mask = None
     cells = []
+    zone = _expand_zone(p, zone)            # `selection` -> the zone text it stands for
     if zone:
         from .capture import zones as zones_mod
         proj_mask, cam_mask, cells = zones_mod.resolve(s, p, zone)
@@ -1322,7 +1332,34 @@ def project_zones(zones: list, preset: Optional[Preset] = None, label: str = "zo
 # The projector is a second monitor: the mouse cursor is projected onto the part, and the
 # operator drags shapes out directly on it. A zone set lives in the library at the geometry
 # it was painted at (zones/<geometry_id>/<name>/) and is named "zoneset:<set>[:Z1,Z3]"
-# wherever a lit zone is named.
+# wherever a lit zone is named; "zoneset:<a>+<b>:Z1" names several sets at once. The zone
+# selection (engine/zones/selection.py) is which sets are switched on at a rig placement;
+# the word "selection" stands for it wherever a zone text is taken.
+
+def _expand_zone(preset: Preset, zone):
+    """A verb's zone as it was given -> the zone it lights. The word `selection` (or
+    `selection@<stamp>`) becomes the zone text of the stored selection of the preset's
+    geometry - refused when that is unknown, unusable, another one than the stamp names, or
+    (the bare word) empty; None when nothing is on and the stamp shows the sender knew (the
+    whole field). Anything else comes back unchanged."""
+    from .zones import selection as zone_selection_mod
+    if not zone_selection_mod.is_word(zone):
+        return zone
+    return zone_selection_mod.expand(_engine().store, preset, zone)[0]
+
+
+def _zone_picked(preset: Preset, zones):
+    """`zones` of a zone verb - "<set>", "<set>:Z1,Z3", "<a>+<b>:Z1", a list of such terms,
+    or the word `selection` - at the preset -> engine.zones.use.Picked."""
+    from .zones import selection as zone_selection_mod
+    from .zones import use as zone_use
+    from .zones.model import ZoneError
+    if zone_selection_mod.is_word(zones):
+        zones = _expand_zone(preset, zones)
+        if zones is None:
+            raise ZoneError("the zone selection is empty: no zone set is switched on")
+    return zone_use.select_multi(_engine().store, preset, zones, bare=True)
+
 
 def zone_sets(preset: Optional[Preset] = None, all_geometries: bool = False) -> list:
     """The saved zone sets: at the preset's geometry (default: the loaded preset's), or of
@@ -1356,20 +1393,54 @@ def zone_recipe(zones: str, preset: Optional[Preset] = None, by_ref: bool = Fals
     return zone_use.recipe_zones(zs, ids, checks, by_ref=bool(by_ref))
 
 
-def zone_mask(zones: str, preset: Optional[Preset] = None, out=None):
-    """The DMD mask a scan is lit through for a zone set ("<set>" or "<set>:Z1,Z3"): the
-    union of its zones, bool (1140, 912). out: also write it as a NEW .npy (for `scan
-    scan-fast --mask`; never replaced) -> the mask, or the file's path."""
+def zone_mask(zones, preset: Optional[Preset] = None, out=None):
+    """The DMD mask a scan is lit through for a zone set ("<set>" or "<set>:Z1,Z3"), several
+    ("<a>+<b>:Z1", or a list of terms) or the stored selection ("selection"): the union of
+    the zones, bool (1140, 912). out: also write it as a NEW .npy (for `scan scan-fast
+    --mask`; never replaced) -> the mask, or the file's path."""
     from .zones import use as zone_use
-    zs, ids, _text = zone_use.select(_engine().store, _preset(preset), zones, bare=True)
-    return zone_use.export_mask(zs, out, ids) if out else zone_use.scan_mask(zs, ids)
+    picked = _zone_picked(_preset(preset), zones)
+    return zone_use.export_mask(picked, out) if out else picked.mask()
+
+
+def zone_selection(preset: Optional[Preset] = None) -> dict:
+    """Which zone sets (and zones) are switched on at the preset's rig placement, checked
+    against the library now (engine/zones/selection.status): {state ok | problem | unknown,
+    ok, empty, text ("zoneset:cells+tube:Z1", "" = the whole field), label ("cells (2), tube
+    (2 of 3)"), stamp, problems [{set, zone, reason, message}], sets [{set, on, ids, n_on,
+    n_zones, found, usable, zones [{id, name, on}], rig_changes}], time, by}. A selection
+    that names something gone is a problem, never repaired silently: runs that ask for it
+    are refused. Files only: never touches the rig."""
+    from .zones import selection as zone_selection_mod
+    return zone_selection_mod.status(_engine().store, _preset(preset))
+
+
+@_verb
+def zone_select(zones=None, on=None, off=None, clear: bool = False,
+                sets: Optional[list] = None, preset: Optional[Preset] = None, by: str = "",
+                expect: Optional[str] = None) -> dict:
+    """Change the zone selection of the preset's rig placement -> zone_selection().
+
+    zones: exactly these are on ("cells+tube:Z1", or a list of terms); clear: everything off
+    (the whole field); on: terms to switch on ("tube:Z1,Z2" = those zones, "tube" = the set
+    with the zone switches it had); off: set names to switch off; sets: the whole selection
+    as [{set, on, ids}] (ids null = every zone). expect: the stamp the sender was shown -
+    refused when the stored selection is another one by now. A set that is switched on must
+    resolve at this rig placement (unknown set, another geometry or other rig settings, an
+    unknown zone id, no zone on: refused, nothing written). Recorded append-only in
+    zones/<geometry_id>/_selection.jsonl (by: who). Files only."""
+    from .zones import selection as zone_selection_mod
+    s = _engine()
+    return zone_selection_mod.change(s.store, _preset(preset), zones=zones, on=on, off=off,
+                                     clear=bool(clear), sets=sets, by=by or s.holder or "",
+                                     expect=expect)
 
 
 @_verb
 def zone_paint(name: str, preset: Optional[Preset] = None, source: Optional[str] = None,
                events: Optional[list] = None, replace: bool = False,
                labels: Optional[list] = None, polarity: str = "measure", note: str = "",
-               idle_timeout_s: float = 600.0, cancel=None) -> dict:
+               idle_timeout_s: float = 600.0, cancel=None, select: bool = False) -> dict:
     """The zone painter: the projector window with mouse handling, so the operator draws
     zones ON THE PART (drag = rectangle, E ellipse, P polygon; move / resize / rotate; N
     names; Space confirms and saves, Esc cancels: engine/zones/painter.py KEYS). Saved as the
@@ -1380,43 +1451,75 @@ def zone_paint(name: str, preset: Optional[Preset] = None, source: Optional[str]
     idle_timeout_s without input, nothing saved. MOCK: headless, `events` is the scripted
     session (a list of painter events). polarity: measure (default: raw black vs raw white,
     one lit field for one hold) | normal | inverted. cancel: a threading.Event that ends it
-    without saving. -> {saved, reason, name, geometry_id, zones [...], preview, camera, ...}"""
+    without saving. select: switch a NEW set on in the zone selection of this rig placement
+    (a set painted over keeps its on / off; its per-zone switches start again at "all
+    zones"). -> {saved, outcome (saved | cancelled | aborted | idle_timeout | script_ended:
+    how the session ended), reason, name, geometry_id, zones [...], preview, camera,
+    replaced (where the set it replaced went), on, selection_note, ...}"""
     from .zones import session as zone_session
-    return zone_session.paint(_engine(), _preset(preset), name, source=source, events=events,
+    s = _engine()
+    return zone_session.paint(s, _preset(preset), name, source=source, events=events,
                               replace=bool(replace), labels=labels, polarity=polarity,
-                              note=note, idle_timeout_s=idle_timeout_s, cancel=cancel)
+                              note=note, idle_timeout_s=idle_timeout_s, cancel=cancel,
+                              select=bool(select), by=s.holder or "")
 
 
 @_verb
-def zone_show(zones: str, preset: Optional[Preset] = None, hold_s: float = 5.0,
+def zone_show(zones, preset: Optional[Preset] = None, hold_s: float = 5.0,
               label: Optional[str] = None, cancel=None) -> dict:
-    """Project a saved zone set ("<set>" or "<set>:Z1,Z3") and report where it lands: each
-    zone lit on its own -> its camera px, centroid and box (seen / not seen by the camera),
-    then the outlines + ids held for hold_s (pumped; `cancel` ends it) and photographed ->
-    {zones [...], all_seen, camera_png, overlay_png, dmd_png, json_path, warnings}."""
+    """Project saved zones and report where they land: a zone set ("<set>" or "<set>:Z1,Z3"),
+    several ("<a>+<b>:Z1", a list of terms) or the stored selection ("selection"). Each zone
+    is lit on its own -> its camera px, centroid and box (seen / not seen by the camera),
+    then the outlines + ids (several sets: "<set>/<id>") held for hold_s (pumped; `cancel`
+    ends it) and photographed -> {zones [{id, key, zoneset, seen, ...}], all_seen,
+    camera_png, overlay_png, dmd_png, json_path, warnings}. A show that ran to its end with
+    every zone seen is recorded: it answers the rig changes since the set was painted."""
     from .zones import session as zone_session
-    from .zones import use as zone_use
     s, p = _engine(), _preset(preset)
-    zs, ids, _text = zone_use.select(s.store, p, zones, bare=True)
-    return zone_session.show(s, p, zs, ids, hold_s, label, cancel=cancel)
+    return zone_session.show(s, p, _zone_picked(p, zones), None, hold_s, label, cancel=cancel,
+                             by=s.holder or "")
+
+
+def zone_users(name: str, stations_dir: Union[str, Path, None] = None) -> dict:
+    """Who names the zone set `name`: {"recipes": [...], "stations": [station configuration
+    files]} (a zone ref, a scan.zone or a job.zone, also inside a several-set text). They
+    inspect another area when the set is painted over and stop working when it is deleted."""
+    from .zones import use as zone_use
+    return zone_use.users(_engine().store, _recipes_dir(),
+                          Path(stations_dir) if stations_dir else STATIONS_DIR, name)
 
 
 @_verb
 def zone_delete(name: str, reason: str, preset: Optional[Preset] = None,
-                force: bool = False) -> dict:
+                force: bool = False, stations_dir: Union[str, Path, None] = None) -> dict:
     """Move the zone set `name` (at the preset's geometry) to trash/zones/ (recoverable).
-    Refused while a recipe names it (zone ref / scan.zone "zoneset:<name>") unless force."""
+    Refused unless force while a recipe or a station configuration names it (zone ref /
+    scan.zone / job.zone "zoneset:<name>"), and while it is switched on in the zone
+    selection (switch it off first: a forced delete leaves it there as NOT FOUND, and every
+    run that asks for the selection is refused until it is switched off)."""
+    from .zones import selection as zone_selection_mod
     from .zones import store as zstore
-    from .zones import use as zone_use
     from .zones.model import ZoneError
     s, p = _engine(), _preset(preset)
-    refs = zone_use.recipe_refs(s.store, _recipes_dir(), name)
-    if refs and not force:
-        raise ZoneError(f"zone set {name!r} is used by recipe(s) {', '.join(refs)}: change them "
-                        "first, or force the delete")
+    used = zone_users(name, stations_dir)
+    refs = used["recipes"]
+    if (refs or used["stations"]) and not force:
+        raise ZoneError(f"zone set {name!r} is used by "
+                        + " and ".join(x for x in (
+                            f"recipe(s) {', '.join(refs)}" if refs else "",
+                            f"station configuration(s) {', '.join(used['stations'])}"
+                            if used["stations"] else "") if x)
+                        + ": change them first, or force the delete")
+    got = zone_selection_mod.read(s.store, p.geometry_id)
+    on = any(e["set"] == name and e["on"] for e in (got["record"] or {}).get("sets") or [])
+    if on and not force:
+        raise ZoneError(f"zone set {name!r} is switched on in the zone selection: switch it "
+                        f"off first (scan zone-select --off {name}), or force the delete")
     dest = zstore.delete(s.store, p.geometry_id, name, reason)
+    zone_selection_mod.after_delete(s.store, p, name, by=s.holder or "")
     return {"name": name, "geometry_id": p.geometry_id, "trashed": dest, "recipes": refs,
-            "forced": bool(refs and force)}
+            "stations": used["stations"], "was_on": bool(on),
+            "forced": bool((refs or used["stations"] or on) and force)}
 
 
 # ------------------------------------------------------------ spectral mode
@@ -1888,10 +1991,13 @@ def scan_metric(preset: Optional[Preset] = None, label: str = "metric", method: 
                 max_consistency_mm: Optional[float] = None, zone: Optional[str] = None):
     """Both-axis multifreq scan -> triangulated point cloud in mm (+ .ply, consistency map).
     Refused without a stereo calibration at this geometry + fingerprint (rule 6).
-    zone: light and keep only these grid cells ("F11:F12") or an atlas region."""
+    zone: light and keep only these grid cells ("F11:F12") or an atlas region; or light only
+    the zones of painted zone sets ("zoneset:<set>[:Z1,Z3]", "zoneset:<a>+<b>"), or of the
+    stored selection ("selection")."""
     from .reconstruct import metric_scan
-    return metric_scan.scan_metric(_engine(), _preset(preset), label, method, steps, periods,
-                                   max_consistency_mm, zone)
+    p = _preset(preset)
+    return metric_scan.scan_metric(_engine(), p, label, method, steps, periods,
+                                   max_consistency_mm, _expand_zone(p, zone))
 
 
 @_verb
@@ -2436,13 +2542,15 @@ def rig_check(preset: Optional[Preset] = None, set_reference: bool = False,
 def scan_fast(zone=None, preset: Optional[Preset] = None, label: str = "fast", steps: int = 4,
               periods: Optional[list] = None, average: int = 2, min_hold_s: float = 0.12,
               axis: str = "x", faces: Optional[list] = None, margin_dmd_px: float = 6.0,
-              zones: Optional[str] = None):
+              zones=None):
     """HDMI fast zone scan: the column-axis multifreq set only (steps x periods, default 4 x
     8 / 80 / 1280 DMD px, + the white / black floods) lit through `zone` (grid cells "F10:J12",
-    'atlas:<name>/<region>', a DMD mask array or .npy (1140 x 912), or None = full field), a
-    painted zone set (`zones`: "<set>" or "<set>:Z1,Z3" - their union is lit, the scan's
-    meta["zones"] and its zones.json carry the points decoded per zone; axis "xy" assigns
-    every point exactly, columns only can't tell zones that share columns apart) and /
+    'atlas:<name>/<region>', a DMD mask array or .npy (1140 x 912), or None = full field),
+    painted zone sets (`zones`: "<set>", "<set>:Z1,Z3", several as "<a>+<b>:Z1" or a list of
+    terms, or "selection" = the sets switched on at this rig placement - their union is lit,
+    the scan's meta["zones"] and its zones.json carry the points decoded per zone, keyed
+    "<set>/<id>" when several sets are named; axis "xy" assigns every point exactly, columns
+    only can't tell zones that share columns apart) and /
     or located end faces (`faces`: face targets, their DMD ellipses + margin_dmd_px), camera
     average and HDMI hold overridden for this run only (the preset file is untouched; average
     < 2 is raised to 2 with a warning: HDMI flicker), ray-plane triangulated -> a metric scan
@@ -2450,10 +2558,16 @@ def scan_fast(zone=None, preset: Optional[Preset] = None, label: str = "fast", s
     average 2, hold 0.12 s = 5.3 s for the whole station scene. Refused before the rig without a
     stereo calibration (rule 6)."""
     from .reconstruct import fast_scan
+    from .zones import selection as zone_selection_mod
     from .zones import use as zone_use
-    if (zones is None or not str(zones).strip()) and zone_use.is_spec(zone):
-        zone, zones = None, zone                # "zoneset:<set>" given as the zone
-    if zones is not None and str(zones).strip():
+    given = zones is not None and not (isinstance(zones, str) and not zones.strip())
+    if not given and isinstance(zone, str) and (zone_use.is_spec(zone)
+                                               or zone_selection_mod.is_word(zone)):
+        zone, zones, given = None, zone, True   # "zoneset:<set>" / "selection" as the zone
+    if given and zone_selection_mod.is_word(zones):
+        zones = _expand_zone(_preset(preset), zones)
+        given = zones is not None               # nothing on (and the sender knew): full field
+    if given:
         return zone_use.scan_fast(_engine(), _preset(preset), zones, zone=zone, label=label,
                                   steps=int(steps), periods=periods, average=average,
                                   min_hold_s=float(min_hold_s), axis=axis, faces=faces,

@@ -8,6 +8,11 @@ Zone sets in the library: save, load, list, delete (to trash, never destroyed).
         masks.npz     union (bool, 1140 x 912), ids, masks (one bool mask per zone)
         preview.png   the zones as a DMD-space picture (dim fill, outline, id)
         camera.png    a photo of the zones projected on the part (when one was taken)
+    <library>/zones/<geometry_id>/_shown.jsonl      one line per zone show that ran to its
+                      end with every shown zone seen (record_shown): the operator had the
+                      outlines on the part to look at. It answers the rig changes before it
+    <library>/zones/<geometry_id>/_selection.jsonl  which sets are switched on
+                      (engine/zones/selection.py). A leading '_' is never a set name.
 
 A set is bound to its geometry_id: the same name may exist at another geometry (another rig
 placement) and is a different set. Nothing is replaced in place: saving an existing name is
@@ -30,6 +35,7 @@ from ..library.store import LibraryStore, json_safe
 from .model import ZoneError, ZoneSet, valid_set_name
 
 KIND = "zones"
+SHOWN_FILE = "_shown.jsonl"     # per geometry: the zone shows that answered rig changes
 ZONES_FILE, MASKS_FILE, PREVIEW_FILE, PHOTO_FILE = "zones.json", "masks.npz", "preview.png", \
     "camera.png"
 FILL_LEVEL = 55                 # preview: a zone's dim fill
@@ -119,17 +125,57 @@ def listing(store: LibraryStore, geometry_id: Optional[str] = None) -> list:
 RIG_EVENTS_MAX = 500            # how far back the rig-state record is read for rig_changes
 
 
+def record_shown(store: LibraryStore, zs: ZoneSet, ids=None, by: str = "") -> dict:
+    """One line onto the geometry's _shown.jsonl: this painting of the set (name + created)
+    was projected on the part and every shown zone landed in the camera image. The rig
+    changes before it count as looked at (rig_changes)."""
+    from ..library.presets import append_selection
+    rec = {"time": datetime.now().isoformat(timespec="seconds"), "set": zs.name,
+           "created": zs.created, "ids": [z.id for z in zs.select(ids)], "by": str(by or "")}
+    f = Path(store.root) / KIND / _geo(zs.geometry_id) / SHOWN_FILE
+    f.parent.mkdir(parents=True, exist_ok=True)
+    append_selection(f, rec)
+    return rec
+
+
+def last_shown(store: LibraryStore, zs: ZoneSet) -> Optional[datetime]:
+    """When THIS painting of the set was last shown on the part with every shown zone seen
+    (None: never). An unreadable line is skipped: a missing answer keeps the warning."""
+    from .. import rigstate
+    f = Path(store.root) / KIND / _geo(zs.geometry_id) / SHOWN_FILE
+    try:
+        data = f.read_bytes()
+    except OSError:
+        return None
+    last = None
+    for raw in data.splitlines():
+        try:
+            rec = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if isinstance(rec, dict) and rec.get("set") == zs.name and rec.get("created") == zs.created:
+            t = rigstate._parse(rec.get("time"))
+            if t is not None and (last is None or t > last):
+                last = t
+    return last
+
+
 def rig_changes(store: LibraryStore, zs: ZoneSet) -> list:
     """What the geometry's rig-state record (engine/rigstate.py) says happened to the rig
-    AFTER the set was painted: a rig check that found the rig MOVED (or could not tell), a
-    re-home, a new stereo calibration, a new rig session (a mobile rig set down again). Any
-    of them may mean the zones no longer sit where they were drawn - the engine cannot see
-    where the projector points now, so this is a WARNING to check (`scan zone-show`) or paint
-    again, never a gate (and clock times are compared: the set is not on that record)."""
+    AFTER the set was painted - and after it was last shown on the part (last_shown): a rig
+    check that found the rig MOVED (or could not tell), a re-home, a new stereo calibration,
+    a new rig session (a mobile rig set down again). Any of them may mean the zones no longer
+    sit where they were drawn - the engine cannot see where the projector points now, so this
+    is a WARNING to check (`scan zone-show`) or paint again, never a gate here (clock times
+    are compared: the set is not on that record). The judged runs lit through zone sets
+    (Quick check, Station: ui/cli.py) PULL the part while a set they use has one."""
     from .. import rigstate
     t0 = rigstate._parse(zs.created)
     if t0 is None or not zs.geometry_id:
         return []
+    shown = last_shown(store, zs)
+    if shown is not None and shown > t0:
+        t0 = shown
     out = []
     try:
         for i, rec in enumerate(rigstate.read_back(store, zs.geometry_id)):
@@ -174,14 +220,15 @@ def preview_image(zs: ZoneSet, ids=None) -> np.ndarray:
     return img
 
 
-def outline_image(zs: ZoneSet, ids=None) -> np.ndarray:
-    """Outlines + ids only on black (what `scan zone-show` projects: the part stays visible)."""
+def outline_image(zs: ZoneSet, ids=None, keys: bool = False) -> np.ndarray:
+    """Outlines + ids only on black (what `scan zone-show` projects: the part stays visible).
+    keys: label each zone "<set>/<id>" (several sets shown together: their ids repeat)."""
     import cv2
     from . import painter
     img = np.zeros(tuple(zs.dmd_shape), np.uint8)
     for z in zs.select(ids):
         cv2.polylines(img, [painter._pts(z.outline())], True, 255, 3, cv2.LINE_AA)
-        painter._label(img, z, 255)
+        painter._label(img, z, 255, f"{zs.name}/{z.id}" if keys else None)
     return img
 
 
@@ -233,6 +280,7 @@ def save(store: LibraryStore, zs: ZoneSet, replace: bool = False,
                 pass
         raise
     zs.path = d
+    zs.replaced = _library_path(store, trashed)     # where the set it replaced went (or None)
     return zs
 
 

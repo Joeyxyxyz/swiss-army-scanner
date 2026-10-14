@@ -371,10 +371,22 @@ def test_measure_takes_a_zone_set_as_its_region(rig, tmp_path):
     assert doc["status"] == "MEASURED" and out["exit_code"] == 0, doc
     n = {v["name"]: v["n_points"] for v in doc["values"]}
     assert all(abs(k - counts["Z1"]) <= 0.02 * counts["Z1"] for k in n.values()), (n, counts)
-    # the whole lit field (both zones) is more points than the one zone
+    # two zones: each one is measured on its own (one plane per zone, named set/id) - a
+    # plane is never fitted across separate zones
     both = api.measure_run("flatness", p, zone="zoneset:demo:Z1,Z3", scans=[ms],
                            runs_dir=tmp_path / "runs")["result"]
-    assert both["values"][0]["n_points"] > 1.3 * max(n.values())
+    assert both["status"] == "MEASURED", both
+    assert [v["name"] for v in both["values"]] == [
+        f"demo/{z}:{k}" for z in ("Z1", "Z3")
+        for k in ("flatness_rms", "flatness_p2_p98", "tilt", "plane_distance")]
+    v0 = both["values"][0]
+    assert v0["zone"] == "demo/Z1" and v0["label"] == "demo/Z1 Flatness (RMS)"
+    assert v0["n_points"] == n["flatness_rms"]                  # the same px as Z1 alone
+    assert abs(both["values"][4]["n_points"] - counts["Z3"]) <= 0.02 * counts["Z3"]
+    zsel = both["zone_selection"]
+    assert zsel["text"] == "zoneset:demo:Z1,Z3" and zsel["source"] == "argument"
+    assert [z["key"] for z in zsel["by_zone"]] == ["demo/Z1", "demo/Z3"]
+    assert all(z["coverage_pct"] > 90 for z in zsel["by_zone"])
     # a zone nothing of this scan decoded into: refused, never the whole field instead
     bad = api.measure_run("flatness", p, zone="zoneset:demo:Z4", scans=[ms],
                           runs_dir=tmp_path / "runs")
@@ -526,3 +538,141 @@ def test_cli_scan_fast_and_measure_take_zones(painted, monkeypatch, tmp_path):
     assert a.func is cli.cmd_zone_paint and a.source == "old" and a.polarity == "measure"
     assert ap.parse_args(["zone-show", "lid:Z1"]).hold == 5.0
     assert "zone-paint --name lid" in cli.EPILOG and "--zones lid" in cli.EPILOG
+
+
+def _second_set(painted):
+    """A second set at the painted geometry whose ids repeat `demo`'s (Z1)."""
+    from engine import config
+    from engine.zones import Zone, ZoneSet
+    s = api.configure(painted["lib"], mock=True)
+    p = api.load_preset(PRESET)
+    if not zstore.exists(s.store, GEO, "band"):
+        zstore.save(s.store, ZoneSet(name="band", geometry_id=GEO, preset=p.name, mock=True,
+                                     fingerprint=config.geometry_fingerprint(p),
+                                     zones=[Zone.rect("Z1", 600, 480, 720, 580, name="edge")]))
+    api._session = None
+
+
+def test_cli_several_sets_in_one_scan_measurement_and_quick_check(painted, monkeypatch, tmp_path):
+    lib = painted["lib"]
+    _second_set(painted)
+    s = api.configure(lib, mock=True)
+    api.load_preset(PRESET)
+    ms = _scan(painted)
+    ms.cloud                                                # loaded once
+    api._session = None
+    ms.meta["zones"] = painted["scan_meta"]["zones"]
+    calls = []
+
+    def fake(zone, preset, label, steps, periods, average, *a, **kw):
+        calls.append({"zone": zone, **kw})
+        return ms
+    monkeypatch.setattr(api, "scan_fast", fake)
+    monkeypatch.setattr(cli, "_mock_place_metric", lambda ctx: None)
+    # --zones may be repeated, or join sets with '+': one zone text, both axes
+    for argv in (["--zones", "demo:Z1,Z3", "--zones", "band"], ["--zones", "demo:Z1,Z3+band"]):
+        code, out, err = run_cli(lib, "scan-fast", "part", *argv)
+        assert code == 0 and calls[-1]["zones"] == "zoneset:demo:Z1,Z3+band", err
+        assert calls[-1]["zone"] is None
+    n = len(calls)
+    for bad, msg in ((["--zones", "demo", "--zones", "demo:Z1"], "named twice"),
+                     (["--zones", "demo+"], "empty zone set"),
+                     (["--zones", "selection", "--zones", "band"], "stands alone")):
+        code, out, err = run_cli(lib, "scan-fast", "part", *bad)
+        assert code == cli.EXIT_REFUSED and msg in err, (bad, err)
+    assert len(calls) == n
+    # Measure: two zones are two planes - each measured on its own, named set/id
+    code, out, err = run_cli(lib, "--json", "measure-run", PRESET, "--what", "flatness",
+                             "--zones", "demo:Z1", "--zones", "band", "--scan", painted["scan_id"],
+                             "--runs-dir", str(tmp_path / "runs"))
+    doc = json.loads(out)
+    assert code == 5 and doc["status"] == "NOT_MEASURABLE", err      # band was not lit in that scan
+    assert doc["reason"] == "too_few_points" and "zone band/Z1 (edge): no point decoded in it" in \
+        doc["result"]["message"]
+    code, out, err = run_cli(lib, "--json", "measure-run", PRESET, "--what", "flatness",
+                             "--zones", "demo:Z1,Z3", "--scan", painted["scan_id"],
+                             "--runs-dir", str(tmp_path / "runs"))
+    doc = json.loads(out)
+    assert code == 0 and [v["name"] for v in doc["values"]][::4] == ["demo/Z1:flatness_rms",
+                                                                   "demo/Z3:flatness_rms"], err
+    assert json.loads((Path(doc["run_dir"]) / "spec.json").read_text(encoding="utf-8"))["zone"] \
+        == "zoneset:demo:Z1,Z3"
+    code, out, err = run_cli(lib, "measure-run", PRESET, "--what", "flatness", "--zones", "demo:Z1,Z3",
+                             "--scan", painted["scan_id"], "--runs-dir", str(tmp_path / "runs"))
+    assert code == 0 and "demo/Z1 Flatness (RMS)" in out and "demo/Z3 Tilt" in out and "seen %" in out
+    # Quick check: the limit applies to each zone (judged on its own px, not the whole image)
+    code, out, err = run_cli(lib, "--json", "quick-check", PRESET, "--check", "flatness",
+                             "--threshold", "0.5", "--zones", "demo:Z1", "--zones", "demo2:Z1",
+                             "--runs-dir", str(tmp_path / "q"))
+    doc = json.loads(out)
+    assert code == 5 and "no zone set 'demo2'" in doc["result"]["invalid_reason"], err
+    assert doc["result"]["disposition"] == "PULL" and len(calls) == n       # nothing was scanned
+    code, out, err = run_cli(lib, "--json", "quick-check", PRESET, "--check", "flatness",
+                             "--threshold", "100", "--zones", "demo:Z1,Z3",
+                             "--runs-dir", str(tmp_path / "q"))
+    res = json.loads(out)["result"]
+    assert code == 0 and res["result"] == "PASS" and res["disposition"] == "CONTINUE", (err, res)
+    assert calls[-1]["zone"] == "zoneset:demo:Z1,Z3" and calls[-1]["axis"] == "xy"
+    z = res["zone_selection"]
+    assert [(b["key"], b["verdict"]) for b in z["by_zone"]] == [("demo/Z1", "PASS"), ("demo/Z3", "PASS")]
+    assert all(b["coverage_pct"] > 90 for b in z["by_zone"]) and z["text"] == "zoneset:demo:Z1,Z3"
+    assert res["deviation_mm"]["method"] == "plane_fit_per_zone" and z["failed"] == []
+    # a limit no surface holds: every zone fails on its own, and each is named
+    code, out, err = run_cli(lib, "quick-check", PRESET, "--check", "flatness", "--threshold",
+                             "0.0001", "--zones", "demo:Z1,Z3", "--runs-dir", str(tmp_path / "q"))
+    assert code == 1 and "FAIL" in out and "demo/Z1 FAIL" in out and "demo/Z3 FAIL" in out, out
+    # the help names the several-set forms
+    ap = cli.build_parser()
+    assert ap.parse_args(["scan-fast", "x", "--zones", "a", "--zones", "b:Z1"]).zones == ["a", "b:Z1"]
+    assert ap.parse_args(["quick-check", "--check", "flatness", "--zones", "selection"]).zones == ["selection"]
+    assert "--zones selection" in cli.EPILOG and "zone-select" in cli.EPILOG
+
+
+def test_cli_zone_select_prints_sets_switches_and_clears(painted, tmp_path):
+    lib = painted["lib"]
+    _second_set(painted)
+    sel_file = lib / "zones" / GEO / "_selection.jsonl"
+    sel_file.unlink(missing_ok=True)
+    try:
+        code, out, err = run_cli(lib, "zone-select")
+        assert code == 0 and "whole field" in out and "nothing is switched on" in out, err
+        code, out, err = run_cli(lib, "--json", "zone-select", "demo:Z1,Z3", "band")
+        st = json.loads(out)["selection"]
+        assert code == 0 and st["label"] == "band (1), demo (2 of 4)" and st["by"] == "command line"
+        assert st["text"] == "zoneset:band+demo:Z1,Z3"
+        code, out, err = run_cli(lib, "zone-select")
+        assert code == 0 and "band (1), demo (2 of 4)" in out and "Z1, Z3" in out and "ON" in out
+        assert "--zones selection" in out
+        code, out, err = run_cli(lib, "zones")                  # the listing marks what is on
+        assert code == 0 and "ON (2 of 4)" in out and "selected at this rig placement" in out
+        code, out, err = run_cli(lib, "--json", "zone-select", "--off", "band", "--on", "demo:Z2")
+        assert code == 0 and json.loads(out)["selection"]["label"] == "demo (1 of 4)"
+        # --zones selection: what a scan through the selection would light
+        code, out, err = run_cli(lib, "--json", "zone-show", "selection", "--hold", "0")
+        assert code == 0 and [z["key"] for z in json.loads(out)["zone_show"]["zones"]] == ["demo/Z2"]
+        # refused: nothing is written
+        for bad, msg in ((["nope"], "no zone set 'nope'"), (["--on", "demo:Z9"], "no zone 'Z9'"),
+                         (["--clear", "demo"], "not with sets to switch on")):
+            code, out, err = run_cli(lib, "zone-select", *bad)
+            assert code == cli.EXIT_REFUSED and msg in err, (bad, err)
+        code, out, err = run_cli(lib, "--json", "zone-select")
+        assert json.loads(out)["selection"]["label"] == "demo (1 of 4)"
+        # a set that is switched on and gone: exit 1, and every run that asks for it is refused
+        code, out, err = run_cli(lib, "zone-select", "--on", "band")
+        assert code == 0
+        code, out, err = run_cli(lib, "zone-delete", "band", "--reason", "test")
+        assert code == cli.EXIT_REFUSED and "switched on in the zone selection" in err
+        code, out, err = run_cli(lib, "zone-delete", "band", "--reason", "test", "--force")
+        assert code == 0 and "the zone selection now names a set that is gone" in out
+        code, out, err = run_cli(lib, "zone-select")
+        assert code == cli.EXIT_NOT_OK and "NOT FOUND" in out and "refused until this is fixed" in out + err
+        code, out, err = run_cli(lib, "scan-fast", "part", "--zones", "selection")
+        assert code == cli.EXIT_REFUSED and "cannot be used" in err and "zone-select --off band" in err
+        code, out, err = run_cli(lib, "--json", "measure-run", PRESET, "--what", "flatness",
+                                 "--zones", "selection", "--runs-dir", str(tmp_path / "runs"))
+        doc = json.loads(out)
+        assert code == cli.EXIT_REFUSED and doc["status"] == "NOT_MEASURABLE" and doc["reason"] == "refused"
+        code, out, err = run_cli(lib, "zone-select", "--clear")
+        assert code == 0 and "whole field" in out
+    finally:
+        sel_file.unlink(missing_ok=True)

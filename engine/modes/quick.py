@@ -58,7 +58,11 @@ def build_config(check: str, preset: Optional[str] = None, *, threshold_mm=None,
     recipe name or file); its tolerances and guard band are the recipe's own, so
     threshold_mm / roi / golden / guard_band_pct are refused. preset: the triangulation
     preset (required for flatness / golden; a recipe pins its own, and a preset named here
-    wins over it)."""
+    wins over it). zone (flatness / golden): what is lit - grid cells, painted zone sets
+    ("zoneset:<set>[:Z1,Z3]", several as "zoneset:<a>+<b>") or "selection" (the zone sets
+    switched on at this rig placement; "selection@<stamp>" = exactly the selection that was
+    shown). Painted zones are judged ONE BY ONE by the job runner: the limit applies to each
+    zone, and a zone that cannot be judged is a PULL (ui/cli.py _run_metric_zones)."""
     bad = []
     if check not in CHECKS:
         raise ValueError(f"quick check: check {check!r} is not one of {', '.join(CHECKS)}")

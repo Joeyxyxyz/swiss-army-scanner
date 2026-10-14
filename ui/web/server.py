@@ -274,11 +274,17 @@ VERBS: dict = {
                    "Space saves the zone set (zones/<geometry>/<name>/: zones.json, masks.npz, "
                    "preview.png, camera.png), Esc cancels. The job holds the rig until then "
                    "(or until idle_timeout_s without input; cancelling the job ends it, nothing "
-                   "saved). An existing name is refused unless replace. -> {saved, reason, "
-                   "zones, preview, camera}",
+                   "saved). An existing name is refused unless replace. -> {saved, outcome "
+                   "(saved | cancelled | aborted | idle_timeout | script_ended: how the session "
+                   "ended), reason, zones, preview, camera, replaced, on, selection_note}. GET "
+                   "/api/cmd/state carries the same for every page (painter, last_paint). "
+                   "Refused (409) unless the station is READY or FAULT.",
                    {"name": "the zone set to save [A-Za-z0-9_.-]",
                     "source": "a saved set to start from (edit it)",
                     "replace": "bool: replace an existing set of this name (old one to trash/)",
+                    "select": "bool: switch a NEW set on in the zone selection (a set painted "
+                              "over keeps its on / off); either way its per-zone switches "
+                              "start again at all zones",
                     "labels": "[names] the N key cycles through (optional)",
                     "polarity": "measure (default) | normal | inverted",
                     "note": "text stored with the set",
@@ -286,19 +292,41 @@ VERBS: dict = {
                                       "(default 600)",
                     "events": "MOCK ONLY: the scripted session, a list of painter events "
                               "(default in MOCK: a built-in demo session)"}),
-    "zone_show": ("Project a saved zone set on the part and report where each zone lands in "
+    "zone_show": ("Project saved zones on the part and report where each zone lands in "
                   "the camera image (camera px, centroid, box; seen or not), outlines + ids "
-                  "photographed and held.",
-                  {"zones": "zone set, optionally some zones: 'lid' or 'lid:Z1,Z3' (GET "
-                            "/api/zonesets)",
+                  "photographed and held. Several sets: each zone carries key '<set>/<id>' and "
+                  "zoneset. A show held 1 s or longer with every zone seen is recorded: it "
+                  "answers the rig changes since the set was painted.",
+                  {"zones": "zone set, optionally some zones: 'lid' or 'lid:Z1,Z3'; several "
+                            "sets 'cells+tube:Z1'; or 'selection' (the sets switched on: GET "
+                            "/api/zones/selection)",
                    "hold_s": f"float, 0..{MAX_HOLD_S:g} s (default 5; cancel the job to end it)",
                    "label": "text"}),
     "zone_delete": ("Move a zone set (at the loaded preset's geometry) to the library trash "
-                    "(recoverable). Refused while a recipe names it (unless force). Needs "
-                    "confirm=true.",
+                    "(recoverable). Refused (unless force) while a recipe or a station "
+                    "configuration names it, or it is switched on in the zone selection. Needs "
+                    "confirm=true. Refused (409) unless the station is READY or FAULT.",
                     {"name": "zone set name (GET /api/zonesets)", "reason": "why (recorded)",
                      "confirm": "bool: must be true (the operator confirmed the delete)",
-                     "force": "bool: delete even when a recipe names it"}),
+                     "force": "bool: delete even when it is named or switched on"}),
+    "zone_select": ("Change the zone selection of the loaded preset's rig placement: which "
+                    "painted zone sets (and zones) are switched on. Runs that ask for the "
+                    "selection (the operator page's MEASURE / START in Quick check, `--zones "
+                    "selection`, a metric station job with \"zone\": \"selection\") light and "
+                    "judge exactly these. Stored append-only in the library (zones/<geometry>/"
+                    "_selection.jsonl); a set that is switched on must resolve now. Refused "
+                    "(409) unless the station is READY or FAULT and no measurement, quick "
+                    "check, painter or zone show is queued or running. -> the selection (GET "
+                    "/api/zones/selection). The page uses POST /api/zones/selection.",
+                    {"sets": "the whole selection: [{set, on, ids}] (ids null = every zone)",
+                     "zones": "or: exactly these are on, 'cells+tube:Z1' or a list of terms",
+                     "on": "or: terms to switch on ('tube:Z1,Z2'; 'tube' = with the switches "
+                           "it had)",
+                     "off": "set names to switch off",
+                     "clear": "bool: everything off (the whole field)",
+                     "by": "who changes it (recorded with the selection)",
+                     "expect": "the stamp of the selection the sender was shown: refused when "
+                               "it changed meanwhile"}),
     "spectral_capture": ("R/G/B LED reflectance capture.", {"label": "text"}),
     "learn_material": ("Teach a material from a camera ROI of a spectral reading.",
                        {"reading_id": "spectral reading id", "name": "material name",
@@ -725,9 +753,10 @@ VERBS: dict = {
                   "to 2: HDMI flicker) -> metric scan (ray-plane, mm) + its flood pair. Bench: "
                   "5.3 s for the whole station scene. Refused without a stereo calibration.",
                   {"zone": "grid cells 'F10:J12' or atlas:<name>/<region> (default: full field)",
-                   "zones": "or a painted zone set 'lid' / 'lid:Z1,Z3' (GET /api/zonesets): "
-                            "only its zones are lit; result.meta.zones has the points per zone "
-                            "(exact with axis xy)",
+                   "zones": "or a painted zone set 'lid' / 'lid:Z1,Z3' (GET /api/zonesets), "
+                            "several 'cells+tube:Z1', or 'selection' (the sets switched on): "
+                            "only those zones are lit; result.meta.zones has the points per "
+                            "zone (exact with axis xy; keyed '<set>/<id>' for several sets)",
                    "face_ids": "[face target ids] also lit (their DMD ellipse + margin)",
                    "margin_dmd_px": "face margin, DMD px (default 6)", "label": "text",
                    "steps": "phase steps (default 4)", "periods": "[T, ...] DMD px",
@@ -875,9 +904,13 @@ VERBS: dict = {
                      "spec": "a measurement spec mapping (the other args override it)",
                      "roi": "[x0, y0, x1, y1] camera px: region A (x1, y1 exclusive)",
                      "roi2": "[x0, y0, x1, y1] camera px: region B (step)",
-                     "zone": "region A as grid cells, or a painted zone set "
-                             "'zoneset:<set>[:Z1,Z3]' (lit + the px that decode into it)",
-                     "zone2": "region B as grid cells",
+                     "zone": "region A as grid cells, or painted zone sets "
+                             "'zoneset:<set>[:Z1,Z3]' / 'zoneset:<a>+<b>' (lit + the px that "
+                             "decode into them), or 'selection' / 'selection@<stamp>' (the sets "
+                             "switched on; with the stamp: refused when the selection is not "
+                             "the one that was shown). Several zones: flatness / cylinder per "
+                             "zone, values named '<set>/<id>:<name>'; not for endface",
+                     "zone2": "region B as grid cells (or ONE painted zone)",
                      "p1": "[x, y] camera px: a picked point (distance)",
                      "p2": "[x, y] camera px: the second point",
                      "golden": "deviation: the golden metric scan (id / label)",
@@ -910,7 +943,11 @@ VERBS: dict = {
                                "check: the recipe's own)",
                      "threshold_mm": "flatness / golden: the limit, mm",
                      "roi": "flatness / golden: [x0, y0, x1, y1] camera px",
-                     "zone": "flatness / golden: light only these grid cells",
+                     "zone": "flatness / golden: light only these grid cells, or painted zone "
+                             "sets 'zoneset:<set>[:Z1,Z3]' / 'zoneset:<a>+<b>', or 'selection' "
+                             "/ 'selection@<stamp>' (the sets switched on). Painted zones are "
+                             "judged one by one: the limit applies to each zone, and a zone "
+                             "that cannot be judged is a PULL",
                      "golden": "golden: the golden metric scan (id / label)",
                      "recipe": "recipe: a recipe name (GET /api/recipes)",
                      "guard_band_pct": "flatness / golden: a PASS this close to the limit is "
@@ -928,6 +965,10 @@ VERBS: dict = {
                     {"config": "station config file name (GET /api/stations)",
                      "operator_confirmed": "bool: a human confirmed the physical setup "
                                            "(required on the real rig)",
+                     "zones_expect": "a config whose job says \"zone\": \"selection\": the "
+                                     "stamp of the zone selection the sender was shown (GET "
+                                     "/api/zones/selection); the run is INVALID -> PULL when "
+                                     "the selection is another one when it scans",
                      "mock_part": "MOCK ONLY: what the simulated human places (as --mock-part)"}),
     "live_view": ("Keep the rig open and stream a flood / focus pattern until stopped "
                   "(POST /api/live/stop), until a rig job is queued, or when nobody polled "
@@ -960,10 +1001,16 @@ RIG_FREE_VERBS = frozenset({
     "compare_metric", "predict_precision", "export_metric_mesh", "calibrate_dent_null",
     "detect_dents", "locate_face", "face_profile", "face_golden", "check_face",
     "station_measure", "station_golden", "station_check", "preset_add", "preset_delete",
-    "recipe_add", "recipe_select", "recipe_delete", "zone_delete"})
+    "recipe_add", "recipe_select", "recipe_delete", "zone_delete", "zone_select"})
 
 # verbs that change which preset is loaded / selected: refused while a station run is busy
 PRESET_CHANGE_VERBS = frozenset({"load_preset", "preset_select", "preset_delete"})
+# verbs that change what "the selected zones" are (the selection itself, a set painted over,
+# a set deleted): refused unless the station is READY or FAULT - what a station inspects
+# never changes while it is ARMED or in a cycle
+SELECTION_CHANGE_VERBS = frozenset({"zone_select", "zone_paint", "zone_delete"})
+# the painter and the zone show hold the rig, and the projector display belongs to them
+PAINTER_VERBS = ("zone_paint", "zone_show")
 
 
 # running jobs that may be aborted: the engine checks the job's cancel event before every
@@ -981,6 +1028,9 @@ CMD_NAMES = {"config": "SELECT_CONFIG", "profile": "SELECT_PROFILE", "mode": "SE
              "workstate": "SELECT_WORKSTATE"}
 BUS_TICK_S = 0.5              # how often a waiting work state's timeout is looked at
 RIG_GATE_TTL_S = 5.0          # the rig's state in the snapshot is re-read at least this often
+ZONE_STATUS_TTL_S = 5.0       # ... and so is the zone selection (its files unchanged)
+ZONE_SELECT_WAIT_S = 10.0     # POST /api/zones/selection waits this long for its files-only job
+ZONE_SELECT_GRACE_S = 3.0     # ... and this long for a job ahead of it to end (a preset load)
 
 
 class ArgError(ValueError):
@@ -1427,8 +1477,16 @@ class App:
                                        pending=self._bus_pending, verify=self._bus_verify,
                                        project=self._bus_project,
                                        cycle_begin=self._bus_cycle_begin,
-                                       cycle_end=self._bus_cycle_end, log=self._bus_log),
+                                       cycle_end=self._bus_cycle_end, log=self._bus_log,
+                                       gate=self._bus_gate),
                               require_confirmation=not self.mock)
+        # painted zones: how the last painter session ended (every page shows the same save
+        # message, also after a reload), the cached zone selection of the loaded preset
+        # (GET /api/cmd/state is polled twice a second) and the selection stamp the bus
+        # accepted for the cycle it is starting (handed to that cycle's run job)
+        self.last_paint: Optional[dict] = None
+        self._zone_cache: dict = {}
+        self._zone_token: Optional[str] = None
         self._cycles: dict = {}                 # open cycle id -> its folder, log, config
         self.last_cycle: Optional[dict] = None  # the last cycle written (links for /quick)
         # MOCK only: the case of the simulated line (the scene the simulated human places
@@ -1654,9 +1712,11 @@ class App:
 
     # ---------------------------------------------------------------- jobs
     def submit(self, verb: str, args: Optional[dict] = None,
-               bus_kind: Optional[str] = None) -> Job:
+               bus_kind: Optional[str] = None, only_if_free: bool = False) -> Job:
         """Queue a job. bus_kind ('run' | 'home'): a job the command bus started; it is
-        registered before the worker can see it, so its end always reaches the bus."""
+        registered before the worker can see it, so its end always reaches the bus.
+        only_if_free: refused (409) instead of queued behind another job (jobs_ahead) - for
+        a change whose sender waits for the answer and must not see it applied later."""
         if verb not in VERBS:
             raise HTTPError(400, f"unknown or not exposed verb {verb!r}; see GET /api/verbs")
         args = dict(args or {})
@@ -1668,6 +1728,19 @@ class App:
         if verb in PRESET_CHANGE_VERBS and self.bus.state in (*BUS_BUSY, *BUS_IN_CYCLE):
             raise HTTPError(409, f"{verb} refused while the station is {self.bus.state}: "
                                  "the running job / cycle uses the loaded preset")
+        if verb in SELECTION_CHANGE_VERBS and self.bus.state not in ("READY", "FAULT"):
+            raise HTTPError(409, f"{verb} refused while the station is {self.bus.state}: the "
+                                 "zones a station inspects are fixed until it is idle (DISARM "
+                                 "or wait for the cycle to end)")
+        if verb == "zone_select":
+            busy = self.mode_jobs() or ([self.painter_state()["job"]]
+                                        if self.painter_state() else [])
+            if busy:
+                raise HTTPError(409, f"zone_select refused: {', '.join(busy)} is still queued "
+                                     "or running (a measurement, a quick check, the painter or "
+                                     "a zone show): wait for it, or ABORT")
+        if verb in MODE_VERBS and self.painter_state():
+            raise HTTPError(409, f"{verb} refused: {self._painter_holds()}")
         need = MODE_VERBS.get(verb)
         if need is not None and self.bus.mode != need:
             raise HTTPError(409, f"{verb} runs in {modes.TITLES[need]} mode and the station is "
@@ -1681,6 +1754,11 @@ class App:
                 for j in [self._current, *self._queue]:
                     if j is not None and j.verb == "live_view" and not j.cancel.is_set():
                         return j
+            ahead = self.jobs_ahead() if only_if_free else []
+            if ahead:
+                raise HTTPError(409, f"{verb} refused: another job holds the scanner ("
+                                     + ", ".join(ahead[:3]) + (", ..." if len(ahead) > 3 else "")
+                                     + "): wait for it to end, or ABORT, then do it again")
             job = Job(id=f"j{next(self._ids)}", verb=verb, args=args)
             if verb != "live_view" and verb not in RIG_FREE_VERBS:
                 # the rig is one physical device: free it for the job (a live
@@ -1735,6 +1813,9 @@ class App:
                 raise HTTPError(409, "a running capture can't be interrupted mid-sequence")
         if dropped is not None:                 # never ran: the bus still hears it ended
             self._bus_notify(dropped)
+            if dropped.verb == "zone_paint":    # ... and the page: nothing was painted
+                self._paint_record(dropped.args.get("name"), "dropped",
+                                   reason="the painter job was cancelled before it started")
         return job
 
     def _fail(self, job: Job, msg: str, etype: str):
@@ -1777,6 +1858,151 @@ class App:
             return [j.id for j in [self._current, *self._queue]
                     if j is not None and j.verb in MODE_VERBS and j.status in ("queued", "running")]
 
+    def jobs_ahead(self) -> list:
+        """The jobs a new rig-free job would wait behind -> ["j14 calibrate_stereo", ...]: the
+        one that is running and every queued one. A running live view is not one (it runs
+        queued rig-free jobs between its frames)."""
+        with self._cv:
+            return [f"{j.id} {j.verb}" for j in [self._current, *self._queue]
+                    if j is not None and j.status in ("queued", "running")
+                    and not (j is self._current and j.verb == "live_view")]
+
+    # ---------------------------------------------------- painted zones: painter, selection
+    def painter_state(self) -> Optional[dict]:
+        """The zone painter / zone show job that is queued or running (it holds the rig and
+        the projector display belongs to it), or None: {running, verb, name, state, since,
+        job}. In the bus snapshot, so every page - also one that was just reloaded - shows
+        "Painting ..." and keeps its run buttons and keys off."""
+        with self._cv:
+            for j in [self._current, *self._queue]:
+                if j is not None and j.verb in PAINTER_VERBS and j.status in ("queued", "running"):
+                    return {"running": True, "verb": j.verb, "state": j.status, "job": j.id,
+                            "name": j.args.get("name") or j.args.get("zones"),
+                            "since": j.started or j.created}
+        return None
+
+    def _painter_holds(self) -> str:
+        """Why nothing else starts while the painter / a zone show is queued or running."""
+        p = self.painter_state() or {}
+        if p.get("verb") == "zone_show":
+            return ("the zones are being shown on the part (the rig is held): wait for it to "
+                    "end, or ABORT")
+        return ("the zone painter holds the rig: finish it on the projector (SPACE saves, ESC "
+                "cancels) or ABORT")
+
+    def _zone_signature(self, p) -> tuple:
+        """What the zone selection's status rests on, by a few stat calls: the selection
+        file, the record of zone shows, the geometry's zone folder (a set added, replaced or
+        trashed renames an entry in it) and the rig-state record (rig changes since a set
+        was painted)."""
+        from engine.zones import selection as zone_sel
+        from engine.zones import store as zstore
+        out = [p.name]
+        try:
+            folder = zone_sel.file_of(self.session.store, p.geometry_id).parent
+            for f in (folder / zone_sel.FILE, folder / zstore.SHOWN_FILE, folder):
+                try:
+                    st = f.stat()
+                    out.append((st.st_size, st.st_mtime_ns))
+                except OSError:
+                    out.append(None)
+        except ValueError:
+            out.append(None)
+        return (*out, *self._rig_signature(p))
+
+    def zone_status(self, fresh: bool = False) -> Optional[dict]:
+        """The zone selection of the loaded preset's rig placement (api.zone_selection: which
+        sets and zones are on, its problems, its stamp), or None when no preset is loaded.
+        Cached while its files are unchanged, for at most ZONE_STATUS_TTL_S (a set's
+        zones.json edited by hand shows up then); fresh: read now (a gate never decides on a
+        cached answer). A read that fails is "unknown": never "nothing is on"."""
+        p = self.session.preset if self.session else None
+        if p is None:
+            return None
+        sig, now = self._zone_signature(p), time.monotonic()
+        hit = self._zone_cache.get(p.geometry_id)
+        if not fresh and hit is not None and hit[0] == sig and now - hit[1] < ZONE_STATUS_TTL_S:
+            return hit[2]
+        try:
+            st = jsonable(api.zone_selection(p), self.root)
+        except Exception as e:          # noqa: BLE001 - unreadable: unknown, and it says why
+            why = f"the zone selection could not be read: {type(e).__name__}: {e}"
+            st = {"geometry_id": p.geometry_id, "preset": p.name, "state": "unknown",
+                  "ok": False, "empty": False, "text": "", "label": "NOT KNOWN",
+                  "stamp": "unknown", "sets": [], "check": [], "time": None, "by": None,
+                  "n_sets_on": 0, "n_zones_on": 0,
+                  "problems": [{"set": None, "zone": None, "reason": "unreadable",
+                                "message": why}]}
+        if len(self._zone_cache) > 16:
+            self._zone_cache.clear()
+        self._zone_cache[p.geometry_id] = (sig, time.monotonic(), st)
+        return st
+
+    def station_zone(self, config: Optional[str]) -> dict:
+        """What the station configuration `config` says about its zone: {"uses_selection":
+        its job says "zone": "selection" (then - and only then - the zone selection decides
+        what its run lights and judges), "zone": its own zone text or None}. A configuration
+        with profiles + a flow, a recipe job, or an unreadable file: its own zones."""
+        from ui import run_job as RJ
+        out = {"uses_selection": False, "zone": None}
+        try:
+            f = self._station_file(config)
+            if not flow_schema.is_legacy(flow_schema.read_doc(f)):
+                return out
+            c = RJ.load_station_config(f)
+        except Exception:               # noqa: BLE001 - the bus marks it unusable itself
+            return out
+        return {"uses_selection": RJ.uses_selection(c.zone), "zone": c.zone}
+
+    def _bus_gate(self, cmd: str, arg, armed=None) -> Optional[dict]:
+        """The bus asks before START / TRIGGER start a cycle and before ARM arms
+        (Handlers.gate). Refused, nothing starts: the painter / a zone show holds the rig;
+        the page's `zones` stamp is not the stored selection's (it changed under the page).
+        Refused with a PULL - only for a configuration whose job says "zone": "selection":
+        another preset is loaded than the run uses (the page shows the loaded one's zone
+        sets), the selection is unknown, unusable or empty, a selected set has a rig change
+        on record since it was painted and last shown, or the selection is not the one the
+        station was ARMED with. -> {"token": the selection's stamp} when it may start."""
+        if self.painter_state():
+            return {"message": self._painter_holds(), "pull": False}
+        self._zone_token = None
+        info = self.station_zone(self.bus.config)
+        if not info["uses_selection"]:
+            return None
+        cfg = self.bus.config
+        p = self.session.preset
+        run = self.bus.run_preset() or (p.name if p is not None else None)
+        if p is None or run != p.name:
+            return {"pull": True, "message": (
+                f"{cfg} inspects the selected zones with preset {run or '(none)'}, and "
+                f"{'preset ' + p.name if p is not None else 'no preset'} is loaded: the zone "
+                "selection shown belongs to the loaded preset - select the station "
+                "configuration again (that loads its preset)")}
+        st = self.zone_status(fresh=True)
+        if st["state"] == "unknown" or not st["ok"]:
+            return {"pull": True, "message": (
+                f"{cfg} inspects the selected zones and the zone selection cannot be used: "
+                f"{st['problems'][0]['message']}")}
+        if st["empty"]:
+            return {"pull": True, "message": (
+                f"{cfg} inspects the selected zones and none is switched on: switch a zone "
+                "set on (Scan zones)")}
+        if st.get("check"):
+            return {"pull": True, "message": (
+                f"{cfg} inspects the selected zones, and since they were painted the rig-state "
+                f"record has - {' | '.join(st['check'])}: show them on the part first (Show "
+                "selected zones), or paint the set again")}
+        want = arg.get("zones") if isinstance(arg, dict) else None
+        if want and str(want) != st["stamp"]:
+            return {"pull": False, "message": (
+                f"the zone selection changed (it is now: {st['label']}): look at the page "
+                "and press it again")}
+        if armed is not None and armed != st["stamp"]:
+            return {"pull": True, "message": (
+                f"the zones changed since ARM (they are now: {st['label']}): ARM again")}
+        self._zone_token = st["stamp"]
+        return {"token": st["stamp"]}
+
     # ------------------------------------------------------------ command bus
     def clear_feedback(self, why: str = "cleared by a new command") -> list:
         """Stop the projected verdict of the last recipe run (queued or holding): the next
@@ -1795,11 +2021,16 @@ class App:
         return touched
 
     def _bus_start(self, config: str, confirmed: bool) -> str:
-        """START on a single-job station config: its job, as `scan run`."""
+        """START on a single-job station config: its job, as `scan run`. A configuration that
+        inspects the selected zones: the run is handed the selection's stamp the bus just
+        accepted (_bus_gate), and is a PULL when the selection is another one when it scans."""
+        if self.painter_state():                # the gate refuses this first: never a run
+            raise RuntimeError(self._painter_holds())       # queued behind the painter
         self.clear_feedback("cleared: the next cycle started")
-        return self.submit("run_station", {"config": config,
-                                           "operator_confirmed": confirmed is True},
-                           bus_kind="run").id
+        args = {"config": config, "operator_confirmed": confirmed is True}
+        if self._zone_token:
+            args["zones_expect"] = self._zone_token
+        return self.submit("run_station", args, bus_kind="run").id
 
     def _bus_select(self, config: str, preset: Optional[str]) -> Optional[str]:
         """SELECT_CONFIG / SELECT_PROFILE accepted: load the preset the configuration's
@@ -1988,6 +2219,12 @@ class App:
         # Measure / Quick check ask strictly; Station mode asks as the station does (a fixed
         # rig is not gated there, and nothing is read for it)
         snap["rig"] = self.rig_gate(p, strict=self.bus.mode != modes.DEFAULT_MODE)
+        # painted zones: the selection of the loaded preset's rig placement (None: no preset
+        # loaded), the painter / zone show that holds the rig now, how the last painter
+        # session ended - what every page draws its Scan zones panel from
+        snap["zone_selection"] = self.zone_status()
+        snap["painter"] = self.painter_state()
+        snap["last_paint"] = dict(self.last_paint) if self.last_paint else None
         snap["last_cycle"] = dict(self.last_cycle) if self.last_cycle else None
         cyc = snap.get("cycle") or {}
         if cyc.get("cycle_id") and cyc.get("active"):
@@ -2185,6 +2422,9 @@ class App:
                 touched.append("live view")
         for j in dropped:                       # never ran: the bus still hears it ended
             self._bus_notify(j)
+            if j.verb == "zone_paint":          # ... and the page: nothing was painted
+                self._paint_record(j.args.get("name"), "dropped",
+                                   reason="ABORT came before the painter started")
         return touched
 
     def _execute(self, job: Job):
@@ -2754,16 +2994,80 @@ class App:
     # ---- painted zone sets (engine/zones)
     def zone_sets(self) -> dict:
         """The painted zone sets at the loaded preset's geometry (files only: answered while
-        a job holds the worker, e.g. the painter itself)."""
+        a job holds the worker, e.g. the painter itself). Each set also says whether it is
+        switched on (`on`, `ids_on`: null = every zone; each zone its own `on`) and who names
+        it (`used_by`: recipes, station configurations); `selection` is the zone selection
+        (zone_status); `others` lists the rig placements that have sets of their own."""
         p = self.session.preset
         geo = p.geometry_id if p is not None else None
         items = api.zone_sets(all_geometries=True)
+        sel = self.zone_status(fresh=True)
+        rows = {r["set"]: r for r in (sel or {}).get("sets") or []}
+        mine = []
+        for i in items:
+            if i["geometry_id"] != geo:
+                continue
+            r = rows.get(i["name"]) or {}
+            on_ids = {z["id"] for z in r.get("zones") or [] if z["on"]}
+            try:
+                used = api.zone_users(i["name"], self.stations_dir)
+            except Exception:           # noqa: BLE001 - a listing never fails on one file
+                used = {"recipes": [], "stations": []}
+            mine.append({**i, "on": bool(r.get("on")), "ids_on": r.get("ids"),
+                         "usable": bool(r.get("usable")) if r else bool(i.get("valid")),
+                         "zones": [{**z, "on": z["id"] in on_ids} for z in i.get("zones") or []],
+                         "used_by": used})
+        others: dict = {}
+        for i in items:
+            if i["geometry_id"] != geo:
+                o = others.setdefault(i["geometry_id"], {"geometry_id": i["geometry_id"],
+                                                         "n_sets": 0, "presets": []})
+                o["n_sets"] += 1
+                if i.get("preset") and i["preset"] not in o["presets"]:
+                    o["presets"].append(i["preset"])
         return jsonable({"geometry_id": geo, "preset": p.name if p is not None else None,
-                         "sets": [i for i in items if i["geometry_id"] == geo],
+                         "sets": mine, "selection": sel,
+                         "others": [others[g] for g in sorted(others)],
                          "other_geometries": sorted({i["geometry_id"] for i in items} - {geo})},
                         self.root)
 
+    def _paint_record(self, name, outcome: str, **more) -> None:
+        """How a painter session ended, for every page (the bus snapshot's last_paint). It
+        says where (preset, geometry_id) and - saved - which painted time the set got: a page
+        tells what is true of that set NOW from the selection, never from this record."""
+        p = self.session.preset if self.session else None
+        self.last_paint = {"name": name, "outcome": outcome, "time": _now(), "reason": None,
+                           "n_zones": None, "zones": [], "replaced": None, "on": None,
+                           "selection_note": None, "photo": None, "preview": None,
+                           "geometry_id": p.geometry_id if p is not None else None,
+                           "preset": p.name if p is not None else None, "created": None,
+                           "mock": self.mock, **more}
+
     def _v_zone_paint(self, a):
+        """The painter job. Whatever its end - saved, cancelled (ESC), aborted, the idle
+        timeout, refused before it opened - is kept in last_paint: the save step is told by
+        the bus snapshot, not by the one browser tab that started the job."""
+        name = a.get("name")
+        try:
+            out, links = self._zone_paint(a)
+        except Exception as e:          # noqa: BLE001 - refused / crashed: nothing was saved
+            self._paint_record(name, "refused", reason=f"{type(e).__name__}: {e}")
+            raise
+        j = jsonable(out, self.root)
+        self._paint_record(
+            out["name"], out["outcome"], reason=out.get("reason"), n_zones=out.get("n_zones"),
+            zones=[{"id": z["id"], "name": z.get("name") or ""} for z in j.get("zones") or []]
+            if out["saved"] else [], replaced=j.get("replaced"), on=out.get("on"),
+            switches_reset=bool(out.get("switches_reset")),
+            selection_note=out.get("selection_note"), photo=j.get("camera"),
+            preview=j.get("preview"), note=out.get("note"),
+            idle_timeout_s=out.get("idle_timeout_s"), rig_error=out.get("rig_error"),
+            geometry_id=out.get("geometry_id"), preset=out.get("preset"),
+            created=out.get("created") if out["saved"] else None,
+            warnings=list(out.get("warnings") or []))
+        return out, links
+
+    def _zone_paint(self, a):
         from engine.zones import painter
         events, note = a.get("events"), None
         if self.mock:
@@ -2785,7 +3089,7 @@ class App:
                                  polarity=_s(a, "polarity", "measure"),
                                  note=_s(a, "note", "") or "",
                                  idle_timeout_s=_num(a, "idle_timeout_s", 600.0),
-                                 cancel=self.session.cancel)
+                                 cancel=self.session.cancel, select=_bool(a, "select"))
         except ValueError as e:         # a bad name / an existing set / a malformed event
             raise ArgError(str(e)) from None
         if note:
@@ -2796,9 +3100,14 @@ class App:
         h = _num(a, "hold_s", 5.0)
         if not 0.0 <= h <= MAX_HOLD_S:
             raise ArgError(f"hold_s must be 0..{MAX_HOLD_S:g} s, got {h:g}")
+        zones = a.get("zones")
+        if isinstance(zones, list) and zones and all(isinstance(z, str) for z in zones):
+            pass                        # a list of terms
+        else:
+            zones = _s(a, "zones", required=True)
         try:
-            out = api.zone_show(_s(a, "zones", required=True), self._preset(), h,
-                                _s(a, "label"), cancel=self.session.cancel)
+            out = api.zone_show(zones, self._preset(), h, _s(a, "label"),
+                                cancel=self.session.cancel)
         except ValueError as e:
             raise ArgError(str(e)) from None
         return out, {"preview": out.get("overlay_png") or out.get("camera_png")}
@@ -2808,8 +3117,34 @@ class App:
             raise ArgError("zone_delete needs confirm=true (the operator confirmed the delete)")
         try:
             return api.zone_delete(_s(a, "name", required=True), _s(a, "reason", required=True),
-                                   self._preset(), force=_bool(a, "force"))
+                                   self._preset(), force=_bool(a, "force"),
+                                   stations_dir=self.stations_dir)
         except ValueError as e:
+            raise ArgError(str(e)) from None
+
+    def _v_zone_select(self, a):
+        """Change the zone selection of the loaded preset's rig placement (files only)."""
+        sets = a.get("sets")
+        if sets is not None and not isinstance(sets, list):
+            raise ArgError("sets must be a list of {set, on, ids}")
+        terms = {}
+        for k in ("zones", "on", "off"):
+            v = a.get(k)
+            if v is not None and not (isinstance(v, str) or (
+                    isinstance(v, list) and all(isinstance(x, str) for x in v))):
+                raise ArgError(f"{k} must be text or a list of texts")
+            terms[k] = v
+        expect = a.get("expect")
+        if expect is not None and not isinstance(expect, str):
+            raise ArgError("expect must be the stamp of the selection that was shown (text)")
+        from engine.zones.selection import SelectionChanged
+        try:
+            return api.zone_select(zones=terms["zones"], on=terms["on"], off=terms["off"],
+                                   clear=_bool(a, "clear"), sets=sets, preset=self._preset(),
+                                   by=_s(a, "by") or "", expect=expect)
+        except SelectionChanged:        # the sender was shown another selection: its own code
+            raise
+        except (ValueError, rules.GeometryMismatch) as e:
             raise ArgError(str(e)) from None
 
     def _v_spectral_capture(self, a):
@@ -3703,6 +4038,9 @@ class App:
                 item.update(station_id=c.station_id, part_label=c.part_label,
                             job_type=c.job_type, preset=c.preset, threshold_mm=c.threshold_mm,
                             zone=c.zone,
+                            # its job says "zone": "selection": the zone sets switched on at
+                            # the operator page decide what its run lights and judges
+                            zone_from_selection=RJ.uses_selection(c.zone),
                             measure=c.measure if c.job_type == "metric" else None)
                 if c.job_type == "recipe":          # the one work state is verified by a recipe
                     r = api.recipe_load(c.recipe)
@@ -3756,6 +4094,9 @@ class App:
         args = cli.build_parser().parse_args(argv)
         args.preset_given = False               # the config's (or its recipe's) preset wins
         args.mock_part_given = mock_part is not None    # else the config's own mock_part
+        # "zone": "selection": the selection's stamp the bus accepted for this cycle (what
+        # the page showed / what the station was ARMED with); another one by now is a PULL
+        args.zone_expect = _s(a, "zones_expect")
         loaded = self.session.preset
         if loaded is not None:
             # a config naming no preset runs the LOADED one: what /quick shows (run_preset)
@@ -4246,6 +4587,8 @@ ROUTES = [
     ("POST", r"/api/presets", "preset_save"),
     ("GET", r"/api/presets/(?P<name>[^/]+)", "preset_get"),
     ("GET", r"/api/zonesets", "zonesets"),
+    ("GET", r"/api/zones/selection", "zone_selection"),
+    ("POST", r"/api/zones/selection", "zone_selection_set"),
     ("GET", r"/api/recipes", "recipes"),
     ("GET", r"/api/recipes/(?P<name>[^/]+)", "recipe_get"),
     ("POST", r"/api/presets/(?P<name>[^/]+)/load", "preset_load"),
@@ -4463,9 +4806,11 @@ class Handler(BaseHTTPRequestHandler):
             arg = body.get("mode")
         elif cmd == "STEP":
             arg = body.get("step")
-        elif cmd in CONFIRMED_CMDS:     # the configuration (+ profile) the sender expects
+        elif cmd in CONFIRMED_CMDS:     # the configuration (+ profile) the sender expects,
+            # and the zone selection it was shown (its stamp: checked for a configuration
+            # whose job says "zone": "selection")
             arg = {"config": body.get("config", body.get("workstate")),
-                   "profile": body.get("profile")}
+                   "profile": body.get("profile"), "zones": body.get("zones")}
         else:
             arg = None
         src = str(body.get("source") or "http")[:40]
@@ -4493,18 +4838,103 @@ class Handler(BaseHTTPRequestHandler):
 
     def _mode_job(self, verb: str, body: dict):
         args = {k: v for k, v in body.items() if k != "source" and v is not None}
+        self._zone_as_shown(args)
         job = self.app.submit(verb, args)
         self._json({**self.app.job(job.id), "bus": self.app.cmd_state()})
 
+    def _zone_as_shown(self, args: dict) -> None:
+        """zone "selection@<stamp>" = "the zone selection exactly as my page showed it": a
+        stamp that is not the stored selection's is refused at once (409, nothing queued; the
+        job checks again when it runs). Only for the loaded preset: a job that names another
+        one loads it first, and its own check decides."""
+        from engine.zones import selection as zone_sel
+        zone = args.get("zone")
+        stamp = zone_sel.word_stamp(zone) if isinstance(zone, str) else None
+        p = self.app.session.preset
+        if not stamp or p is None or args.get("preset") not in (None, p.name):
+            return
+        st = self.app.zone_status(fresh=True)
+        if st["stamp"] != stamp:
+            raise HTTPError(409, f"the zone selection changed (it is now: {st['label']}): "
+                                 "look at the page, then press it again")
+
     def r_measure(self, q, body):
         """MEASURE mode: one measurement (the measure_run verb's arguments) as a job ->
-        {id, status, ...}; poll GET /api/jobs/<id>. 409 unless Measure mode is selected."""
+        {id, status, ...}; poll GET /api/jobs/<id>. 409 unless Measure mode is selected, while
+        the zone painter holds the rig, and when zone "selection@<stamp>" names a selection
+        that is not the stored one any more."""
         self._mode_job("measure_run", body)
 
     def r_quick_check(self, q, body):
         """QUICK CHECK mode: one quick check (the quick_check verb's arguments) as a job.
-        409 unless Quick check mode is selected."""
+        409 unless Quick check mode is selected (and as for /api/measure)."""
         self._mode_job("quick_check", body)
+
+    def r_zone_selection(self, q, body):
+        """The zone selection of the loaded preset's rig placement: which painted zone sets
+        (and zones) are switched on -> {selection: {state ok | problem | unknown, ok, empty,
+        text, label, stamp, problems, sets [{set, on, ids, n_on, n_zones, zones, ...}],
+        time, by} | null (no preset loaded)}. Files only."""
+        self._json({"selection": self.app.zone_status(fresh=True)})
+
+    def r_zone_selection_set(self, q, body):
+        """Change the zone selection: {sets: [{set, on, ids}]} (the whole selection; ids
+        null = every zone of the set), or {zones | on | off | clear} as the zone_select verb
+        takes them; was: the stamp of the selection the sender was shown; source: who.
+        Always answers {accepted, message, selection, bus} with the STORED selection, so a
+        page redraws from it and never keeps a switch the server refused. 200 changed; 400
+        a set / zone that does not resolve (nothing written); 409 the station is not idle, a
+        job is queued or running, or `was` is not the stored selection any more.
+
+        The answer is final: "not changed" is never followed by the change. A job ahead of
+        it that ends within ZONE_SELECT_GRACE_S (the preset load of a configuration just
+        selected) is waited for; one that holds the worker longer refuses the change (it
+        would wait in the queue and be applied later, with nobody looking); one that still
+        got stuck behind a job is taken out of the queue before the answer goes out."""
+        app = self.app
+        args = {k: body[k] for k in ("sets", "zones", "on", "off", "clear")
+                if body.get(k) is not None}
+        if not args:
+            raise HTTPError(400, "send sets (the whole selection: [{set, on, ids}]) or zones / "
+                                 "on / off / clear")
+        if body.get("was") is not None:
+            args["expect"] = str(body["was"])
+        src = str(body.get("source") or "http")[:40]
+        args["by"] = "operator page" if src == "quick" else src
+        code, msg = 200, ""
+        until = time.monotonic() + ZONE_SELECT_GRACE_S
+        while app.jobs_ahead() and time.monotonic() < until:
+            time.sleep(0.05)
+        try:
+            job = app.submit("zone_select", args, only_if_free=True)
+        except HTTPError as e:
+            if e.code != 409:
+                raise
+            code, msg = 409, e.msg
+        else:
+            j = app.wait(job.id, ZONE_SELECT_WAIT_S)
+            if j["status"] == "queued":         # a job got in ahead of it: not later, not at all
+                try:
+                    app.cancel(job.id)
+                except HTTPError:               # it started this instant: it ends in a moment
+                    pass
+                j = app.wait(job.id, ZONE_SELECT_WAIT_S)
+            elif j["status"] == "running":      # files only: it ends in a moment
+                j = app.wait(job.id, ZONE_SELECT_WAIT_S)
+            if j["status"] == "error":
+                kind = str(j.get("error_type") or "")
+                code = 409 if kind in ("SelectionChanged", "Cancelled") else 400
+                msg = str(j.get("error") or "refused")
+                if kind == "Cancelled":
+                    msg = ("zone_select refused: another job holds the scanner: wait for it to "
+                           "end, or ABORT, then do it again")
+                elif kind and msg.startswith(kind + ": "):  # the reason, in plain words
+                    msg = msg[len(kind) + 2:]
+            elif j["status"] != "done":         # still running after all that: said as not known
+                code, msg = 409, ("the server is still writing the change: it is NOT KNOWN yet "
+                                  "whether it was stored - look at the switches again")
+        self._json({"accepted": code == 200, "message": msg,
+                    "selection": app.zone_status(fresh=True), "bus": app.cmd_state()}, code)
 
     def r_run_file(self, q, body, run_id, name):
         self._file(self.app.run_file(run_id, name), RUN_FILES[name],
@@ -4626,7 +5056,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def r_zonesets(self, q, body):
         """The painted zone sets (engine/zones) at the loaded preset's geometry: {geometry_id,
-        preset, sets [{name, zones, created, preview, camera, valid}], other_geometries}."""
+        preset, sets [{name, zones [{id, name, on}], created, preview, camera, valid, on,
+        ids_on, usable, rig_changes, used_by {recipes, stations}}], selection (as GET
+        /api/zones/selection), others [{geometry_id, n_sets, presets}], other_geometries}."""
         self._json(self.app.zone_sets())
 
     def r_recipes(self, q, body):

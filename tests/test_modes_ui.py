@@ -500,6 +500,11 @@ const srv = { mode: 'mock', jobs: {}, n: 6,
   bus: { state: 'READY', operating_mode: 'station', station_config: 'a.json',
          station_configs: ['a.json'], unusable: {}, signals: {}, jobs: {}, mode_jobs: [],
          active_preset: 'bench', run_preset: 'bench',
+         // the zone selection the server sends with every bus state: nothing switched on
+         zone_selection: { state: 'ok', ok: true, empty: true, text: '', label: 'whole field',
+                           stamp: 's0', problems: [], sets: [], check: [], n_zones_on: 0,
+                           preset: 'bench', geometry_id: 'g' },
+         painter: null, last_paint: null,
          rig: { ok: true, mount: 'fixed', message: '' } } };
 const sandbox = {
   console, setTimeout, clearTimeout, setInterval, clearInterval,
@@ -815,15 +820,17 @@ def test_quick_js_mode_switch_posts_the_right_verbs_and_a_measurement_shows_no_v
     # ---- clicks -> camera px; the measurement posts what it reads, and only that
     assert o["distanceRows"] == {"p1": True, "roi2": False, "golden": False}
     assert o["points"] == ["200,100", "601,100"]
+    # (zone: the zone selection exactly as the page showed it - here: nothing switched on)
     assert o["distancePost"] == {"what": "distance", "source": "quick", "scan_kind": "metric",
-                                 "preset": "bench", "p1": [200, 100], "p2": [601, 100]}
+                                 "preset": "bench", "p1": [200, 100], "p2": [601, 100],
+                                 "zone": "selection@s0"}
     assert o["regions"] == ["20,40,101,81", "400,200,521,321"]
     assert "region B" in o["hint"]
     assert o["mKey"] == {"prevented": True, "sent": ["/api/measure"]}
     assert o["stepPost"] == {"what": "step", "source": "quick", "scan_kind": "fast",
                              "preset": "bench", "roi": [20, 40, 101, 81],
                              "roi2": [400, 200, 521, 321], "repeats": 3,
-                             "mock_scene": "scene:plate"}
+                             "zone": "selection@s0", "mock_scene": "scene:plate"}
     assert o["lampBusy"] == {"text": "MEASURING", "cls": "qlamp lamp-running"}
     assert o["busyButtons"] == {"measure": True, "modes": True}
     # ---- MEASURED: neutral, a table with uncertainty, never a PASS / CONTINUE
@@ -860,7 +867,7 @@ def test_quick_js_mode_switch_posts_the_right_verbs_and_a_measurement_shows_no_v
     assert o["quickPost"] == {"check": "flatness", "source": "quick", "operator_confirmed": True,
                               "threshold_mm": 0.5, "roi": [10, 20, 300, 400],
                               "guard_band_pct": 10, "preset": "cart",       # the loaded one
-                              "mock_part": "scene:plate"}
+                              "zone": "selection@s0", "mock_part": "scene:plate"}
     assert o["quickPass"] == {"lamp": {"text": "PASS", "cls": "qlamp lamp-pass"},
                               "disp": "CONTINUE"}
     assert o["quickPassKept"] == o["quickPass"]["lamp"]

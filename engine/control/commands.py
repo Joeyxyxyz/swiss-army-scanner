@@ -222,6 +222,14 @@ class Handlers:
     cycle_begin: Callable = lambda info: None
     cycle_end: Callable = lambda record: None
     log: Callable = lambda meta, event: None
+    # gate(cmd, arg, armed): asked before START / TRIGGER start a cycle and before ARM arms,
+    # after the bus's own checks. None (or {"token": x}): go. {"message": why, "pull": bool}:
+    # refused - pull False: nothing starts and the last cycle no longer speaks for the part
+    # (as any START that starts no cycle); pull True: the cycle's result is INVALID and the
+    # part PULLed (the configuration cannot inspect what it says: e.g. its zone selection is
+    # empty or changed). token: what the owner wants remembered while ARMED (handed back as
+    # `armed` at every TRIGGER, so the owner can refuse a cycle whose setup changed since)
+    gate: Callable = lambda cmd, arg, armed: None
 
 
 class CommandBus:
@@ -247,6 +255,7 @@ class CommandBus:
         self._asked: Optional[dict] = None           # the verify the bus waits for an answer to
         self._permits: dict = {}                     # every permission name ever known (ordered)
         self.armed_confirmed = False
+        self.armed_token = None                      # what the owner's gate said at ARM
         self.last_result: Optional[str] = None      # PASS | FAIL | INVALID | ABORTED
         self.last_disposition: Optional[str] = None  # CONTINUE | REJECT | PULL
         self.alarm_acknowledged = False              # RESET / a good HOME since the last result
@@ -603,6 +612,9 @@ class CommandBus:
         if self.require_confirmation and not confirmed:
             return self._not_started(cmd, "the real rig needs the operator's confirmation of "
                                           "the setup")
+        held = self._gate(cmd, arg)
+        if held is not None:
+            return held
         cfg = self.flow_of(self.config)
         self._return_armed = self.state == "ARMED"
         self._result(None, None)
@@ -623,6 +635,40 @@ class CommandBus:
             return self._ok(cmd, f"started {self.config}")
         return self._ok(cmd, f"cycle started: {self.config}, profile {self.profile}; "
                         + self._where())
+
+    def _ask_gate(self, cmd: str, arg) -> tuple:
+        """The owner's gate (Handlers.gate) -> (why not, pull, token). A gate that raises
+        refuses, and PULLs: nothing starts on a check that could not be made."""
+        try:
+            g = self.h.gate(cmd, arg, self.armed_token if self.state == "ARMED" else None)
+        except Exception as e:              # noqa: BLE001 - never a start past a broken gate
+            return f"the start check failed: {type(e).__name__}: {e}", True, None
+        if not isinstance(g, dict):
+            return None, False, None
+        return (str(g["message"]) if g.get("message") else None, bool(g.get("pull")),
+                g.get("token"))
+
+    def _gate(self, cmd: str, arg) -> Optional[Reply]:
+        """START / TRIGGER: ask the owner's gate. Refused without a pull: nothing starts (a
+        part was announced and not checked: _not_started). Refused with a pull: the cycle
+        never started, so its result is INVALID and its part PULLed (as for an unusable
+        configuration), and an armed station is disarmed."""
+        why, pull, _token = self._ask_gate(cmd, arg)
+        if why is None:
+            return None
+        if not pull:
+            return self._not_started(cmd, why)
+        self._drop_permissions(f"{cmd} refused")
+        self.cycle = None                       # the last cycle is not this part's
+        self._result("INVALID", "PULL")
+        if self.state == "ARMED":
+            self.armed_confirmed = False
+            self.armed_token = None
+            self._go("READY")
+            why += " - disarmed"
+        else:
+            self._publish()
+        return self._no(cmd, why)
 
     def _where(self) -> str:
         """What the open cycle is doing now (a reply's message)."""
@@ -991,6 +1037,10 @@ class CommandBus:
             return self._no("ARM", f"station configuration {self.config} is not usable: {why}")
         if self.require_confirmation and not confirmed:
             return self._no("ARM", "the real rig needs the operator's confirmation to arm")
+        why, _pull, token = self._ask_gate("ARM", arg)
+        if why is not None:                     # ARM announces no part: refused, no PULL
+            return self._no("ARM", why)
+        self.armed_token = token
         self.armed_confirmed = bool(confirmed)
         self._release("ARM")                    # armed for the NEXT part: the last one is over
         self._go("ARMED")

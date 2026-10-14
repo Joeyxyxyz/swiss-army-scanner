@@ -116,6 +116,8 @@ DEFAULT_PORT = 8765
 DEFAULT_PRESET = "cell_wall_2p7ft_vstripe"   # fringes vertical in camera, projector right
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_BODY = 5 * 1024 * 1024
+DRAIN_MAX = 1024 * 1024       # a refused request's body is read and dropped up to this size ...
+DRAIN_WAIT_S = 2.0            # ... waiting at most this long for it (Handler._drain)
 MAX_JOBS_KEPT = 300
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 STATIONS_DIR = Path(__file__).resolve().parents[2] / "stations"
@@ -4642,6 +4644,7 @@ class Handler(BaseHTTPRequestHandler):
         return {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
 
     def _dispatch(self, method: str):
+        self._body_read = False
         try:
             host = self.headers.get("Host")
             if host is not None and f"http://{host}" not in self._origins():
@@ -4664,16 +4667,60 @@ class Handler(BaseHTTPRequestHandler):
                     return getattr(self, "r_" + name)(q=q, body=body, **groups)
             raise HTTPError(404, f"no route {method} {url.path}")
         except HTTPError as e:
+            self._drain()
             self._json({"error": e.msg}, e.code)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
         except Exception as e:          # noqa: BLE001 - a handler bug must not kill the server
+            self._drain()
             self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+
+    def _drain(self) -> None:
+        """Read and drop the body of a request answered without reading it (a refusal: a
+        foreign Host or Origin, not JSON). On Windows a socket closed with unread bytes is
+        reset, and the client may lose the answer (WinError 10053 / 10054) before it has read
+        it. What is refused and what is logged do not change. A body over DRAIN_MAX, a
+        Content-Length that is no number, or a body that has not come within DRAIN_WAIT_S
+        is not waited for: the connection is closed after the answer. Never raises."""
+        if getattr(self, "_body_read", True):
+            return
+        self._body_read = True
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            n = -1
+        if n == 0:
+            return
+        if not 0 < n <= DRAIN_MAX:
+            self.close_connection = True
+            return
+        sock = self.connection
+        read = getattr(self.rfile, "read1", self.rfile.read)     # one recv at most a call
+        try:
+            old = sock.gettimeout()
+            end = time.monotonic() + DRAIN_WAIT_S
+            try:
+                while n > 0:
+                    left = end - time.monotonic()
+                    if left <= 0:
+                        self.close_connection = True
+                        return
+                    sock.settimeout(left)
+                    chunk = read(min(n, 64 * 1024))
+                    if not chunk:
+                        self.close_connection = True
+                        return
+                    n -= len(chunk)
+            finally:
+                sock.settimeout(old)
+        except Exception:               # noqa: BLE001 - the answer goes out all the same
+            self.close_connection = True
 
     def _read_json(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n > MAX_BODY:
             raise HTTPError(413, "request body too large")
+        self._body_read = True
         raw = self.rfile.read(n) if n else b"{}"
         try:
             data = json.loads(raw.decode("utf-8") or "{}")

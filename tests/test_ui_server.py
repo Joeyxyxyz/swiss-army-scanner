@@ -11,6 +11,7 @@ import os
 import json
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -989,6 +990,65 @@ def test_post_guards_and_log(fast):
     verbs = [r["verb"] for r in log["records"]]
     assert "load_preset" in verbs and "check_signal" in verbs
     assert any(r["ok"] is False for r in log["records"])     # failures are logged too
+
+
+def _post_by_hand(port, headers: dict, body: bytes, pause_s: float) -> tuple:
+    """A POST written on a socket: its headers, a pause, then its body (a slow client: the
+    body is not in the server's buffer when it reads the headers) -> (status, JSON answer).
+    The answer is read to its end, as a browser does."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=30)
+    try:
+        lines = ["POST /api/jobs HTTP/1.1", f"Content-Length: {len(body)}", "Connection: close"]
+        lines += [f"{k}: {v}" for k, v in headers.items()]
+        s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+        time.sleep(pause_s)
+        s.sendall(body)
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        s.close()
+    head, _, payload = data.partition(b"\r\n\r\n")
+    return int(head.split()[1]), json.loads(payload)
+
+
+def test_a_refused_post_is_answered_every_time(ui):
+    """A POST refused before its body was read (a foreign Host or Origin, not JSON) used to
+    lose its answer now and then on Windows: the server closed the connection with the body
+    still unread, the socket was reset, and the client saw WinError 10053 / 10054 instead of
+    the 403 / 415. The server reads (and drops) a refused request's body before it answers;
+    what it refuses, and what it logs, are unchanged."""
+    c, app, _ = ui
+    port = app.port
+    _, log = c.get("/api/log?n=500")
+    before = log["records"]
+    body = json.dumps({"verb": "check_signal", "args": {"pad": "x" * 2000}}).encode()
+    refusals = (({"Origin": "http://evil.example"}, 403, "cross-origin request"),
+                ({"Content-Type": "text/plain"}, 415, "must be application/json"),
+                ({"Host": "attacker.example:80"}, 403, "unexpected Host header"))
+    for hdrs, code, says in refusals:
+        for _ in range(150):                     # http.client: headers and body sent apart
+            status, raw, _h = c.request("POST", "/api/jobs", body,
+                                        {"Content-Type": "application/json", **hdrs})
+            assert status == code and says in json.loads(raw)["error"], (status, raw)
+        for _ in range(5):                       # a slow client: the body comes later
+            status, answer = _post_by_hand(
+                port, {"Host": f"127.0.0.1:{port}", "Content-Type": "application/json", **hdrs},
+                body, 0.2)
+            assert status == code and says in answer["error"], (status, answer)
+    # an accepted POST after them is read as before
+    status, j = c.post("/api/jobs", {"verb": "check_signal"})
+    assert status == 200 and j["verb"] == "check_signal", j
+    _wait_job(c, j["id"])
+    # nothing refused reached the log: only the accepted job was added
+    _, log = c.get("/api/log?n=500")
+    after = log["records"]
+    i = max((k for k, r in enumerate(after) if before and r == before[-1]), default=-1)
+    added = after[i + 1:]
+    assert added and {r["verb"] for r in added} == {"check_signal"}, added
 
 
 def test_log_filters_before_the_cut_and_browsing_is_compact(fast):

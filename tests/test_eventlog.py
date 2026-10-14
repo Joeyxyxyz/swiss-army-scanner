@@ -298,6 +298,39 @@ def test_a_number_the_document_holds_as_text_is_still_a_number(tmp_path, eventlo
     assert _row(tmp_path, run_id)["reason"].startswith("deviation_mm.max 0.25 mm is outside")
 
 
+def test_a_single_job_judged_zone_by_zone_has_a_value_row_per_zone(tmp_path, eventlog_on):
+    """A plane job lit through painted zones is judged zone by zone (ui/cli.py
+    _run_metric_zones: result.json zone_selection.by_zone[], each zone with its verdict):
+    one value row per zone, its zone the zone's name; a REJECT's reason names the zone that
+    failed. Through zones without zone verdicts (a golden compare is one compare): the run's
+    one row, as before."""
+    zsel = {"text": "zoneset:cells", "source": "argument",
+            "by_zone": [{"key": "cells/Z1", "verdict": "PASS", "max_mm": 0.12},
+                        {"key": "cells/Z2", "verdict": "FAIL", "max_mm": 0.31}]}
+    run_id, _, _ = _job(tmp_path, result="FAIL", max_dev=0.31, threshold=0.2,
+                        zone_selection=zsel)
+    assert [(v["zone"], v["check"], v["name"], v["value"], v["upper_limit"], v["result"])
+            for v in _values(tmp_path, run_id)] == [
+        ("cells/Z1", "metric", "deviation_mm.max", "0.12", "0.2", "OK"),
+        ("cells/Z2", "metric", "deviation_mm.max", "0.31", "0.2", "OUT")]
+    row = _row(tmp_path, run_id)
+    assert row["judgment"] == "FAIL" and (row["n_values"], row["n_out_of_limit"]) == ("2", "1")
+    assert row["reason"] == "cells/Z2: deviation_mm.max 0.31 mm is outside its limits [..0.2]"
+    # a zone that could not be judged: its row INVALID, the run PULLed
+    run_id, _, _ = _job(tmp_path, result="INVALID", max_dev=0.12, threshold=0.2,
+                        zone_selection={**zsel, "by_zone": [
+                            {"key": "cells/Z1", "verdict": "PASS", "max_mm": 0.12},
+                            {"key": "cells/Z2", "verdict": "INVALID", "max_mm": None}]})
+    assert [(v["zone"], v["result"]) for v in _values(tmp_path, run_id)] == [
+        ("cells/Z1", "OK"), ("cells/Z2", "INVALID")]
+    assert _row(tmp_path, run_id)["judgment"] == "PULL"
+    # lit through zones, judged as one (no zone verdicts): the run's one row
+    run_id, _, _ = _job(tmp_path, max_dev=0.1, threshold=0.2,
+                        zone_selection={**zsel, "by_zone": [{"key": "cells/Z1", "points": 900}]})
+    (val,) = _values(tmp_path, run_id)
+    assert (val["zone"], val["name"], val["result"]) == ("", "deviation_mm.max", "OK")
+
+
 def test_a_disposition_that_is_none_of_the_three_never_reads_pass(tmp_path):
     run_id, run_dir, doc = _job(tmp_path, max_dev=0.1, threshold=0.2)
     doc["disposition"] = "MAYBE"                            # a document from somewhere else

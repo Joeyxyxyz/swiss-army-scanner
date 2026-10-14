@@ -82,6 +82,8 @@ from engine import disposition as D  # noqa: E402
 from engine.library import longpath  # noqa: E402
 from engine.library import presets as preset_lib  # noqa: E402
 from engine.capture.hwtrigger import TRIGGER_LINES  # noqa: E402
+from engine.zones import selection as _zone_sel  # noqa: E402
+from engine.zones import use as _zone_use  # noqa: E402
 
 DEFAULT_PRESET = "cell_wall_2p7ft_vstripe"   # fringes vertical in camera, projector right
 TRIGGER_LINE_HELP = ("camera input the trigger is wired to: Line0 = opto-isolated "
@@ -1491,12 +1493,22 @@ def _zone_rows(zones: list) -> list:
 _ZONE_HEAD = ["zone", "name", "shape", "size DMD px", "deg", "box col0,row0,col1,row1", "area px"]
 
 
-def _zones_text(spec: str) -> str:
+def _zones_text(spec) -> str:
     """--zones SET[:Z1,Z3] -> the engine's zone text 'zoneset:SET[:Z1,Z3]' (checked here so
-    a typo is refused before anything is loaded)."""
+    a typo is refused before anything is loaded). Several sets: --zones given more than
+    once, or joined with '+' ('cells+tube:Z1') -> 'zoneset:cells+tube:Z1'. The word
+    `selection` (the zone sets switched on at this rig placement: `scan zone-select`) stands
+    alone and stays the word: the verb expands it."""
+    from engine.zones import selection as zone_sel
     from engine.zones import use as zone_use
-    name, ids = zone_use.parse_spec(spec, bare=True)
-    return zone_use.spec_text(name, ids)
+    items = [str(i) for i in spec] if isinstance(spec, (list, tuple)) else [str(spec)]
+    if any(zone_sel.is_word(i) for i in items):
+        if len(items) != 1:
+            raise CLIError("--zones selection stands alone: it is the zone sets that are "
+                           "switched on (scan zone-select), not one more set")
+        stamp = zone_sel.word_stamp(items[0])
+        return zone_sel.WORD + (f"@{stamp}" if stamp else "")
+    return zone_use.join_terms(items)
 
 
 def cmd_zone_paint(ctx):
@@ -1520,13 +1532,18 @@ def cmd_zone_paint(ctx):
     labels = [s.strip() for s in a.labels.split(",")] if a.labels else None
     out = api.zone_paint(a.name, ctx.preset(), source=a.source, events=events,
                          replace=a.replace, labels=labels, polarity=a.polarity,
-                         note=a.note or "", idle_timeout_s=a.idle_timeout)
+                         note=a.note or "", idle_timeout_s=a.idle_timeout,
+                         select=bool(a.select))
     ctx.warn(out.get("warnings"))
     if not out["saved"]:
         ctx.say(f"Zone set {a.name}: NOT saved - {_one_line(out['reason'])}")
         return EXIT_NOT_OK, {"zone_paint": out}
     ctx.say(f"Zone set {out['name']} saved: {out['n_zones']} zone(s), geometry "
             f"{out['geometry_id']} (projector px, valid at this rig placement)")
+    if out.get("replaced"):
+        ctx.say(f"  the set it replaced is in the library trash: {out['replaced']}")
+    ctx.say(f"  selection: {_one_line(out.get('selection_note') or '-')}"
+            + ("" if out.get("on") else f"  (scan zone-select --on {out['name']} switches it on)"))
     ctx.table(_ZONE_HEAD, _zone_rows(out["zones"]))
     ctx.kv([["zones", str(out["zones_json"])], ["masks", str(out["masks"])],
             ["preview", str(out["preview"])], ["photo", str(out["camera"] or "-")]])
@@ -1546,17 +1563,34 @@ def cmd_zones(ctx):
             here = None
         items = [i for i in api.zone_sets(all_geometries=True)
                  if not a.geometry or i["geometry_id"] == a.geometry]
+        sel = None
+        if here is not None:                    # which of them are switched on (zone-select)
+            try:
+                sel = api.zone_selection(ctx.preset())
+            except (ValueError, OSError, rules.RuleViolation):
+                sel = None
+        on = {r["set"]: r for r in (sel or {}).get("sets") or [] if r["on"]}
+
+        def switched(i) -> str:
+            r = on.get(i["name"]) if i["geometry_id"] == here else None
+            if r is None:
+                return ""
+            return "ON" if r["n_on"] == r["n_zones"] else f"ON ({r['n_on']} of {r['n_zones']})"
+
         ctx.say(f"Zone sets ({len(items)}; * = painted at this preset's geometry"
                 f"{' ' + here if here else ''}):")
-        ctx.table(["", "name", "geometry", "zones", "created", ""],
+        ctx.table(["", "name", "geometry", "zones", "created", "selected", ""],
                   [["*" if i["geometry_id"] == here else "", i["name"], i["geometry_id"],
                     ", ".join(z["id"] + (f" ({z['name']})" if z.get("name") else "")
                               for z in i["zones"]) or "-",
-                    i.get("created") or "-",
+                    i.get("created") or "-", switched(i),
                     "" if i["valid"] else f"INVALID: {_one_line(i['error'])}"] for i in items])
         if not items:
             ctx.say("  none yet - paint one on the part: scan zone-paint --name NAME")
-        return EXIT_OK, {"zone_sets": items}
+        if sel is not None:
+            ctx.say(f"  selected at this rig placement: {_zone_sel.describe(sel)}"
+                    "   (scan zone-select changes it; --zones selection uses it)")
+        return EXIT_OK, {"zone_sets": items, **({"selection": sel} if sel is not None else {})}
     zs = api.zone_set(a.set, ctx.preset())
     text = _zones_text(a.set)
     ids = text.split(":")[2].split(",") if text.count(":") > 1 else None
@@ -1588,14 +1622,18 @@ def cmd_zones(ctx):
 
 
 def cmd_zone_show(ctx):
-    """Project a saved zone set, photograph it, report where each zone lands."""
+    """Project saved zones (one set, several, or the selection), photograph them, report
+    where each zone lands."""
     ctx.header()
     a = ctx.args
-    r = api.zone_show(a.set, ctx.preset(), a.hold, a.label)
-    ctx.say(f"Zone set {r['zoneset']}: {sum(z['seen'] for z in r['zones'])} of "
+    r = api.zone_show(_zones_text(a.set), ctx.preset(), a.hold, a.label)
+    several = len(r["zonesets"]) > 1
+    ctx.say(f"Zone set{'s' if several else ''} {', '.join(r['zonesets'])}: "
+            f"{sum(z['seen'] for z in r['zones'])} of "
             f"{len(r['zones'])} zone(s) land in the camera image")
     ctx.table(["zone", "name", "seen", "camera px", "centre x,y", "box x0,y0,x1,y1", "DMD px"],
-              [[z["id"], z.get("name") or "-", _f(z["seen"]), z["camera_px"],
+              [[z["key"] if several else z["id"], z.get("name") or "-", _f(z["seen"]),
+                z["camera_px"],
                 ",".join(_f(v, 0) for v in z["centroid_px"]) if z["centroid_px"] else "-",
                 ",".join(str(v) for v in z["bbox_px"]) if z["bbox_px"] else "-", z["dmd_px"]]
                for z in r["zones"]])
@@ -1611,7 +1649,49 @@ def cmd_zone_delete(ctx):
     ctx.say(f"Zone set {r['name']} moved to the library trash: {r['trashed']}")
     if r["recipes"]:
         ctx.say(f"  ! recipe(s) {', '.join(r['recipes'])} named it (forced)")
+    if r.get("stations"):
+        ctx.say(f"  ! station configuration(s) {', '.join(r['stations'])} named it (forced)")
+    if r.get("was_on"):
+        ctx.say(f"  ! it was switched on: the zone selection now names a set that is gone and "
+                f"is refused by every run until: scan zone-select --off {r['name']}")
     return EXIT_OK, {"deleted": r}
+
+
+def cmd_zone_select(ctx):
+    """The zone selection of this rig placement: print it, or change it."""
+    a = ctx.args
+    p = ctx.preset()
+    changing = bool(a.terms or a.on or a.off or a.clear)
+    if a.clear and (a.terms or a.on):
+        raise CLIError("--clear switches everything off: not with sets to switch on")
+    if changing:
+        st = api.zone_select(zones=_zones_text(a.terms) if a.terms else None,
+                             on=[_zones_text(t) for t in a.on or []] or None,
+                             off=list(a.off or []) or None, clear=bool(a.clear), preset=p,
+                             by="command line")
+    else:
+        st = api.zone_selection(p)
+    ctx.say(f"Zone selection at geometry {st['geometry_id']} (preset {st['preset']}): "
+            f"{_one_line(_zone_sel.describe(st))}")
+    ctx.table(["", "set", "zones on", "of", "painted", ""],
+              [["ON" if r["on"] else "", r["set"],
+                ", ".join(z["id"] for z in r["zones"] if z["on"]) or "-", r["n_zones"],
+                r["created"] or "-",
+                _one_line(r["error"] or ("CHECK: " + "; ".join(r["rig_changes"][:2])
+                                         if r["rig_changes"] else ""))] for r in st["sets"]])
+    if not st["sets"]:
+        ctx.say("  no zone set at this rig placement - paint one: scan zone-paint --name NAME")
+    if st.get("time"):
+        ctx.say(f"  last changed {st['time']} by {st['by'] or '?'}")
+    if st["ok"]:
+        ctx.say("  use it: --zones selection (scan-fast, measure-run, quick-check); a station "
+                "configuration: \"job\": {\"zone\": \"selection\"}"
+                if not st["empty"] else
+                "  nothing is switched on (the whole field): scan zone-select --on SET")
+    else:
+        ctx.warn([p_["message"] for p_ in st["problems"]]
+                 + ["every run that asks for the selection is refused until this is fixed"])
+    return (EXIT_OK if st["ok"] else EXIT_NOT_OK), {"selection": st}
 
 
 def _load_patterns(src: str) -> list:
@@ -4318,10 +4398,230 @@ def _deviation_png(run_dir: Path, dev: np.ndarray, scale_mm: float) -> Optional[
     return str(out)
 
 
+class _ZoneRefused(Exception):
+    """A run's zone does not resolve, or may not be judged as it stands: nothing is
+    captured, the run is INVALID and the part PULLed. code: the pull reason."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _zone_doc(text: str, info: Optional[dict], picked) -> dict:
+    """result.json `zone_selection` of a run lit through painted zone sets (or that asked
+    for the selection): what was lit, from where; the points and the verdict per zone are
+    filled in after the scan."""
+    return {"text": text, "source": "selection" if info is not None else "argument",
+            "selected": (info or {}).get("selected"),
+            "sets": picked.created() if picked is not None else [],
+            "by_zone": [], "outside": None, "points": None, "summary": None, "warnings": []}
+
+
+def _zone_gate(ctx, cfg, p, res, log) -> tuple:
+    """The job's zone, resolved BEFORE anything is captured -> (the config that is run, the
+    resolved zone sets or None).
+
+    The word `selection` (job.zone of a metric job, `quick-check --zones selection`, the
+    operator page) is expanded into the zone text of the zone sets switched on at the
+    preset's rig placement; that text is what is lit and what result.json records
+    (capture.zone; job.zone keeps the configuration's own word). A text of painted zone sets
+    is checked against this rig placement. _ZoneRefused (INVALID -> PULL, nothing captured,
+    never the whole field or another zone in its place) when:
+      - the selection is empty (the bare word), unknown, names something gone, or is not
+        the one the sender was shown (`selection@<stamp>` / the stamp START carried);
+      - a set is not at this geometry / these rig settings, or a zone id is not in its set;
+      - a metric job would decode columns only (its zones could not be told apart);
+      - a set it uses has a rig change on record since it was painted and last shown (the
+        zones may no longer sit on the part).
+    A metric job lit through zone sets is then judged zone by zone (_run_metric) and carries
+    res["zone_selection"]. Grid cells and atlas regions pass through unchanged."""
+    from dataclasses import replace
+    from engine.zones import store as zstore
+    zone, info = cfg.zone, None
+    if not zone or cfg.job_type == "recipe":    # a recipe job is lit by its recipe's scan.zone
+        return cfg, None
+    s = api._engine()
+    try:
+        if _zone_sel.is_word(zone):
+            zone, info = _zone_sel.expand(s.store, p, zone,
+                                          expect=getattr(ctx.args, "zone_expect", None))
+        if zone is None:                        # nothing is on, and the sender knew it
+            res["zone_selection"] = _zone_doc("", info, None)
+            res["capture"]["zone"] = None
+            log.event("zones", text="(the whole field)", source="selection", zones=[])
+            return replace(cfg, zone=None), None
+        if not _zone_use.is_spec(zone):
+            return cfg, None
+        picked = _zone_use.select_multi(s.store, p, zone)
+        if not picked.mask().any():
+            raise ValueError(f"zone set {picked.text} covers no DMD mirror: nothing would be lit")
+    except (ValueError, rules.GeometryMismatch) as e:       # a ZoneError is a ValueError
+        raise _ZoneRefused("zone_unresolved", _one_line(e)) from None
+    cfg = replace(cfg, zone=picked.text)
+    res["capture"]["zone"] = picked.text
+    if cfg.job_type != "metric":                # inspect / compare: lit through it, as before
+        return cfg, None
+    if cfg.scan == "fast" and cfg.axis != "xy":
+        raise _ZoneRefused("zone_unresolved",
+                           f"job.axis x with zone set {picked.text}: a columns-only scan cannot "
+                           "tell which zone a point is in, so no zone could be judged - set "
+                           "job.axis xy")
+    stale = [f"zone set {zs.name} (painted {zs.created}): {'; '.join(ch[:3])}"
+             for zs, ch in ((zs, zstore.rig_changes(s.store, zs)) for zs in picked.sets) if ch]
+    if stale:
+        raise _ZoneRefused(
+            "zone_unresolved",
+            "since it was painted the rig-state record has - " + " | ".join(stale) + ". Its "
+            "zones may no longer sit on the part: project them and look (operator page: Show "
+            f"selected zones; scan zone-show {picked.text[len(_zone_use.PREFIX):]}), or paint "
+            "the set again")
+    res["zone_selection"] = _zone_doc(picked.text, info, picked)
+    log.event("zones", text=picked.text, zones=picked.keys,
+              source=res["zone_selection"]["source"])
+    return cfg, picked
+
+
+def _plane_zone(cloud, region: np.ndarray, row: dict, cfg, area, where: str) -> dict:
+    """ONE zone judged as a plane (the plane job's rules, on the zone's own px): its own
+    robust plane, its own out-of-tolerance clusters, its own verdict -> {"verdict": PASS |
+    FAIL | None (it cannot be judged: "code" + "message" say why), "mx", "d" (every px's
+    distance to the zone's plane), stats}. A plane is never fitted across separate zones."""
+    from engine.measure import metric
+    thr, min_px = cfg.threshold_mm, cfg.min_defect_px
+    key = row["key"]
+    who = f"zone {key}" + (f" ({row['name']})" if row.get("name") else "")
+    n = int(region.sum())
+    out = {"key": key, "verdict": None, "code": None, "message": None, "mx": None, "d": None,
+           "n_points": n, "defects": [], "outlier_px": 0, "outlier_clusters": 0,
+           "n_measured": 0, "dense": None, "plane_distance_mm": None,
+           "plane_rms_inliers_mm": None}
+    doubt = _zone_use.zone_doubt({**row, "points": n, "coverage_pct":
+                                  None if where else row.get("coverage_pct")},
+                                 cfg.min_valid_pct, where)
+    if doubt:
+        return {**out, "code": "too_few_points", "message": doubt}
+    P = cloud.xyz[region]
+    fit, _ = metric.ransac_plane(P, 0.5)
+    dist = abs(float(fit.normal @ fit.point))       # plane to camera centre, mm
+    out.update(plane_distance_mm=round(dist, 3), plane_rms_inliers_mm=round(fit.rms, 5))
+    if cfg.plane_range_mm is not None and not (
+            cfg.plane_range_mm[0] <= dist <= cfg.plane_range_mm[1]):
+        return {**out, "code": "invalid",
+                "message": f"{who}: its plane is {dist:.1f} mm from the camera, outside "
+                           f"job.plane_range_mm {list(cfg.plane_range_mm)}: no part surface "
+                           "where it should be (part absent or misplaced?)"}
+    dev = np.full(cloud.mask.shape, np.nan)
+    dev[region] = fit.distance(P)
+    cl = _tolerance_clusters(np.abs(dev), thr, min_px, area, "test")
+    defects = sorted(cl["defects"], key=_defect_order, reverse=True)
+    for d in defects:
+        d["zone"] = key
+    out.update(mx=cl["robust_max"], d=dev[region], defects=defects,
+               outlier_px=cl["outlier_px"], outlier_clusters=cl["outlier_clusters"],
+               n_measured=cl["n_measured"], dense=cl["dense"])
+    if cl["robust_max"] is None:
+        return {**out, "code": "too_few_points",
+                "message": f"{who}: nothing left to judge once the stray points (clusters "
+                           f"under job.min_defect_px {min_px} px) are dropped"}
+    if defects or cl["robust_max"] > thr:       # any defect cluster fails, whatever else
+        return {**out, "verdict": "FAIL"}
+    pct = 100.0 * cl["outlier_px"] / max(cl["n_measured"], 1)
+    if pct > cfg.max_outlier_pct:
+        return {**out, "code": "incomplete",
+                "message": f"{who}: {cl['outlier_px']} px ({pct:.3g} % of {cl['n_measured']} "
+                           f"measured) beyond {thr:g} mm sit in {cl['outlier_clusters']} isolated "
+                           f"stray cluster(s) under job.min_defect_px {min_px} px, more than "
+                           f"job.max_outlier_pct {cfg.max_outlier_pct:g} %: noisy data or a "
+                           "pitted surface, can't pass"}
+    if cl["dense"]:
+        dn = cl["dense"]
+        return {**out, "code": "incomplete",
+                "message": f"{who}: {dn['n_px']} stray px ({dn['share_pct']:g} % of the measured "
+                           f"px) beyond {thr:g} mm within {METRIC_DENSE_WIN_PX} camera px of "
+                           f"each other at camera px {dn['window_px']}, each under "
+                           f"job.min_defect_px {min_px} px: pits or a noisy patch, never stray "
+                           "points - can't pass"}
+    return {**out, "verdict": "PASS"}
+
+
+def _run_metric_zones(cfg, ms, cam: dict, log, res, run_dir) -> None:
+    """A plane job lit through painted zones: the limit applies to EACH zone. Every zone is
+    judged on the camera px that decoded into it (cut by job.roi when one is given) with its
+    own plane (_plane_zone); points decoded outside every zone are reported, never judged.
+    The run: any zone that cannot be judged -> INVALID (PULL), the reason names every such
+    zone and any zone that also failed; else any zone FAIL -> FAIL, the summary names it;
+    else PASS. Never a PASS on the remaining zones. deviation_mm.max is the worst zone's."""
+    from engine.measure import metric
+    cloud = ms.cloud
+    thr, min_px = cfg.threshold_mm, cfg.min_defect_px
+    roi = _roi_mask(cloud.mask.shape, cfg.roi)
+    where = f" inside job.roi {list(cfg.roi)}" if cfg.roi else ""
+    area = metric.pixel_area_mm2(np.where(cloud.mask[..., None], cloud.xyz, np.nan))
+    zsel = res["zone_selection"]
+    per, dev = [], np.full(cloud.mask.shape, np.nan)
+    for row in zsel["by_zone"]:
+        region = cloud.mask & cam[row["key"]] & roi
+        z = _plane_zone(cloud, region, row, cfg, area, where)
+        if z["d"] is not None:
+            dev[region] = z["d"]
+        row.update(verdict=z["verdict"] or "INVALID", reason=z["message"],
+                   max_mm=round(z["mx"], 5) if z["mx"] is not None else None,
+                   rms_mm=(round(float(np.sqrt(np.mean(z["d"] * z["d"]))), 5)
+                           if z["d"] is not None and z["d"].size else None),
+                   n_defects=len(z["defects"]), plane_distance_mm=z["plane_distance_mm"],
+                   **({"points_in_roi": z["n_points"]} if where else {}))
+        per.append(z)
+        log.event("zone", level="info" if z["verdict"] == "PASS" else "warning", zone=z["key"],
+                  verdict=row["verdict"], max_deviation_mm=row["max_mm"], n_points=z["n_points"],
+                  coverage_pct=row.get("coverage_pct"), n_defects=len(z["defects"]),
+                  reason=z["message"])
+    invalid = [z for z in per if z["verdict"] is None]
+    failed = [z for z in per if z["verdict"] == "FAIL"]
+    said = [f"{z['key']} " + ("cannot be judged" if z["verdict"] is None else z["verdict"])
+            + (f" (max {z['mx']:.3f} mm" + (f" > {thr:g} mm" if z["verdict"] == "FAIL" else "")
+               + ")" if z["mx"] is not None else "") for z in per]
+    zsel["summary"] = "; ".join(sorted(said, key=lambda t: (" PASS" in t, t)))
+    zsel["failed"] = [z["key"] for z in failed]
+    zsel["invalid"] = [z["key"] for z in invalid]
+    mxs = [z["mx"] for z in per if z["mx"] is not None]
+    d = dev[np.isfinite(dev)]
+    defects = sorted((x for z in per for x in z["defects"]), key=_defect_order, reverse=True)
+    outlier_px = sum(z["outlier_px"] for z in per)
+    n_measured = sum(z["n_measured"] for z in per)
+    dense = next((z["dense"] for z in per if z["dense"]), None)
+    if mxs:
+        res["deviation_units"] = "mm"
+        res["deviation_mm"].update(
+            max=round(max(mxs), 5), mean=round(float(np.mean(d)), 5),
+            rms=round(float(np.sqrt(np.mean(d * d))), 5), method="plane_fit_per_zone",
+            n_points=int(d.size), n_defects=len(defects),
+            largest_defect=defects[0] if defects else None, outlier_px=outlier_px,
+            outlier_clusters=sum(z["outlier_clusters"] for z in per),
+            outlier_pct=round(100.0 * outlier_px / max(n_measured, 1), 4), dense_strays=dense)
+        res["outputs"]["deviation_map"] = _deviation_png(run_dir, dev, thr)
+    if invalid:                                 # a zone in doubt: never a verdict on the rest
+        also = [f"zone {z['key']} FAILED (max {z['mx']:.3f} mm > {thr:g} mm)" for z in failed]
+        res["invalid_reason"] = " | ".join([z["message"] for z in invalid]
+                                           + (["also: " + "; ".join(also)] if also else []))
+        for z in invalid:
+            D.add(res, z["code"], z["message"], zone=z["key"])
+    else:
+        res["result"] = res["engine_verdict"] = "FAIL" if failed else "PASS"
+        res["invalid_reason"] = None
+    log.event("measure", level="info" if not (invalid or failed) else "warning",
+              method="plane_fit_per_zone", zones=zsel["summary"],
+              max_deviation_mm=res["deviation_mm"]["max"], n_points=int(d.size),
+              threshold_mm=thr, min_defect_px=min_px, n_defects=len(defects),
+              min_valid_pct=cfg.min_valid_pct, outside_every_zone=zsel.get("outside"))
+
+
 def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     """metric job: scan_fast / scan_metric (stereo calibration, rule 6) -> mm, then a plane
     fit in the roi or a golden metric compare (both directions); PASS / FAIL against
-    threshold_mm. The verdict comes from out-of-tolerance clusters (_tolerance_clusters):
+    threshold_mm. A job lit through painted zone sets (_zone_gate resolved them and opened
+    res["zone_selection"]): a plane job is judged zone by zone (_run_metric_zones), a golden
+    compare needs a golden scanned through the same zones and every zone seen well enough.
+    The verdict comes from out-of-tolerance clusters (_tolerance_clusters):
     only isolated clusters smaller than job.min_defect_px are dropped, as stray points, and
     more of them than job.max_outlier_pct of the measured px (golden: of both scans together,
     or of either scan's own once they are two defect clusters' worth), or dropped px dense
@@ -4333,6 +4633,10 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     from engine.calibrate import stereo
     from engine.measure import metric
     s = api._engine()
+    # the painted zones of this run (the gate resolved the same text just before)
+    picked = (_zone_use.select_multi(s.store, p, cfg.zone)
+              if (res.get("zone_selection") or {}).get("text") and _zone_use.is_spec(cfg.zone)
+              else None)
     if cfg.threshold_mm is None:
         res["invalid_reason"] = ("metric jobs need threshold_mm (mm) in the station config: "
                                  "there is no preset default for a metric measurement")
@@ -4350,6 +4654,15 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
         return
     res["calibration"].update(calibration_id=cal.id, same_geometry=True)
     golden = _find_station_golden(cfg, "metric") if cfg.measure == "golden" else None
+    if golden is not None:
+        # a golden shows only what was lit when it was scanned: against a run lit through
+        # other zones its unlit rest would read as missing material (a REJECT of a good part)
+        why = _zone_use.golden_mismatch(s, p, golden, picked)
+        if why:
+            res["invalid_reason"] = why
+            D.add(res, "golden", why)
+            log.event("refused", level="warning", reason=why)
+            return
     s.check_cancel()
     _mock_place_metric(ctx)
     if cfg.scan == "metric":
@@ -4371,6 +4684,31 @@ def _run_metric(ctx, cfg, p, log, res, run_dir) -> None:
     s.check_cancel()
     cloud = ms.cloud
     thr, min_px = cfg.threshold_mm, cfg.min_defect_px
+    if picked is not None:
+        # lit through painted zones: the points and the coverage of every zone, from this
+        # scan's own decode (the camera px of a zone depend on the depth of what it hits)
+        try:
+            _p, cam, rep = _zone_use.camera_regions(s, p, cfg.zone, ms, cloud.mask.shape)
+        except ValueError as e:
+            res["invalid_reason"] = _one_line(e)
+            D.add(res, "zone_unresolved", res["invalid_reason"])
+            log.event("measure", level="warning", method="zones", reason=res["invalid_reason"])
+            return
+        res["zone_selection"].update(by_zone=rep["by_zone"], outside=rep["outside"],
+                                     points=rep["points"], warnings=list(rep["warnings"]))
+        res["warnings"] += [w for w in rep["warnings"] if w not in res["warnings"]]
+        if cfg.measure == "plane":
+            _run_metric_zones(cfg, ms, cam, log, res, run_dir)
+            return
+        doubts = [(r["key"], _zone_use.zone_doubt(r, cfg.min_valid_pct))
+                  for r in rep["by_zone"]]
+        doubts = [(k, w) for k, w in doubts if w]
+        if doubts:                              # a zone the golden compare would not see
+            res["invalid_reason"] = " | ".join(w for _k, w in doubts)
+            for k, w in doubts:
+                D.add(res, "too_few_points", w, zone=k)
+            log.event("measure", level="warning", method="zones", reason=res["invalid_reason"])
+            return
     roi = _roi_mask(cloud.mask.shape, cfg.roi)
     incomplete = None
     untrusted = None            # why every deviation is in doubt (a FAIL on them is a PULL)
@@ -4798,6 +5136,17 @@ def _run_job(ctx, cfg, quick: Optional[dict] = None):
                       how_to_fix=gate["how_to_fix"])
             _settle_run(res, recipe)                # a doubt: PULL
             return _run_done(ctx, cfg, run_id, run_dir, res, log, D.exit_code(res))
+        # the job's zone: the word `selection` expanded, painted zone sets checked against
+        # this rig placement - before anything is captured. What does not resolve is a PULL,
+        # never the whole field (or another zone) in its place
+        try:
+            cfg, _picked = _zone_gate(ctx, cfg, p, res, log)
+        except _ZoneRefused as e:
+            res["invalid_reason"] = str(e)
+            D.add(res, e.code, str(e))
+            log.event("refused", level="warning", reason=str(e), zone=cfg.zone)
+            _settle_run(res, recipe)
+            return _run_done(ctx, cfg, run_id, run_dir, res, log, D.exit_code(res))
         if cfg.job_type == "metric":            # stereo calibration: no base involved
             _run_metric(ctx, cfg, p, log, res, run_dir)
             _settle_metric(res, cfg)
@@ -4975,6 +5324,16 @@ def _run_done(ctx, cfg, run_id, run_dir, res, log, code) -> tuple:
     ctx.say(f"Run {run_id}: {res['result']}"
             + (f"  ({res['invalid_reason']})" if res["invalid_reason"] else ""))
     ctx.say(f"  disposition: {_one_line(D.summary(res))}")
+    zsel = res.get("zone_selection")
+    if zsel:                                    # lit through painted zones: judged per zone
+        ctx.say(f"  zones: {zsel['text'] or 'the whole field (nothing is switched on)'}"
+                + (" (the zone selection)" if zsel.get("source") == "selection" else "")
+                + (f" - {_one_line(zsel['summary'])}" if zsel.get("summary") else ""))
+        if zsel.get("by_zone"):
+            ctx.table(["zone", "name", "verdict", "max mm", "points", "seen %"],
+                      [[z["key"], z.get("name") or "-", z.get("verdict") or "-",
+                        _f(z.get("max_mm"), 4), "?" if z.get("points") is None else z["points"],
+                        _f(z.get("coverage_pct"), 1)] for z in zsel["by_zone"]], indent="    ")
     ctx.kv([["station", cfg.station_id], ["part", f"{cfg.part_label} ({cfg.part_role})"],
             ["max deviation", _u(dev, "mm", 4) if dev is not None else "-"],
             ["threshold", _u(res["threshold_mm"], "mm", 3)
@@ -5069,6 +5428,15 @@ def cmd_measure_run(ctx):
         if doc.get("how_to_fix"):
             ctx.say(f"  fix: {_one_line(doc['how_to_fix'])}")
     ctx.say(f"  validity: {_one_line(doc['validity'])}")
+    zsel = doc.get("zone_selection")
+    if zsel:                                        # what was lit (and measured per zone)
+        ctx.say(f"  zones: {zsel['text'] or 'the whole field (nothing is switched on)'}"
+                + (" (the zone selection)" if zsel.get("source") == "selection" else ""))
+        if zsel.get("by_zone"):
+            ctx.table(["zone", "name", "points", "seen %"],
+                      [[z["key"], z.get("name") or "-",
+                        "?" if z.get("points") is None else z["points"],
+                        _f(z.get("coverage_pct"), 1)] for z in zsel["by_zone"]], indent="    ")
     files = [["result.json", str(run_dir / "result.json")],
              ["values.csv", str(run_dir / doc["outputs"]["values_csv"])]]
     files += [[k, str(run_dir / doc["outputs"][k])] for k in ("overlay", "ply")
@@ -5139,11 +5507,16 @@ def cmd_quick_check(ctx):
     preset = a.preset if a.preset_given else None
     if preset is None and a.check != "recipe":      # the selected preset (refused when gone)
         preset = ctx.preset().name
+    zone = a.zone
+    if a.zones:                                     # painted zone sets, or the selection
+        if zone:
+            raise CLIError("give --zones (painted zone sets) or --zone (grid cells), not both")
+        zone = _zones_text(a.zones)
     try:
         doc = api.quick_check_config(
             a.check, preset, threshold_mm=a.threshold, roi=_roi(a.roi), golden=a.golden,
             recipe=a.recipe, guard_band_pct=a.guard_band or 0.0, runs_dir=_mode_runs_dir(ctx),
-            zone=a.zone, scan=a.scan_kind or "fast")
+            zone=zone, scan=a.scan_kind or "fast")
         if a.recipe and a.recipe.lower().endswith((".json", ".yaml", ".yml")):
             doc["job"]["recipe"] = str(Path(a.recipe).resolve())
         cfg = RJ.config_from_doc(doc, Path.cwd())
@@ -5221,6 +5594,14 @@ is projected; zones are projector px, valid at this rig placement):
   scan zone-show lid               project it, photograph, where each zone lands
   scan scan-fast part --zones lid[:Z1,Z3]   light + decode only those zones; points per zone
   scan measure-run P --what flatness --zones lid:Z1   the zone as the measured region
+  several sets at once: --zones cells --zones tube:Z1 (or --zones cells+tube:Z1); zones are
+      then named set/id (cells/Z1) and measured / judged one by one, never as one plane
+  scan zone-select [cells tube:Z1] [--on SET[:IDS]] [--off SET] [--clear]   the zone
+      selection: which sets are switched on at this rig placement (kept in the library; the
+      operator page's Scan zones panel shows the same); no argument prints it
+  --zones selection                scan-fast / measure-run / quick-check use that selection; a
+      station configuration does only when its job says "zone": "selection" (metric jobs)
+  scan quick-check P --check flatness --threshold 0.3 --zones cells   the limit per zone
   recipes: a zone {"id": "lid", "ref": "zoneset:lid/Z1", "checks": [...]}, scan.zone
       "zoneset:lid"; mock: scan --mock zone-paint --name lid --events demo
 
@@ -5688,6 +6069,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--idle-timeout", type=float, default=600.0, metavar="S",
                    help="give the rig back after S seconds without input, nothing saved "
                         "(default 600)")
+    p.add_argument("--select", action="store_true",
+                   help="switch a NEW set on in the zone selection of this rig placement (scan "
+                        "zone-select); a set painted over keeps its on / off")
+    p = cmd("zone-select", cmd_zone_select,
+            "the zone selection: which painted zone sets (and zones) are switched on at this "
+            "rig placement. No argument prints it; SET[:IDS] (several: A+B:Z1) makes exactly "
+            "those the selection; --on / --off switch one; --clear switches everything off. "
+            "`--zones selection` and a station job's \"zone\": \"selection\" use it. Exit 0, "
+            "1 when the selection has a problem (a set that is gone ...), 2 refused",
+            "the zone selection")
+    p.add_argument("terms", nargs="*", metavar="SET[:IDS]",
+                   help="exactly these are switched on (cells tube:Z1, or cells+tube:Z1)")
+    p.add_argument("--on", action="append", metavar="SET[:IDS]",
+                   help="switch this set on (with :IDS exactly those zones; without, the zone "
+                        "switches it had); repeatable")
+    p.add_argument("--off", action="append", metavar="SET",
+                   help="switch this set off (its zone switches are remembered); repeatable")
+    p.add_argument("--clear", action="store_true", help="switch everything off (the whole field)")
     p = cmd("zones", cmd_zones, "list the painted zone sets; zones SET[:Z1,Z3] shows one (its "
                                 "zones in projector px), --recipe prints it as a recipe's "
                                 "zones, --mask-out writes its scan mask", "the zone sets")
@@ -5705,7 +6104,9 @@ def build_parser() -> argparse.ArgumentParser:
                                         "and report where each zone lands in the camera image "
                                         "(exit 0 every zone seen, 1 one is not)",
             "the zone set projection")
-    p.add_argument("set", metavar="SET[:IDS]", help="zone set, optionally some zones (lid:Z1,Z3)")
+    p.add_argument("set", metavar="SET[:IDS]", help="zone set, optionally some zones "
+                   "(lid:Z1,Z3); several sets: cells+tube:Z1; `selection`: the sets that are "
+                   "switched on (scan zone-select)")
     p.add_argument("--hold", type=float, default=5.0, metavar="S",
                    help="keep the outlines up S seconds to look at them (default 5)")
     p.add_argument("--label", help="output label (default zones_<set>)")
@@ -5713,7 +6114,9 @@ def build_parser() -> argparse.ArgumentParser:
                                             "(recoverable)", "zone set delete")
     p.add_argument("name", metavar="SET")
     p.add_argument("--reason", required=True, help="why (recorded with the trashed set)")
-    p.add_argument("--force", action="store_true", help="delete even when a recipe names it")
+    p.add_argument("--force", action="store_true",
+                   help="delete even when a recipe or a station configuration names it, or it "
+                        "is switched on in the zone selection")
     p = cmd("project-capture", cmd_project_capture, "project your own DMD images (1140 x 912 "
                                                     "uint8, <= 256) and photograph each one",
             "the custom pattern capture")
@@ -6075,10 +6478,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("label", nargs="?", default="fast")
     p.add_argument("--zone", help='light only these grid cells ("F10:J12") or atlas:<name>/<region>')
     p.add_argument("--mask", metavar="NPY", help="or a DMD mask (1140 x 912 .npy)")
-    p.add_argument("--zones", metavar="SET[:IDS]",
+    p.add_argument("--zones", metavar="SET[:IDS]", action="append",
                    help="or a painted zone set (scan zone-paint): light and decode only its "
                         "zones (lid, or lid:Z1,Z3; their union is lit); the result gives the "
-                        "points per zone")
+                        "points per zone. Several sets: repeat it, or cells+tube:Z1 (zones are "
+                        "then named set/id); `selection`: the sets switched on (zone-select)")
     p.add_argument("--face", action="append", metavar="FACE",
                    help="also light this face target's ellipse (+ --margin); repeatable")
     p.add_argument("--margin", type=float, default=6.0, metavar="DMD_PX")
@@ -6356,9 +6760,12 @@ def build_parser() -> argparse.ArgumentParser:
                                                   "only them)")
     p.add_argument("--zone2", metavar="ZONE", help="region B as grid cells (needs a projector "
                                                    "map: scan map)")
-    p.add_argument("--zones", metavar="SET[:IDS]",
+    p.add_argument("--zones", metavar="SET[:IDS]", action="append",
                    help="region A as a painted zone set (scan zone-paint): only its zones are "
-                        "lit, and the camera px that decode into them are the region")
+                        "lit, and the camera px that decode into them are the region. Several "
+                        "zones (lid:Z1,Z3, repeated --zones, cells+tube, or `selection` = the "
+                        "sets switched on): flatness / cylinder are measured per zone, named "
+                        "set/id; step, dims, deviation need one zone")
     p.add_argument("--p1", metavar="X,Y", help="a picked point, camera px")
     p.add_argument("--p2", metavar="X,Y", help="a second picked point, camera px")
     p.add_argument("--golden", metavar="ID", help="deviation: the golden metric scan (id / label)")
@@ -6422,6 +6829,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="flatness / golden: the limit, mm")
     p.add_argument("--roi", metavar="X0,Y0,X1,Y1", help=f"flatness / golden: {roi_help}")
     p.add_argument("--zone", metavar="ZONE", help="flatness / golden: light only these grid cells")
+    p.add_argument("--zones", metavar="SET[:IDS]", action="append",
+                   help="flatness / golden: light only these painted zones (repeatable; "
+                        "cells+tube:Z1; `selection` = the sets switched on) and judge each "
+                        "zone on its own: the limit applies per zone, a zone the camera does "
+                        "not see well enough is a PULL")
     p.add_argument("--golden", metavar="ID", help="golden: the golden metric scan (id / label)")
     p.add_argument("--recipe", metavar="NAME", help="recipe: a recipe name or file")
     p.add_argument("--guard-band", type=_finite_nonneg, metavar="PCT",

@@ -17,7 +17,19 @@
 // station selectors are hidden, and a key must never change what is hidden. The picker of
 // Measure / Quick check always shows the LOADED preset (the bus's active_preset: the one HOME
 // checks and the measurement runs with). The operator's confirmation of the physical setup
-// is for one setup: a mode change or another preset clears it.
+// is for one setup: a mode change, another preset or another zone selection clears it.
+//
+// Scan zones (the panel above 1 Lights): the zone sets painted at the loaded preset's rig
+// placement, each with an on / off switch and one switch per zone. What is switched on is
+// the ZONE SELECTION; the server stores it (it survives a reload and a restart) and sends it
+// with every bus state (zone_selection), together with the painter that holds the rig
+// (painter) and how the last painter session ended (last_paint) - so every page, also one
+// just reloaded, shows the same rows, the same "Painting ..." and the same SAVED / NOT SAVED.
+// ONE function (zoneScope) says what the run button inspects in the mode, measurement and
+// station configuration shown, and what it does with the selection: the bold line and the
+// sentence above the run buttons, the save message and the requests all come from it. A run
+// that uses the selection sends "selection@<stamp>" (the selection exactly as this page
+// showed it): the server refuses a stamp that is not the stored one any more.
 'use strict';
 
 const $ = (sel) => document.querySelector(sel);
@@ -26,7 +38,13 @@ const state = { setupBusy: false, mode: null, stations: [], bus: null, runJobId:
   lampDisp: null, flowKey: null, mockKey: null, profileKey: null, cycleKey: null, resultShown: false,
   // operating mode (null until the first bus state), its job, its pickers, the picture clicks
   opMode: null, modeJobId: null, shownModeJob: null, rigKey: null, recipeKey: null,
-  pick: { n: 0, corner: null }, presetBusy: false, shownPreset: null, rigAsked: null };
+  pick: { n: 0, corner: null }, presetBusy: false, shownPreset: null, rigAsked: null,
+  // Scan zones: the sets of GET /api/zonesets (photo, who uses them), what the rows were
+  // drawn from, the open question, the page's own zone job, the message under the buttons
+  zoneSets: [], zoneOthers: [], zoneKey: null, zoneSetsSig: null, zoneStamp: null, ask: null,
+  zoneBusy: false, zoneMsg: null, paintKey: null, painting: null,
+  // a change of the selection is on its way to the server (its answer is not here yet)
+  selBusy: false };
 
 async function api(method, path, body) {
   const opt = { method, headers: {} };
@@ -36,7 +54,11 @@ async function api(method, path, body) {
   }
   const r = await fetch(path, opt);
   const data = await r.json().catch(() => ({}));
-  if (!r.ok && r.status !== 409) throw new Error(data.error || `${r.status}`);
+  if (!r.ok && r.status !== 409) {
+    const e = new Error(data.error || data.message || `${r.status}`);
+    e.data = data;                                 // a refusal's own answer (its bus, its selection)
+    throw e;
+  }
   return data;
 }
 
@@ -77,6 +99,11 @@ function clearResult() {
   $('#qValidity').textContent = '';
   $('#qValuesLink').hidden = true;
   $('#qPlyLink').hidden = true;
+  // which area the last result was about, its zones and their warnings: gone with it
+  $('#qInspected').textContent = '';
+  $('#qZoneCounts').textContent = '';
+  $('#qZoneCounts').hidden = true;
+  $('#qZoneWarn').textContent = '';
   clearChecks();
   steps('', '', '');
   state.resultShown = false;
@@ -203,15 +230,22 @@ function refreshButtons() {
   const modeBusy = (b.mode_jobs || []).length > 0
     || !!(state.modeJobId && state.shownModeJob !== state.modeJobId);
   const free = (s === 'READY' || s === 'FAULT') && !modeBusy;
+  // the painter (or a zone show) holds the rig and the projector display: nothing starts
+  const pOn = painterOn();
+  // what the run button would do with the zone selection: a measurement / quick check that
+  // could only be refused (a selection that is unknown or unusable, a measurement that has
+  // no meaning across several zones) is not offered - the sentence beside the button says why
+  const sc = zoneScope();
   $('#qConfirmRow').hidden = state.mode !== 'real' || m === 'measure';
   // Station: START begins a cycle; Quick check: START runs the one check
-  $('#qStart').disabled = m === 'station' ? (!idle || !usable || !confirmed()) : (!free || !confirmed());
-  $('#qMeasure').disabled = !free;
+  $('#qStart').disabled = m === 'station' ? (!idle || !usable || !confirmed() || pOn)
+    : (!free || !confirmed() || !sc.ok || pOn);
+  $('#qMeasure').disabled = !free || !sc.ok || pOn;
   for (const k of MODES) $(MODE_BTN[k]).disabled = !(idle || s === 'FAULT') || modeBusy;
-  $('#qRigPreset').disabled = !free;
+  $('#qRigPreset').disabled = !free || pOn;
   $('#qAbort').disabled = false;                       // ABORT is never disabled
   $('#qHome').disabled = !(idle || s === 'FAULT' || s === 'ABORTING');
-  $('#qArm').disabled = s === 'ARMED' ? false : (s !== 'READY' || !usable || !confirmed());   // DISARM: always
+  $('#qArm').disabled = s === 'ARMED' ? false : (s !== 'READY' || !usable || !confirmed() || pOn);   // DISARM: always
   $('#qArm').textContent = s === 'ARMED' ? 'DISARM' : 'ARM';
   $('#qArm').classList.toggle('on', s === 'ARMED');
   $('#qTrigger').disabled = !(s === 'ARMED' || waitStep);
@@ -221,9 +255,13 @@ function refreshButtons() {
   $('#qStation').disabled = !(idle || s === 'FAULT');
   $('#qProfile').disabled = !(idle || s === 'FAULT');
   $('#qBusState').textContent = s;
-  for (const id of ['#qGrid', '#qZones', '#qLive', '#qSignal', '#qPaint', '#qZoneShow']) {
-    $(id).disabled = !(idle || s === 'FAULT') || state.setupBusy;       // setup only when idle
+  for (const id of ['#qGrid', '#qZones', '#qLive', '#qSignal']) {
+    $(id).disabled = !(idle || s === 'FAULT') || state.setupBusy || pOn;    // setup only when idle
   }
+  // the zones a station inspects are fixed while it is ARMED or in a cycle: painting, deleting
+  // and the switches only while READY / FAULT with no job of a mode or of the zones going
+  const zfree = zonesFree();
+  for (const id of ['#qPaint', '#qZoneDelete', '#qZoneShow']) $(id).disabled = !zfree || state.setupBusy;
   for (const el of document.querySelectorAll('#qSignals span')) {
     el.classList.toggle('on', !!(b.signals && b.signals[el.dataset.sig]));
   }
@@ -252,7 +290,8 @@ function showStation() {
       + (st.preset ? `, preset ${st.preset}` : '');
   }
   $('#qStationInfo').textContent = txt;
-  $('#qZone').textContent = (st && st.zone) || 'whole field';
+  $('#qZone').textContent = st && st.zone_from_selection
+    ? `the selected zones (${(zsel() || {}).label || 'not known'})` : ((st && st.zone) || 'whole field');
   refreshButtons();
 }
 
@@ -607,6 +646,7 @@ async function selectMode(mode) {
     applyMode(r.bus);
     syncConfig(r.bus);
     renderCycle(r.bus);
+    renderZones();                               // another mode: another use of the zones
     notice(r.accepted ? '' : `${r.command}: ${r.message}`);
   } catch (e) {
     $('#qConn').hidden = false;
@@ -767,8 +807,12 @@ function measureArgs() {
   }
   const rep = numOrNull($('#qMeasRepeats').value, 'repeats');
   if (rep !== null && rep !== 1) a.repeats = rep;
-  // a painted zone set picked in Lights: only its zones are lit, and they are the region
-  if ($('#qZoneSet').value && what !== 'endface') a.zone = `zoneset:${$('#qZoneSet').value}`;
+  // the zone selection exactly as this page shows it (also "nothing on = the whole field"):
+  // the server refuses a stamp that is not the stored selection's any more. A measurement
+  // that does not use the selection (the end face) sends no zone
+  const sc = zoneScope();
+  if (!sc.ok) throw new Error(sc.scope);
+  if (sc.uses) a.zone = `selection@${sc.stamp}`;
   if (state.mode === 'mock' && $('#qMockPart').value.trim()) a.mock_scene = $('#qMockPart').value.trim();
   return a;
 }
@@ -794,6 +838,10 @@ function quickArgs() {
       a.golden = $('#qQuickGolden').value.trim();
     }
   }
+  // flatness / golden: the zone selection as this page shows it (a recipe has its own zones)
+  const sc = zoneScope();
+  if (!sc.ok) throw new Error(sc.scope);
+  if (sc.uses) a.zone = `selection@${sc.stamp}`;
   if (state.mode === 'mock' && $('#qMockPart').value.trim()) a.mock_part = $('#qMockPart').value.trim();
   return a;
 }
@@ -852,6 +900,7 @@ function showMeasure(job) {
     : (job.status === 'error' ? (job.error || 'error')
       : `${r.reason || 'not measurable'}: ${r.message || ''}` + (r.how_to_fix ? ` | fix: ${r.how_to_fix}` : ''));
   $('#qValidity').textContent = ok ? (r.validity || '') : '';
+  showInspected(r);                              // which area these numbers are about
   const body = $('#qValuesBody');
   body.textContent = '';
   const vals = ok ? (r.values || []) : [];
@@ -936,13 +985,23 @@ async function send(name, extra) {
     body.operator_confirmed = confirmed();
     body.config = $('#qStation').value;          // refused if the bus has another selected
     if ($('#qProfile').value) body.profile = $('#qProfile').value;
+    // a configuration that inspects the selected zones: the selection this page shows
+    // (refused if the stored one is another by now)
+    const sc = zoneScope();
+    if (sc.uses && sc.stamp) body.zones = sc.stamp;
   }
   try {
     const r = await api('POST', `/api/cmd/${name}`, body);
+    if (!r.bus) {                                // a refusal that is not the bus's own reply
+      notice(`${name.toUpperCase()}: ${r.message || r.error || 'refused'}`);
+      refreshButtons();
+      return;
+    }
     state.bus = r.bus;
     trackJobs(r.jobs);
     syncConfig(r.bus);
     renderCycle(r.bus);
+    renderZones();
     notice(r.accepted ? '' : `${r.command}: ${r.message}`);
     if (!r.accepted) {
       applyBus(r.bus);                           // e.g. a refused START: the bus PULLs, or forgets a PASS
@@ -997,8 +1056,11 @@ function showRun(job) {
   const reasons = [];
   if (job.status === 'error') reasons.push(job.error || 'error');
   if (r.invalid_reason) reasons.push(r.invalid_reason);
+  // lit through painted zones: the verdict of each zone (the one that failed is named)
+  if (r.zone_selection && r.zone_selection.summary) reasons.push(`zones: ${r.zone_selection.summary}`);
   for (const w of r.warnings || []) if (/abort/i.test(w)) reasons.push(w);
   $('#qReason').textContent = reasons.join(' | ');
+  showInspected(r);                              // which area this verdict is about
   showZones(r, disp);
   const links = job.links || {};
   const fl = $('#qFeedbackLink');
@@ -1011,6 +1073,59 @@ function showRun(job) {
   img.hidden = !links.preview;
   if (links.preview) img.src = `${links.preview}?t=${Date.now()}`;
   steps('done', 'done', verdict === 'ABORTED' ? '' : 'done');
+}
+
+function inspectedText(r) {
+  // which area a result is about, from the run's OWN record - never from what is switched on
+  // now: the zones it was lit through, the whole field, a station configuration's own zone
+  const z = r.zone_selection || null;
+  if (z) {
+    if (!z.text) return 'Inspected: whole field (no zone set was switched on)';
+    const keys = (z.by_zone || []).map((x) => x.key);
+    return `Inspected: ${keys.length ? keys.join(', ') : z.text}`
+      + (z.source === 'selection' ? ' (the zone selection'
+        + (z.selected && z.selected.time ? ` of ${String(z.selected.time).replace('T', ' ')}` : '') + ')' : '');
+  }
+  if (r.operating_mode === 'measure') {
+    const sp = r.spec || {};
+    if (sp.what === 'endface') return 'Inspected: whole field (the end-face measurement)';
+    return `Inspected: ${sp.zone || 'whole field'}` + (sp.roi ? `, inside region ${sp.roi.join(',')}` : '');
+  }
+  const job = r.job || {};
+  if (job.type === 'recipe' || job.recipe) return `Inspected: recipe ${job.recipe || '?'}'s own zones`;
+  const zone = (r.capture || {}).zone || job.zone;
+  const file = job.config && r.operating_mode !== 'quick_check' ? `station configuration ${job.config}, ` : '';
+  return `Inspected: ${file}${zone ? `its own zone ${zone}` : 'whole field'}`;
+}
+
+function showInspected(r) {
+  $('#qInspected').textContent = r && (r.run_id || r.zone_selection) ? inspectedText(r) : '';
+  const z = (r && r.zone_selection) || {};
+  const ul = $('#qZoneCounts');
+  ul.textContent = '';
+  const rows = z.by_zone || [];
+  ul.hidden = rows.length === 0;
+  for (const x of rows) {
+    // one line per zone: its verdict (a quick check / station run), its points, how much of it was seen
+    const li = document.createElement('li');
+    const v = x.verdict || '';
+    li.className = v ? `z-${v.toLowerCase()}` : '';
+    const b = document.createElement('b');
+    b.textContent = `${x.key}${x.name ? ` ${x.name}` : ''}${v ? ` ${v}` : ''}`;
+    li.appendChild(b);
+    const bits = [];
+    if (x.max_mm != null) bits.push(`max ${Number(x.max_mm).toFixed(3)} mm`);
+    bits.push(x.points == null ? 'points not known' : `${x.points} points`);
+    if (x.coverage_pct != null) bits.push(`${Number(x.coverage_pct).toFixed(0)} % of the zone seen`);
+    if (x.reason) bits.push(x.reason);
+    const t = document.createElement('span');
+    t.textContent = bits.join(', ');
+    li.appendChild(t);
+    ul.appendChild(li);
+  }
+  const notes = [...(z.warnings || [])];
+  if (z.outside) notes.push(`${z.outside} point(s) decoded outside every zone (reported, not judged)`);
+  $('#qZoneWarn').textContent = notes.join(' | ');
 }
 
 function showZones(r, disp) {
@@ -1079,6 +1194,7 @@ async function pollOnce() {
   syncConfig(b);
   showPreset(b);
   showWarnings(b);
+  renderZones();                                 // the Scan zones panel, the line above the run buttons
   trackJobs(b.jobs);
   const inFlow = renderCycle(b);
   if (state.runJobId && state.shownRun !== state.runJobId) {
@@ -1118,9 +1234,21 @@ async function pollOnce() {
   refreshButtons();
 }
 
+function contactLost() {
+  $('#qConn').hidden = false;
+  const p = state.painting;
+  if (p && !(state.zoneMsg && state.zoneMsg.lost)) {
+    // the painter was open when the server stopped answering: what it did is not known here
+    state.zoneMsg = { warn: true, lost: true,
+      text: `NOT KNOWN: lost contact with the server while painting ${p.name}. Look at the list when it is back: `
+        + `${p.name} is new only if its painted time is after ${p.at || 'now'}.` };
+    renderZoneMsg();
+  }
+}
+
 async function loop() {
   for (;;) {
-    try { await pollOnce(); } catch (e) { $('#qConn').hidden = false; }
+    try { await pollOnce(); } catch (e) { contactLost(); }
     await new Promise((res) => setTimeout(res, 500));
   }
 }
@@ -1132,9 +1260,16 @@ async function setupJob(verb, args, msgEl, busyText) {
   $(msgEl).textContent = busyText || `${verb}...`;
   try {
     let j = await api('POST', '/api/jobs', { verb, args: args || {} });
+    let fails = 0;
     while (j.status === 'queued' || j.status === 'running') {
       await new Promise((res) => setTimeout(res, 400));
-      j = await api('GET', `/api/jobs/${j.id}`);
+      try {                                      // one failed poll is not the job's end
+        j = await api('GET', `/api/jobs/${j.id}`);
+        fails = 0;
+      } catch (e) {
+        fails += 1;
+        if (fails > 75) throw e;
+      }
     }
     $(msgEl).textContent = j.status === 'error' ? `${verb}: ${j.error}` : `${verb}: done`;
     return j;
@@ -1156,85 +1291,730 @@ async function projectGrid() {
   if (link) img.src = `/files/${link}`;
 }
 
-// ---- painted zone sets (engine/zones): drawn on the part with the mouse, in projector px
+// ---- Scan zones: painted zone sets (engine/zones), drawn on the part with the mouse, in
+// projector px; which of them are switched on is the zone selection (stored by the server)
+
+function busHas(key) {
+  return !!state.bus && Object.prototype.hasOwnProperty.call(state.bus, key);
+}
+
+function zsel() {
+  // the zone selection as the server sent it: an object; null = no preset is loaded;
+  // undefined = this bus state says nothing about it (never read as "nothing is on")
+  return busHas('zone_selection') ? state.bus.zone_selection : undefined;
+}
+
+function painterOn() {
+  // the painter or a zone show holds the rig (from the bus state: true in every tab and
+  // after a reload), or this page's own zone job has not reported back yet
+  return !!(state.bus && state.bus.painter) || state.zoneBusy;
+}
+
+function zonesFree() {
+  // painting, deleting and the switches: only while the station is READY / FAULT (what a
+  // station inspects is fixed while it is ARMED or in a cycle) and no measurement, quick
+  // check, painter, zone show or setup job of this page (grid, signal check) is queued or
+  // running: the server would refuse the change, or keep it waiting behind that job
+  const b = state.bus || { state: 'READY' };
+  const modeBusy = (b.mode_jobs || []).length > 0
+    || !!(state.modeJobId && state.shownModeJob !== state.modeJobId);
+  return (b.state === 'READY' || b.state === 'FAULT') && !modeBusy && !painterOn() && !state.setupBusy;
+}
+
+function hm(t) {
+  // "2026-01-02T09:14:02" -> "09:14"
+  const m = /T(\d\d:\d\d)/.exec(String(t || ''));
+  return m ? m[1] : '';
+}
+
+function when(t) {
+  // "2026-01-02T09:14:02" -> "2026-01-02 09:14": with its date (a message may be days old)
+  const m = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d)/.exec(String(t || ''));
+  return m ? `${m[1]} ${m[2]}` : hm(t);
+}
+
+function plural(n, word) { return `${n} ${word}${n === 1 ? '' : 's'}`; }
+
+function selProblem(s) {
+  // why the selection cannot be used by a run (null: it can)
+  if (s === undefined) return 'the server has not said which zone sets are switched on';
+  if (s === null) return 'no preset is loaded';
+  if (s.state === 'unknown' || !s.ok) {
+    return ((s.problems || [])[0] || {}).message || 'a zone set that is switched on cannot be used';
+  }
+  return null;
+}
+
+// What the run button inspects, and what it does with the zone selection - in the mode, the
+// measurement / check and the station configuration this page shows now. Everything the page
+// says or sends about zones comes from here:
+//   line   the bold line above the run buttons: what the run inspects
+//   scope  the sentence beside it: what the run button does (or why it will be refused)
+//   uses   the run lights and inspects the SELECTED zones (it sends selection@<stamp>)
+//   ok     false: a run could only be refused - MEASURE / START (Quick check) stay off
+//   warn   the line is shown in the warning colour
+function zoneScope() {
+  const b = state.bus || {};
+  const mode = state.opMode || 'station';
+  const s = zsel();
+  const known = !!s && s.state !== 'unknown';
+  const lbl = known ? s.label : (s === null ? 'no preset loaded' : 'NOT KNOWN');
+  const on = known && !s.empty;
+  const bad = selProblem(s);
+  const chk = known && (s.check || []).length ? s.check.join(' | ') : '';
+  const n = known ? (s.n_zones_on || 0) : 0;
+  const many = n > 1;
+  const these = many ? 'these zones' : 'this zone';
+  const out = { line: `Zones: ${lbl}`, scope: '', uses: true, ok: true, warn: !!bad || !!chk,
+    stamp: known ? s.stamp : null, n, label: lbl };
+  const unused = (line, text) => {               // this run does not use the selection
+    out.uses = false;
+    out.line = line;
+    out.warn = false;
+    out.stamp = null;
+    out.scope = text + (s && bad ? ` The selection has a problem (${bad}); this run does not use it.`
+      : (on ? ` The selected zones (${lbl}) are NOT used.` : ''));
+    return out;
+  };
+  const refuse = (text) => { out.ok = false; out.warn = true; out.scope = text; return out; };
+  const region = (id) => $(id).value.trim();
+  const fix = s && s.state === 'problem' ? ' Switch that set off or paint it again.' : '';
+
+  if (mode === 'measure') {
+    const what = $('#qMeasWhat').value || 'flatness';
+    if (what === 'endface') {
+      return unused('End face: whole field', 'The end-face measurement uses the whole field (it finds the rim on the fully lit part).');
+    }
+    if (bad) {
+      return refuse(s === null ? 'Load a preset first: MEASURE is off.'
+        : `This run will be refused: ${bad}.${fix || ' MEASURE stays off until the selection is known.'}`);
+    }
+    const roi = region('#qMeasRoi');
+    if (!on) {
+      out.scope = `MEASURE uses the whole field${roi ? `, inside Region ${roi}` : ''}.`;
+      return out;
+    }
+    if (what === 'step') {
+      return refuse('Step height needs region A and region B, and the selected zones cannot say which is which: switch the zones off and type Region A and Region B.');
+    }
+    if (many && (what === 'dims' || what === 'deviation')) {
+      return refuse(`${what === 'dims' ? 'The bounding dimensions are of ONE part' : 'The deviation from the golden is ONE compare'}: with several zones on MEASURE is off. Leave one zone on, or switch the zones off.`);
+    }
+    if (what === 'distance') {
+      if (many && !$('#qMeasP2').value.trim()) {
+        return refuse('Point 1 to the plane of the region needs ONE zone: with several zones on give Point 2, or leave one zone on.');
+      }
+      out.scope = `MEASURE lights only ${these}: pick the points inside ${many ? 'them' : 'it'}.`
+        + (many ? '' : ' Point 1 is also measured to the plane of this zone.');
+    } else if (what === 'flatness' || what === 'cylinder') {
+      const one = what === 'flatness' ? 'plane' : 'cylinder';
+      out.scope = many ? `MEASURE lights only these zones and measures each one on its own (one ${one} per zone, named set/zone).`
+        : 'MEASURE lights and measures only this zone.';
+    } else if (what === 'dims') out.scope = 'MEASURE lights only this zone and measures the part inside it.';
+    else out.scope = 'MEASURE lights only this zone; the golden must have been scanned through the same zone.';
+    if (roi) out.scope += ` Only the part of ${these} inside Region ${roi} is measured.`;
+    if (chk) out.scope += ` Check them first (Show selected zones): since they were painted, ${chk}.`;
+    return out;
+  }
+
+  if (mode === 'quick_check') {
+    const c = $('#qQuickCheck').value || 'flatness';
+    if (c === 'recipe') {
+      const r = $('#qQuickRecipe').value || '?';
+      return unused(`Recipe ${r}: its own zones`, `START runs recipe ${r} with its own zones.`);
+    }
+    if (bad) {
+      return refuse(s === null ? 'Load a preset first: START is off.'
+        : `This run will be refused: ${bad}.${fix || ' START stays off until the selection is known.'}`);
+    }
+    const roi = region('#qQuickRoi');
+    if (!on) {
+      out.scope = `START checks the whole field${roi ? `, inside Region ${roi}` : ''}.`;
+      return out;
+    }
+    out.scope = c === 'golden'
+      ? `START lights only ${these} and compares what ${many ? 'they show' : 'it shows'} with the golden, which must have been scanned through the same zones (else the part is PULLed).`
+      : (many ? 'START lights only these zones and checks each one against the limit on its own; the result names a zone that fails.'
+        : 'START lights and checks only this zone.');
+    out.scope += ' A zone the camera does not see well enough PULLs the part.';
+    if (roi) out.scope += ` Only the part of ${these} inside Region ${roi} is checked.`;
+    if (chk) out.scope += ` START will PULL until they were shown on the part (Show selected zones) or painted again: since they were painted, ${chk}.`;
+    return out;
+  }
+
+  // Station: a run inspects what its configuration says, always. The selection is used only
+  // when the configuration's own job says "zone": "selection"
+  const st = state.stations.find((x) => x.config === $('#qStation').value);
+  if (!st || st.error) return unused('Station zone: no usable configuration selected', '');
+  const file = st.config;
+  if (!st.zone_from_selection) {
+    let line = `Station zone: ${st.zone || 'whole field'} (${file})`;
+    let text = `START runs ${file} as written: ${st.zone ? `its own zone ${st.zone}` : 'the whole field'}.`;
+    if (st.job_type === 'flow') {
+      line = `Station zones: each work state's recipe (${file})`;
+      text = `START runs ${file} as written: each work state is checked by its recipe's own zones.`;
+    } else if (st.job_type === 'recipe') {
+      line = `Station zones: recipe ${st.recipe}'s own (${file})`;
+      text = `START runs ${file} as written: recipe ${st.recipe} with its own zones.`;
+    }
+    unused(line, text);
+    if (on && !bad) out.scope += ' To inspect them, use Quick check or Measure, or a station configuration whose job says "zone": "selection".';
+    return out;
+  }
+  const pulled = 'START will be refused and the part PULLed';
+  const run = b.run_preset || '';
+  const loaded = b.active_preset || '';
+  if (run && run !== loaded) {
+    return refuse(`${file} inspects the selected zones with preset ${run}, and ${loaded ? `preset ${loaded}` : 'no preset'} is loaded: ${pulled}. Select the station configuration again (that loads ${run}).`);
+  }
+  if (bad) return refuse(`${file} inspects the selected zones and the selection cannot be used (${bad}): ${pulled}.${fix}`);
+  if (!on) return refuse(`${file} inspects the selected zones and none is switched on: ${pulled}. Switch a zone set on.`);
+  if (chk) {
+    return refuse(`${file} inspects the selected zones, and since they were painted: ${chk}. ${pulled} until they were shown on the part (Show selected zones) or painted again.`);
+  }
+  out.scope = `START runs ${file}, which inspects the SELECTED zones: ${lbl}, each one against the limit on its own. `
+    + 'Changing the selection changes what this station inspects; it is fixed while the station is ARMED or in a cycle.';
+  return out;
+}
+
+function zoneSay(text, warn) {
+  // what the last zone action did (stays until the next one)
+  state.zoneMsg = { text: text || '', warn: !!warn };
+  renderZoneMsg();
+}
+
+function paintingText(name) {
+  return state.mode === 'mock'
+    ? `Painting ${name} (MOCK: a scripted demo session)...`
+    : `Painting ${name}: draw on the part with the mouse. SPACE on the projector saves, ESC cancels. ABORT here ends it and saves nothing.`;
+}
+
+function waitingText(name) {
+  // the painter job is queued behind another job: it has not opened yet
+  return `Waiting to paint ${name}: another job still holds the scanner. The painter opens on the projector when that job ends; nothing is drawn yet. ABORT here drops it.`;
+}
+
+function paintNow(lp, fresh) {
+  // what is true of the saved set NOW, from the selection the server stores - never from
+  // what was so when it was saved (it may have been switched off, painted again or deleted
+  // since, or belong to another rig placement than the one this page shows). fresh: this
+  // page saw the session end; else the message is history (a reload, a second screen)
+  if (lp.on !== true && lp.on !== false) return lp.selection_note || 'The zone selection was not changed.';
+  const s = zsel();
+  if (!s || s.state === 'unknown') return '';     // not known: nothing is said about its switch
+  if (lp.geometry_id && s.geometry_id && lp.geometry_id !== s.geometry_id) {
+    return `That was at another rig placement${lp.preset ? ` (preset ${lp.preset})` : ''}: it is not one of the sets listed here.`;
+  }
+  const r = (s.sets || []).find((x) => x.set === lp.name);
+  if (!r || r.found === false) return 'It is not in the list any more: it was deleted since.';
+  if (lp.created && r.created && r.created !== lp.created) return 'It was painted again since.';
+  if (!r.on) {
+    if (!fresh) return 'It is switched OFF now: switch it on in the list to select it.';
+    return lp.replaced ? 'It stays switched OFF, as before: switch it on in the list to select it.'
+      : 'It is NOT switched on: switch it on in the list to select it.';
+  }
+  const all = r.n_on === r.n_zones;
+  if (!fresh) return `It is switched ON now${all ? '' : ` (${r.n_on} of ${r.n_zones} zones)`}.`;
+  let t = lp.replaced ? 'It stays switched ON.' : 'It is switched ON.';
+  if (!all) t += ` ${r.n_on} of ${r.n_zones} zones are on.`;
+  else if (lp.switches_reset) t += ` All ${r.n_zones} zones are on (the per-zone switches were reset: the zones were painted again).`;
+  return `${t} ${zoneScope().scope}`.trim();      // what the run button does with it, now
+}
+
+function paintText(lp, fresh) {
+  // how the last painter session ended, from its outcome (never by reading the engine's
+  // English). What happened then is said with its date and time; what is so now: paintNow
+  const n = lp.name || 'the set';
+  const at = when(lp.time) ? ` ${when(lp.time)}` : '';
+  const head = fresh ? '' : 'Last painter session - ';
+  switch (lp.outcome) {
+    case 'saved': {
+      const zs = (lp.zones || []).map((z) => z.id + (z.name ? ` ${z.name}` : '')).join(', ');
+      let t = `${head}SAVED${at}: zone set ${n}${lp.replaced ? ' replaced' : ''}, ${plural(lp.n_zones || 0, 'zone')}: ${zs}.`;
+      if (lp.replaced) t += ' The earlier one is in the library trash.';
+      t += ` ${paintNow(lp, fresh)}`;
+      if (!lp.photo) t += ' No photo of the zones could be taken (the drawing is shown instead).';
+      if (lp.rig_error) t += ` The rig was NOT given back cleanly after the save (${lp.rig_error}): check the camera and the projector before the next scan.`;
+      return t.replace(/\s+/g, ' ').trim();
+    }
+    case 'cancelled': return `${head}NOT SAVED${at}: ${n} - the painter was cancelled (ESC). Nothing was written.`;
+    case 'aborted': return `${head}NOT SAVED${at}: ${n} - ABORT ended the painter. Nothing was written.`;
+    case 'idle_timeout': return `${head}NOT SAVED${at}: ${n} - no input for ${lp.idle_timeout_s || 600} s, so the rig was given back. Nothing was written.`;
+    case 'script_ended': return `${head}NOT SAVED${at}: ${n} - the scripted session ended without SPACE.`;
+    case 'dropped': return `${head}NOT SAVED${at}: ABORT came before the painter started.`;
+    default: return `${head}NOT SAVED${at}: the painter did not start - ${lp.reason || 'refused'}.`;
+  }
+}
+
+function renderZoneMsg() {
+  const m = state.zoneMsg;
+  const el = $('#qZoneResult');
+  el.textContent = !m ? '' : (m.paint ? paintText(m.paint, !!m.fresh) : m.text);
+  el.classList.toggle('qwarn', !!(m && (m.warn || (m.paint && (m.paint.outcome !== 'saved' || m.paint.rig_error)))));
+  if (m && m.reveal) {
+    // how the painter ended, in view the moment it is known (the operator scrolled down to
+    // the Paint zones button; the page's scroll padding keeps the line above the run buttons)
+    m.reveal = false;
+    if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function renderPainter(b) {
+  // "Painting ..." while the painter holds the rig, then how it ended: both from the bus
+  // state, so a reload, a second screen or one failed poll never loses the save message
+  const p = b.painter || null;
+  if (p && p.verb === 'zone_paint') {
+    state.painting = { name: p.name, at: hm(p.since) };
+    // queued: another job still holds the scanner, nothing is on the projector yet
+    state.zoneMsg = { text: p.state === 'queued' ? waitingText(p.name) : paintingText(p.name),
+      warn: false, painting: true };
+    return;
+  }
+  state.painting = null;
+  const lp = b.last_paint || null;
+  const key = lp ? `${lp.time}|${lp.name}|${lp.outcome}` : '';
+  if (key === state.paintKey) {
+    if (state.zoneMsg && state.zoneMsg.painting) state.zoneMsg = lp ? { paint: lp, fresh: true, reveal: true } : null;
+    return;
+  }
+  // the first bus state of this page: the session ended before the page was loaded, so it
+  // is shown as history. Later ones this page saw end
+  const first = state.paintKey === null;
+  state.paintKey = key;
+  if (!lp) return;
+  state.zoneMsg = { paint: lp, fresh: !first, reveal: !first };
+  if (lp.outcome === 'saved') {
+    if (!first) $('#qZoneName').value = '';
+    loadZoneSets(lp.name).catch(() => {});      // listed, viewed, its photo shown
+  }
+}
+
+function focusedSwitch(box) {
+  // the zone switch that has the keyboard focus -> { set, zone } (null: none has it)
+  const a = document.activeElement;
+  if (!a || !a.dataset || !a.dataset.set || typeof box.contains !== 'function' || !box.contains(a)) return null;
+  return { set: a.dataset.set, zone: a.dataset.zone || '' };
+}
+
+function refocusSwitch(box, had, made) {
+  // the rows were rebuilt, so the switch that had the focus is gone: the same switch gets it
+  // back. Left alone, the focus would fall to the page, where Space / Enter is the run
+  // button - a second Space meant for the switch would start a run. A switch that is gone or
+  // cannot be pressed now: the Scan zones panel takes the focus (Space / Enter start nothing
+  // there)
+  if (!had) return;
+  const to = made.find((c) => c.dataset.set === had.set && (c.dataset.zone || '') === had.zone);
+  const el = to && !to.disabled ? to : $('#qScanZones');
+  if (typeof el.focus === 'function') el.focus();
+}
+
+function renderZoneRows(b) {
+  // one row per zone set of this rig placement: its switch, one switch per zone; sets that
+  // are on first. Drawn from the bus state's zone_selection (what is STORED), so a refused
+  // click never stays checked
+  const s = zsel();
+  const free = zonesFree();
+  const key = JSON.stringify([s === undefined ? '?' : s, state.zoneOthers, free]);
+  if (key === state.zoneKey) return;
+  state.zoneKey = key;
+  const box = $('#qZoneRows');
+  const had = focusedSwitch(box);
+  const made = [];
+  box.textContent = '';
+  const geo = $('#qZoneGeo');
+  if (s === undefined) {
+    geo.textContent = 'Which zone sets are switched on is NOT KNOWN: the server has not said.';
+    refocusSwitch(box, had, made);
+    return;
+  }
+  if (s === null) {
+    geo.textContent = 'Load a preset first: zone sets belong to a rig placement.';
+    refocusSwitch(box, had, made);
+    return;
+  }
+  const rows = [...(s.sets || [])].sort((x, y) => (Number(!!y.on) - Number(!!x.on)) || (x.set < y.set ? -1 : 1));
+  let head = `Zone sets at this rig placement (preset ${s.preset}). Switch a set on to select it; the line above the run button says what the next run does with the selection.`;
+  if (s.state === 'unknown') head = `The stored zone selection cannot be read (${selProblem(s)}). Nothing is known to be on: switch the sets on again.`;
+  else if (s.time) head += ` Last changed ${String(s.time).replace('T', ' ')}${s.by ? ` by ${s.by}` : ''}.`;
+  if (!rows.length) {
+    const o = state.zoneOthers || [];
+    const n = o.reduce((a, x) => a + (x.n_sets || 0), 0);
+    const ps = [...new Set(o.flatMap((x) => x.presets || []))];
+    head = n ? `No zone set at this rig placement (preset ${s.preset}). ${plural(n, 'set')} ${n === 1 ? 'was' : 'were'} painted `
+      + `${ps.length ? `with preset ${ps.join(', ')}` : 'elsewhere'} (another rig placement): load that preset to use ${n === 1 ? 'it' : 'them'}.`
+      : 'No zone set painted at this rig placement yet. Name one and press Paint zones.';
+  }
+  geo.textContent = head;
+  const check = (set, zone, on, off, tip) => {
+    const c = document.createElement('input');
+    c.type = 'checkbox';
+    c.checked = !!on;
+    c.disabled = !!off;
+    c.title = tip;
+    c.dataset.set = set;
+    if (zone) c.dataset.zone = zone;
+    made.push(c);
+    return c;
+  };
+  for (const r of rows) {
+    const gone = r.found === false;
+    const row = document.createElement('div');
+    row.className = `qzrow${r.on ? ' on' : ''}${gone || (r.on && !r.usable) ? ' bad' : ''}${r.on && (r.rig_changes || []).length ? ' check' : ''}`;
+    row.dataset.set = r.set;
+    const lab = document.createElement('label');
+    lab.className = 'qzset';
+    // a set that cannot be used can only be switched OFF
+    lab.appendChild(check(r.set, '', r.on, !free || (!r.usable && !r.on),
+      'On: this set\'s zones are selected. Off: the set is left out. What a run does with the selection is said above the run button.'));
+    const name = document.createElement('b');
+    name.textContent = r.set;
+    lab.appendChild(name);
+    const cnt = document.createElement('span');
+    cnt.textContent = gone ? 'NOT FOUND (deleted or renamed)' : plural(r.n_zones, 'zone');
+    lab.appendChild(cnt);
+    row.appendChild(lab);
+    const zs = document.createElement('span');
+    zs.className = 'qzzones';
+    for (const z of r.zones || []) {
+      const zl = document.createElement('label');
+      zl.appendChild(check(r.set, z.id, z.on, !free || !r.usable,
+        'Off: this one zone is left out; the rest of the set stays on.'));
+      const t = document.createElement('span');
+      t.textContent = z.id + (z.name ? ` ${z.name}` : '');
+      zl.appendChild(t);
+      zs.appendChild(zl);
+    }
+    row.appendChild(zs);
+    const notes = [];
+    if (gone) notes.push(`${r.set}: ${r.error || 'not in the library any more'}. Switch it off to take it out of the selection.`);
+    else if (!r.usable) notes.push(`not usable: ${r.error || 'it cannot be read'}`);
+    if (!gone && (r.rig_changes || []).length) notes.push(`CHECK: since it was painted, ${r.rig_changes.slice(0, 3).join('; ')} - show it on the part (Show selected zones) or paint it again.`);
+    if (notes.length) {
+      const nt = document.createElement('span');
+      nt.className = 'qznote';
+      nt.textContent = notes.join(' ');
+      row.appendChild(nt);
+    }
+    box.appendChild(row);
+  }
+  refocusSwitch(box, had, made);
+}
+
+function renderZones() {
+  // the Scan zones panel and the line above the run buttons, from the bus state
+  const b = state.bus || {};
+  renderPainter(b);
+  renderZoneRows(b);
+  const sc = zoneScope();
+  $('#qZoneLine').textContent = sc.line;
+  $('#qZoneLine').classList.toggle('qwarn', !!sc.warn);
+  $('#qRunScope').textContent = sc.scope;
+  $('#qMeasZone').textContent = state.opMode === 'measure' ? sc.scope : '';   // (repeated in the Measure pane)
+  renderZoneMsg();
+  const s = zsel();
+  // another selection: what the operator confirmed was not this one
+  const stamp = s ? s.stamp : null;
+  if (state.zoneStamp !== null && stamp !== state.zoneStamp) $('#qConfirm').checked = false;
+  state.zoneStamp = stamp;
+  // the picker, the photos and who uses a set (GET /api/zonesets): re-read when the sets changed
+  const sig = s ? JSON.stringify([s.geometry_id, (s.sets || []).map((r) => [r.set, r.created])]) : '-';
+  if (sig !== state.zoneSetsSig) {
+    const firstTime = state.zoneSetsSig === null;
+    state.zoneSetsSig = sig;
+    if (!firstTime) loadZoneSets().catch(() => {});
+  }
+}
+
 async function loadZoneSets(pick) {
-  // the sets painted at the loaded preset's geometry; `pick`: the one to select afterwards
+  // the sets painted at the loaded preset's geometry (their photo, who uses them) for the
+  // picker; `pick`: the one to view afterwards
   let d;
   try { d = await api('GET', '/api/zonesets'); } catch (e) { return; }
   state.zoneSets = d.sets || [];
+  state.zoneOthers = d.others || [];
+  if (state.bus && d.selection !== undefined) state.bus.zone_selection = d.selection;
   const sel = $('#qZoneSet');
   const want = pick !== undefined ? pick : sel.value;
   sel.textContent = '';
   const none = document.createElement('option');
   none.value = '';
-  none.textContent = state.zoneSets.length ? '(none: the whole field)' : '(none painted yet)';
+  none.textContent = '(a new set: type its name)';
   sel.appendChild(none);
   for (const z of state.zoneSets) {
     const o = document.createElement('option');
     o.value = z.name;
-    o.textContent = `${z.name} - ${z.n_zones} zone(s)` + (z.valid ? '' : ' (invalid)');
+    o.textContent = `${z.name} - ${plural(z.n_zones, 'zone')}` + (z.valid ? '' : ' (invalid)');
     sel.appendChild(o);
   }
   sel.value = state.zoneSets.some((z) => z.name === want) ? want : '';
   showZoneSet();
+  state.zoneKey = null;
+  renderZones();
+}
+
+function usedBy(z) {
+  // who names the set (their inspected area changes with it)
+  const u = (z && z.used_by) || {};
+  const bits = [];
+  if ((u.recipes || []).length) bits.push(`recipe${u.recipes.length === 1 ? '' : 's'} ${u.recipes.join(', ')}`);
+  if ((u.stations || []).length) bits.push(`station configuration${u.stations.length === 1 ? '' : 's'} ${u.stations.join(', ')}`);
+  return bits.join(' and ');
 }
 
 function showZoneSet() {
-  // the picked set: its zones and its picture (the photo of the zones on the part, else the
-  // DMD-space preview)
+  // the viewed set: its zones and its picture (the photo of the zones on the part, else the
+  // DMD-space preview). It does not decide what a run uses: the switches do
   const z = (state.zoneSets || []).find((x) => x.name === $('#qZoneSet').value);
   const img = $('#qZoneImg');
   const link = z && (z.camera || z.preview);
   img.hidden = !link;
   if (link) img.src = `/files/${link}?t=${encodeURIComponent(z.created || '')}`;
+  const used = usedBy(z);
   $('#qZoneInfo').textContent = !z ? ''
-    : (z.valid ? `${z.name}: ` + (z.zones || []).map((q) => q.id + (q.name ? ` ${q.name}` : '')).join(', ')
-      + ` (painted ${String(z.created || '?').replace('T', ' ')}; projector px, valid at this rig placement). `
-      + 'MEASURE lights and measures only these zones.'
-      + ((z.rig_changes || []).length ? ` CHECK (Show zones) or paint again: since it was painted, ${z.rig_changes.slice(0, 3).join('; ')}.` : '')
+    : (z.valid ? `Viewing ${z.name}: ` + (z.zones || []).map((q) => q.id + (q.name ? ` ${q.name}` : '')).join(', ')
+      + ` (painted ${String(z.created || '?').replace('T', ' ')}; projector px, valid at this rig placement).`
+      + (used ? ` Used by ${used}.` : '')
+      + ((z.rig_changes || []).length ? ` CHECK (Show selected zones) or paint again: since it was painted, ${z.rig_changes.slice(0, 3).join('; ')}.` : '')
       : `${z.name} is not usable: ${z.error}`);
-  // Measure mode shows what MEASURE will be limited to (the Lights panel may be closed)
-  $('#qMeasZone').textContent = z
-    ? `Zone set ${z.name} is picked (Lights): only its zones are lit and measured.` : '';
 }
 
-async function paintZones() {
-  // a new set (a name typed), or the picked set edited (its zones loaded, the old one to trash)
-  const typed = $('#qZoneName').value.trim();
-  const picked = $('#qZoneSet').value;
-  if (!typed && !picked) {
-    $('#qSetupMsg').textContent = 'name the zone set to paint (New set name), or pick one to edit';
+function focusOn(sel) {
+  const el = $(sel);
+  if (el && typeof el.focus === 'function') el.focus();
+}
+
+function openAsk(a) {
+  // one question at a time, in the page (no browser dialog): the focus goes to the answer
+  // that changes nothing (delete: to the reason). a.from: the button that asked (the focus
+  // goes back to it when the question closes)
+  state.ask = a;
+  const box = $('#qZoneAsk');
+  box.hidden = false;
+  $('#qZoneAskText').textContent = a.text;
+  $('#qZoneReasonRow').hidden = !a.reason;
+  $('#qZoneReason').value = '';
+  $('#qZoneAskYes').textContent = a.yes;
+  focusOn(a.reason ? '#qZoneReason' : '#qZoneAskNo');
+  // the whole question in view (never half under the run buttons that stay at the bottom)
+  if (typeof box.scrollIntoView === 'function') box.scrollIntoView({ block: 'nearest' });
+}
+
+function closeAsk(to) {
+  // the question goes away. When the focus was on one of its answers it moves to `to`
+  // (default: the button that asked; a button that is switched off: the Scan zones panel).
+  // Hiding the question would drop the focus on the page, where Space / Enter is the run
+  // button
+  const a = state.ask;
+  state.ask = null;
+  const box = $('#qZoneAsk');
+  const act = document.activeElement;
+  const inside = !!a && !!act && typeof box.contains === 'function' && box.contains(act);
+  box.hidden = true;
+  if (!inside) return;
+  const back = to || a.from || '#qScanZones';
+  focusOn($(back) && !$(back).disabled ? back : '#qScanZones');
+}
+
+async function postSelection(sets, said) {
+  // the whole selection as it should be stored, with the stamp of the one this page showed:
+  // the answer always carries the STORED selection, and the rows are redrawn from it. Until
+  // the answer is here the page says so, and takes no second change and no run key
+  const s = zsel();
+  state.selBusy = true;
+  zoneSay('Changing the zone selection...');
+  try {
+    const r = await api('POST', '/api/zones/selection', { sets, was: s ? s.stamp : undefined, source: 'quick' });
+    if (r.bus) state.bus = r.bus;
+    zoneSay(r.accepted ? said : `NOT changed: ${r.message || r.error || 'refused'}`, !r.accepted);
+  } catch (e) {
+    if (e.data && e.data.bus) state.bus = e.data.bus;
+    zoneSay(`NOT changed: ${e.message || e}`, true);
+  }
+  state.selBusy = false;
+  state.zoneKey = null;
+  renderZones();
+  refreshButtons();
+}
+
+function storedEntries() {
+  // what is stored, as the entries POST /api/zones/selection takes
+  const s = zsel();
+  return ((s && s.sets) || []).map((r) => ({ set: r.set, on: !!r.on, ids: r.ids || null }));
+}
+
+function toggleSet(name, on) {
+  closeAsk();
+  if (!zsel()) return Promise.resolve();
+  const sets = storedEntries().map((e) => (e.set === name ? { ...e, on: !!on } : e));
+  return postSelection(sets, `${name} is switched ${on ? 'ON' : 'OFF'}.`);
+}
+
+function toggleZone(name, id, on) {
+  closeAsk();
+  const s = zsel();
+  const r = ((s && s.sets) || []).find((x) => x.set === name);
+  if (!r) return Promise.resolve();
+  const ids = (r.zones || []).filter((z) => (z.id === id ? on : z.on)).map((z) => z.id);
+  let entry;
+  let said = `${name}/${id} is switched ${on ? 'on' : 'off'}.`;
+  if (!ids.length) {
+    if (!r.on) {                                 // an OFF set keeps at least one zone to come back with
+      zoneSay(`${name}: at least one zone stays switched on in a set (the set itself is off).`, true);
+      state.zoneKey = null;
+      renderZones();
+      return Promise.resolve();
+    }
+    // the last zone of a set that is on: the set is switched off, its switches stay
+    entry = { set: name, on: false, ids: r.ids || null };
+    said = `${name}/${id} was the last zone that was on: ${name} is switched OFF.`;
+  } else entry = { set: name, on: !!r.on, ids: ids.length === (r.zones || []).length ? null : ids };
+  return postSelection(storedEntries().map((e) => (e.set === name ? entry : e)), said);
+}
+
+function onZoneRowChange(ev) {
+  // one listener on the rows: a set's switch, or one zone's
+  const t = ev && ev.target;
+  if (!t || !t.dataset || !t.dataset.set) return;
+  if (state.selBusy) {
+    // the last change is not answered yet: this one is not taken (the rows are redrawn from
+    // what the server stores when the answer is here)
+    t.checked = !t.checked;
     return;
   }
-  const args = typed && typed !== picked ? { name: typed } : { name: picked, source: picked, replace: true };
-  const j = await setupJob('zone_paint', args, '#qSetupMsg',
-    state.mode === 'mock' ? 'painting (MOCK: a scripted demo session)...'
-      : 'painting: draw on the part with the mouse - SPACE saves, ESC cancels (ABORT ends it)');
-  const r = j && j.status === 'done' ? j.result : null;
-  if (!r) return;
-  if (r.saved) {
-    $('#qSetupMsg').textContent = `zone set ${r.name} saved: ${r.n_zones} zone(s)`;
-    $('#qZoneName').value = '';
-    await loadZoneSets(r.name);
-  } else {
-    $('#qSetupMsg').textContent = `zone set ${args.name} not saved: ${r.reason || 'cancelled'}`;
+  if (t.dataset.zone) toggleZone(t.dataset.set, t.dataset.zone, !!t.checked);
+  else toggleSet(t.dataset.set, !!t.checked);
+}
+
+async function zoneJob(verb, args, busyText) {
+  // one zone job of this page (show, delete), followed to its end. A poll that fails is
+  // asked again: one lost answer is not the job's end
+  state.zoneBusy = true;
+  refreshButtons();
+  zoneSay(busyText);
+  try {
+    let j = await api('POST', '/api/jobs', { verb, args: args || {} });
+    let fails = 0;
+    while (j.status === 'queued' || j.status === 'running') {
+      await new Promise((res) => setTimeout(res, 400));
+      try {
+        j = await api('GET', `/api/jobs/${j.id}`);
+        fails = 0;
+      } catch (e) {
+        fails += 1;
+        if (fails > 75) throw e;                 // half a minute without an answer
+      }
+    }
+    return j;
+  } catch (e) {
+    zoneSay(`NOT KNOWN: lost contact with the server (${e.message || e}). Look at the list of zone sets.`, true);
+    return null;
+  } finally {
+    state.zoneBusy = false;
+    refreshButtons();
   }
+}
+
+async function startPaint(args) {
+  // the painter job; the page then only follows the bus state (painter, last_paint)
+  closeAsk('#qScanZones');                       // (Paint zones is switched off in a moment)
+  state.zoneBusy = true;
+  refreshButtons();
+  zoneSay(paintingText(args.name));
+  try {
+    const j = await api('POST', '/api/jobs', { verb: 'zone_paint', args });
+    if (j.error || !j.id) zoneSay(`NOT SAVED: the painter did not start - ${j.error || 'refused'}.`, true);
+    else state.painting = { name: args.name, at: hm(j.created) };
+  } catch (e) {
+    zoneSay(`NOT SAVED: the painter did not start - ${e.message || e}.`, true);
+  }
+  state.zoneBusy = false;
+  try { await pollOnce(); } catch (e) { $('#qConn').hidden = false; }
+  refreshButtons();
+}
+
+function paintZones() {
+  // Paint zones: a NEW set needs its name first; an existing one (typed, or the viewed set)
+  // is painted over only after the question (the set as it is goes to the library trash
+  // when the painter saves)
+  closeAsk();
+  const typed = $('#qZoneName').value.trim();
+  const name = typed || $('#qZoneSet').value;
+  if (!name) {
+    zoneSay('Name the new zone set first (New set name), or pick a set to edit.', true);
+    focusOn('#qZoneName');
+    return Promise.resolve();
+  }
+  const z = (state.zoneSets || []).find((x) => x.name === name);
+  if (!z) return startPaint({ name, select: true });
+  const used = usedBy(z);
+  openAsk({ kind: 'paint', name, from: '#qPaint', yes: `Replace ${name}`,
+    args: { name, source: name, replace: true, select: true },
+    text: `Zone set ${name} exists (${plural(z.n_zones, 'zone')}, painted ${String(z.created || '?').replace('T', ' ')}). `
+      + 'Paint over it? The painter opens with its zones. When you save with SPACE the set as it is now moves to the library trash (it can be brought back). ESC in the painter leaves it unchanged.'
+      + (used ? ` It is used by ${used}: what they inspect changes with it.` : '') });
+  return Promise.resolve();
+}
+
+function deleteZoneSet() {
+  // Delete set: the viewed set, to the library trash - after a question, with a reason. A set
+  // that is switched on is switched off first (a run never loses its zones behind its back)
+  closeAsk();
+  const name = $('#qZoneSet').value;
+  if (!name) { zoneSay('Pick the set to delete under Set to view or edit.', true); return; }
+  const s = zsel();
+  const r = ((s && s.sets) || []).find((x) => x.set === name);
+  if (r && r.on) { zoneSay(`${name} is switched on. Switch it off first, then delete it.`, true); return; }
+  const z = (state.zoneSets || []).find((x) => x.name === name) || {};
+  const used = usedBy(z);
+  openAsk({ kind: 'delete', name, reason: true, from: '#qZoneDelete', yes: `Move ${name} to the trash`,
+    text: `Move zone set ${name} (${plural(z.n_zones || 0, 'zone')}) to the library trash? It can be brought back from there. Give a reason (it is recorded).`
+      + (used ? ` It is used by ${used}: the delete is refused while they name it.` : '') });
+}
+
+async function confirmAsk() {
+  // the Yes button of the open question
+  const a = state.ask;
+  if (!a) return;
+  if (a.kind === 'paint') { await startPaint(a.args); return; }
+  const reason = $('#qZoneReason').value.trim();
+  if (!reason) {
+    $('#qZoneAskText').textContent = `${a.text} Type a reason first.`;
+    focusOn('#qZoneReason');
+    return;
+  }
+  closeAsk('#qScanZones');                       // (Delete set is switched off in a moment)
+  const j = await zoneJob('zone_delete', { name: a.name, reason, confirm: true }, `Moving ${a.name} to the library trash...`);
+  if (!j) return;
+  if (j.status === 'done') zoneSay(`DELETED: ${a.name} is in the library trash.`);
+  else zoneSay(`NOT deleted: ${j.error || 'refused'}`, true);
+  await loadZoneSets('');
+  try { await pollOnce(); } catch (e) { $('#qConn').hidden = false; }
 }
 
 async function showZonesOnPart() {
-  const name = $('#qZoneSet').value;
-  if (!name) { $('#qSetupMsg').textContent = 'pick a zone set first (or paint one)'; return; }
-  const j = await setupJob('zone_show', { zones: name, hold_s: 5 }, '#qSetupMsg');
-  const r = j && j.status === 'done' ? j.result : null;
-  if (!r) return;
-  const seen = (r.zones || []).filter((z) => z.seen).length;
-  $('#qSetupMsg').textContent = `${name}: ${seen} of ${(r.zones || []).length} zone(s) land in the camera image`
-    + ((r.warnings || []).length ? ` - ${r.warnings.join('; ')}` : '');
+  // Show selected zones: every switched-on zone projected on the part and photographed
+  closeAsk();
+  const s = zsel();
+  if (!s || s.state === 'unknown') { zoneSay(`Not shown: ${selProblem(s)}.`, true); return; }
+  if (s.empty) { zoneSay('No zone set is switched on: there is nothing to show.'); return; }
+  if (!s.ok) { zoneSay(`Not shown: ${selProblem(s)}. Switch that set off or paint it again.`, true); return; }
+  const j = await zoneJob('zone_show', { zones: `selection@${s.stamp}`, hold_s: 5 },
+    `Showing ${s.label} on the part for 5 s...`);
+  if (!j) return;
+  const r = j.status === 'done' ? j.result : null;
+  if (!r) { zoneSay(`Not shown: ${j.error || 'refused'}`, true); return; }
+  const zs = r.zones || [];
+  const miss = zs.filter((z) => !z.seen).map((z) => z.key || z.id);
+  zoneSay(miss.length
+    ? `Shown: ${zs.length - miss.length} of ${zs.length}. NOT SEEN: ${miss.join(', ')} (outside the camera's view, in shadow, or on nothing).`
+    : `Shown: ${zs.length} of ${plural(zs.length, 'zone')} land${zs.length === 1 ? 's' : ''} in the camera image. Look at the part: an outline that does not sit where it should means paint that set again.`,
+  miss.length > 0);
   const link = r.overlay_png || r.camera_png;
   if (link && !/^[A-Za-z]:|^\//.test(link)) {                      // library-relative only
     $('#qZoneImg').hidden = false;
     $('#qZoneImg').src = `/files/${link}`;
   }
+  try { await pollOnce(); } catch (e) { $('#qConn').hidden = false; }    // a CHECK it answered is gone
 }
 
 async function showZone() {
@@ -1278,13 +2058,41 @@ const ACTIVATABLE = 'button, summary, a[href], [role="button"], [tabindex]';
 
 function onKey(ev) {
   const t = ev.target;
-  if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA'
-            || t.isContentEditable)) {
+  const field = !!t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA'
+                        || t.isContentEditable);
+  if (state.ask) {
+    // a question of the Scan zones panel is open: the keys answer it and start nothing.
+    // Esc closes it (and still sends ABORT: Esc is ABORT everywhere); Enter in the reason
+    // box presses the Yes button; Space / Enter elsewhere press only a focused button
+    if (ev.key === 'Escape') {
+      closeAsk();
+      zoneSay('Cancelled (Esc): nothing was changed. ABORT was sent too.');
+      send('abort');
+      ev.preventDefault();
+    } else if (ev.key === 'Enter' && t && t.id === 'qZoneReason') {
+      confirmAsk();
+      ev.preventDefault();
+    }
+    return;
+  }
+  if (painterOn()) {
+    // the painter (or a zone show) holds the rig: its keys - P polygon, N name, H legend,
+    // digits ... - belong to the projector display. Here only Esc works: ABORT
+    if (ev.key === 'Escape') { send('abort'); ev.preventDefault(); }
+    return;
+  }
+  if (field) {
     if (ev.key !== 'Escape') return;                // Esc = ABORT, even from a field
   }
   if (ev.ctrlKey || ev.altKey || ev.metaKey) return;
   const k = ev.key;
   if ((k === ' ' || k === 'Enter') && t && t.closest && t.closest(ACTIVATABLE)) return;
+  if ((k === ' ' || k === 'Enter') && state.selBusy) {
+    // a zone switch was just pressed and its change is not answered yet: a second Space /
+    // Enter is meant for the switches, never for the run button
+    ev.preventDefault();
+    return;
+  }
   const s = state.bus ? state.bus.state : 'READY';
   const mode = state.opMode || 'station';
   let handled = true;
@@ -1317,6 +2125,7 @@ async function selectConfig(arg) {
     syncConfig(r.bus);                 // accepted or refused: show the bus's configuration
     showPreset(r.bus);
     renderCycle(r.bus);
+    renderZones();                     // another configuration: another zone, another use
     applyBus(r.bus);                   // another configuration: the last cycle is forgotten
     const said = r.accepted ? (/disarmed/.test(r.message) ? r.message : '') : `${r.command}: ${r.message}`;
     if (said || !flowCycle(r.bus)) $('#qReason').textContent = said;
@@ -1334,6 +2143,7 @@ async function selectProfile(arg) {
     syncConfig(r.bus);                 // accepted or refused: show the bus's profile
     showPreset(r.bus);
     renderCycle(r.bus);
+    renderZones();
     applyBus(r.bus);                   // another profile: the last cycle is forgotten
     const said = r.accepted ? (/disarmed/.test(r.message) ? r.message : '') : `${r.command}: ${r.message}`;
     if (said || !flowCycle(r.bus)) $('#qReason').textContent = said;
@@ -1389,8 +2199,13 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#qConfirm').addEventListener('change', refreshButtons);
   for (const k of MODES) $(MODE_BTN[k]).addEventListener('click', () => selectMode(k));
   $('#qRigPreset').addEventListener('change', () => selectRigPreset($('#qRigPreset').value));
-  $('#qMeasWhat').addEventListener('change', measFields);
-  $('#qQuickCheck').addEventListener('change', quickFields);
+  // what the run button does with the zones depends on the measurement / check and on the
+  // region typed: the line above the run buttons follows them at once
+  const rescope = () => { renderZones(); refreshButtons(); };
+  $('#qMeasWhat').addEventListener('change', () => { measFields(); rescope(); });
+  $('#qQuickCheck').addEventListener('change', () => { quickFields(); rescope(); });
+  for (const id of ['#qMeasRoi', '#qMeasP2', '#qQuickRoi']) $(id).addEventListener('input', rescope);
+  $('#qQuickRecipe').addEventListener('change', rescope);
   $('#qMeasure').addEventListener('click', sendMeasure);
   $('#qMeasImg').addEventListener('click', onPreviewClick);
   $('#qStart').addEventListener('click', () => (state.opMode === 'quick_check' ? sendQuick() : send('start')));
@@ -1404,10 +2219,14 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#qZones').addEventListener('click', showZone);
   $('#qPaint').addEventListener('click', paintZones);
   $('#qZoneShow').addEventListener('click', showZonesOnPart);
-  $('#qZoneSet').addEventListener('change', showZoneSet);
-  // zone sets belong to the loaded preset's geometry: re-read when the panel opens, when
-  // another preset is loaded and after painting
-  $('#qLights').addEventListener('toggle', () => { if ($('#qLights').open) loadZoneSets(); });
+  $('#qZoneDelete').addEventListener('click', deleteZoneSet);
+  $('#qZoneSet').addEventListener('change', () => { closeAsk(); showZoneSet(); });
+  $('#qZoneRows').addEventListener('change', onZoneRowChange);       // every switch, one listener
+  $('#qZoneAskYes').addEventListener('click', confirmAsk);
+  $('#qZoneAskNo').addEventListener('click', () => { closeAsk(); zoneSay('Cancelled: nothing was changed.'); });
+  $('#qZoneImg').addEventListener('click', () => $('#qZoneImg').classList.toggle('big'));
+  // zone sets belong to the loaded preset's geometry: read now, and again whenever the bus
+  // state shows another set list (another preset, a set painted or deleted - by anyone)
   loadZoneSets();
   $('#qLive').addEventListener('click', toggleLive);
   $('#qSignal').addEventListener('click', signalCheck);

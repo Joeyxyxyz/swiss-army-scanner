@@ -325,12 +325,21 @@ def resolve(session, preset, zone_text: str, pmap=None):
     cells). camera_mask needs a ProjectorMap (latest for the geometry if pmap
     is None); without one it is None and a warning explains how to make one.
     'atlas:<name>/<region>' names a region of an imported Surfer atlas;
-    'zoneset:<set>[:Z1,Z3]' the zones of a painted zone set (engine/zones: lit through
-    their union; never a camera mask - their camera px are derived per scan)."""
+    'zoneset:<set>[:Z1,Z3]' the zones of a painted zone set, 'zoneset:<a>+<b>' of several
+    (engine/zones: lit through their union; never a camera mask - their camera px are
+    derived per scan). The word 'selection' is the zone sets switched on at this geometry
+    (engine/zones/selection.py; the verbs expand it first, so what is recorded is the text
+    it stood for): here it is refused when it is empty - there is no mask for "no zone"."""
     from . import atlas as _atlas
     if _atlas.is_atlas_spec(zone_text):
         return _atlas.resolve_region(session, preset, zone_text, pmap=pmap)
+    from ..zones import selection as _selection
     from ..zones import use as _zoneset
+    if _selection.is_word(zone_text):
+        zone_text, _info = _selection.expand(session.store, preset, zone_text)
+        if zone_text is None:
+            raise ValueError("the zone selection is empty: nothing is switched on, so there "
+                             "is no zone to light (leave the zone out for the whole field)")
     if _zoneset.is_spec(zone_text):
         return _zoneset.resolve(session, preset, zone_text)
     text, spacing = _split_spacing(zone_text)

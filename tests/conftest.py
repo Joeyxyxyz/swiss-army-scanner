@@ -52,7 +52,7 @@ PRESET = "cell_wall_2p7ft_vstripe"   # fringes vertical in camera = correct for 
 
 
 # ------------------------------------------------- isolation guard
-# Three things no test may do, whatever the code under test makes of the variables:
+# Four things no test may do, whatever the code under test makes of the variables:
 #   - open the machine's projector rig file (beside the rig lock);
 #   - write an event-log file (events/inspections_v1_*, events/inspection_values_v1_*,
 #     events/last_v1*, the two lock files, events/pending/, events/img/, a rebuild's
@@ -61,7 +61,10 @@ PRESET = "cell_wall_2p7ft_vstripe"   # fringes vertical in camera = correct for 
 #   - write a file of the bad-part output (engine/badparts.py: its marker, its index and
 #     lock files, anything in a folder below its marker, the copies that wait in
 #     bad_part_pending/, a run folder's bad_part_output.json, a scan's bad_part.jsonl and
-#     bad_part_swept.json) outside a temporary folder.
+#     bad_part_swept.json) outside a temporary folder;
+#   - write the stored zone selection or the zone-show record of a rig placement
+#     (engine/zones: zones/<geometry>/_selection.jsonl, zones/<geometry>/_shown.jsonl)
+#     outside a temporary folder: what a run lights is switched there.
 # An audit hook sees every open() and rename in this process. It refuses the call
 # (IsolationError) and notes it; the note fails the running test at its end, also
 # when the code under test swallowed the refusal. Child processes are not watched:
@@ -124,6 +127,15 @@ def _is_bad_part(full: str) -> bool:
     return False
 
 
+_ZONE_STATE_FILES = ("_selection.jsonl", "_shown.jsonl")    # engine/zones selection / store
+
+
+def _is_zone_state(full: str) -> bool:
+    """The stored zone selection or zone-show record: zones/<geometry>/<that file>."""
+    parts = [p.lower() for p in Path(full).parts]
+    return len(parts) >= 3 and parts[-1] in _ZONE_STATE_FILES and parts[-3] == "zones"
+
+
 def _writes(mode, flags) -> bool:
     if isinstance(mode, str):
         return any(c in mode for c in "wax+")
@@ -144,12 +156,15 @@ def _refused(event, args):
     low = text.lower()
     plain = os.path.normcase(os.path.abspath(text))
     if _writes(mode, flags) and not any(plain.startswith(root) for root in _Guard.temp):
-        forms = _forms(text)                             # the bad-part output: in a temp folder
-        if not any(f.startswith(root) for f in forms for root in _Guard.temp) \
-                and any(_is_bad_part(f) for f in forms):
+        forms = _forms(text)                 # the bad-part output, the zone selection: in a
+        outside = not any(f.startswith(root) for f in forms for root in _Guard.temp)  # temp folder
+        if outside and any(_is_bad_part(f) for f in forms):
             return (f"a bad-part output file was written outside a temporary folder ({text}): "
                     f"keep the test's bad-part output and library under tmp_path "
                     f"({BAD_PART_ENV} is off for tests; the bad_part_output fixture gives one)")
+        if outside and any(_is_zone_state(f) for f in forms):
+            return (f"a zone selection file was written outside a temporary folder ({text}): "
+                    "keep the test's library under tmp_path")
     if RIG_FILE_NAME not in low and "events" not in low:
         return None
     forms = _forms(text)

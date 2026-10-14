@@ -370,7 +370,21 @@ this file.
 | `job.min_defect_px`, `job.max_outlier_pct`, `job.min_valid_pct`, `job.min_coverage_pct`, `job.plane_range_mm` | metric: smallest out-of-tolerance cluster that FAILs (default 5 camera px, 1..50; smaller isolated ones are stray points); share of the measured px that may be dropped as stray points before the run is INVALID (default 0.1 %, 0..5); plane: decoded share of the roi below which the run is INVALID (default 30 %), optional `[near, far]` plane distance from the camera (mm, presence check); golden: share of each surface within the threshold below which the run is INVALID (default 95 %) |
 | `job.base` | `latest` usable base, or `capture` a new one (the scene must be empty). In `--mock`, a missing base is captured automatically. |
 | `job.zone`, `job.average`, `job.n_sigma`, `job.min_area_px` | passed to the engine verbs |
+| `job.zone` | what is lit: `null` (the whole field), grid cells (`"C4:D5"`), painted zone sets (`"zoneset:cells"`, `"zoneset:cells+tube:Z1"`), or `"selection"` (below) |
 | `part.role`, `part.label` | `golden` / `test`, and the scan label |
+
+### Painted zones in a station job
+
+A station configuration is the definition of an inspection: **its run inspects what this file says, always.** The zone sets an operator switches on at the page (README, *Scan zones*) never change that by themselves.
+
+- `"zone": "zoneset:cells"` (or several sets: `"zoneset:cells+tube:Z1"`): the job is lit through those zones, whatever is switched on. A **metric** job is then judged zone by zone: each zone has its own plane, its own coverage (`job.min_valid_pct` is the share of the ZONE the camera must have seen) and its own verdict; `job.roi` cuts the zones further. Any zone that cannot be judged makes the run INVALID → PULL; else any zone over `threshold_mm` is a FAIL that names the zone. Points decoded outside every zone are reported, not judged. `job.axis` must be `xy` (with columns only the zones cannot be told apart). A `golden` compare needs a golden that was scanned through the same zones.
+- `"zone": "selection"`: the job inspects **the zone sets switched on at the operator page** (`scan zone-select`), for the rig placement of its preset. This is the one way the page's selection reaches a station run, and it is a line in this file. Metric jobs only (an inspect / compare job judges only what its base / golden also covers; a recipe names its own zones). Only the bare word: the form `selection@...` that a quick check records for itself is refused in a station file. With it:
+  - nothing switched on, a set that is gone or was painted at another rig placement, a zone id that no longer exists, another preset loaded than the run uses, or a rig change on record since a selected set was painted: START / TRIGGER are refused and the part is **PULLed**, with nothing captured. Never the whole field instead.
+  - the selection cannot be changed while the station is ARMED or in a cycle (the switches, the painter and delete are refused); a change made behind the server's back (a terminal) makes the next TRIGGER PULL and disarms: "the zones changed since ARM".
+  - START from the page carries the selection the page showed; a selection that changed meanwhile starts nothing ("look at the page and press it again").
+  - the page says so before START: "START runs FILE, which inspects the SELECTED zones: cells (2), tube (2 of 3)". For every other configuration it says "START runs FILE as written ... The selected zones are NOT used."
+
+`result.json` of a run lit through painted zones has one more key, `zone_selection`: `{text` (the zone text that was lit)`, source` (`selection` | `argument`)`, selected {time, by}, sets [{set, created, ids}], by_zone [{key` ("cells/Z1")`, zoneset, id, name, points, dmd_px, coverage_pct, verdict, max_mm, rms_mm, reason}], outside, summary, failed, invalid, warnings}`. `job.zone` keeps this file's own word (`"selection"`), `capture.zone` the text it stood for. The key is absent for every other run.
 
 ## result.json
 

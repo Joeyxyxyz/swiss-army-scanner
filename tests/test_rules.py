@@ -420,3 +420,26 @@ def test_event_log_fixture_allows_rows_in_a_temporary_folder_only(tmp_path, monk
     with pytest.raises(conftest.IsolationError, match="temporary folder"):
         open(rows, "a", encoding="utf-8")
     assert len(conftest.take_isolation_notes()) == 1
+
+
+def test_the_zone_selection_is_written_in_a_temporary_folder_only(tmp_path, monkeypatch):
+    """The stored zone selection and zone-show record of a rig placement (engine/zones)
+    decide what a run lights: a test writes them in its own library under tmp_path only."""
+    geo = tmp_path / "library" / "zones" / "geo_1"
+    geo.mkdir(parents=True)
+    for name in ("_selection.jsonl", "_shown.jsonl"):
+        with open(geo / name, "a", encoding="utf-8") as fh:     # in a temporary folder: fine
+            fh.write("{}\n")
+    assert conftest.take_isolation_notes() == []
+    monkeypatch.setattr(conftest._Guard, "temp",
+                        {f + os.sep for f in conftest._forms(tmp_path / "temp")})
+    for attempt in (lambda: open(geo / "_selection.jsonl", "a", encoding="utf-8"),
+                    lambda: open(geo / "_shown.jsonl", "ab"),
+                    lambda: os.replace(tmp_path / "sel.tmp", geo / "_selection.jsonl")):
+        with pytest.raises(conftest.IsolationError, match="zone selection"):
+            attempt()
+    assert len(conftest.take_isolation_notes()) == 3
+    with open(geo / "_selection.jsonl", encoding="utf-8") as fh:  # reading: never refused
+        assert fh.read() == "{}\n"
+    open(geo.parent / "_selection.jsonl", "w").close()             # not a rig placement's file
+    assert conftest.take_isolation_notes() == []

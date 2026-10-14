@@ -678,10 +678,11 @@ def _square(img, x, y, half: int, level: int, filled: bool = True) -> None:
     cv2.rectangle(img, p0, p1, int(level), -1 if filled else 1)
 
 
-def _label(img, z: Zone, level: int) -> None:
+def _label(img, z: Zone, level: int, name: Optional[str] = None) -> None:
+    """The zone's id (or `name` in its place: a key "<set>/<id>") + its label, above it."""
     import cv2
     H, W = img.shape[:2]
-    text = z.id + (f" {z.name}" if z.name else "")
+    text = (name or z.id) + (f" {z.name}" if z.name else "")
     font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
     (tw, th), base = cv2.getTextSize(text, font, scale, thick)
     x0, y0, _x1, _y1 = z.bbox()

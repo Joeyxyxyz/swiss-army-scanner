@@ -84,7 +84,9 @@ The value row (VALUE_FIELDS): inspection_id, step (the work state of a cycle, el
 zone, check, name, value, unit, lower_limit, upper_limit, result. One row per value a check
 held to a limit: its `tolerances`, or its `key` / `limit` when it gives none (|value| <=
 limit, as engine/disposition.tolerances_of); a single job without zones: deviation_mm.max
-against threshold_mm; a measurement: every value, no limits. result: OK (inside its limits),
+against threshold_mm - judged zone by zone through painted zones: one such row per zone,
+`zone` its name ("cells/Z1"); a measurement: every value, no limits (a value measured per
+painted zone: `zone` its name). result: OK (inside its limits),
 OUT (outside), INVALID (the check could not measure, or there is no finite number), "-" (no
 limit to hold it to). A value in the guard band is OK here: the inspection row says PULL.
 
@@ -494,7 +496,8 @@ def _value(step, zone, check, name, value, unit, lo, hi, verdict) -> dict:
 def _run_values(doc: dict, step: str = "") -> list:
     """The values a run held to a limit: every tolerance of every check (its `tolerances`,
     else its key / limit); a job without checked zones: deviation_mm.max against
-    threshold_mm, when there is a number."""
+    threshold_mm, when there is a number - one row per zone when it was judged zone by zone
+    through painted zones (_zone_values)."""
     out = []
     zones = [z for z in doc.get("zones") or [] if isinstance(z, dict) and z.get("checks")]
     for z in zones:
@@ -509,6 +512,9 @@ def _run_values(doc: dict, step: str = "") -> list:
                 out.append(_value(step, z.get("id"), ch.get("id"), t["name"], t.get("value"),
                                   _unit(t["name"], ch.get("units")), t.get("lo"), t.get("hi"),
                                   ch.get("verdict")))
+    per_zone = [] if zones else _zone_values(doc, step)
+    if per_zone:                            # judged zone by zone: one row per painted zone
+        return per_zone
     dev = doc.get("deviation_mm") if isinstance(doc.get("deviation_mm"), dict) else {}
     if not zones and _num(dev.get("max")) is not None:
         job = doc.get("job") if isinstance(doc.get("job"), dict) else {}
@@ -516,6 +522,20 @@ def _run_values(doc: dict, step: str = "") -> list:
                           doc.get("deviation_units") or "mm", None, doc.get("threshold_mm"),
                           doc.get("result")))
     return out
+
+
+def _zone_values(doc: dict, step: str = "") -> list:
+    """A single job lit through painted zones and judged zone by zone (result.json
+    zone_selection.by_zone[], each with its own verdict: ui/cli.py _run_metric_zones): one
+    row per zone, its zone the zone's name ("cells/Z1"), its max deviation against
+    threshold_mm with the zone's own verdict (a zone that could not be judged: INVALID).
+    [] for any other run (a golden compare through zones is one compare: no zone verdicts)."""
+    zsel = doc.get("zone_selection") if isinstance(doc.get("zone_selection"), dict) else {}
+    rows = [r for r in zsel.get("by_zone") or [] if isinstance(r, dict) and r.get("verdict")]
+    job = doc.get("job") if isinstance(doc.get("job"), dict) else {}
+    return [_value(step, r.get("key"), job.get("type"), "deviation_mm.max", r.get("max_mm"),
+                   doc.get("deviation_units") or "mm", None, doc.get("threshold_mm"),
+                   r.get("verdict")) for r in rows]
 
 
 def _summary(values: list) -> str:
@@ -563,8 +583,9 @@ def _run_reason(doc: dict, values: list) -> str:
             why = " - ".join(str(x) for x in (kick.get("reason"), kick.get("detail")) if x)
             return _short(f"{kick.get('step')}: {why}")
         out = next((v for v in values if v["result"] == "OUT"), None)
-        if out is not None:
-            return _short(f"{out['name']} {_g(out['value'])} {out['unit']} is outside its "
+        if out is not None:                 # a zone judged on its own: named ("cells/Z2: ...")
+            return _short((f"{out['zone']}: " if out["zone"] else "")
+                          + f"{out['name']} {_g(out['value'])} {out['unit']} is outside its "
                           f"limits [{_g(out['lower_limit'])}..{_g(out['upper_limit'])}]")
     if pulls:
         return _pull_text(pulls)
@@ -760,9 +781,9 @@ def inspection(run_dir, library=None) -> Optional[dict]:
         return _first((x.get(section) or {}).get(key) for _, x in folders
                       if isinstance(x.get(section), (dict, type(None))))
 
-    if measure:
-        vals = [_value("", "", doc.get("what"), v.get("name"), v.get("value"), v.get("units"),
-                       None, None, NO_JUDGMENT)
+    if measure:                             # a value measured per painted zone names its zone
+        vals = [_value("", v.get("zone"), doc.get("what"), v.get("name"), v.get("value"),
+                       v.get("units"), None, None, NO_JUDGMENT)
                 for v in doc.get("values") or [] if isinstance(v, dict)]
         judgment = NO_JUDGMENT
         reason = "" if doc.get("status") == "MEASURED" else _short(

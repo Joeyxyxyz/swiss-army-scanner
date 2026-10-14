@@ -347,6 +347,11 @@ def _scan_rules(scan: dict, E: _Errors) -> None:
     if scan["zone"] is not None and (not isinstance(scan["zone"], str) or not scan["zone"].strip()):
         E.add("scan.zone", "must be grid cells ('F10:J12', 'F10:J12@96'), 'atlas:<name>/<region>' "
               "or null (whole field)")
+    elif isinstance(scan["zone"], str) and scan["zone"].strip().lower().split("@")[0] == "selection":
+        # the zone selection is the operator's switch: a recipe is a fixed definition
+        E.add("scan.zone", "'selection' (the zone sets switched on at the operator page) is not "
+              "for a recipe: a recipe names its own zones ('zoneset:<set>[:Z1,Z3]', grid "
+              "cells, or null)")
     for k, lo in (("average", 1), ("steps", 3)):
         v = scan[k]
         if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < lo):

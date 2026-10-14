@@ -121,6 +121,7 @@ from typing import Optional
 
 from . import eventlog as E
 from . import rules
+from .library import longpath
 
 log = logging.getLogger(__name__)
 
@@ -371,6 +372,10 @@ def _not_copied(it: dict, root: Path, why: str, folder) -> str:
 
 
 def _why(e: OSError) -> str:
+    if longpath.too_long(e):                # a path the OS can't take: its length, the limit
+        return longpath.explain(e, fix="give the bad-part output a folder with a shorter path, "
+                                       "nearer the drive root, or have Windows long paths "
+                                       "turned on, then copy it again").rstrip(".")
     return " ".join(str(e).split()) or type(e).__name__
 
 

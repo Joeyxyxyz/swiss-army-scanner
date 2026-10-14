@@ -14,6 +14,11 @@ profile_quick, productised).
     vertical (u = 0) sections, flatness (RMS and p2-p98 inside r_flat_mm: 0.855 x the face
     radius unless given, radii.py - 9.0 mm on a 21.05 mm face), per-point repeatability (std
     across repeats at each face pixel), tilt vs the camera ray
+  * what each repeat gave: its face points (repeat_face_points), the repeats that gave any
+    (repeats_used) and the share of the face points every repeat measured (all_repeats_pct).
+    A repeat that kept far fewer points than the others (low_repeats: under
+    LOW_REPEAT_FRACTION of their median - a glint, a moved part, a busy PC) is named by the
+    face scan and by the profile; it still counts where it measured (the median per pixel)
 """
 
 from __future__ import annotations
@@ -34,6 +39,24 @@ BEHIND_MM = 2.0                         # a measured point this far behind the f
 RADIAL_BIN_MM = 0.5
 MAP_RANGE_MM = 0.4                      # PNG colour range +-
 SECTION_RANGE_MM = 0.5
+# a repeat with fewer face points than this x the median of the other repeats is named (the
+# bench: one of three repeats kept half its points and took longer, and nothing said so)
+LOW_REPEAT_FRACTION = 0.75
+
+
+def low_repeats(counts, fraction: float = LOW_REPEAT_FRACTION) -> list:
+    """The repeats that kept far fewer points than their siblings: fewer than `fraction` x
+    the median of the OTHER repeats' counts -> [{repeat (1-based), points, others_median,
+    pct_of_others}]. One repeat, or others with no points: nothing to compare with."""
+    c = [int(n) for n in counts]
+    out = []
+    for k, n in enumerate(c):
+        others = c[:k] + c[k + 1:]
+        med = float(np.median(others)) if others else 0.0
+        if med > 0 and n < fraction * med:
+            out.append({"repeat": k + 1, "points": n, "others_median": med,
+                        "pct_of_others": round(100.0 * n / med, 1)})
+    return out
 
 
 def grid_axis(radius_mm: float, step_mm: float = GRID_MM) -> np.ndarray:
@@ -130,6 +153,8 @@ def analyse(X: np.ndarray, K: np.ndarray, face_mask: np.ndarray, origin, cal, ra
         & (np.hypot(pu, pv) <= radius_mm + 1.0)
     pu, pv, ph = (np.where(good, a, np.nan) for a in (pu, pv, ph))
     anyk = good.any(0)
+    per_repeat = good.sum(1)                # the face points each repeat gave
+    n_by_point = good.sum(0)[anyk]          # how many repeats measured each face point
     pixels = {"iy": iy[anyk], "ix": ix[anyk], "U": pu[:, anyk], "V": pv[:, anyk],
               "H": ph[:, anyk]}
     # per-point repeatability: std of the height across repeats at each face pixel
@@ -156,6 +181,10 @@ def analyse(X: np.ndarray, K: np.ndarray, face_mask: np.ndarray, origin, cal, ra
     tilt = float(np.degrees(np.arccos(min(1.0, abs(n @ (-C0 / np.linalg.norm(C0)))))))
     stats = {"n_points": int(len(Q)), "n_off_face": int((fm & np.isfinite(M[..., 2])).sum() - len(Q)),
              "n_repeats": int(len(X)),
+             "repeat_face_points": [int(n) for n in per_repeat],
+             "repeats_used": int((per_repeat > 0).sum()),
+             "all_repeats_pct": (round(100.0 * float(np.mean(n_by_point == len(X))), 1)
+                                 if n_by_point.size else None),
              "covered_radius_mm": float(r.max()) if len(r) else None,
              "grid_coverage_pct": round(100.0 * float(cover.mean()), 2) if cover.size else None,
              "r_flat_mm": float(r_flat_mm),

@@ -33,7 +33,8 @@ Exit codes let a script or an agent branch without parsing the text:
      NOT_ALIGNED, no code / spot found, base auto-rejected, cancelled, or
      an unexpected error
   2  refused: rule / geometry / safety / config violation, rig busy (another
-     program holds the camera + DMD) or bad input
+     program holds the camera + DMD), bad input, or a library / run / output
+     path longer than the OS takes (PathTooLong: the path, its length, the limit)
   3  the requested mode is not available yet (engine stub)
   4  dent-detect only: the detector itself failed (an unexpected error), so a
      crash is never read as FLAG (1) or CLEAR (0)
@@ -78,6 +79,7 @@ if str(_ROOT) not in sys.path:          # `python ui/cli.py` from anywhere
 
 from engine import api, badparts, config, rules  # noqa: E402
 from engine import disposition as D  # noqa: E402
+from engine.library import longpath  # noqa: E402
 from engine.library import presets as preset_lib  # noqa: E402
 from engine.capture.hwtrigger import TRIGGER_LINES  # noqa: E402
 
@@ -2891,8 +2893,10 @@ def cmd_face_scan(ctx):
             + (f": face p95 {ae.get('p95_dn'):.0f} DN, {ae.get('clipped_pct'):.2f} % clipped"
                if ae.get("ok") else "")
             + f"), depth set {a.mode}: {fs.meta.get('depth_frames')} frames)")
-    ctx.table(["repeat", "metric scan", "face decoded", "capture"],
-              [[i + 1, r["metric_scan"], _u(r["face_decoded_pct"], "%", 1), _u(r["capture_s"], "s", 1)]
+    low = {lo["repeat"] for lo in fs.meta.get("low_repeats") or []}
+    ctx.table(["repeat", "metric scan", "face points", "face decoded", "capture"],
+              [[f"{i + 1}{' !' if i + 1 in low else ''}", r["metric_scan"], _f(r.get("face_points")),
+                _u(r["face_decoded_pct"], "%", 1), _u(r["capture_s"], "s", 1)]
                for i, r in enumerate(fs.repeats)])
     if ae.get("shots"):
         ctx.table(["exposure ms", "p95 DN", "clipped %", "ok"],
@@ -2901,6 +2905,17 @@ def cmd_face_scan(ctx):
     ctx.kv([["stored", str(fs.path)]])
     ctx.warn(fs.warnings)
     return EXIT_OK, {"facescan": fs, **_scan_says(fs.meta)}
+
+
+def _repeats_line(st: dict) -> str:
+    """How many repeats a face profile really used, and what each gave."""
+    pts = st.get("repeat_face_points")
+    if pts is None:                             # a profile stored before it was counted
+        return f"{st.get('n_repeats')} (not counted per repeat)"
+    low = {lo["repeat"] for lo in st.get("low_repeats") or []}
+    return (f"{st.get('repeats_used')} of {st.get('n_repeats')} used; face points per repeat "
+            + " / ".join(f"{n}{' (!)' if k in low else ''}" for k, n in enumerate(pts, 1))
+            + f"; measured by all: {_u(st.get('all_repeats_pct'), '%', 0)}")
 
 
 def cmd_face_profile(ctx):
@@ -2929,6 +2944,7 @@ def cmd_face_profile(ctx):
             ["centre", (st.get("centre") or {}).get("message") or "the located circle's"],
             ["repeatability", f"{_u(st['repeatability_median_mm'], 'mm', 4)} median, "
                               f"{_u(st['repeatability_p90_mm'], 'mm', 4)} p90 (per point, across repeats)"],
+            ["repeats", _repeats_line(st)],
             ["tilt", _u(st["tilt_deg"], "deg", 1)],
             ["coverage", f"{_u(st['grid_coverage_pct'], '%', 1)} of the face grid, to r "
                          f"{_u(st['covered_radius_mm'], 'mm', 2)}"],
@@ -6526,6 +6542,8 @@ def _classify_error(e: BaseException, mode: str) -> tuple:
         return EXIT_REFUSED, f"error: {msg}"
     if isinstance(e, Abort):
         return EXIT_NOT_OK, f"stopped: {msg}"
+    if longpath.too_long(e):                       # a path the OS can't take: refused, no crash
+        return EXIT_REFUSED, f"PathTooLong: {_one_line(longpath.explain(e))}"
     if isinstance(e, ValueError):                  # engine precondition / bad value
         return EXIT_REFUSED, f"{type(e).__name__}: {msg}"
     if isinstance(e, KeyboardInterrupt):

@@ -67,6 +67,17 @@ class EntryInUse(RuleViolation):
     rename (a file in it is open). Nothing was moved; retry once it is free."""
 
 
+class PathTooLong(RuleViolation, FileNotFoundError):
+    """A library, run or output path is longer than the operating system takes
+    (Windows without long paths: 260 characters). Raised from the OS error that
+    really happened, never from a length alone (engine/library/longpath.py); the
+    message names the path, its length, the limit and what to do. Still the
+    FileNotFoundError the OS raised, so a caller that caught that still does."""
+
+    def __str__(self) -> str:                   # the message, not OSError's "[Errno 2] ..."
+        return str(self.args[0]) if self.args else ""
+
+
 # ------------------------------------------------------------ rule 1: HDMI
 
 # Modules that must never be loaded in a scan process. Importing the

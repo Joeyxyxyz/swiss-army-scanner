@@ -6,6 +6,10 @@ jobs (`scan run`, ui/run_job.py) and the recipe runner (api.recipe_run, engine/r
         result.json      the machine-readable result (RESULT_SCHEMA_VERSION; written once)
         run.log.jsonl    one JSON event per line, every line carries run_id
 
+A run folder the OS cannot make, or one with no room for the files it will hold (a path too
+long for Windows without long paths), is refused before the run starts (new_run:
+rules.PathTooLong, engine/library/longpath.py).
+
 The result keys are the same for every run (a script or an automation flow reads them
 without knowing the job type). The verdict is only ever PASS / FAIL / INVALID / ABORTED:
 INVALID means the numbers cannot be trusted and must never be reported as a pass or a fail.
@@ -56,30 +60,67 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import badparts, eventlog
+from . import badparts, eventlog, rules
 from . import disposition as D
+from .library import longpath
 
 RESULT_SCHEMA_VERSION = "0.4"
 RESULTS = ("PASS", "FAIL", "INVALID", "ABORTED")
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ROOT = Path(__file__).resolve().parents[1]
+# the longest file name a run folder holds (badparts.DONE_FILE, bad_part_output.json): a new
+# run folder must have room for it, or the run is refused before anything is measured
+RUN_FILE_ROOM = 20
+NOT_MEASURED = "Nothing was measured."
 
 
-def new_run(runs_dir, name: str, now: Optional[datetime] = None) -> tuple:
-    """(run_id, run_dir): a fresh folder under runs_dir, never an existing one."""
+def run_id_chars(name: str) -> int:
+    """The length of a run id made for `name`: <UTC timestamp, 16>_<name>_<8 hex>."""
+    return 16 + 1 + len(str(name)) + 1 + 8
+
+
+def steps_room(steps_dir: str, names) -> int:
+    """The room a flow's cycle folder needs: its own files, and <steps_dir>/<the run id of a
+    work state's run named `names[i]`>/<its files> (engine/flow/verify.open_cycle). The work
+    state's run folder fits when its files do: a separator and a file name are longer than
+    the 12 characters a new folder keeps free (longpath.folder_slack)."""
+    return max([RUN_FILE_ROOM] + [len(steps_dir) + 1 + run_id_chars(n) + 1 + RUN_FILE_ROOM
+                                  for n in names])
+
+
+def new_run(runs_dir, name: str, now: Optional[datetime] = None,
+            room: int = RUN_FILE_ROOM) -> tuple:
+    """(run_id, run_dir): a fresh folder under runs_dir, never an existing one. room: the
+    longest name it will hold (a file, or a path below it: a cycle folder's work states).
+    A folder the OS cannot make, or one with no room for that, is refused
+    (rules.PathTooLong, engine/library/longpath.py) and nothing is left behind."""
     if not RUN_ID.fullmatch(str(name)):
         raise ValueError(f"run name {name!r}: letters, digits, _ . - only (max 64)")
     now = now or datetime.now(timezone.utc)
     root = Path(runs_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    with longpath.guard("the runs folder", root, fix=longpath.FIX_RUNS, done=NOT_MEASURED):
+        root.mkdir(parents=True, exist_ok=True)
     for _ in range(5):
         run_id = f"{now.strftime('%Y%m%dT%H%M%SZ')}_{name}_{uuid.uuid4().hex[:8]}"
         run_dir = root / run_id
         try:
-            run_dir.mkdir()
-            return run_id, run_dir
+            with longpath.guard("the run folder", run_dir, fix=longpath.FIX_RUNS,
+                                done=NOT_MEASURED):
+                run_dir.mkdir()
         except FileExistsError:
             continue
+        try:
+            longpath.check_room(run_dir, room, "the run folder", fix=longpath.FIX_RUNS,
+                                done=NOT_MEASURED,
+                                holds="the files a run writes" if room <= RUN_FILE_ROOM
+                                else "the files and the work states' run folders it holds")
+        except rules.PathTooLong:
+            try:
+                run_dir.rmdir()             # made just now and still empty
+            except OSError:
+                pass
+            raise
+        return run_id, run_dir
     raise FileExistsError(f"could not create a new run folder under {root}")
 
 

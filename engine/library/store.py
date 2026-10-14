@@ -58,8 +58,14 @@ import numpy as np
 
 from .. import rules
 from ..results import Calibration
+from . import longpath
 
 _LABEL_RE = re.compile(r"[^A-Za-z0-9_.\-]+")
+# sessions/<timestamp>/log.jsonl: the session log, the first file every command writes
+# (ScanSession.log_path), in a new folder sessions/<timestamp>. The library folder must have
+# room for both (ensure_readme)
+SESSION_LOG_CHARS = len(os.path.join("sessions", "YYYYmmddTHHMMSS_ffffff", "log.jsonl"))
+SESSION_DIR_CHARS = len(os.path.join("sessions", "YYYYmmddTHHMMSS_ffffff"))
 
 OUTPUT_KINDS = ("pointclouds", "defects", "measurements", "codes", "spectral", "previews",
                 "profiles", "anomalies", "tuning", "comparisons", "sensors", "calibration",
@@ -133,24 +139,38 @@ class LibraryStore:
         self.root = Path(root)
 
     def ensure_readme(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(self.root / "README.md", "x", encoding="utf-8") as f:
-                f.write(LIBRARY_README)
-        except FileExistsError:
-            pass
+        """The library folder and its README. The session opens the library here
+        (api.configure): a library folder whose path is too long for the OS, or with no
+        room for the session log every command writes (its folder sessions/<time> and the
+        file in it), is refused at once (rules.PathTooLong, engine/library/longpath.py),
+        before any command runs."""
+        with longpath.guard("the library folder", self.root):
+            self.root.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(self.root / "README.md", "x", encoding="utf-8") as f:
+                    f.write(LIBRARY_README)
+            except FileExistsError:
+                pass
+        longpath.check_room(self.root, SESSION_LOG_CHARS, "the library folder",
+                            new_folder=SESSION_DIR_CHARS,
+                            holds="the session log every command writes "
+                                  "(sessions/<time>/log.jsonl)")
 
     # ------------------------------------------------------- output bin
     def output_path(self, kind: str, label: str, ext: str) -> Path:
-        """A fresh file path in output/<kind>/ (never an existing one)."""
+        """A fresh file path in output/<kind>/ (never an existing one). A path the OS
+        cannot take is refused here (rules.PathTooLong), before the result is written."""
         if kind not in OUTPUT_KINDS:
             raise ValueError(f"output kind must be one of {OUTPUT_KINDS}")
         d = self.root / "output" / kind
-        d.mkdir(parents=True, exist_ok=True)
+        what = f"the output bin folder output/{kind}"
+        with longpath.guard(what, d):
+            d.mkdir(parents=True, exist_ok=True)
         stem = f"{timestamp()}_{safe_label(label)}"
         for n in range(1000):
             p = d / (f"{stem}{ext}" if n == 0 else f"{stem}-{n}{ext}")
             if not p.exists():
+                longpath.check_room(d, len(p.name), what, holds=f"the new file {p.name}")
                 return p
         raise rules.OverwriteRefused(f"could not allocate a new output under {d}")
 
@@ -244,14 +264,18 @@ class LibraryStore:
 
     # ---------------------------------------------------------- writing
     def new_dir(self, *parts: str, label: Optional[str] = None) -> Path:
-        """Create a fresh, never-before-used entry directory."""
+        """Create a fresh, never-before-used entry directory (a path the OS cannot take:
+        rules.PathTooLong, nothing made)."""
         parent = self.root.joinpath(*parts)
-        parent.mkdir(parents=True, exist_ok=True)
+        what = f"a new library entry under {'/'.join(parts) or 'the library'}"
+        with longpath.guard(what, parent):
+            parent.mkdir(parents=True, exist_ok=True)
         stem = timestamp() + (f"_{safe_label(label)}" if label else "")
         for n in range(1000):
             d = parent / (stem if n == 0 else f"{stem}-{n}")
             try:
-                d.mkdir()           # exist_ok=False: never reuse a directory
+                with longpath.guard(what, d):
+                    d.mkdir()       # exist_ok=False: never reuse a directory
                 return d
             except FileExistsError:
                 continue
@@ -260,21 +284,27 @@ class LibraryStore:
     @staticmethod
     def write_json(path: Path, obj) -> Path:
         rules.ensure_new_path(path)
-        with open(path, "x", encoding="utf-8") as f:
+        with longpath.guard("a library file", path):
+            f = open(path, "x", encoding="utf-8")
+        with f:
             json.dump(obj, f, indent=2, default=_json_default)
         return path
 
     @staticmethod
     def write_npz(path: Path, **arrays) -> Path:
         rules.ensure_new_path(path)
-        with open(path, "xb") as f:
+        with longpath.guard("a library file", path):
+            f = open(path, "xb")
+        with f:
             np.savez_compressed(f, **arrays)
         return path
 
     @staticmethod
     def write_field(path: Path, fld) -> Path:
         rules.ensure_new_path(path)
-        with open(path, "xb") as f:
+        with longpath.guard("a library file", path):
+            f = open(path, "xb")
+        with f:
             fld.save(f)
         return path
 
@@ -296,7 +326,9 @@ class LibraryStore:
         ok, buf = cv2.imencode(".png", img8)
         if not ok:
             return None
-        with open(path, "xb") as f:
+        with longpath.guard("a library file", path):
+            f = open(path, "xb")
+        with f:
             f.write(buf.tobytes())
         return path
 

@@ -869,6 +869,34 @@ def as_facescan(s, fs) -> FaceScan:
     return hits[-1]
 
 
+def _low_repeats(reps: list) -> list:
+    """The repeats of one placement that kept far fewer face points than the others
+    (profile.low_repeats) -> [{repeat, metric_scan, points, others_median, pct_of_others,
+    capture_s, others_capture_s}]. reps: [{metric_scan, face_points, capture_s}]."""
+    out = []
+    for lo in profile_mod.low_repeats([r.get("face_points") or 0 for r in reps]):
+        k = lo["repeat"]
+        caps = [float(r["capture_s"]) for i, r in enumerate(reps, 1)
+                if i != k and r.get("capture_s") is not None]
+        out.append({**lo, "metric_scan": reps[k - 1].get("metric_scan"),
+                    "capture_s": reps[k - 1].get("capture_s"),
+                    "others_capture_s": round(float(np.median(caps)), 2) if caps else None})
+    return out
+
+
+def _low_repeat_warning(lo: dict, did: str, tail: str = "") -> str:
+    """One line naming the repeat and the two counts: its face points, the others' median."""
+    took = ""
+    if lo.get("capture_s") is not None and lo.get("others_capture_s") is not None:
+        took = (f"; its capture took {float(lo['capture_s']):.1f} s, the others "
+                f"{float(lo['others_capture_s']):.1f} s")
+    return (f"repeat {lo['repeat']} ({lo['metric_scan']}) {did} {lo['points']} face points, "
+            f"far fewer than the other repeats ({lo['others_median']:.0f}, their median: "
+            f"{lo['pct_of_others']:.0f} % of theirs){took} - something disturbed it (a glint, a "
+            "moved part, a busy PC); the profile uses it only where it measured" + tail
+            + ": scan again if in doubt")
+
+
 def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int = 3,
                        margin_dmd_px: float = 6.0, polar: bool = True, duty: Optional[float] = None,
                        steps=None, periods=None, polar_steps: int = patterns.POLAR_STEPS,
@@ -1005,6 +1033,10 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
             worst = max(miss, key=lambda kc: kc[1].get("median_mm") or float("inf"))[1]
             warnings.append(f"repeat{'s' if len(miss) > 1 else ''} "
                             f"{', '.join(str(k) for k, _ in miss)}: {worst['warning']}")
+        # a repeat that kept far fewer face points than its siblings (the bench: one of three
+        # kept half and took longer, and nothing said so) is named, with both counts
+        low = _low_repeats(reps)
+        warnings += [_low_repeat_warning(lo, "kept") for lo in low]
         if flood is not None:
             s.store.write_preview(d / "preview.png", flood[y0:y1, x0:x1])
         meta = {"kind": "facescan", "id": d.name, "label": label, "geometry_id": p.geometry_id,
@@ -1019,7 +1051,8 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
                 "dmd_ellipse": t.dmd_ellipse, "method": "plane",
                 "depth_set": set_meta, "depth_frames": nb,
                 "polar": bool(polar), "polar_patterns": specs, "crop_x0y0x1y1": list(box),
-                "metric_scans": ids, "repeats": reps, "mock": s.mock, "rig": rig_stamp,
+                "metric_scans": ids, "repeats": reps, "low_repeats": low,
+                "mock": s.mock, "rig": rig_stamp,
                 "note": "polar coords: R = 1 at the face rim (the DMD face ellipse normalised); "
                         "polar frames are float32 camera DN of the crop, in polar_patterns order; "
                         "pattern 255 lands bright when invert is false",
@@ -1597,6 +1630,18 @@ def face_profile(s, scans=None, face=None, label: Optional[str] = None,
     elif st["repeatability_median_mm"] is not None and st["repeatability_median_mm"] > REPEAT_WARN_MM:
         warnings.append(f"per-point repeatability {st['repeatability_median_mm']:.3f} mm (median) is "
                         f"above {REPEAT_WARN_MM:g} mm: dim / glinting face or a moving part?")
+    # what each repeat gave the profile: one that measured far fewer face points than the
+    # others is named with both counts (whatever its face scan said: an older scan, or plain
+    # metric scans, said nothing)
+    st["low_repeats"] = _low_repeats([
+        {"metric_scan": m.id, "face_points": n, "capture_s": (m.meta or {}).get("capture_s")}
+        for m, n in zip(ms, st["repeat_face_points"])])
+    for lo in st["low_repeats"]:
+        warnings.append(_low_repeat_warning(
+            lo, "gave the profile",
+            f" ({st['repeats_used']} of {len(ms)} repeats measured the face; "
+            f"{st['all_repeats_pct'] or 0:.0f} % of the face points were measured by all "
+            f"{len(ms)})"))
     if st["grid_coverage_pct"] is not None and st["grid_coverage_pct"] < 90:
         warnings.append(f"only {st['grid_coverage_pct']:.0f}% of the face grid is measured")
     if t.calibration_id != cal.id:

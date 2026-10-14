@@ -315,8 +315,11 @@ def runs_dir_for(cfg: StationConfiguration) -> Path:
 def open_cycle(cfg: StationConfiguration, profile: str, *, runs_dir=None, mock: bool,
                operator_confirmed: bool = False, source: str = "") -> dict:
     """A NEW cycle folder + its run.log.jsonl (never an existing one). -> {cycle_id,
-    cycle_dir, log (RunLog)}; step run folders go under <cycle_dir>/steps/."""
-    cycle_id, cycle_dir = R.new_run(runs_dir or runs_dir_for(cfg), cfg.station_id)
+    cycle_dir, log (RunLog)}; step run folders go under <cycle_dir>/steps/ (the folder must
+    have room for them, or the cycle is refused before it starts: rules.PathTooLong)."""
+    cycle_id, cycle_dir = R.new_run(
+        runs_dir or runs_dir_for(cfg), cfg.station_id,
+        room=R.steps_room(STEPS_DIR, [_name(cfg.station_id, s.id) for s in cfg.flow]))
     log = R.RunLog(Path(cycle_dir) / "run.log.jsonl", cycle_id)
     log.event("run_start", station=cfg.station_id, mode="MOCK" if mock else "REAL", job="flow",
               config=cfg.source.name if cfg.source else None, profile=profile,

@@ -4,6 +4,7 @@ One TI DLP LightCrafter 4500 (DMD) and one FLIR Blackfly S mono camera become ma
 
 It is one engine with one small verb API (`engine/api.py`). A web UI, a CLI and AI agents (Claude, Grok) all drive the same verbs. The engine owns the hardware, patterns, decoding, calibration, the library and the safety rules; callers never touch the rig directly.
 
+- How it measures, in plain words (one page): [`docs/HOW_IT_MEASURES.md`](docs/HOW_IT_MEASURES.md)
 - Spec: [`docs/ENGINE_ARCHITECTURE.md`](docs/ENGINE_ARCHITECTURE.md)
 - Agent guide: [`ui/agent.md`](ui/agent.md)
 - Operating modes (Measure / Quick check / Station) and the mount (fixed / mobile): *Operating modes* below

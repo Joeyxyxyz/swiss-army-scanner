@@ -1,22 +1,32 @@
 """
 DMD control utility — DLPC350 over USB-HID. NOT PART OF THE SCAN PATH.
 
-This module exists for diagnostics, LED work and future pattern-mode work
-(build step 10). It is the ONLY engine module allowed to load the DLPC350
-USB driver, and loading it poisons the process for scanning on purpose:
+This module exists for diagnostics of the video input. It is one of the two
+engine modules allowed to load USB code (the sequence-control helper,
+engine/seqctl/helper.py, is the other), the only one that loads the seed
+DLPC350 driver, and loading it poisons the process for scanning on purpose:
 `rules.check_scan_path_usb_free()` refuses to open or drive the projector
 once swiss_army_sensor.drivers.dlp_driver is imported. Run it as its own
 process:
 
     python -m engine.capture.dmd_control --status
-    python -m engine.capture.dmd_control --relock
-    python -m engine.capture.dmd_control --source 0
+    python -m engine.capture.dmd_control --relock --yes
+    python -m engine.capture.dmd_control --source 0 --yes
+
+Every command takes the machine-wide rig lock (capture/riglock.py, holder
+"dmd_control") before the USB device is opened, and exits 2 with one line if
+a scan holds it: nothing may be sent to the controller while a scan runs.
 
 The write commands (--relock, --source, --bitdepth) make the controller
-re-acquire its HDMI input, which would wreck a scan in progress: they take
-the machine-wide rig lock (capture/riglock.py, holder "dmd_control") before
-the USB device is opened, and exit 2 with one line if a scan holds it.
---status only reads and stays lock-free (it says so).
+re-acquire its video input: the picture leaves the wall and may not come
+back without a power cycle. They need --yes and are refused (exit 2, nothing
+sent) without it; no command waits for input. --status only reads.
+
+Writes reach the device only inside `driver.writes_allowed(reason)`, which
+main() enters after --yes and nothing else in the repo enters: select_source
+and safe_relock called from other code on a real device are refused by the
+driver. This tool cannot switch the projector display (video / pattern
+sequence): it has no such command, and the driver refuses that write always.
 
 tests/test_rules.py fails the build if any other engine module imports it.
 
@@ -47,8 +57,10 @@ byte-verified against pycrafter4500 — CMD3 goes on the wire before CMD2)
         byte0 bits 2:0 source: 0 parallel RGB (the EVM's HDMI), 1 internal
         test pattern, 2 flash, 3 FPD-link; bits 5:3 parallel bit depth
         (0=30, 1=24 [reset], 2=20, 3=16, 4=10, 5=8).
-    Display Mode Selection   CMD2 0x1A  CMD3 0x1B  write   §2.4.1, Table 2-49, p.37-38
-        byte0 bit 0: 0 video, 1 pattern.
+    Display Mode Selection   CMD2 0x1A  CMD3 0x1B          §2.4.1, Table 2-49, p.37-38
+        byte0 bit 0: 0 video, 1 pattern. NOT SENT by this tool (named here
+        because it is the other command that makes the controller re-acquire
+        its input).
     Input Video Signal       CMD2 0x07  CMD3 0x1C  read    §2.1.5, Table 2-5, p.13-14;
       Detection Status                                     appendix quick reference p.68
         28-byte reply, firmware >= 2.0.0. The controller monitors the signal
@@ -56,9 +68,9 @@ byte-verified against pycrafter4500 — CMD3 goes on the wire before CMD2)
         "USB: 0x04"; the appendix lists only 0x071C / 28 bytes — treated as
         a typo.)
 
-Closing: the swiss_army_sensor DLPDriver.close() PARKS THE DMD (mirrors
-off). This utility closes the HID handle directly and never parks, so a
-status check does not black out the display.
+Closing: this utility closes the HID handle directly and never parks the
+mirrors, so a status check does not black out the display. (The seed
+DLPDriver.close() would park them where writes are allowed.)
 """
 
 from __future__ import annotations
@@ -79,8 +91,12 @@ from .riglock import RigLock
 LOCK_HOLDER = "dmd_control"
 
 CMD_INPUT_SOURCE = (0x1A, 0x00)
-CMD_DISPLAY_MODE = (0x1A, 0x1B)
 CMD_VIDEO_SIGNAL_STATUS = (0x07, 0x1C)
+
+WRITE_FLAGS = "--relock, --source, --bitdepth"
+NEEDS_YES = (f"dmd_control: nothing sent - {WRITE_FLAGS} write to the projector: it "
+             "re-acquires its video input, the picture leaves the wall and may not come "
+             "back without a power cycle. Add --yes to send (no command waits for input).")
 
 SOURCES = {0: "parallel RGB (HDMI on the EVM)", 1: "internal test pattern",
            2: "flash", 3: "FPD-link"}
@@ -176,7 +192,7 @@ class VideoLockStatus:
             s += (f" — LOCK FAILED. The controller saw {self.resolution}, "
                   f"v-blank {self.v_blank_lines} lines, first line {self.first_line}; the DMD "
                   "will show its internal test pattern (blue lines). Check the "
-                  "Windows display mode is 912x1140@60 and re-run --relock.")
+                  "Windows display mode is 912x1140@60 and re-run --relock --yes.")
         elif self.detected and (self.h_res, self.v_res) != NATIVE:
             s += f" — note: not the DMD-native {NATIVE[0]}x{NATIVE[1]}"
         return s
@@ -205,6 +221,9 @@ class DMDControl:
     """Thin, guarded wrapper over the DLPC350 HID driver.
 
     `driver` may be a MockDLPDriver (tests) or a real, unopened DLPDriver.
+    On a real driver the writes (select_source, safe_relock) pass only inside
+    `driver.writes_allowed(reason)`, which main() enters after --yes: called
+    from anywhere else they raise WriteRefused with nothing sent.
     """
 
     def __init__(self, driver: Optional[DLPDriver] = None, mock: bool = False):
@@ -243,15 +262,6 @@ class DMDControl:
             raise ValueError(f"bit_depth must be one of {sorted(BIT_DEPTHS.values())}")
         self.driver._send(CMD_INPUT_SOURCE, bytes([(kind & 0x07) | (depth_code << 3)]))
 
-    def select_display_mode(self, mode: int) -> None:
-        """Display Mode Selection (0x1A1B). 0 video, 1 pattern.
-
-        Switching modes makes the controller re-acquire its input — the
-        operation behind the blue-lines failure. Follow with safe_relock()."""
-        if mode not in (0, 1):
-            raise ValueError("mode must be 0 (video) or 1 (pattern)")
-        self.driver._send(CMD_DISPLAY_MODE, bytes([mode]))
-
     def read_video_lock(self) -> VideoLockStatus:
         """Input Video Signal Detection Status (0x071C read, 28 bytes)."""
         return parse_video_lock(self.driver._send(CMD_VIDEO_SIGNAL_STATUS, read=True))
@@ -275,22 +285,30 @@ class DMDControl:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m engine.capture.dmd_control",
-        description="DLPC350 diagnostics over USB. NOT part of the scan path. Write commands "
-                    "(--relock, --source, --bitdepth) take the machine-wide rig lock, so they "
-                    "refuse (exit 2) while a scan holds the rig; --status is read-only and "
-                    "lock-free.")
+        description="DLPC350 video-input diagnostics over USB. NOT part of the scan path. "
+                    "Every command takes the machine-wide rig lock, so it is refused (exit 2) "
+                    "while a scan holds the rig. The write commands (--relock, --source, "
+                    "--bitdepth) make the projector re-acquire its video input and need "
+                    "--yes; --status only reads.")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--status", action="store_true",
-                   help="read input video lock status (read-only: does not take the rig lock)")
+                   help="read input video lock status (read-only; takes the rig lock for "
+                        "the read)")
     g.add_argument("--relock", action="store_true",
-                   help="re-assert HDMI/parallel source and poll until Detected")
+                   help="re-assert HDMI/parallel source and poll until Detected (a write: "
+                        "needs --yes)")
     g.add_argument("--source", type=int, choices=sorted(SOURCES),
-                   help="Input Source Selection: " + ", ".join(f"{k}={v}" for k, v in SOURCES.items()))
+                   help="Input Source Selection (a write: needs --yes): "
+                        + ", ".join(f"{k}={v}" for k, v in SOURCES.items()))
     ap.add_argument("--bitdepth", "--bit-depth", dest="bit_depth", type=int, default=None,
                     choices=sorted(BIT_DEPTHS.values()),
                     help="parallel RGB bit depth (default 24). Alone: assert source 0 "
-                         "at this depth, then read status. With --relock/--source: the "
-                         "depth sent with them.")
+                         "at this depth, then read status (a write: needs --yes). With "
+                         "--relock/--source: the depth sent with them.")
+    ap.add_argument("--yes", action="store_true",
+                    help=f"send the write ({WRITE_FLAGS}): the picture leaves the wall while "
+                         "the projector re-acquires its input. Without --yes a write command "
+                         "is refused (exit 2) with nothing sent")
     ap.add_argument("--timeout", type=float, default=5.0)
     ap.add_argument("--mock", action="store_true", help="MockDLPDriver, no hardware")
     a = ap.parse_args(argv)
@@ -300,48 +318,58 @@ def main(argv=None) -> int:
     a.bit_depth = 24 if a.bit_depth is None else a.bit_depth
 
     # every command but --status WRITES to the controller (Input Source
-    # Selection makes it re-acquire the HDMI input), so it must never run
-    # under a scan: take the same machine-wide lock the scan path takes,
-    # BEFORE the USB device is opened. The mock touches no hardware.
+    # Selection makes it re-acquire the HDMI input): the answer is an
+    # argument, never a prompt, and without it nothing is opened or sent.
+    if not a.status and not a.yes:
+        print(NEEDS_YES, file=sys.stderr)
+        return 2
+    # nothing may be sent to the controller while a scan runs (a write wrecks
+    # it, and a scan may be playing a pattern sequence, when even a read is
+    # too much): every command takes the same machine-wide lock the scan path
+    # takes, BEFORE the USB device is opened. The mock touches no hardware.
     lock = None
-    if not a.status and not a.mock:
+    if not a.mock:
         try:
             lock = RigLock(holder=LOCK_HOLDER).acquire()
         except RigBusy as e:
             print(f"dmd_control: nothing sent - {e}", file=sys.stderr)
             return 2
-    elif a.status and not a.mock:
-        print("(--status is read-only and does not take the rig lock)")
     try:
-        return _run(a, set_depth_only)
+        with DMDControl(mock=a.mock) as dmd:
+            if a.status:
+                return _run(a, dmd, set_depth_only)
+            # the one place in the repo that allows writes to the real device
+            what = "--relock" if a.relock else (
+                f"--bitdepth {a.bit_depth}" if set_depth_only else f"--source {a.source}")
+            with dmd.driver.writes_allowed(f"dmd_control {what} --yes"):
+                return _run(a, dmd, set_depth_only)
     finally:
         if lock is not None:
             lock.release()
 
 
-def _run(a, set_depth_only: bool) -> int:
-    with DMDControl(mock=a.mock) as dmd:
-        if set_depth_only:
-            dmd.select_source(0, bit_depth=a.bit_depth)
-            print(f"input source -> 0 ({SOURCES[0]}), parallel bit depth {a.bit_depth}")
-            time.sleep(STATUS_POLL_S)
-            st = dmd.read_video_lock()
-        elif a.status:
-            st = dmd.read_video_lock()
-        elif a.relock:
-            print(f"re-asserting source 0 ({SOURCES[0]}, {a.bit_depth}-bit), "
-                  f"polling up to {a.timeout:.1f}s ...")
-            st = dmd.safe_relock(timeout_s=a.timeout, bit_depth=a.bit_depth)
-        else:
-            dmd.select_source(a.source, bit_depth=a.bit_depth)
-            print(f"input source -> {a.source} ({SOURCES[a.source]})")
-            if a.source != 0:
-                return 0
-            time.sleep(STATUS_POLL_S)
-            st = dmd.read_video_lock()
-        print(st.describe())
-        print(st.table())
-        return 0 if st.detected else 2
+def _run(a, dmd: DMDControl, set_depth_only: bool) -> int:
+    if set_depth_only:
+        dmd.select_source(0, bit_depth=a.bit_depth)
+        print(f"input source -> 0 ({SOURCES[0]}), parallel bit depth {a.bit_depth}")
+        time.sleep(STATUS_POLL_S)
+        st = dmd.read_video_lock()
+    elif a.status:
+        st = dmd.read_video_lock()
+    elif a.relock:
+        print(f"re-asserting source 0 ({SOURCES[0]}, {a.bit_depth}-bit), "
+              f"polling up to {a.timeout:.1f}s ...")
+        st = dmd.safe_relock(timeout_s=a.timeout, bit_depth=a.bit_depth)
+    else:
+        dmd.select_source(a.source, bit_depth=a.bit_depth)
+        print(f"input source -> {a.source} ({SOURCES[a.source]})")
+        if a.source != 0:
+            return 0
+        time.sleep(STATUS_POLL_S)
+        st = dmd.read_video_lock()
+    print(st.describe())
+    print(st.table())
+    return 0 if st.detected else 2
 
 
 if __name__ == "__main__":

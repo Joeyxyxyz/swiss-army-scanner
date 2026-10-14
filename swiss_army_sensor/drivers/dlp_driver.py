@@ -56,12 +56,27 @@ Command codes (TI DLPU010G):
   Pattern Exposure/Period      CMD2:0x1A CMD3:0x29
   Software Reset               CMD2:0x08 CMD3:0x02
   DMD Park/Unpark              CMD2:0x06 CMD3:0x09
+
+WRITE GUARD (real device only; the mock driver sends nothing):
+  Every command passes one place, DLPDriver._send, and is checked there on
+  the BUILT packet (bytes 5-6 are the command, bit 7 of byte 1 is "read"),
+  before the first byte goes to the device:
+    - a read always passes;
+    - a write passes only inside `with driver.writes_allowed(reason)`;
+    - a write of Display Mode Select never passes: the projector display is
+      switched by a person, never through this driver.
+  So no single call (set_mode, software_reset, set_led_current, start_sequence,
+  a raw _send, ...) changes anything on the controller, and close() parks the
+  mirrors only when writes are allowed. open() refuses when SAS_NO_HARDWARE is
+  set (the test suite sets it).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -77,6 +92,15 @@ DMD_HEIGHT = 1140
 _PKT = 65          # hidapi write size: report id + 64
 _FIRST_DATA = 58   # data bytes that fit in the first packet (64 - 6 header)
 _CONT_DATA = 64    # data bytes per continuation packet
+
+# environment variable: set (to anything but "" or "0") for a process that must not
+# open a real device
+NO_HARDWARE_ENV = "SAS_NO_HARDWARE"
+
+
+class WriteRefused(RuntimeError):
+    """A write was about to go to a real DLPC350 and is not allowed. Nothing
+    was sent."""
 
 
 class CMD:
@@ -170,10 +194,15 @@ class DLPDriver:
         self.transport = transport   # PatternTransport for streamed patterns
         self._hid = None
         self._seq = 0
+        self._writes_reason = None   # set inside writes_allowed() only
 
     # ------------------------------------------------------------ lifecycle
 
     def open(self):
+        if os.environ.get(NO_HARDWARE_ENV, "").strip() not in ("", "0"):
+            raise RuntimeError(
+                f"{NO_HARDWARE_ENV} is set: this process must not open a real "
+                "DLPC350 (use MockDLPDriver)")
         try:
             import hid
             self._hid = hid.device()
@@ -195,6 +224,11 @@ class DLPDriver:
         if self._hid is not None:
             try:
                 self.park_dmd(True)
+            except WriteRefused:
+                # parking is a write: outside writes_allowed() the handle is
+                # closed and the mirrors stay as they are
+                log.info("DLPC350 closed without parking the mirrors "
+                         "(writes are not allowed)")
             finally:
                 self._hid.close()
                 self._hid = None
@@ -207,12 +241,51 @@ class DLPDriver:
 
     # ------------------------------------------------------------ transport
 
+    @contextmanager
+    def writes_allowed(self, reason: str):
+        """Allow writes to the real device inside this `with` block, and only
+        there. `reason` says who allowed them and how (it is logged). Reads
+        need no permission; Display Mode Select is refused in here too (see
+        WRITE GUARD in the module docstring)."""
+        reason = str(reason or "").strip()
+        if not reason:
+            raise ValueError("writes_allowed needs a reason: who allows the "
+                             "write, and how")
+        before, self._writes_reason = self._writes_reason, reason
+        log.warning("DLPC350 writes allowed: %s", reason)
+        try:
+            yield self
+        finally:
+            self._writes_reason = before
+
+    def _check_packet(self, first: bytes) -> None:
+        """The write guard, on the first packet of a built command (it carries
+        the header; continuation packets are raw data). Raises WriteRefused
+        before anything is written."""
+        if first[1] & 0x80:
+            return                              # a read
+        cmd = (first[6], first[5])              # on the wire: CMD3, then CMD2
+        name = f"0x{cmd[0]:02X}{cmd[1]:02X}"
+        if cmd == CMD.DISPLAY_MODE:
+            raise WriteRefused(
+                f"Display Mode Select ({name}) is never written through this "
+                "driver: the projector display (video / pattern sequence) is "
+                "switched by a person. Nothing was sent.")
+        if self._writes_reason is None:
+            raise WriteRefused(
+                f"write of command {name} refused: this driver writes to a "
+                "real DLPC350 only inside `with driver.writes_allowed(reason)`"
+                ". Nothing was sent.")
+
     def _send(self, cmd: Tuple[int, int], data: bytes = b"",
               read: bool = False) -> bytes:
-        """Send one command; always drain and parse the 64-byte reply."""
+        """Send one command; always drain and parse the 64-byte reply.
+        A write that is not allowed raises WriteRefused with nothing sent."""
         self._seq = (self._seq + 1) & 0xFF
-        for pkt in build_packet(cmd, data, read=read, reply=True,
-                                seq=self._seq):
+        packets = build_packet(cmd, data, read=read, reply=True,
+                               seq=self._seq)
+        self._check_packet(packets[0])
+        for pkt in packets:
             self._hid.write(pkt)
         raw = bytes(self._hid.read(64, timeout_ms=2000))
         return parse_reply(raw)
@@ -227,6 +300,8 @@ class DLPDriver:
         self._send(CMD.DMD_PARK, bytes([0x01 if park else 0x00]))
 
     def set_mode(self, mode: str):
+        """Display Mode Select. On a real device this is refused, always
+        (WriteRefused, nothing sent); the mock driver records it."""
         assert mode in ("video", "pattern")
         self._send(CMD.DISPLAY_MODE, bytes([0x01 if mode == "pattern" else 0x00]))
         self.cfg.mode = mode

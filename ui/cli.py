@@ -3560,8 +3560,9 @@ def cmd_scan_trigger(ctx):
     if not a.pattern_mode_set_by_human:
         raise CLIError("scan-trigger needs --pattern-mode-set-by-human: a HUMAN has put the "
                        "projector in Pattern Sequence mode (flash, TRIG_OUT_1 wired to the "
-                       "camera) in the 4500 MKII GUI. The engine never switches the projector "
-                       "mode (docs/TRIGGER_FULLSPEED_TEST.md)")
+                       "camera) in the vendor program. This command never sends the projector "
+                       "a command, and it gives mm only with a stereo calibration made in "
+                       "pattern-sequence display (docs/TRIGGER_FULLSPEED_TEST.md)")
     r = api.scan_trigger(a.pack, a.variant, a.label, ctx.preset(), a.line, a.repeats,
                          a.exposure, ACK_PHRASE, a.first_timeout)
     t = r["timing"]

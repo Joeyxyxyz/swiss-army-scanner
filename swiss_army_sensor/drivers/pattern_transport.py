@@ -16,13 +16,16 @@ video input works the same way, which is most of what makes the package
 drop-in across DMD families (DLP4500 here; DLP3010/DLP471TP/DLP472TP
 differ only in resolution, taken from hardware.DMD_PROFILES).
 
-Usage (real hardware, Windows 10 host):
+Usage (real hardware, Windows 10 host): the transport alone, no USB.
     from swiss_army_sensor.drivers.pattern_transport import HDMITransport
     t = HDMITransport(monitor_offset=(1920, 0), size=(912, 1140))
-    dlp = DLPDriver(transport=t).open()
-    dlp.set_mode("pattern"); dlp.set_pattern_source("stream")
-    dlp.set_pattern_trigger_mode(0); dlp.set_trigger_out1()
-    dlp.project_static(pattern)
+    t.show(pattern)
+
+The projector display (video / pattern sequence) and the sequence settings
+are not set from here: a person sets them in the vendor program. The seed
+driver refuses to write the display register to a real device, always, and
+writes nothing else outside `driver.writes_allowed(reason)` (dlp_driver.py,
+WRITE GUARD).
 
 `monitor_offset` is the top-left pixel of the EVM's display in the
 Windows virtual desktop (e.g. (1920, 0) when the EVM is to the right of

@@ -2,7 +2,9 @@
 
 **Symptom:** after a DLPC350 USB display-mode or input-source command, the DMD stops showing the HDMI desktop and drops to its internal test pattern (blue lines). Only a power cycle has recovered it so far.
 
-**Scope:** this procedure and `engine/capture/dmd_control.py` are for diagnostics, LED work and future pattern-mode work only. **They are not part of the scan path.** The scan path (`first_scan_v10.py`, `engine/capture/projector.py`) never sends USB display-mode or input-source commands (ENGINE_ARCHITECTURE §9 rule 1). The engine also refuses to project in any process where the USB driver is loaded.
+**Scope:** this procedure and `engine/capture/dmd_control.py` are for diagnostics of the video input only. **They are not part of the scan path.** The scan path (`first_scan_v10.py`, `engine/capture/projector.py`) never sends USB display-mode or input-source commands (ENGINE_ARCHITECTURE §9 rule 1). The engine also refuses to project in any process where the USB driver is loaded.
+
+**What the tool sends:** one status read, and one write (Input Source Selection). It cannot switch the projector display (video / pattern sequence): it has no such command, and the driver under it refuses that write always. The write commands (`--relock`, `--source`, `--bitdepth`) make the projector re-acquire its video input, so the picture leaves the wall and may not come back without a power cycle. They need `--yes`; without it the tool exits 2 and sends nothing. Every command, `--status` included, takes the rig lock and exits 2 while a scan holds the rig.
 
 ## Root cause (working hypothesis)
 
@@ -29,9 +31,9 @@ The status readout shows both, so you can tell which mode is live.
 |---|---|---|---|---|
 | Input Video Signal Detection Status | **0x07** | **0x1C** | read, 28 bytes, firmware ≥ 2.0.0 | §2.1.5, Table 2-5 (p.13–14). Appendix quick reference p.68 lists `0x071C`, 28 bytes. The §2.1.5 header also shows a stray "USB: 0x04" that appears nowhere else; treated as a typo. |
 | Input Source Selection | 0x1A | 0x00 | write | §2.3.4.2, Table 2-19. Bits 2:0 are the source (0 parallel/HDMI, 1 test pattern, 2 flash, 3 FPD-link). Bits 5:3 are the parallel bit depth (0=30, **1=24**, 2=20, 3=16, 4=10, 5=8). |
-| Display Mode Selection | 0x1A | 0x1B | write | §2.4.1, Table 2-49 (0 video, 1 pattern) |
+| Display Mode Selection | 0x1A | 0x1B | **not sent by the tool** (named because it is the other command that makes the controller re-acquire its input) | §2.4.1, Table 2-49 (0 video, 1 pattern) |
 
-The wire format is `swiss_army_sensor.drivers.dlp_driver`, which is byte-verified against pycrafter4500: CMD3 goes on the wire before CMD2. The tool closes the HID handle **without** parking the DMD, unlike `DLPDriver.close()`, which parks it.
+The wire format is `swiss_army_sensor.drivers.dlp_driver`, which is byte-verified against pycrafter4500: CMD3 goes on the wire before CMD2. The tool closes the HID handle **without** parking the DMD.
 
 ## Procedure
 
@@ -43,7 +45,7 @@ set PY=python
 
 **0. Preconditions.**
 - The LightCrafter GUI is **closed** while the tool runs, because both open the same HID device.
-- No scan is running.
+- No scan is running (the tool takes the rig lock for every command and is refused while a scan holds it).
 
 **1. Record the BEFORE timing,** with the current CVT-RB mode still active:
 
@@ -60,7 +62,7 @@ Copy the table into "Before" below.
 
 **3. Set the bit depth to 24.** Use one of these:
 - **LightCrafter GUI:** Video Mode tab → Parallel RGB bit depth = **24** → close the GUI.
-- **The tool:** `%PY% -m engine.capture.dmd_control --bitdepth 24`. This re-asserts source 0 at 24-bit.
+- **The tool:** `%PY% -m engine.capture.dmd_control --bitdepth 24 --yes`. This re-asserts source 0 at 24-bit.
 
 **4. Record the AFTER timing.** Expect:
 - **Detected** at **912x1140**
@@ -74,8 +76,8 @@ Copy the table into "Before" below.
 **5. Recovery test.** This deliberately causes the failure, then recovers without a power cycle:
 
 ```
-%PY% -m engine.capture.dmd_control --source 1     (blue lines / test pattern should appear)
-%PY% -m engine.capture.dmd_control --relock       (expect "Detected", exit code 0)
+%PY% -m engine.capture.dmd_control --source 1 --yes     (blue lines / test pattern should appear)
+%PY% -m engine.capture.dmd_control --relock --yes       (expect "Detected", exit code 0)
 ```
 
 If `--relock` ends in **Lock Failed**, the output shows the resolution, vertical blanking and first line the controller saw. Record them below. Power-cycling the EVM is still the fallback.

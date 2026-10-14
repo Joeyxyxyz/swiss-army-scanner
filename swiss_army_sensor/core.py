@@ -20,9 +20,15 @@ import numpy as np
 
 from . import patterns as P
 from . import decoders as D
-from .drivers.dlp_driver import DLPDriver, MockDLPDriver
+from .drivers.dlp_driver import DLPDriver, MockDLPDriver, WriteRefused
 from .drivers.camera_driver import CameraDriver, MockCameraDriver
 from ._utils import synthetic_scene
+
+USB_REFUSED = (
+    "SensorRig.create(mock=False, usb=True) is refused: it used to switch the "
+    "projector to pattern display over USB without being asked. The projector "
+    "display is switched by a person, never by this package. Nothing was "
+    "opened and nothing was sent. Use usb=False (the HDMI-only path).")
 
 
 class SensorMode(str, Enum):
@@ -59,8 +65,8 @@ class _HDMIOnlyDLP:
     interface SensorRig uses, delivers every pattern through the
     HDMITransport, and cannot touch USB by construction. LED color
     selection is unavailable on this path (no USB), so color modes
-    degrade to whatever the EVM's current LED state shows — use
-    usb=True (configured before streaming) if a mode needs LED control.
+    degrade to whatever the EVM's current LED state shows — a person
+    selects the LEDs in the vendor program if a mode needs another color.
     """
 
     def __init__(self, transport):
@@ -74,8 +80,9 @@ class _HDMIOnlyDLP:
     def set_leds(self, *a, **k):
         import logging
         logging.getLogger(__name__).warning(
-            "HDMI-only path: LED control needs USB (usb=True, configured "
-            "before the stream is up). Ignoring set_leds%s.", a)
+            "HDMI-only path: this package does not select LEDs on a real "
+            "projector (a person does, in the vendor program). Ignoring "
+            "set_leds%s.", a)
 
     def start_sequence(self):
         pass
@@ -107,9 +114,9 @@ class SensorRig:
                monitor_offset=(1920, 0), usb: bool = False) -> "SensorRig":
         """
         mock=True  -> numpy simulator end to end.
-        mock=False -> real hardware. Default is the HDMI-ONLY path:
-        patterns render fullscreen to the EVM's HDMI input and the
-        DLPC350 is NEVER opened over USB.
+        mock=False -> real hardware, the HDMI-ONLY path: patterns render
+        fullscreen to the EVM's HDMI input and the DLPC350 is NEVER
+        opened over USB.
 
         BENCH RULE (verified on real silicon, 2026-09): the HDMI stream
         and the USB command channel are mutually exclusive while
@@ -117,33 +124,23 @@ class SensorRig:
         re-run source acquisition; the non-standard 912x1140 timing then
         fails to re-lock and the DMD falls back to its internal test
         pattern (blue lines = "no valid source"). Whoever is streaming
-        owns the device; USB configures only while the stream is down.
+        owns the device.
 
-        usb=True opts into USB configuration (pattern mode, Pattern
-        Trigger Mode 0, TRIG_OUT_1) for the trigger-synced path. Order
-        of operations there: configure over USB FIRST, establish the
-        HDMI lock SECOND, then no further USB traffic while streaming.
+        usb=True on real hardware is REFUSED, always (WriteRefused,
+        before the window, the camera or the USB device is opened): it
+        used to send Display Mode Select unasked. The projector display
+        is switched by a person, never by this package.
         """
         if mock:
             dlp = MockDLPDriver().open()
             scene_img = synthetic_scene((1080, 1440), kind=scene)
             cam = MockCameraDriver(scene=scene_img, dlp=dlp).open()
         else:
+            if usb:
+                raise WriteRefused(USB_REFUSED)
             from .drivers.pattern_transport import HDMITransport
             transport = HDMITransport(monitor_offset=monitor_offset)
-            if usb:
-                dlp = DLPDriver(transport=transport).open()
-                dlp.set_mode("pattern")
-                dlp.set_pattern_source("stream")
-                dlp.set_pattern_trigger_mode(0)
-                dlp.set_trigger_out1()
-                v = dlp.validate()
-                if not v.get("valid", False):
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        "DLPC350 validation flags after setup: %s", v)
-            else:
-                dlp = _HDMIOnlyDLP(transport)
+            dlp = _HDMIOnlyDLP(transport)
             cam = CameraDriver().open()
         return cls(dlp=dlp, camera=cam, config=config)
 

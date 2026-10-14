@@ -280,6 +280,13 @@ relative for metric.
    caller tries. (A future `sync.hardware_trigger` mode will need USB
    pattern-mode — it must be a separate, explicitly-entered mode with its
    own guard, never the default.)
+   No scan, recipe, station or command-line tool switches the projector
+   display (video / pattern sequence). The seed driver
+   (`swiss_army_sensor/drivers/dlp_driver.py`) checks every command on the
+   built packet: a read passes, a write passes only inside
+   `driver.writes_allowed(reason)`, and a write of the display register is
+   refused always. Only the diagnostics tool `engine/capture/dmd_control.py`
+   allows writes, for its video-input commands, after `--yes`.
 2. **Window stays painted during holds** (pump cv2.waitKey; no bare sleeps
    in the projector transport).
 3. **LED thermal limits** enforced in config validation: short-burst
@@ -291,6 +298,20 @@ relative for metric.
 6. **Calibration is geometry-bound**; `measure/compare` refuse to report mm
    without a calibration matching the scan's geometry_id (they report px
    + a warning instead).
+   **A calibration is also bound to the projector display it was made in**
+   (video, or pattern sequence): the same pattern lands a fraction of a
+   projector column apart in the two. The calibration record and every
+   metric scan carry `display_mode`; the lookup returns only a calibration
+   of the scan's display, and a scan captured in the other display gives no
+   mm. Only the simulated bench, which has no such offset, lets one
+   calibration count for both, when it has none of the display asked for.
+   The display comes from the board poses: the capture step of a pose says
+   it (the engine's own captures in video display), a pose whose capture
+   does not say is not stored, and a pose set holds one display.
+   The rig check, the re-home and the rig gate work on the video
+   calibration. So a pattern-display calibration counts only while no video
+   calibration of the geometry is newer, and a mobile rig that is verified
+   for one calibration gives no mm with another.
 7. **Never overwrite** library data; sessions are append-only.
 
 ---

@@ -9,7 +9,13 @@ Library layout (append-only, rule 7):
 
 Poses and parity carry the preset's geometry fingerprint; calibrate_stereo
 only uses poses captured at the same geometry_id AND fingerprint (rule 6),
-so a moved rig can never be calibrated from old poses.
+so a moved rig can never be calibrated from old poses. A pose set is captured
+in ONE projector display. The capture step says which (the shot's
+`display_mode`: the engine's own capture projects through the HDMI window,
+video); capture_pose stores nothing when it does not say, writes it into the
+pose's meta and refuses a pose of the other display than its set. A pose
+stored before the key existed is a video pose. calibrate_stereo refuses a set
+that mixes the two and stamps the calibration with the set's display.
 
 Each pose records how many of its corners got a projector position; the default
 fringe periods are retried coarser when they map too few (capture_pose), a pose
@@ -206,7 +212,8 @@ def set_periods(poses: list) -> Optional[list]:
 
 def _shoot_pose(s, preset, boards: list, fxs, par, steps, periods) -> dict:
     """One capture of the board(s) at these fringe periods: decode, detection, and how many
-    corners got a projector position."""
+    corners got a projector position. "display_mode": the projector display the frames
+    were captured in - here video, the fringes go through the HDMI window."""
     from .projector import projector_corner_count
     basis = multifreq_basis(preset, par, steps, periods)
     t0 = time.perf_counter()
@@ -226,7 +233,38 @@ def _shoot_pose(s, preset, boards: list, fxs, par, steps, periods) -> dict:
     return {"basis": basis, "fld": fld, "flood": flood, "found": found, "mapped": mapped,
             "n": n, "k": k, "pct": pct, "usable": bool(usable),
             "accepted": bool(usable and pct >= MIN_PROJECTOR_CORNER_PCT),
-            "capture_s": round(time.perf_counter() - t0, 2)}
+            "capture_s": round(time.perf_counter() - t0, 2), "display_mode": "video"}
+
+
+def _stored_display(m: dict) -> str:
+    """The projector display a STORED pose says it was captured in. A pose without the
+    key is a video pose: every pose stored before the key existed was captured through
+    the HDMI window."""
+    d = m.get("display_mode") or "video"
+    return d if isinstance(d, str) else repr(d)
+
+
+def _pose_display(shot: dict, in_set: list, set_label: str) -> str:
+    """The projector display one pose capture was made in, as the capture step says it
+    (shot "display_mode", rules.DISPLAYS). Refused, before anything is stored:
+      - a capture step that does not say (rules.DisplayMismatch): a pose of unknown
+        display must never become a calibration, and never a video one by default;
+      - a pose of the other display than the poses its set already holds (ValueError)."""
+    said = shot.get("display_mode")
+    if not isinstance(said, str) or said not in rules.DISPLAYS:
+        raise rules.DisplayMismatch(
+            "capture_pose: the capture step did not say which projector display its frames "
+            f"were captured in (display_mode: {said!r}, it must be one of {rules.DISPLAYS}), "
+            "so the pose is not stored (rule 6): a calibration counts only for the display "
+            "its poses were captured in")
+    other = sorted({_stored_display(m) for m in in_set} - {said})
+    if other:
+        raise ValueError(
+            f"pose set {set_label!r} holds poses captured in {rules.display_text(other[0])}; "
+            f"this capture was made in {rules.display_text(said)}, which would mix the two "
+            "projector displays in one calibration. The pose is not stored: start a new "
+            "pose set (another set name)")
+    return said
 
 
 def capture_pose(s, preset, set_label: str = "stereo", spec: Optional[BoardSpec] = None,
@@ -247,13 +285,16 @@ def capture_pose(s, preset, set_label: str = "stereo", spec: Optional[BoardSpec]
       - else the preset's (default 8, 80, 1280 DMD px); when they map too few corners and
         auto_periods is on, the pose is captured again at COARSER_PERIODS (16,160,1280, then
         24,192,1280) and the first set that reaches the limit is stored; when none does, the
-        best attempt is stored, not accepted (it does not fix the set's periods)."""
+        best attempt is stored, not accepted (it does not fix the set's periods).
+    Projector display: the pose records the display its frames were captured in (meta
+    "display_mode", from the capture step: _pose_display). One display per pose set."""
     safe_label(set_label)
     fxs = fixture_mod.load(fixture) if fixture is not None else None
     boards = fixture_mod.boards(fxs) if fxs else [spec or BoardSpec()]
     par, src, warn = resolve_parity(s, preset, parity)
     fp = config.geometry_fingerprint(preset)
-    fixed = set_periods(list_poses(s.store, preset.geometry_id, fp, set_label))
+    in_set = list_poses(s.store, preset.geometry_id, fp, set_label)
+    fixed = set_periods(in_set)
     default = [float(x) for x in multifreq_basis(preset, par, steps, None).periods]
     if periods is not None:
         want = [float(x) for x in periods]
@@ -273,11 +314,13 @@ def capture_pose(s, preset, set_label: str = "stereo", spec: Optional[BoardSpec]
     shots = []
     for per in ladder:
         shots.append(_shoot_pose(s, preset, boards, fxs, par, steps, per))
+        _pose_display(shots[-1], in_set, set_label)         # refused: nothing is stored
         if shots[-1]["accepted"] or not shots[-1]["usable"]:
             break                       # good, or no board to map: coarser fringes can't help
     shot = shots[-1] if shots[-1]["accepted"] else max(shots, key=lambda a: a["pct"])
     basis, fld, found = shot["basis"], shot["fld"], shot["found"]
     n = shot["n"]
+    display = _pose_display(shot, in_set, set_label)
     if shot is not shots[0]:
         source = "auto"
     attempts = [{"periods_px": a["basis"].periods, "corners_found": a["n"],
@@ -313,7 +356,7 @@ def capture_pose(s, preset, set_label: str = "stereo", spec: Optional[BoardSpec]
                 "projector_corner_pct": shot["pct"], "accepted": shot["accepted"],
                 "diamond_parity": par, "parity_source": src,
                 "steps": basis.steps, "periods_px": basis.periods, "periods_source": source,
-                "attempts": attempts, "mock": s.mock,
+                "attempts": attempts, "mock": s.mock, "display_mode": display,
                 "valid_pct": round(fld.valid_pct, 2), "decode": fld.meta,
                 "capture_s": round(sum(a["capture_s"] for a in shots), 2),
                 "created": datetime.now().isoformat(timespec="seconds"), "warnings": warnings}
@@ -451,10 +494,11 @@ def calibrate_stereo(s, preset, set_label: Optional[str] = None, square_mm: Opti
     if len(is_fx) != 1:
         raise ValueError(f"pose set {set_label!r} mixes single-board poses and fixture "
                          "placements; capture one consistent set")
+    display = _display_of(poses, set_label)
     info = {"n_captured": n_captured, "skipped": skipped, "periods_px": periods_used}
     if is_fx.pop():
         return _calibrate_fixture(s, preset, poses, set_label, square_mm, projector_distortion,
-                                  fixture, rigid, fp, pars, info)
+                                  fixture, rigid, fp, pars, info, display_mode=display)
     specs = {tuple(sorted(p["board"].items())) for p in poses}
     if len(specs) != 1 or len(pars) != 1:
         raise ValueError(f"pose set {set_label!r} mixes boards or diamond parities; "
@@ -474,7 +518,8 @@ def calibrate_stereo(s, preset, set_label: Optional[str] = None, square_mm: Opti
                           extra_report={"set": set_label, "poses": ids,
                                         "square_mm_used": spec.square_mm,
                                         "periods_px": periods_used, "poses_skipped": skipped},
-                          truth=truth, parity_source=psrc, parity_info=pinfo)
+                          truth=truth, parity_source=psrc, parity_info=pinfo,
+                          display_mode=display)
     except stereo.CalibrationRejected as e:
         raise _rejected(s, preset, e, ids, set_label, info) from None
     summary = _summary(cal, fit, set_label, n_captured, par, info)
@@ -482,6 +527,21 @@ def calibrate_stereo(s, preset, set_label: Optional[str] = None, square_mm: Opti
     if truth is not None:
         summary["vs_truth"] = stereo.compare_truth(cal, truth)
     return _finish(s, preset, cal, fit, summary, set_label, par, ids)
+
+
+def _display_of(poses: list, set_label: str) -> str:
+    """The projector display a pose set was captured in: its poses' meta `display_mode`,
+    written by capture_pose (_stored_display: a pose without the key is a video pose). A
+    calibration is made in ONE display and counts only for captures in that display, so a
+    set that mixes the two is refused."""
+    seen = {_stored_display(p) for p in poses}
+    seen = [d for d in rules.DISPLAYS if d in seen] + sorted(seen - set(rules.DISPLAYS))
+    if len(seen) != 1:
+        raise ValueError(
+            f"pose set {set_label!r} mixes poses captured in "
+            f"{' and in '.join(rules.display_text(d) for d in seen)}: a calibration is made "
+            "in one projector display; capture one consistent set")
+    return rules.check_display(seen[0], f"pose set {set_label!r}: display_mode")
 
 
 def _one_period_set(poses: list, set_label: str) -> tuple:
@@ -577,6 +637,7 @@ def _summary(cal, fit: dict, set_label: str, n_captured: int, par,
                                    "projector_corner_pct", "contributed", "camera_rms_px")}
             for r in fit["per_pose"]]
     return {"calibration_id": cal.id, "geometry_id": cal.geometry_id, "set": set_label,
+            "display_mode": cal.display_mode,
             "n_poses_captured": n_captured, "n_poses_used": fit["n_poses"],
             "rms": cal.rms, "baseline_mm": round(cal.baseline_mm, 3),
             "angle_deg": round(cal.angle_deg, 3), "diamond_parity": par,
@@ -632,9 +693,11 @@ RIGID_RMS_FACTOR, RIGID_RMS_SLACK_PX = 1.5, 0.05
 
 
 def _calibrate_fixture(s, preset, poses: list, set_label: str, square_mm, projector_distortion,
-                       fixture, rigid: bool, fp, pars, info: Optional[dict] = None) -> tuple:
+                       fixture, rigid: bool, fp, pars, info: Optional[dict] = None,
+                       display_mode: str = "video") -> tuple:
     """A fixture pose set: one planar view per detected face of every placement, the
-    unchanged per-view calibration, then the rigid-fixture refinement + face-angle check."""
+    unchanged per-view calibration, then the rigid-fixture refinement + face-angle check.
+    display_mode: the projector display the placements were captured in (stamped)."""
     import cv2
     from . import rigid as rigid_mod
     if square_mm is not None:
@@ -735,7 +798,8 @@ def _calibrate_fixture(s, preset, poses: list, set_label: str, square_mm, projec
                                         "rigid": rig, "face_check": check,
                                         "periods_px": info.get("periods_px"),
                                         "poses_skipped": info.get("skipped") or []},
-                          truth=truth, board=board_rec, parity_source=psrc, parity_info=pinfo)
+                          truth=truth, board=board_rec, parity_source=psrc, parity_info=pinfo,
+                          display_mode=display_mode)
     except stereo.CalibrationRejected as e:
         raise _rejected(s, preset, e, [], set_label, info, views) from None
     summary = _summary(cal, fit, set_label, info.get("n_captured", len(poses)), par, info)

@@ -5,6 +5,19 @@ checked before the rig is touched), store, and the measurements on top
 (cylinder deviation, golden compare, accuracy check, metric mesh).
 
     metric/<geometry_id>/<ts>_<label>/  field.npz, cloud.npz, preview.png, meta.json (last)
+
+The projector display (rule 6): a capture is made in video display (every scan
+that projects through the HDMI window) or in pattern-sequence display (the two
+scans a flash pack plays: meta mode flash_trigger / flash_softsync). _save, the
+one function that writes mm, stamps the capture's display (meta "display_mode")
+and refuses a calibration of the other display before any file exists; check_cal
+and triangulate_scan look the calibration up by the stored scan's display, so
+re-triangulating never changes which display a scan counts as.
+
+The rig check, the re-home and the rig gate (engine/rigstate) speak for the video
+calibration. So a pattern-display calibration counts only while no video calibration
+at its geometry is newer (_overtaken_by), and a mobile rig that is verified for one
+calibration gives no mm with another (_require_rig).
 """
 
 from __future__ import annotations
@@ -24,17 +37,103 @@ from ..results import MetricScan
 from .triangulate import MetricCloud, triangulate, write_ply
 
 
-def _require_cal(s, geometry_id: str, fp: Optional[dict], what: str):
-    return stereo.require(s.store, geometry_id, fp, what)
+# meta "mode" of the scans captured in pattern-sequence display (trigger_scan.MODE,
+# flash_scan.MODE): how such a scan is known when it was stored before the stamp existed
+PATTERN_MODES = ("flash_trigger", "flash_softsync")
 
 
-def _require_rig(s, preset, what: str, scan=None) -> Optional[dict]:
+def _both_displays(s, geometry_id: str) -> bool:
+    """True only on the simulated bench, whose projector has no offset between the two
+    displays: a MOCK session's calibration counts for both. Decided from the session and
+    from where mock data lives (geometry mock-<id>), never from a record or an argument:
+    a real session never gets this answer, and neither does real data opened in a mock
+    session."""
+    return getattr(s, "mock", False) is True and \
+        str(geometry_id).startswith(config.MOCK_PREFIX)
+
+
+def _overtaken_by(s, cal, geometry_id: str, fp: Optional[dict]):
+    """The video calibration that is NEWER than this pattern-display calibration, or None.
+
+    A newer calibration at the geometry (solved from new poses, or a re-home) says the rig
+    is not where the older one was made. The rig check and the re-home work on the video
+    calibration only, so they never renew a pattern-display one: it counts until a video
+    calibration is newer, and is then made again. (Before a calibration carried its
+    display, the newest record was the rig's calibration for every scan: the same rule.)"""
+    if cal is None or (getattr(cal, "display_mode", None) or "video") != "pattern":
+        return None
+    vid = stereo.latest(s.store, geometry_id, fp, "video")
+    return vid if vid is not None and vid.path.name > cal.path.name else None
+
+
+def _find_cal(s, geometry_id: str, fp: Optional[dict], display_mode: str = "video"):
+    """The stereo calibration a capture in `display_mode` gives mm with, or None: the
+    newest at this geometry + fingerprint made in that display (a pattern-display one only
+    while no video calibration is newer, _overtaken_by). A video lookup is therefore the
+    record stereo.latest() gives every other caller. On the simulated bench
+    (_both_displays), and only when there is none of that display: the other display's."""
+    rules.check_display(display_mode)
+    cal = stereo.latest(s.store, geometry_id, fp, display_mode)
+    if _overtaken_by(s, cal, geometry_id, fp) is not None:
+        cal = None
+    if cal is None and _both_displays(s, geometry_id):
+        other = next(d for d in rules.DISPLAYS if d != display_mode)
+        cal = stereo.latest(s.store, geometry_id, fp, other)
+    return cal
+
+
+def _require_cal(s, geometry_id: str, fp: Optional[dict], what: str,
+                 display_mode: str = "video"):
+    """Rule 6, before the rig: the stereo calibration for a capture made in projector
+    display `display_mode`, else refuse (GeometryMismatch; DisplayMismatch when the
+    display is what is missing, or when the pattern-display calibration is older than
+    the rig's newest video calibration)."""
+    cal = _find_cal(s, geometry_id, fp, display_mode)
+    if cal is not None:
+        return cal
+    old = stereo.latest(s.store, geometry_id, fp, display_mode)
+    newer = _overtaken_by(s, old, geometry_id, fp)
+    if newer is not None:
+        raise rules.DisplayMismatch(
+            f"{what}: the stereo calibration made in pattern-sequence display ({old.id}) is "
+            f"older than the rig's calibration {newer.id}: the rig was calibrated again or "
+            "re-homed since, and neither renews a calibration of the other display, so mm "
+            "are refused (rule 6). Make the pattern-display calibration again, from poses "
+            "captured now.")
+    # raises, naming what is missing (the mock bench: none of either display)
+    return stereo.require(s.store, geometry_id, fp, what,
+                          "video" if _both_displays(s, geometry_id) else display_mode)
+
+
+def _check_display(s, cal, display_mode: str, geometry_id: str, what: str) -> None:
+    """Refuse (DisplayMismatch) a calibration made in the other projector display."""
+    rules.check_display(display_mode)
+    made_in = getattr(cal, "display_mode", None) or "video"
+    if made_in != display_mode and not _both_displays(s, geometry_id):
+        raise rules.DisplayMismatch(
+            f"{what}: the capture was made in {rules.display_text(display_mode)}, the stereo "
+            f"calibration {cal.id} in {rules.display_text(made_in)}, so mm are refused "
+            "(rule 6): a calibration counts only for the projector display it was made in.")
+
+
+def _require_rig(s, preset, what: str, scan=None, cal=None) -> Optional[dict]:
     """The rig gate of a capture that gives mm (engine/rigstate.require): a MOBILE rig that
     is not verified in this session is refused (rules.RuleViolation) before the rig is
     touched; a fixed rig never is. -> what the scan records of it (meta "rig": the
-    verification it was captured under; None for a fixed rig)."""
+    verification it was captured under; None for a fixed rig).
+    cal: the calibration the capture is triangulated with. The gate speaks for the video
+    calibration of the geometry; a mobile rig verified for that one is not verified for
+    another (a pattern-display calibration): refused too."""
     from .. import rigstate
-    return rigstate.stamp(rigstate.require(s, preset, what, scan=scan))
+    g = rigstate.require(s, preset, what, scan=scan)
+    spoke_for = (g.get("state") or {}).get("calibration_id")
+    if cal is not None and g.get("mount") == "mobile" and spoke_for != cal.id:
+        made_in = rules.display_text(getattr(cal, "display_mode", None) or "video")
+        raise rules.RuleViolation(
+            f"{what}: {rigstate.UNVERIFIED} (the rig is verified for calibration {spoke_for}; "
+            f"this capture is triangulated with {cal.id}, made in {made_in}, and a "
+            "verification counts only for the calibration it was made with)")
+    return rigstate.stamp(g)
 
 
 def scan_metric(s, preset, label: str = "metric", method: str = "auto", steps=None,
@@ -45,7 +144,7 @@ def scan_metric(s, preset, label: str = "metric", method: str = "auto", steps=No
     safe_label(label)
     fp = config.geometry_fingerprint(preset)
     cal = _require_cal(s, preset.geometry_id, fp, "scan_metric")       # before the rig
-    rig = _require_rig(s, preset, "scan_metric")                       # a mobile rig: verified
+    rig = _require_rig(s, preset, "scan_metric", cal=cal)              # a mobile rig: verified
     basis = flow.multifreq_basis(preset, cal.diamond_parity, steps, periods)
     t0 = time.perf_counter()
     proj_mask = cam_mask = cells = None
@@ -66,9 +165,13 @@ def scan_metric(s, preset, label: str = "metric", method: str = "auto", steps=No
 
 
 def _save(s, fld, cloud: MetricCloud, label: str, cal, fp, preset_name, extra: dict,
-          arrays: Optional[dict] = None) -> MetricScan:
+          arrays: Optional[dict] = None, display_mode: str = "video") -> MetricScan:
     """arrays: {file name: {array name: ndarray}} extra .npz files of the entry (e.g. the
-    flood pair of a fast scan), written before meta.json."""
+    flood pair of a fast scan), written before meta.json.
+    display_mode: the projector display the frames were captured in (rules.DISPLAYS),
+    stamped on the entry. A calibration made in the other display is refused
+    (rules.DisplayMismatch) before the entry's folder exists: no file is left."""
+    _check_display(s, cal, display_mode, fld.geometry_id, f"metric scan {label!r}")
     d = s.store.new_dir("metric", fld.geometry_id, label=label)
     with s.store.filling(d):
         s.store.write_field(d / "field.npz", fld)
@@ -84,7 +187,7 @@ def _save(s, fld, cloud: MetricCloud, label: str, cal, fp, preset_name, extra: d
                 "units": "mm", "n_points": int(cloud.mask.sum()),
                 "valid_pct": round(100.0 * float(cloud.mask.mean()), 2),
                 "consistency": cloud.consistency_stats(), "preset": preset_name,
-                "mock": s.mock, "decode": fld.meta, **extra}
+                "mock": s.mock, "decode": fld.meta, **extra, "display_mode": display_mode}
         s.store.write_json(d / "meta.json", json_safe(meta))
     cloud.meta = meta
     ply = s.store.output_path("pointclouds", label, ".ply")
@@ -95,11 +198,12 @@ def _save(s, fld, cloud: MetricCloud, label: str, cal, fp, preset_name, extra: d
                       _field=fld)
 
 
-def _require_rig_of(s, scan, what: str) -> Optional[dict]:
+def _require_rig_of(s, scan, what: str, cal=None) -> Optional[dict]:
     """_require_rig for a STORED capture (no preset in hand): the preset it was captured
     with says how the rig is mounted. A capture of a mobile rig gives mm only when it was
     made in the session the rig is verified in now. A capture whose preset is gone is
-    refused when any preset at its geometry says mobile (it can't be shown to be covered)."""
+    refused when any preset at its geometry says mobile (it can't be shown to be covered).
+    cal: the calibration it is triangulated with (_require_rig)."""
     from .. import rigstate
     name = (scan.meta or {}).get("preset")
     preset = None
@@ -110,7 +214,7 @@ def _require_rig_of(s, scan, what: str) -> Optional[dict]:
     except config.ConfigError:
         preset = None
     if preset is not None and preset.geometry_id == scan.geometry_id:
-        return _require_rig(s, preset, what, scan=scan)
+        return _require_rig(s, preset, what, scan=scan, cal=cal)
     geo = scan.geometry_id
     if s.mock and geo.startswith(config.MOCK_PREFIX):
         geo = geo[len(config.MOCK_PREFIX):]
@@ -139,11 +243,64 @@ def list_metric(store, geometry_id: Optional[str] = None) -> list:
     return out
 
 
+def _source_meta(s, scan_id: str, geometry_id: str) -> Optional[dict]:
+    """meta.json of the stored scan a metric entry was triangulated from (a metric entry
+    at the same geometry, or an object scan), or None when it is not in the library."""
+    for parts in (("metric", geometry_id), ("objects",)):
+        try:
+            dirs = s.store.entries(*parts)
+        except ValueError:
+            continue
+        for d in dirs:
+            if d.name == scan_id:
+                return read_meta(d)
+    return None
+
+
+def scan_display(s, scan) -> str:
+    """The projector display a stored scan was captured in: "video" or "pattern".
+
+    - its stamp (meta "display_mode", written by _save);
+    - pattern, whatever else it says, when its mode is one of PATTERN_MODES or its decode
+      block has the "softsync" key the one-bit flash decode writes;
+    - an entry without a stamp that was triangulated from another scan (meta
+      "source_scan"; such entries were stored without their mode) is its source's display,
+      and is REFUSED (rules.DisplayMismatch) when the source is not in the library any
+      more: its display cannot be shown;
+    - else video (every other scan stored before the stamp existed projected through the
+      HDMI window)."""
+    meta, sid, seen = scan.meta or {}, str(getattr(scan, "id", "?")), set()
+    first = sid
+    while True:
+        stamp = meta.get("display_mode")
+        if stamp is not None and stamp not in rules.DISPLAYS:
+            raise rules.DisplayMismatch(
+                f"scan {sid}: its record names an unknown projector display ({stamp!r}), so "
+                "mm are refused (rule 6): scan again")
+        dec = meta.get("decode")
+        if stamp == "pattern" or meta.get("mode") in PATTERN_MODES or \
+                (isinstance(dec, dict) and "softsync" in dec):
+            return "pattern"
+        src = meta.get("source_scan")
+        if stamp == "video" or not src:
+            return "video"
+        seen.add(sid)
+        nxt = None if str(src) in seen else _source_meta(s, str(src), scan.geometry_id)
+        if nxt is None:
+            raise rules.DisplayMismatch(
+                f"scan {first} was triangulated from {src}, which is not in the library any "
+                "more: it cannot be shown which projector display it was captured in, so mm "
+                "are refused (rule 6). Scan again")
+        meta, sid = nxt, str(src)
+
+
 def check_cal(s, scan, what: str):
     """Rule 6 at use time: the calibration that made a stored metric scan must
     still be the one in the library for its geometry (a trashed or replaced
-    calibration stops the mm)."""
-    cal = _require_cal(s, scan.geometry_id, (scan.meta or {}).get("geometry_fp"), what)
+    calibration stops the mm), and it must have been made in the projector
+    display the scan was captured in."""
+    cal = _require_cal(s, scan.geometry_id, (scan.meta or {}).get("geometry_fp"), what,
+                       display_mode=scan_display(s, scan))
     if isinstance(scan, MetricScan) and cal.id != scan.calibration_id:
         raise rules.GeometryMismatch(
             f"{what}: scan {scan.id} was triangulated with calibration {scan.calibration_id}, but "
@@ -154,10 +311,12 @@ def check_cal(s, scan, what: str):
 
 def triangulate_scan(s, scan, method: str = "auto", label: Optional[str] = None) -> dict:
     """An existing scan (ObjectScan from capture_object, or a MetricScan) ->
-    a new metric cloud with the current stereo calibration + .ply."""
+    a new metric cloud with the current stereo calibration + .ply. The calibration is the
+    one of the display the scan was captured in, and the new entry carries that display."""
     fp = (scan.meta or {}).get("geometry_fp")
-    cal = _require_cal(s, scan.geometry_id, fp, "triangulate")
-    rig = _require_rig_of(s, scan, "triangulate")
+    display = scan_display(s, scan)
+    cal = _require_cal(s, scan.geometry_id, fp, "triangulate", display_mode=display)
+    rig = _require_rig_of(s, scan, "triangulate", cal=cal)
     fld = scan.field
     warnings = []
     basis = (scan.meta or {}).get("basis_names") or fld.basis_names
@@ -167,7 +326,7 @@ def triangulate_scan(s, scan, method: str = "auto", label: Optional[str] = None)
     cloud = triangulate(fld, cal, method)
     ms = _save(s, fld, cloud, label or f"{scan.label}_tri", cal, fp,
                (scan.meta or {}).get("preset"), {"source_scan": scan.id, "warnings": warnings,
-                                                 "rig": rig})
+                                                 "rig": rig}, display_mode=display)
     return {"scan": ms, "calibration_id": cal.id, "method": cloud.method,
             "n_points": int(cloud.mask.sum()), "consistency": cloud.consistency_stats(),
             "units": "mm", "warnings": warnings}

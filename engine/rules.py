@@ -8,6 +8,9 @@ AI agent — can violate them. They are not advisory: every violation raises.
      driven in the scan path. A USB display-mode command (set_mode("video")
      etc.) forces source re-acquisition, the 912x1140 HDMI timing fails to
      re-lock and the DMD drops to its internal blue-lines pattern.
+     No scan, recipe, station or tool switches the projector display (video /
+     pattern sequence), and the seed driver refuses that write on a real
+     device, always (swiss_army_sensor/drivers/dlp_driver.py).
   2. The projector window stays painted during holds (pumped waitKey, no
      bare sleeps) — enforced structurally in capture/projector.py and by
      tests/test_rules.py.
@@ -15,6 +18,8 @@ AI agent — can violate them. They are not advisory: every violation raises.
   4. Mono camera => bw scheme; colour schemes are flagged.
   5. Base and object share geometry_id.
   6. Calibration is geometry-bound; mm only with a matching calibration.
+     A calibration is also bound to the projector display it was made in:
+     a capture in the other display gives no mm.
   7. Library data is never overwritten.
 """
 
@@ -35,6 +40,12 @@ class SafetyViolation(RuleViolation):
 
 class GeometryMismatch(RuleViolation):
     """Rule 5 / 6: data from different rig geometries mixed."""
+
+
+class DisplayMismatch(GeometryMismatch):
+    """Rule 6: a capture and a calibration made in different projector displays
+    (video / pattern sequence), a capture whose display cannot be shown, or a
+    pattern-display calibration that is older than the rig's newest calibration."""
 
 
 class OverwriteRefused(RuleViolation):
@@ -65,13 +76,16 @@ class EntryInUse(RuleViolation):
 FORBIDDEN_SCAN_MODULES = (
     "swiss_army_sensor.drivers.dlp_driver",
     "hid",                      # hidapi — the DLPC350 USB-HID transport
+    # the sequence-control helper: it runs as its own process and is the only
+    # other module that may load hid (tests/test_rules.py)
+    "engine.seqctl.helper",
 )
 
 # DLPC350 USB commands that knock the DMD off HDMI lock. The Projector
 # refuses these by name, so a caller "trying" gets a clear error instead
 # of a dead scan.
 USB_DISPLAY_COMMANDS = frozenset({
-    "set_mode", "set_display_mode", "set_pattern_source",
+    "set_mode", "set_display_mode", "switch_display", "set_pattern_source",
     "set_pattern_trigger_mode", "set_trigger_out1", "load_pattern_sequence",
     "start_sequence", "stop_sequence", "set_led_currents", "usb", "hid",
 })
@@ -82,7 +96,8 @@ _FORBIDDEN_PROJECTION_KEYS = {"usb", "dlp_usb", "set_mode", "display_mode",
 
 
 def check_scan_path_usb_free(modules: Optional[dict] = None) -> None:
-    """Raise if the DLPC350 USB driver (or hidapi) is loaded in this process."""
+    """Raise if the DLPC350 USB driver, hidapi or the sequence-control helper is
+    loaded in this process."""
     mods = sys.modules if modules is None else modules
     loaded = [m for m in FORBIDDEN_SCAN_MODULES if m in mods]
     if loaded:
@@ -212,6 +227,27 @@ def require_same_geometry(a: str, b: str, what: str) -> None:
 
 def calibration_matches(calibration, geometry_id: str) -> bool:
     return calibration is not None and calibration.geometry_id == geometry_id
+
+
+# The two displays of the projector. In pattern-sequence display the mirrors show
+# a pattern pixel for pixel; in video display the picture is resampled, so the same
+# pattern lands a fraction of a projector column elsewhere: enough to shift every
+# mm. A calibration, and every capture, belongs to the display it was made in.
+DISPLAYS = ("video", "pattern")
+DISPLAY_TEXT = {"video": "video display", "pattern": "pattern-sequence display"}
+
+
+def display_text(display) -> str:
+    """A display as the operator reads it."""
+    if isinstance(display, str) and display in DISPLAY_TEXT:
+        return DISPLAY_TEXT[display]
+    return f"an unknown display ({display!r})"
+
+
+def check_display(display, what: str = "display_mode") -> str:
+    if not isinstance(display, str) or display not in DISPLAYS:
+        raise ValueError(f"{what} must be one of {DISPLAYS}, got {display!r}")
+    return display
 
 
 def fingerprint_diffs(recorded: Optional[dict], current: Optional[dict]) -> list[str]:

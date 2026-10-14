@@ -69,14 +69,17 @@ def test_select_source_and_bit_depth_encoding(dc):
         d.select_source(0, bit_depth=12)
 
 
-def test_display_mode_encoding(dc):
-    drv = scripted(dc, [lock_reply()])
-    d = dc.DMDControl(driver=drv)
-    d.select_display_mode(0)
-    d.select_display_mode(1)
-    assert drv.calls == [((0x1A, 0x1B), b"\x00", False), ((0x1A, 0x1B), b"\x01", False)]
-    with pytest.raises(ValueError):
-        d.select_display_mode(2)
+def test_tool_has_no_display_command(dc):
+    """The tool cannot switch the projector display (video / pattern sequence): the
+    method and its command constant are gone, and no flag reaches one."""
+    assert not hasattr(dc.DMDControl, "select_display_mode")
+    assert not hasattr(dc, "CMD_DISPLAY_MODE")
+    names = [n for n in dir(dc.DMDControl) if "display" in n.lower() or "mode" in n.lower()]
+    assert names == []
+    assert dc.main(["--mock", "--status", "--yes"]) == 2      # a known command line (mock: zeros)
+    for flag in ("--display", "--mode", "--display-mode", "--pattern", "--video"):
+        with pytest.raises(SystemExit):                       # the same with an unknown flag
+            dc.main(["--mock", "--status", "--yes", flag, "1"])
 
 
 def test_parse_full_timing_and_margins(dc):
@@ -138,7 +141,7 @@ def test_cli_bitdepth_alone_asserts_source0(dc, monkeypatch):
     monkeypatch.setattr(dc.DMDControl, "select_source",
                         lambda self, k, bit_depth=24: sent.append((k, bit_depth)) or orig(self, k, bit_depth))
     monkeypatch.setattr(dc.time, "sleep", lambda s: None)
-    dc.main(["--mock", "--bitdepth", "24"])
+    dc.main(["--mock", "--bitdepth", "24", "--yes"])
     assert sent == [(0, 24)]
 
 
@@ -178,8 +181,11 @@ def _fake_real_driver(dc, on_send):
     return FakeReal
 
 
-@pytest.mark.parametrize("argv", [["--relock", "--timeout", "0.01"], ["--source", "0"],
-                                  ["--bitdepth", "24"], ["--source", "1"]])
+WRITES = [["--relock", "--timeout", "0.01"], ["--source", "0"], ["--bitdepth", "24"],
+          ["--source", "1"]]
+
+
+@pytest.mark.parametrize("argv", WRITES)
 def test_write_commands_hold_the_rig_lock(dc, lockfile, monkeypatch, argv):
     path, real = lockfile
     seen = []
@@ -191,7 +197,7 @@ def test_write_commands_hold_the_rig_lock(dc, lockfile, monkeypatch, argv):
         seen.append(cmd)
     monkeypatch.setattr(dc, "DLPDriver", _fake_real_driver(dc, on_send))
     monkeypatch.setattr(dc.time, "sleep", lambda s: None)
-    assert dc.main(argv) in (0, 2)
+    assert dc.main(argv + ["--yes"]) in (0, 2)
     assert (0x1A, 0x00) in seen                          # the write went out, under the lock
     real(path, "scan").acquire().release()              # ...and the lock is released after
 
@@ -208,7 +214,7 @@ def test_write_command_refused_while_a_scan_holds_the_rig(dc, lockfile, monkeypa
     scan = real(path, "web UI scan").acquire()
     try:
         for argv in (["--relock"], ["--source", "0"], ["--bitdepth", "24"]):
-            assert dc.main(argv) == 2
+            assert dc.main(argv + ["--yes"]) == 2
             err = capsys.readouterr().err.strip().splitlines()
             assert len(err) == 1 and "nothing sent" in err[0] and "web UI scan" in err[0]
     finally:
@@ -216,26 +222,149 @@ def test_write_command_refused_while_a_scan_holds_the_rig(dc, lockfile, monkeypa
     assert not opened                                    # refused before touching the device
 
 
-def test_status_is_read_only_and_lock_free(dc, lockfile, monkeypatch, capsys):
+@pytest.mark.parametrize("argv", WRITES)
+@pytest.mark.parametrize("mock", [[], ["--mock"]])
+def test_write_commands_need_yes(dc, lockfile, monkeypatch, capsys, argv, mock):
+    """--relock, --source and --bitdepth make the projector re-acquire its video input.
+    Without --yes: exit 2, one line, the device not opened, the rig lock not taken, and
+    the command never waits for input."""
     path, real = lockfile
-    monkeypatch.setattr(dc, "DLPDriver", _fake_real_driver(dc, lambda cmd, read: None))
-    scan = real(path, "scan").acquire()
+    touched = []
+
+    class Untouchable(dc.MockDLPDriver):
+        def open(self):
+            touched.append("open")
+            return self
+
+        def _send(self, cmd, data=b"", read=False):
+            touched.append(cmd)
+            return b""
+    monkeypatch.setattr(dc, "DLPDriver", Untouchable)
+    monkeypatch.setattr(dc, "MockDLPDriver", Untouchable)
+    monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("the tool asked a question"))
+    scan = real(path, "a scan").acquire()                # would be RigBusy if the lock were tried
     try:
-        assert dc.main(["--status"]) == 0                # works while a scan holds the rig
+        assert dc.main(mock + argv) == 2
     finally:
         scan.release()
-    out = capsys.readouterr().out
-    assert "read-only" in out and "rig lock" in out and "Detected" in out
+    cap = capsys.readouterr()
+    err = cap.err.strip().splitlines()
+    assert len(err) == 1 and "nothing sent" in err[0] and "--yes" in err[0]
+    assert "a scan" not in err[0] and cap.out == ""
+    assert touched == []
 
 
-def test_mock_writes_take_no_lock(dc, lockfile, monkeypatch):
+def test_status_takes_the_rig_lock_and_is_refused_while_a_scan_holds_it(dc, lockfile,
+                                                                         monkeypatch, capsys):
+    """A scan may be playing a pattern sequence, when nothing may be sent to the
+    controller, not even a read: --status takes the rig lock like every other command."""
+    path, real = lockfile
+    seen = []
+
+    def on_send(cmd, read):
+        assert read                                      # --status only reads
+        with pytest.raises(dc.RigBusy, match="dmd_control"):
+            real(path, "scan").acquire()                 # held during the read
+        seen.append(cmd)
+    monkeypatch.setattr(dc, "DLPDriver", _fake_real_driver(dc, on_send))
+    assert dc.main(["--status"]) == 0                    # needs no --yes
+    assert seen == [(0x07, 0x1C)] and "Detected" in capsys.readouterr().out
+    real(path, "scan").acquire().release()              # released after
+    opened = []
+
+    class Untouchable(dc.MockDLPDriver):
+        def open(self):
+            opened.append(1)
+            raise AssertionError("USB opened while the rig is busy")
+    monkeypatch.setattr(dc, "DLPDriver", Untouchable)
+    scan = real(path, "web UI scan").acquire()
+    try:
+        assert dc.main(["--status"]) == 2
+    finally:
+        scan.release()
+    cap = capsys.readouterr()
+    err = cap.err.strip().splitlines()
+    assert len(err) == 1 and "nothing sent" in err[0] and "web UI scan" in err[0]
+    assert not opened and cap.out == ""
+
+
+def test_mock_takes_no_lock(dc, lockfile, monkeypatch):
     path, real = lockfile
     monkeypatch.setattr(dc.time, "sleep", lambda s: None)
     scan = real(path, "scan").acquire()
     try:
-        assert dc.main(["--mock", "--source", "1"]) == 0
+        assert dc.main(["--mock", "--source", "1", "--yes"]) == 0
+        assert dc.main(["--mock", "--status"]) == 2      # the mock reads zeros: not Detected
     finally:
         scan.release()
+
+
+# ------------------------------------- the driver's write guard under the tool
+
+class FakeHID:
+    """Stands in for the opened USB device: keeps what is written to it."""
+
+    def __init__(self, reply=None):
+        self.written, self.closed, self.reply = [], False, reply
+
+    def write(self, pkt):
+        self.written.append(bytes(pkt))
+        return len(pkt)
+
+    def read(self, n, timeout_ms=0):
+        data = lock_reply() if self.reply is None else self.reply
+        return list(bytes([0x40, 0, len(data) & 0xFF, len(data) >> 8]) + data)[:n]
+
+    def close(self):
+        self.closed = True
+
+
+def _real_tool(dc):
+    """DMDControl on the REAL driver class with a fake device in place of hidapi."""
+    drv = dc.DLPDriver()
+    drv._hid = FakeHID()
+    return dc.DMDControl(driver=drv), drv._hid
+
+
+def test_tool_writes_as_python_calls_are_refused(dc):
+    """select_source / safe_relock called from other code, on a real device: refused by
+    the driver with nothing sent. Only main() allows writes, after --yes."""
+    from swiss_army_sensor.drivers.dlp_driver import WriteRefused
+    dmd, hid = _real_tool(dc)
+    with pytest.raises(WriteRefused, match="Nothing was sent"):
+        dmd.select_source(0, bit_depth=24)
+    with pytest.raises(WriteRefused):
+        dmd.select_source(1)
+    with pytest.raises(WriteRefused):
+        dmd.safe_relock(timeout_s=0.01)
+    assert hid.written == []
+    assert dmd.read_video_lock().detected                # a read needs no permission
+    assert len(hid.written) == 1 and hid.written[0][1] & 0x80
+    assert hid.written[0][5:7] == b"\x1c\x07"
+    dmd.close()
+    assert hid.closed and len(hid.written) == 1          # closed, and never parked
+
+
+@pytest.mark.parametrize("argv,writes", [(["--status"], 0), (["--source", "0", "--yes"], 1),
+                                         (["--relock", "--yes", "--timeout", "0.01"], 1),
+                                         (["--bitdepth", "24", "--yes"], 1)])
+def test_cli_on_the_real_driver_class(dc, lockfile, monkeypatch, argv, writes):
+    """main() on the real driver class (fake device): --status sends reads only; a write
+    command with --yes sends its one Input Source Selection write and never a park, a
+    reset or the display command."""
+    hid = FakeHID()
+
+    class Opened(dc.DLPDriver):
+        def open(self):
+            self._hid = hid
+            return self
+    monkeypatch.setattr(dc, "DLPDriver", Opened)
+    monkeypatch.setattr(dc.time, "sleep", lambda s: None)
+    assert dc.main(argv) == 0
+    sent = [(p[1] & 0x80 == 0, (p[6], p[5])) for p in hid.written]
+    assert [c for w, c in sent if w] == [(0x1A, 0x00)] * writes
+    assert {c for w, c in sent if not w} == {(0x07, 0x1C)}
+    assert hid.closed
 
 
 def test_tool_loads_only_riglock_and_rules_from_the_engine():

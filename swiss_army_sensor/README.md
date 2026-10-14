@@ -111,9 +111,9 @@ DLP4500 J14 TRIG_OUT_1 ── 1 kΩ ── FLIR Hirose pin 4 (OPTO_IN, Line0)
 command channel are mutually exclusive while streaming. USB display-mode
 commands force source re-acquisition; the non-standard 912x1140 timing
 fails to re-lock and the DMD reverts to its internal test pattern.
-`SensorRig.create(mock=False)` is therefore **HDMI-only by default** —
-it never opens USB. Pass `usb=True` only for the trigger-synced path,
-and configure over USB *before* establishing the HDMI lock, never after.
+`SensorRig.create(mock=False)` is therefore **HDMI-only** — it never
+opens USB. `usb=True` on real hardware is refused, always: the projector
+display is switched by a person, never by this package.
 
 ## Verification status (v0.5)
 

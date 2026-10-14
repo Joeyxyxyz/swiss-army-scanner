@@ -28,7 +28,6 @@ from typing import Optional
 import numpy as np
 
 from .. import config, rules
-from ..calibrate import stereo
 from ..capture import softsync
 from ..library.store import json_safe, safe_label
 from . import metric_scan
@@ -209,8 +208,9 @@ def fast_scan_flash(s, preset, pack=None, variant: Optional[str] = None, label: 
     fp = config.geometry_fingerprint(preset)
     cal = rig = None
     if not dry_run:
-        cal = metric_scan._require_cal(s, preset.geometry_id, fp, "fast_scan_flash")   # rule 6
-        rig = metric_scan._require_rig(s, preset, "fast_scan_flash")    # a mobile rig: verified
+        cal = metric_scan._require_cal(s, preset.geometry_id, fp, "fast_scan_flash",   # rule 6
+                                       display_mode="pattern")
+        rig = metric_scan._require_rig(s, preset, "fast_scan_flash", cal=cal)   # mobile: verified
     full_shape = tuple(s.bench.cam_shape) if s.mock else softsync.SENSOR_SHAPE
     cam_mask, zone_label, dmd_zone, w2 = _camera_zone(s, preset, zone, roi, layout, pack_dir,
                                                       full_shape, manifest)
@@ -233,7 +233,7 @@ def fast_scan_flash(s, preset, pack=None, variant: Optional[str] = None, label: 
         return {"dry_run": True, "mode": MODE, "plan": plan, "estimate_s": _estimate(plan),
                 "layout": pack_info, "zone": zone_label, "warnings": warnings,
                 "calibration": (lambda c: c.id if c is not None else None)(
-                    stereo.latest(s.store, preset.geometry_id, fp))}
+                    metric_scan._find_cal(s, preset.geometry_id, fp, "pattern"))}
     gain = float(preset.camera.gain_db if gain_db is None else gain_db)
     times = {}
     t_all = time.perf_counter()
@@ -293,7 +293,8 @@ def fast_scan_flash(s, preset, pack=None, variant: Optional[str] = None, label: 
     ms = metric_scan._save(s, fld, cloud, label, cal, fp, preset.name, {
         "mode": MODE, "capture_s": times["record_s"], "steps": layout.steps,
         "periods_px": list(layout.periods), "diamond_parity": layout.diamond_parity,
-        "zone": zone_label, "fast": True, "flash": json_safe(flash), "rig": rig})
+        "zone": zone_label, "fast": True, "flash": json_safe(flash), "rig": rig},
+        display_mode="pattern")
     times["triangulate_save_s"] = round(time.perf_counter() - t0, 3)
     times["total_s"] = round(time.perf_counter() - t_all, 3)
     warnings += r.get("warnings", [])

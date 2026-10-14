@@ -9,7 +9,9 @@ Each step below is marked **HUMAN** (done by a person at the bench or in the GUI
 ## Safety rules (all steps)
 
 - **The HDMI path is untouched.** Nothing here changes presets, the HDMI scan or the projector window.
-- **Pattern mode is entered only by a human, in the GUI.** The engine never sends the DLPC350 a USB / HID command. `scan-trigger` refuses to run without `--pattern-mode-set-by-human`.
+- **Pattern mode is entered only by a human, in the vendor program (the GUI).** `trigger-test` and `scan-trigger` never send the projector a command: a person sets the sequence and presses Play. `scan-trigger` refuses to run without `--pattern-mode-set-by-human`.
+- **No mm without a calibration made in pattern-sequence display.** `scan-trigger` captures in pattern-sequence display, where a pattern lands a fraction of a projector column away from where video display puts it. A stereo calibration counts only for the display it was made in (rule 6). On a real rig `scan-trigger` is therefore refused, before the camera is opened, until a calibration made in pattern-sequence display exists at this geometry; the calibration of the normal HDMI scans does not count. `trigger-test` needs no calibration. Mock runs are not affected: the simulated projector has no offset between the two displays.
+- **After a rig check MOVED, a re-home or a new calibration, make the pattern-display calibration again.** The rig check and the re-home renew the video calibration only. A pattern-display calibration that is older than the newest video calibration of the geometry is refused. On a mobile rig (`rig.mount: mobile`) `scan-trigger` is refused for now: the rig is verified for its video calibration only.
 - **Never write flash without the firmware backup** (step 1). The GUI cannot read the flash back.
 - **LED currents stay within the continuous limits** (R120 G180 B160). Start at the HDMI bench values. See [FLASH_FASTSCAN_4500.md §5.5](FLASH_FASTSCAN_4500.md).
 - **Measure the trigger level before wiring** (step 4). Connect grounds first and disconnect them last. Make all wiring changes with the sequence stopped.
@@ -41,7 +43,8 @@ The 226 fps figure is FLIR's full-frame number for this model. It has not been m
 ## 0. Preconditions — HUMAN
 
 - [ ] The projector and the camera have been on for **≥ 20 min** (warm-up). The HDMI video mode shows the desktop on the DMD.
-- [ ] A normal HDMI scan works today (`scan-fast` or `scan-metric`). A **stereo calibration** exists at this geometry, because `scan-trigger` refuses to run without one (rule 6).
+- [ ] A normal HDMI scan works today (`scan-fast` or `scan-metric`).
+- [ ] For step 7 and later only: a **stereo calibration made in pattern-sequence display** exists at this geometry (its record says `display_mode: pattern`) and is newer than the rig's video calibration. `scan-trigger` refuses to run without one (rule 6). Steps 1 to 6 (packs, wiring, `trigger-test`) need no calibration.
 - [ ] The LED currents are noted (LED Driver Control) and are within the continuous limits.
 - [ ] **No engine capture is running.** Modes are changed only in the GUI and never mid-scan.
 - [ ] The fast-scan pack's plane check ([FLASH_FASTSCAN_4500.md §5.4](FLASH_FASTSCAN_4500.md)) passed on this unit, if it was done before.
@@ -192,7 +195,7 @@ Exit codes: 0 = OK, 1 = NO PULSES or RATE MISMATCH, 4 = an error: the test did n
 
 ## 7. First triggered scan at 10 ms — SOFTWARE
 
-Same scene as an HDMI reference scan. The sequence is playing (Repeat on).
+Same scene as an HDMI reference scan. The sequence is playing (Repeat on). The calibration made in pattern-sequence display is in the library (step 0): without it the command exits 2 with "no stereo calibration made in pattern-sequence display", and nothing is captured or saved.
 
 ```
 scan --preset <...> scan-trigger trig10 --pack <trig10ms pack folder> --variant full --line Line0 --repeats 2 --pattern-mode-set-by-human
@@ -203,7 +206,7 @@ What happens:
 1. The camera grabs exactly (repeats + 1) × 16 frames. The extra loop is used to find the start. Missing frames, extra frames, spacing ±50 % of the period and the first-trigger timeout (30 s) are checked by `TriggeredSequenceCapture`.
 2. The frames are aligned on the loop's sync markers (sync_code = horizontal bars, sync_white just before it). A G/R plane swap in the GUI only rotates the loop, which the alignment absorbs.
 3. The loops are averaged per slot.
-4. The result goes through the unchanged multifreq decode and 'plane' triangulation, into a metric scan (meta `mode: flash_trigger`, `trigger.timing`: frames, total ms, per-frame ms, drops).
+4. The result goes through the unchanged multifreq decode and 'plane' triangulation with the pattern-display calibration, into a metric scan (meta `mode: flash_trigger`, `display_mode: pattern`, `trigger.timing`: frames, total ms, per-frame ms, drops).
 
 Check:
 
@@ -234,7 +237,7 @@ On the same scene, without touching anything between the scans:
 - [ ] **A known step height** (gauge block or the bench step): the triggered result should agree with the HDMI result within its repeatability.
 - [ ] **Capture time:** 160 / 80 / 72 ms per set vs ~5 s HDMI.
 
-The 1-bit fine level reads a constant offset of about 0.04 column against HDMI 8-bit fringes on the diamond DMD. Relative heights are unaffected; see FLASH_FASTSCAN_4500.md.
+The two scans do not decode the same projector column for the same point: pattern-sequence display shows a pattern pixel for pixel, video display resamples the picture. That is why each is triangulated with the calibration of its own display, and why the engine refuses to mix them (rule 6). Compare the results in mm, not the decoded columns.
 
 ## 10. Back to video mode / rollback — HUMAN
 
@@ -269,6 +272,9 @@ The camera needs nothing: every command sets TriggerMode back to Off when it exi
 | scan-trigger (8-bit): "starts of the sequence fit" | The camera sees too little of the pattern field to tell where the sequence starts | Point the camera at more of the projected field |
 | scan-trigger (8-bit): "loops do not show the same images" | The GUI sequence is not the pack's 16 patterns, or the scene moved | Match the GUI rows to the pack; keep the part still |
 | Refused: no stereo calibration | Rule 6 | `calibrate-stereo` at this geometry first |
+| Refused: "no stereo calibration made in pattern-sequence display" | Rule 6: the calibration of this geometry was made in video display, which does not count for a capture in pattern-sequence display | Calibrate from board poses captured in pattern-sequence display (their meta says `display_mode: pattern`; `calibrate-stereo` stamps the calibration with it). `calib-pose` captures in video display, so those poses do not serve, and the engine has no command yet that captures poses in pattern-sequence display. A program that does hands each pose to the engine's `capture_calib_pose` with `display_mode: pattern` in its capture result; a capture that does not say its display is refused and nothing is stored |
+| Refused: the calibration made in pattern-sequence display "is older than the rig's calibration" | The rig was calibrated again or re-homed after the pattern-display calibration was made, and neither renews a calibration of the other display | Make the pattern-display calibration again, from poses captured now |
+| Refused: "mobile rig not verified" ... "the rig is verified for calibration" | A mobile rig is verified in a session for its video calibration only | Not available on a mobile rig yet: use the normal HDMI scans there |
 
 ## Not verified yet
 

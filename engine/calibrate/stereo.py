@@ -22,6 +22,12 @@ as a calibration.
 A re-homed calibration (rehome()) is a NEW entry: the same intrinsics and t,
 R1 = R0 @ Rd for a small camera rotation Rd fitted by the rig check, flagged
 `rehomed` with the calibration it came from. The original is never changed.
+
+A calibration is also bound to the projector display its poses were captured
+in (`display_mode`: "video" or "pattern"; a record without the key is video,
+as every record was before the key existed). latest() / require() return only
+records of the display asked for (default video) and skip the others, so a
+pattern-display calibration never becomes the calibration of a normal scan.
 """
 
 from __future__ import annotations
@@ -115,6 +121,9 @@ class StereoCalibration:
     parity_source: Optional[str] = None
     parity_info: dict = field(default_factory=dict)     # the measurement (shift, note, id)
     rehomed: Optional[dict] = None      # set on a re-homed copy: {"from": calibration id, ...}
+    # the projector display the poses were captured in (rules.DISPLAYS); the calibration
+    # gives mm only for captures made in the same display
+    display_mode: str = "video"
 
     @property
     def parity_measured(self) -> Optional[bool]:
@@ -153,7 +162,7 @@ class StereoCalibration:
                 "n_poses": self.n_poses, "geometry_fp": self.fingerprint,
                 "baseline_mm": self.baseline_mm, "angle_deg": self.angle_deg,
                 "created": self.created, "units": "mm; projector px = native DMD (col, row)",
-                "rehomed": self.rehomed,
+                "rehomed": self.rehomed, "display_mode": self.display_mode,
                 "note": "X_proj = R X_cam + t; valid only at this geometry_id + fingerprint"
                         + (f"; {self.rehomed.get('note')}" if self.rehomed else "")}
 
@@ -169,7 +178,8 @@ class StereoCalibration:
                    fingerprint=d.get("geometry_fp"), path=path, created=d.get("created", ""),
                    parity_source=d.get("diamond_parity_source"),
                    parity_info=d.get("diamond_parity_info") or {},
-                   rehomed=d.get("rehomed") or None)
+                   rehomed=d.get("rehomed") or None,
+                   display_mode=d.get("display_mode") or "video")
 
 
 def calibrate(poses: list, spec: BoardSpec, cam_size=(1440, 1080), proj_size=(912, 1140),
@@ -327,12 +337,15 @@ def save(store, geometry_id: str, fit: dict, *, fingerprint: Optional[dict], spe
          parity: Optional[int], created: str, extra_report: Optional[dict] = None,
          truth: Optional[dict] = None, board: Optional[dict] = None,
          parity_source: Optional[str] = None,
-         parity_info: Optional[dict] = None) -> StereoCalibration:
+         parity_info: Optional[dict] = None,
+         display_mode: str = "video") -> StereoCalibration:
     """board: what the calibration records as its target (default spec.to_dict(); the
     calibration fixture records its faces). parity_source / parity_info: how the diamond
-    row parity is known (PARITY_SOURCES) and its measurement. A fit that fails
-    fit_problems() is refused (CalibrationRejected): never saved as a calibration."""
+    row parity is known (PARITY_SOURCES) and its measurement. display_mode: the projector
+    display the poses were captured in (rules.DISPLAYS), stamped on the record. A fit that
+    fails fit_problems() is refused (CalibrationRejected): never saved as a calibration."""
     from ..library.store import json_safe
+    rules.check_display(display_mode)
     bad = fit_problems(fit)
     if bad:
         raise CalibrationRejected(bad, fit.get("per_pose"))
@@ -348,10 +361,11 @@ def save(store, geometry_id: str, fit: dict, *, fingerprint: Optional[dict], spe
              "stereo_px": fit["rms_stereo"], "camera_ok": fit["cam"]["ok"],
              "projector_ok": fit["proj"]["ok"]},
         board=board or spec.to_dict(), n_poses=fit["n_poses"], fingerprint=fingerprint, path=d,
-        created=created, parity_source=parity_source, parity_info=dict(parity_info or {}))
+        created=created, parity_source=parity_source, parity_info=dict(parity_info or {}),
+        display_mode=display_mode)
     report = {"per_pose": fit["per_pose"], "camera_per_pose_rms": fit["cam"]["per_pose_rms"],
               "projector_per_pose_rms": fit["proj"]["per_pose_rms"],
-              "fv_over_fu": fit["proj"]["fv_over_fu"],
+              "fv_over_fu": fit["proj"]["fv_over_fu"], "display_mode": display_mode,
               "diamond_parity": parity, "diamond_parity_source": parity_source,
               "diamond_parity_measured": cal.parity_measured,
               "diamond_parity_text": parity_text(parity, parity_source),
@@ -409,7 +423,7 @@ def rehome(store, cal: StereoCalibration, Rd, *, created: str,
         proj_size=tuple(cal.proj_size), diamond_parity=cal.diamond_parity, rms=dict(cal.rms),
         board=dict(cal.board), n_poses=cal.n_poses, fingerprint=cal.fingerprint, path=d,
         created=created, parity_source=cal.parity_source, parity_info=dict(cal.parity_info),
-        rehomed=info)
+        rehomed=info, display_mode=cal.display_mode)
     store.write_json(d / "report.json", json_safe({"rehomed": info, "R_before": cal.R.tolist(),
                                                    "R_after": R1.tolist(),
                                                    "t": np.ravel(cal.t).tolist()}))
@@ -417,8 +431,12 @@ def rehome(store, cal: StereoCalibration, Rd, *, created: str,
     return new
 
 
-def latest(store, geometry_id: str, fingerprint: Optional[dict] = None) -> Optional[StereoCalibration]:
-    """Newest complete stereo calibration at this geometry (and fingerprint)."""
+def latest(store, geometry_id: str, fingerprint: Optional[dict] = None,
+           display_mode: str = "video") -> Optional[StereoCalibration]:
+    """Newest complete stereo calibration at this geometry (and fingerprint) that was made
+    in projector display `display_mode`. Records of the other display are skipped, also
+    when they are newer: a calibration counts only for the display it was made in."""
+    rules.check_display(display_mode)
     for d in reversed(store.entries("calibrations", geometry_id)):
         f = d / STEREO_FILE
         if not f.is_file():
@@ -427,19 +445,34 @@ def latest(store, geometry_id: str, fingerprint: Optional[dict] = None) -> Optio
             cal = StereoCalibration.from_json(json.loads(f.read_text(encoding="utf-8")), d)
         except (OSError, ValueError, KeyError, TypeError):
             continue
+        if cal.display_mode != display_mode:
+            continue
         if cal.geometry_id == geometry_id and not rules.fingerprint_diffs(cal.fingerprint, fingerprint):
             return cal
     return None
 
 
-def require(store, geometry_id: str, fingerprint: Optional[dict], what: str) -> StereoCalibration:
+def require(store, geometry_id: str, fingerprint: Optional[dict], what: str,
+            display_mode: str = "video") -> StereoCalibration:
     """Rule 6 for metric (mm) output: a stereo calibration at this geometry_id
-    AND fingerprint, read from the library now — else refuse."""
-    cal = latest(store, geometry_id, fingerprint)
+    AND fingerprint, made in projector display `display_mode`, read from the
+    library now — else refuse."""
+    cal = latest(store, geometry_id, fingerprint, display_mode)
     if cal is None:
-        raise rules.GeometryMismatch(
-            f"{what}: no stereo calibration for geometry '{geometry_id}' at these geometry-bound "
-            "settings, so mm are refused (rule 6). Run calibrate_stereo at this geometry first.")
+        other = [d for d in rules.DISPLAYS if d != display_mode
+                 and latest(store, geometry_id, fingerprint, d) is not None]
+        if display_mode == "video" and not other:
+            raise rules.GeometryMismatch(
+                f"{what}: no stereo calibration for geometry '{geometry_id}' at these geometry-bound "
+                "settings, so mm are refused (rule 6). Run calibrate_stereo at this geometry first.")
+        raise rules.DisplayMismatch(
+            f"{what}: no stereo calibration made in {rules.display_text(display_mode)} for "
+            f"geometry '{geometry_id}' at these geometry-bound settings, so mm are refused "
+            "(rule 6). "
+            + (f"The calibration of this geometry was made in {rules.display_text(other[0])}: "
+               if other else "")
+            + f"a capture in {rules.display_text(display_mode)} gives mm only with a "
+            "calibration made in that display.")
     rules.require_same_geometry(cal.geometry_id, geometry_id, what)
     rules.require_same_fingerprint(cal.fingerprint, fingerprint, what)
     return cal

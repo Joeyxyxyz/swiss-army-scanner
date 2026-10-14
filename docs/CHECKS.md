@@ -117,6 +117,7 @@ another presence-like check under the type id `presence`.
 | `ctx.frame` | the part frame: reference plane, origin, axes e1 / e2 / n |
 | `ctx.golden` | the golden scan's view (scan, frame, the same zones), or None; `ctx.need_golden()` |
 | `ctx.codes` | codes read before the scan, or None |
+| `ctx.keep_sections(grid_mm, height_mm)` | optional: a check that gridded the zone's heights hands over the two lines through the centre; the runner writes them beside the result as `profile_x.csv` / `profile_y.csv` (position mm, height mm) for the inspection event log. Files only: nothing of it reaches the check's result, and it never raises |
 
 ## Add your own check
 

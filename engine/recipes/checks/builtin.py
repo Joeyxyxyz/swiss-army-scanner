@@ -762,6 +762,7 @@ class Defect(Check):
             warnings.simplefilter("ignore", RuntimeWarning)
             gr = mfcfar.Gridder(px, g, radius, prm["max_edge_mm"])
             maps = gr.repeat_maps()
+            ctx.keep_sections(g, maps[0])       # the face's two centre lines: files, no result
             det = mfcfar.detect(maps, None, g, prm, px_mm=mpp)
         trig = [t for t in det["triggers"] if abs(t["depth_mm"]) >= p["depth_mm"]
                 and (p["sign"] == "both" or t["kind"] == "dent")]

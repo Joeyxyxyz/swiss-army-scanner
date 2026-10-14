@@ -12,6 +12,9 @@ CheckContext: everything a check may read about ONE zone of ONE scan (never the 
     ctx.frame         the PartFrame (reference plane, axes)
     ctx.golden        GoldenView or None: the good part's scan, frame and the same zones
     ctx.codes         codes read before the scan (scan.codes: true), or None
+    ctx.keep_sections(grid_mm, height_mm)   hand over a gridded height map's two centre lines:
+                      the runner writes them beside the result as profile_x.csv / profile_y.csv
+                      (engine/eventlog.py); they are never part of a result
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ class CheckContext:
     codes: Optional[list] = None
     recipe_name: str = ""
     min_points: int = 30
+    sections: Optional[dict] = None      # out: zone id -> height sections (keep_sections)
 
     # ---------------------------------------------------------- the zone's points
     def index(self, zone=None) -> tuple:
@@ -78,6 +82,23 @@ class CheckContext:
         d = np.linalg.norm(X[ys, xs + 1] - X[ys, xs], axis=1)
         d = d[np.isfinite(d) & (d < 5.0)]
         return float(np.median(d)) if d.size else None
+
+    def keep_sections(self, grid_mm, height_mm) -> None:
+        """A check that gridded this zone's heights (height_mm (G, G) mm on the square grid
+        grid_mm (G,) centred on the part; rows = camera down, columns = camera right) hands
+        over the two lines through the centre. Files only (the runner writes them into the
+        run folder): nothing of it reaches the check's result. The first check of a zone
+        that calls it counts; without a runner (sections None) it does nothing. It never
+        raises: a file is never a reason for a check to fail."""
+        try:
+            if self.sections is None or self.zone.id in self.sections:
+                return
+            g, h = np.array(grid_mm, np.float64), np.array(height_mm, np.float64)
+            ic = len(g) // 2
+            self.sections[self.zone.id] = {"pos_mm": g, "x_mm": h[ic, :].copy(),
+                                           "y_mm": h[:, ic].copy()}
+        except Exception:                   # noqa: BLE001
+            pass
 
     def other(self, zone_id: str):
         try:

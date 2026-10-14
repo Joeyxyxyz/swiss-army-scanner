@@ -110,6 +110,7 @@ Written by the engine. Nothing here is overwritten; "delete" moves entries to tr
 | recipes/ | USER RECIPES (the checks that verify a work state: preset -> zones -> checks -> projected feedback): recipes/<name>/recipe.json + meta.json; recipes/active.jsonl records the selected recipe (last line wins) |
 | zones/<geometry_id>/<name>/ | PAINTED ZONE SETS (scan zone-paint: shapes drawn on the part with the mouse, in projector px, valid at this rig placement): zones.json + masks.npz (union + one DMD mask per zone) + preview.png (+ camera.png, a photo of the zones on the part) |
 | runs/ | recipe run folders (api.recipe_run): result.json + run.log.jsonl + overlay / feedback images, one NEW folder per run |
+| events/ | INSPECTION EVENT LOG (engine/eventlog.py), for a spreadsheet: inspections_v1_<YYYY-MM>.csv (one row per inspection) and inspection_values_v1_<YYYY-MM>.csv (one row per value with its limits), one pair per month, append-only; img/ a copy of each run's picture; pending/ rows that wait while a month's file is open elsewhere; last_v1.csv the newest row alone |
 | sessions/ | log.jsonl - every action, success or failure |
 | trash/ | deleted entries (recoverable - move back to restore) |
 """

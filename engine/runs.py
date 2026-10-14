@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import disposition as D
+from . import eventlog
 
 RESULT_SCHEMA_VERSION = "0.4"
 RESULTS = ("PASS", "FAIL", "INVALID", "ABORTED")
@@ -103,11 +104,14 @@ def append_event(log_path: Path, run_id: str, event: str, level: str = "info",
                  **fields) -> None:
     """One more event on a run's CLOSED log (what happened to the run after run_end, e.g.
     the line counting the cycle ABORTED after its verdict was written). result.json is
-    never rewritten; the log records it."""
+    never rewritten; the log records it. The inspection event log gets the run's row again
+    when the event changes what the row says (ABORTED after the verdict: PULL)."""
     rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
            "run_id": run_id, "level": level, "event": event, **fields}
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, default=str) + "\n")
+    if event == eventlog.ABORTED_EVENT:
+        eventlog.amend(Path(log_path).parent)   # its row again, now PULL (never raises)
 
 
 def software_info() -> dict:
@@ -210,4 +214,5 @@ def write_result(run_dir: Path, result: dict) -> Path:
     with open(out, "x", encoding="utf-8") as f:
         json.dump(result, f, indent=2, default=str)
         f.write("\n")
+    eventlog.record(run_dir)                # its row in the inspection event log (never raises)
     return out

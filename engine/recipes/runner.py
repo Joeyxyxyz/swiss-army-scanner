@@ -45,7 +45,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from .. import config, rigstate, rules
+from .. import config, eventlog, rigstate, rules
 from .. import disposition as D
 from .. import runs as R
 from . import feedback as FB
@@ -310,6 +310,7 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
         if gerr:
             res["warnings"].append(f"golden: {gerr}")
     zres = []
+    sections = {}                           # height lines a check gridded: files, never results
     for z in recipe.zones:
         zv = views[z.id]
         entry = {"id": z.id, "label": z.label, "shape": z.shape, "units": z.units,
@@ -327,7 +328,7 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
             ctx = CheckContext(scan=sv, frame=frame, zone=zv,
                                zones={k: v for k, v in views.items() if v is not None},
                                golden=golden, golden_error=gerr, codes=codes,
-                               recipe_name=recipe.name)
+                               recipe_name=recipe.name, sections=sections)
             for c in z.checks:
                 s.check_cancel()
                 entry["checks"].append(_run_check(c, ctx))
@@ -336,6 +337,7 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
         zres.append(entry)
         log.event("zone", zone=z.id, verdict=entry["verdict"], n_points=entry["n_points"],
                   checks={ch["id"]: ch["verdict"] for ch in entry["checks"]})
+    eventlog.write_profiles(run_dir, sections)      # profile_x.csv / profile_y.csv (never raises)
     checked = [z for z in zres if z["checks"]]
     verdict = aggregate(z["verdict"] for z in checked)
     res["zones"] = zres

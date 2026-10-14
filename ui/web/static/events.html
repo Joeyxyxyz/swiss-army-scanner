@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event log</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23161b21'/%3E%3Ccircle cx='8' cy='8' r='4' fill='%233ccf8a'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  .evbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 14px; }
+  .evbar input, .evbar button { font: inherit; color: var(--text); background: var(--panel2);
+    border: 1px solid var(--line2); border-radius: 4px; padding: 3px 8px; min-height: 26px; }
+  .evbar button { cursor: pointer; }
+  .evbar button:disabled { opacity: .5; cursor: default; }
+  .evwrap { padding: 0 14px 14px; overflow-x: auto; }
+  table.t td.evwhy { min-width: 26ch; max-width: 60ch; overflow-wrap: anywhere; }
+  table.t td.evvals { min-width: 44ch; max-width: 70ch; overflow-wrap: anywhere; }
+  table.t td.evtime, table.t td.evid { white-space: nowrap; }
+  table.t td.evfiles a, table.t td.evfiles span { margin-right: 10px; white-space: nowrap; }
+  .evnote { margin: 10px 14px; max-width: 110ch; }
+</style>
+<script src="/static/events.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <span class="brand"><span class="name">Event log</span></span>
+  <span class="muted small">one row per inspection</span>
+  <span class="spacer"></span>
+  <a href="/quick" title="The operator page">Operator page</a>
+  <a href="/" title="The full engineering UI">Advanced UI</a>
+</header>
+<div id="evErr" class="banner" hidden></div>
+<div id="evWaiting" class="banner warn" hidden
+     title="Rows that could not be written into the file of this month yet: the file was open in another program, or the log was busy. They are added to the file at the next inspection."></div>
+<div class="evbar">
+  <button id="evPrev" title="The month before">&lsaquo;</button>
+  <label for="evMonth" class="muted small">Month (UTC)</label>
+  <input id="evMonth" type="month" pattern="[0-9]{4}-[0-9]{2}" placeholder="YYYY-MM">
+  <button id="evNext" title="The month after">&rsaquo;</button>
+  <button id="evReload" title="Read the file again">Reload</button>
+  <input id="evFilter" type="search" size="24" placeholder="Filter: part ID, program, ..."
+         title="Show only the rows that contain this text">
+  <span id="evCount" class="muted small"></span>
+  <span class="spacer"></span>
+  <a id="evCsv" class="small" hidden title="The inspections of this month as a csv file">inspections (csv)</a>
+  <a id="evValuesCsv" class="small" hidden title="Every measured value of this month, with its limits, as a csv file">values (csv)</a>
+</div>
+<div class="evwrap">
+  <table class="t">
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Inspection no.</th>
+        <th>Part ID</th>
+        <th>Part</th>
+        <th>Program</th>
+        <th>Judgment</th>
+        <th>Reason</th>
+        <th>Values</th>
+        <th>Files</th>
+      </tr>
+    </thead>
+    <tbody id="evBody"></tbody>
+  </table>
+  <div id="evEmpty" class="muted" hidden></div>
+  <button id="evMore" hidden>Show more</button>
+</div>
+<p class="note evnote">
+  Every inspection that opened a run folder adds one row: a recipe run, a quick check, a station
+  cycle (one row for the whole cycle), a measurement. A START that is refused before a run folder
+  exists is not listed. Judgment: PASS, FAIL, or PULL (the part is pulled for quality inspection:
+  the Reason says why); a measurement has none. Part ID is the code read from the part, when one
+  was read. Times are shown in this computer's time; the files are kept by UTC month. The files
+  are in the library folder under <code>events/</code> and open in a spreadsheet program.
+</p>
+<p class="note evnote">
+  This page reads the whole month: late in a busy month that is many thousands of rows and can
+  take a few seconds. When something happens to an inspection after its result was written
+  (ABORT pressed after the verdict), its row is written again in the file; this page shows the
+  last one, and in a spreadsheet the last row of an Inspection no. is the one that counts. A
+  cycle that never ended (the program was closed while it ran) is listed as PULL after the log
+  was rebuilt (<code>python -m engine.eventlog --rebuild</code>).
+</p>
+</body>
+</html>

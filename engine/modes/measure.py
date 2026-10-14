@@ -83,7 +83,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from .. import config, rigstate, rules
+from .. import config, eventlog, rigstate, rules
 from .. import disposition as D
 from .. import runs as R
 from ..measure import values as V
@@ -830,6 +830,7 @@ def _write_doc(run_dir: Path, doc: dict) -> Path:
     with open(out, "x", encoding="utf-8") as f:
         json.dump(doc, f, indent=2, default=str)
         f.write("\n")
+    eventlog.record(run_dir)                # its row in the inspection event log (never raises)
     return out
 
 

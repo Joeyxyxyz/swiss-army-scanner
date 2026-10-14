@@ -36,7 +36,7 @@ from typing import Optional
 
 import numpy as np
 
-from ... import config, rules
+from ... import badparts, config, rules
 from ...library.store import json_safe, read_meta, safe_label
 from ...results import DentReport, DentSet, MetricScan
 from . import dentset as ds_mod
@@ -433,6 +433,9 @@ def calibrate_dent_null(s, dentsets: list, cell_diameter_mm: float, label: str =
     for ds in dentsets:
         dset = as_dentset(s, ds)
         scans, c, g, f, w = _metric_for(s, dset, metric_scans)
+        # a KNOWN-GOOD cell only: never a part judged REJECT / PULL (engine/badparts.py)
+        badparts.require_good(s.store, f"calibrate_dent_null: dent set {dset.id}",
+                              [dset, *scans], sweep=True)
         warnings += w
         if geo_id is None:
             geo_id, fp, cal = g, f, c
@@ -499,6 +502,13 @@ def detect_dents(s, dentset, metric_scans=None, cell_diameter_mm: Optional[float
                 "calibrate_dent_null first")
     if null.get("kind") != "dent_null":
         raise ValueError("that file is not a dent null calibration")
+    # never against a null made on a cell judged REJECT / PULL since (engine/badparts.py)
+    badparts.require_good(
+        s.store, f"detect_dents: the null calibration {null.get('id')}: its dent set",
+        [x for src in null.get("sources") or [] if isinstance(src, dict)
+         for x in ([src["path"]] if src.get("path") and Path(src["path"]).exists() else [])
+         + list(src.get("metric_scans") or [])],
+        how="calibrate the null again on a known-good cell")
     rules.require_same_geometry(null["geometry_id"], geo_id, "detect_dents (null calibration)")
     rules.require_same_fingerprint(null.get("geometry_fp"), fp, "detect_dents (null calibration)")
     if null.get("stereo_calibration_id") != cal.id:                 # rule 6

@@ -56,12 +56,13 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
 from scipy import ndimage
 
-from .. import rules
+from .. import badparts, rules
 from ..library.store import safe_label
 from ..results import TIER_DEPTH, TIER_RELIEF
 from .segment import BRIDGE_PX
@@ -197,10 +198,13 @@ def _valid(relief, mask):
 # --------------------------------------------------------------- the verbs
 
 def add(session, scan, bank: str = "default") -> BankInfo:
-    """Append a known-good scan to banks/<geometry_id>/<bank>/members.jsonl."""
+    """Append a known-good scan to banks/<geometry_id>/<bank>/members.jsonl. A scan of a part
+    judged REJECT or PULL (by an inspection or a check) is refused: the bank holds good parts
+    only (engine/badparts.py)."""
     store = session.store
     name = safe_label(bank)
     _refuse_foreign(store, name, scan.geometry_id, "bank_add")
+    badparts.require_good(store, f"bank_add (bank '{name}')", [scan], sweep=True)
     relief, mask = scan.relief, scan.relief_mask
     valid = _valid(relief, mask)
     if not valid.any():
@@ -314,6 +318,12 @@ def check(session, scan, bank: str = "default", k_sigma: float = 4.0, calibratio
                         "add some with bank_add first")
         _write(session, scan, v, label, None)
         return v
+    # a member judged REJECT / PULL since it was added: the bank is not checked against
+    badparts.require_good(
+        store, f"bank_check: a member of bank '{name}'",
+        [SimpleNamespace(id=m["scan_id"], path=_resolve(store, m["path"])) for m in members],
+        how=f"remove it from the bank (bank_remove / `scan bank-remove <scan> --bank {name}`) "
+            "or make the bank again from good parts")
 
     model = _load_or_build(store, d, members)
     relief = np.asarray(scan.relief, np.float64)

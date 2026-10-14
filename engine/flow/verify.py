@@ -32,6 +32,7 @@ import os
 from pathlib import Path
 from typing import Callable, Optional
 
+from .. import badparts
 from .. import disposition as D
 from .. import runs as R
 from .cycle import Cycle
@@ -278,7 +279,8 @@ def verify_step(cfg: StationConfiguration, profile: str, step_id: str, *, runs_d
         station=cfg.station_id,
         context={"station_config": cfg.source.name if cfg.source else None, "profile": profile,
                  "job": {"config": cfg.source.name if cfg.source else None,
-                         "work_state": step.id}})
+                         "work_state": step.id},
+                 badparts.KEY: bad_part_output(cfg)})
     res = out["result"]
     return {"dlp": {**dlp_answer(res, step, recipe.name), "exit_code": out["exit_code"]},
             "run_id": out["run_id"], "run_dir": out["run_dir"], "result": res,
@@ -380,7 +382,55 @@ def cycle_document(cfg: StationConfiguration, record: dict, *, cycle_id: str, cy
         doc["warnings"].append("CONTINUE with work state(s) left unconfirmed (not required): "
                                + ", ".join(f"{x['step']} ({x['outcome']})" for x in left))
     doc["outputs"]["report"] = None
+    doc["outputs"][badparts.KEY] = bad_part_output(cfg)
+    if doc["outputs"][badparts.KEY] is None:    # the station says nothing: its recipes'
+        doc["outputs"][badparts.KEY], why = recipes_bad_part_output(
+            cfg, record.get("profile"), done, record.get("kickout"))
+        if why:
+            doc["warnings"].append(why)
     return doc
+
+
+def bad_part_output(cfg: StationConfiguration) -> Optional[str]:
+    """The configuration's parameters.bad_part_output (relative to its file; "off"; None: it
+    says nothing) - for its cycles, and for a work state's check run on its own, where it
+    wins over the recipe's (engine/badparts.py). A value that is no folder was refused when
+    the configuration was loaded; here it never stops a cycle (None)."""
+    try:
+        return badparts.configured(cfg.parameters.get(badparts.KEY),
+                                   cfg.source.parent if cfg.source else None)
+    except ValueError:
+        return None
+
+
+def recipes_bad_part_output(cfg: StationConfiguration, profile: Optional[str], steps: list,
+                            kickout=None) -> tuple:
+    """The bad-part output of a cycle whose station configuration names none (engine/
+    badparts.py): the outputs.bad_part_output of the recipes of the work states it checked
+    (`steps`, in flow order) - the one they name; when they name different ones, the one of
+    the work state that speaks for the cycle (where it was kicked out, else its last check
+    that names one), with a warning. -> (a folder | "off" | None, the warning | None). Never
+    raises: a recipe that cannot be read here says nothing."""
+    from ..recipes import runner
+    said = {}
+    for st in steps:
+        try:
+            v = runner.recipe_bad_part_output(
+                resolve_recipe(cfg, profile or cfg.parameters.get("default_profile"),
+                               cfg.step(st["id"])))
+        except Exception:                       # noqa: BLE001 - never stops a cycle
+            continue
+        if v is not None:
+            said[st["id"]] = v
+    if len(set(said.values())) <= 1:
+        return next(iter(said.values()), None), None
+    kick = kickout.get("step") if isinstance(kickout, dict) else None
+    speaker = kick if kick in said else list(said)[-1]
+    return said[speaker], (
+        f"{badparts.WARNING}: the recipes of this cycle's work states name different bad-part "
+        f"outputs ({'; '.join(f'{k}: {v}' for k, v in said.items())}): this cycle uses the "
+        f"one of work state {speaker}; set parameters.bad_part_output in the station "
+        "configuration to choose one for every cycle")
 
 
 def write_cycle(cfg: StationConfiguration, record: dict, opened: dict, *, mock: bool,

@@ -172,14 +172,21 @@ def test_station_limits_bands_and_rules(station, tmp_path):
                            flood=station["scans"]["good1"])
     with pytest.raises(ValueError, match="params= applies"):
         api.station_golden([m1], "x", params={"zone_skip": [1, 0]})
-    # an absolute per-item band decides alone for that item
+    # an absolute per-item band decides alone for that item. In a copy of the library: the
+    # FAIL it gives good2 makes good2 a part judged REJECT there - never a golden again
+    # (engine/badparts.py) - and the module's good2 is a golden's measurement elsewhere
     zl = [z["label"] for z in m1.zones if z.get("included")]
-    g = api.station_golden([m1], "banded", bands={zl[0]: [-4.4, -4.0], "C2-C1": [-0.3, -0.1]})
-    r = api.station_check(station["scans"]["good2"], g)
-    assert r.verdict == "FAIL" and [t["item"] for t in r.triggers] == [zl[0]]
-    assert next(it for it in r.items if it["item"] == "C2-C1")["band_mm"] == [-0.3, -0.1]
-    # goldens are append-only: a second one is a new entry, the first is unchanged
-    assert len(api.list_library("station_golden")) == 2
+    api.configure(Path(shutil.copytree(station["lib"], tmp_path / "banded")), mock=True)
+    try:
+        g = api.station_golden([m1], "banded", bands={zl[0]: [-4.4, -4.0],
+                                                      "C2-C1": [-0.3, -0.1]})
+        r = api.station_check(station["scans"]["good2"], g)
+        assert r.verdict == "FAIL" and [t["item"] for t in r.triggers] == [zl[0]]
+        assert next(it for it in r.items if it["item"] == "C2-C1")["band_mm"] == [-0.3, -0.1]
+        # goldens are append-only: a second one is a new entry, the first is unchanged
+        assert len(api.list_library("station_golden")) == 2
+    finally:
+        _use(station)
     # rule 6: a newer stereo calibration makes the scans (and the golden) stale
     lib = Path(shutil.copytree(station["lib"], tmp_path / "library"))
     s2 = api.configure(lib, mock=True)

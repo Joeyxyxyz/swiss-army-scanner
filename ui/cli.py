@@ -76,7 +76,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:          # `python ui/cli.py` from anywhere
     sys.path.insert(0, str(_ROOT))
 
-from engine import api, config, rules  # noqa: E402
+from engine import api, badparts, config, rules  # noqa: E402
 from engine import disposition as D  # noqa: E402
 from engine.library import presets as preset_lib  # noqa: E402
 from engine.capture.hwtrigger import TRIGGER_LINES  # noqa: E402
@@ -4259,7 +4259,8 @@ def _golden_compare(s, ms, golden, roi, thr: float, min_px: int) -> dict:
 def _find_station_golden(cfg, kind: str = "metric"):
     """job.golden -> the golden scan ('metric' scans for metric jobs, 'objects' for compare
     jobs): an explicit id or label, never 'latest' (every run saves its own test scan, so that
-    is the previous part) and never this station's part.label (its test scans carry it)."""
+    is the previous part), never this station's part.label (its test scans carry it) and
+    never a part judged REJECT or PULL (engine/badparts.require_good)."""
     key = str(cfg.golden or "").strip()
     what, cmd_ = ("metric scan", "metric") if kind == "metric" else ("scan", "scans")
     if key.lower() in ("latest", "last") or key == cfg.part_label:
@@ -4270,6 +4271,9 @@ def _find_station_golden(cfg, kind: str = "metric"):
     if golden.label == cfg.part_label:
         raise CLIError(f"job.golden {key!r} resolves to {golden.id}, labelled with this "
                        f"station's part.label {cfg.part_label!r}: an earlier test scan, not a golden")
+    # never a part judged REJECT / PULL (engine/badparts.py): refused, the run is a PULL
+    badparts.require_good(api._engine().store, f"job.golden {key!r}", [golden],
+                          how=badparts.HOW_GOLDEN)
     return golden
 
 
@@ -4658,6 +4662,9 @@ def _run_flow(ctx):
             ["permissions", ", ".join(on) or "none granted"],
             ["result.json", str(Path(out["cycle_dir"]) / "result.json")],
             ["log", str(Path(out["cycle_dir"]) / "run.log.jsonl")]])
+    # a copy to the bad-part output that failed is said (the cycle's other warnings are its
+    # work states', shown in the table)
+    ctx.warn([w for w in res.get("warnings") or [] if str(w).startswith(badparts.WARNING)])
     return out["exit_code"], {"run_id": out["cycle_id"], "run_dir": str(out["cycle_dir"]),
                               "result": res}
 
@@ -5129,6 +5136,16 @@ def cmd_quick_check(ctx):
     return _run_job(ctx, cfg, quick=doc)
 
 
+def _bad_part_option(p: argparse.ArgumentParser) -> None:
+    """--bad-part-output on a run command (run, recipe-run, quick-check): engine/badparts.py."""
+    p.add_argument("--bad-part-output", metavar="DIR",
+                   help="the bad-part output for THIS run: a part judged REJECT or PULL is "
+                        "copied to a folder of its own there (result, picture, height "
+                        "profiles, 3D file) and listed in its bad_parts_v1.csv; 'off' for "
+                        "none. Default: the station configuration's / recipe's "
+                        "bad_part_output, else $SAS_BAD_PART_OUTPUT, else none")
+
+
 def _add_globals(p: argparse.ArgumentParser, sub: bool) -> None:
     """Globals work before OR after the command. Sub-parsers use SUPPRESS so
     an option given before the command is not reset by the sub-parser."""
@@ -5507,6 +5524,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="a human confirmed the physical setup (required on the real rig)")
     p.add_argument("--pattern-mode-set-by-human", action="store_true",
                    help="scan.kind trigger only: a HUMAN put the projector in pattern mode")
+    _bad_part_option(p)
     p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a FAIL verdict (1)
     p = cmd("recipe-golden", cmd_recipe_golden, "scan a GOOD part with a recipe's scan settings, "
             "recorded as the recipe's golden (labelled the recipe's golden.scan; golden.scan "
@@ -6290,6 +6308,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "nobody acknowledges ends the cycle PULL; --interactive asks). A work "
                         "state's prompts are answered at most retries + 1 times, then the "
                         "cycle ends PULL")
+    _bad_part_option(p)
     p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a FAIL verdict (1)
     p = cmd("flow-show", cmd_flow_show, "show + validate a station configuration: parameters, "
             "profiles (the profile library set), work states (the flow), permissions; exit 2 "
@@ -6400,6 +6419,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="recipe: do not project the verdict on the part")
     p.add_argument("--runs-dir", metavar="DIR", help="where the run folder goes (default "
                    "$SCANNER_RUNS_DIR, else <library>/runs)")
+    _bad_part_option(p)
     p.set_defaults(unexpected_exit=EXIT_ERROR)          # a crash (4) is not a verdict (1)
     p = cmd("rig-session", cmd_rig_session,
             "the rig's state for mm results (mount, calibration, last rig check, verified?); "
@@ -6567,6 +6587,8 @@ def main(argv: Optional[list] = None) -> int:
     args.preset_given = any(t == "--preset" or t.startswith("--preset=") for t in raw)
     args.mock_part_given = any(t == "--mock-part" or t.startswith("--mock-part=") for t in raw)
     ctx = Ctx(args)
+    # this command's --bad-part-output (run commands): it wins over the configuration
+    badparts.set_command_line(getattr(args, "bad_part_output", None))
     try:
         ctx.start()
         code, data = args.func(ctx)
@@ -6595,6 +6617,8 @@ def main(argv: Optional[list] = None) -> int:
                                         **_error_disposition(e, args.command, code, line)}),
                              indent=2))
         return code
+    finally:
+        badparts.set_command_line(None)
 
 
 DISPOSITION_COMMANDS = ("run", "recipe-run", "quick-check", "station-check", "face-check")

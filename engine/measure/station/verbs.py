@@ -25,7 +25,7 @@ from typing import Optional
 
 import numpy as np
 
-from ... import rules
+from ... import badparts, rules
 from ...library.store import json_safe, read_meta, safe_label
 from ...results import MetricScan, StationCheck, StationGolden, StationMeasurement
 from . import figure
@@ -294,6 +294,13 @@ def load_measurement(s, item) -> StationMeasurement:
     raise ValueError(f"{item!r} is not a station measurement (a StationMeasurement or its .json)")
 
 
+def _measurement_sources(s, item) -> list:
+    """What a station measurement rests on, for engine/badparts.require_good: its JSON file
+    and its metric scan."""
+    m = load_measurement(s, item)
+    return [m.files.get("json"), m.scan_id]
+
+
 # ------------------------------------------------------------ station_golden
 
 def _golden_handle(d: Path) -> Optional[StationGolden]:
@@ -555,7 +562,9 @@ def station_golden(s, measurements: list, label: str = "golden", limits: Optiona
     gates, given with ones made with them, is re-measured from its scan with the gates (written
     to the output bin) and stands in only when it finds the same end faces; an end face that
     lies further from the measurements' mean position than the face position tolerance is
-    refused, never averaged."""
+    refused, never averaged. A measurement or scan of a part judged REJECT or PULL (an
+    inspection, station_check) is refused: references are made from good parts only
+    (engine/badparts.py)."""
     safe_label(label)
     lim = check_limits(limits)
     if not measurements:
@@ -569,6 +578,12 @@ def station_golden(s, measurements: list, label: str = "golden", limits: Optiona
     if params is not None and all(is_meas):
         raise ValueError("station_golden: params= applies to metric scans measured here; station "
                          "measurements keep the parameters they were measured with")
+    # good parts only (engine/badparts.py): a measurement's file and its scan, a scan given
+    from ..endface.verbs import as_metric_scan
+    badparts.require_good(s.store, "station_golden measurement", [
+        x for i, it in enumerate(measurements)
+        for x in (_measurement_sources(s, it) if is_meas[i] else [as_metric_scan(s, it)]
+                  if isinstance(it, (str, Path, MetricScan)) else [])], sweep=True)
     ms_list = []
     for i, it in enumerate(measurements):
         if is_meas[i]:
@@ -807,6 +822,16 @@ def station_check(s, scan, golden=None, flood=None, label: Optional[str] = None)
     ms0 = as_metric_scan(s, scan)
     g = as_golden(s, golden, ms0.geometry_id, (ms0.meta or {}).get("geometry_fp"),
                   ms0.calibration_id)
+    # never against a golden whose measurements were judged REJECT / PULL since (badparts)
+    try:
+        made_from = json.loads(Path(g.files["json"]).read_text(encoding="utf-8")).get(
+            "measurements") or []
+    except (OSError, ValueError, AttributeError):
+        made_from = []
+    badparts.require_good(s.store, f"station_check: golden {g.id}: its measurement",
+                          [g.path] + [x for m in made_from if isinstance(m, dict)
+                                      for x in (m.get("scan_id"), m.get("file") or None)],
+                          how=badparts.HOW_USE)
     rules.require_same_geometry(ms0.geometry_id, g.geometry_id, f"station_check: golden {g.id}")
     rules.require_same_fingerprint((ms0.meta or {}).get("geometry_fp"), g.meta.get("geometry_fp"),
                                    f"station_check: golden {g.id}")

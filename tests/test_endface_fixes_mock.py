@@ -30,7 +30,7 @@ import pytest
 
 import face_synth as S
 from conftest import FIXTURE_PRESETS
-from engine import api, config
+from engine import api, badparts, config
 from engine.capture.mock_bench import MockBench
 from engine.capture.mock_stereo import EndFace, MetricCylinder, Plane
 from engine.measure.endface import depth as depth_mod
@@ -857,6 +857,11 @@ def test_edge_dents_are_rim_outline_triggers(f195):
 def test_size_mismatch_is_a_pull_never_a_pass_never_a_reject(f195, capsys):
     _use(f195)
     g, prof, s = f195["golden"], f195["prof"], f195["s"]
+    # a golden is never built on it
+    with pytest.raises(ValueError, match="placement small: part reads 16"):
+        api.face_golden([prof["g1"], prof["g2"], prof["small"]], "bad", synthetic=False)
+    assert len(api.list_library("face_golden")) == len(
+        [d for d in (f195["lib"] / "face_golden" / S.GEO).iterdir()])
     r = V.check_face(s, prof["small"], g, "small")
     assert r.verdict == "INCOMPLETE" and r.stats["disposition"] == "PULL"
     (why,) = [p for p in r.stats["pull_reasons"] if p["reason"] == "size_mismatch"]
@@ -876,11 +881,9 @@ def test_size_mismatch_is_a_pull_never_a_pass_never_a_reject(f195, capsys):
     wide = V.check_face(s, prof["small"], g, "small_wide", {"size_tol_pct": 20.0})
     assert wide.stats["size_check"]["status"] == "ok" and wide.params["size_tol_pct"] == 20.0
     assert not [p for p in wide.stats["pull_reasons"] if p["reason"] == "size_mismatch"]
-    # a golden is never built on it
-    with pytest.raises(ValueError, match="placement small: part reads 16"):
+    # ... and now that a check has pulled it, also as a part judged PULL (engine/badparts.py)
+    with pytest.raises(badparts.BadPartReference, match="judged PULL"):
         api.face_golden([prof["g1"], prof["g2"], prof["small"]], "bad", synthetic=False)
-    assert len(api.list_library("face_golden")) == len(
-        [d for d in (f195["lib"] / "face_golden" / S.GEO).iterdir()])
     # the command line: exit 5 = PULL, the reason in the JSON; a good face 0, an edge dent 1
     from ui import cli
     base = ["--mock", "--library", str(f195["lib"]), "--json"]
@@ -923,7 +926,9 @@ def test_cli_face_golden_and_profile_take_the_radii(f195, capsys):
         assert prm["rim"]["tol_mm"] == 0.5 and prm["rim"]["min_arc_mm"] == 2.0
         code = cli.main(base + ["face-golden", *[f195["fs"][k] for k in ("g1", "g2", "small")],
                                 "--label", "cli_bad", "--no-synthetic"])
-        assert code == 2 and "part reads 16" in capsys.readouterr().out      # refused
+        out = capsys.readouterr().out                       # refused: for its size, or - once
+        assert code == 2 and ("part reads 16" in out        # a face check pulled it (the test
+                              or "was judged PULL" in out)  # above) - as a part judged PULL
         code = cli.main(base + ["face-profile", f195["fs"]["g4"], "--label", "cli_prof", "--no-stl"])
         doc = json.loads(capsys.readouterr().out)
         assert code == 0 and doc["profile"]["stats"]["r_flat_mm"] == pytest.approx(0.855 * R195, abs=0.01)

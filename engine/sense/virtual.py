@@ -95,6 +95,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -1278,11 +1279,14 @@ def _align_from_doc(doc: dict, vpath: Path) -> AlignmentRef:
 
 def teach_alignment(session, preset, name: str, scan) -> AlignmentRef:
     """Store the reference pose of the part blob in `scan`'s relief (a new
-    version; latest wins)."""
+    version; latest wins). A scan of a part judged REJECT or PULL is refused: a
+    reference is taught on a good part only (engine/badparts.py)."""
+    from .. import badparts
     name = _name(name)
     geo = preset.geometry_id
     rules.require_same_geometry(scan.geometry_id, geo, "teach_alignment")
     _guard_kind(session, geo, name, "alignment")
+    badparts.require_good(session.store, f"teach_alignment {name!r}", [scan], sweep=True)
     from ..measure.segment import SegmentationError
     try:
         pose = _pose(scan)
@@ -1317,6 +1321,12 @@ def check_alignment(session, preset, name: str, scan, tol_mm: float = 1.0,
     rules.require_same_geometry(scan.geometry_id, geo, "check_alignment")
     doc, vpath = _latest_doc(session, geo, name, kind="alignment")
     rules.require_same_geometry(doc.get("geometry_id", geo), geo, f"alignment {name!r}")
+    from .. import badparts                 # never against a part judged REJECT / PULL since
+    taught = doc.get("scan_path")
+    badparts.require_good(session.store, f"check_alignment (reference {name!r}): its scan",
+                          [SimpleNamespace(id=doc.get("scan_id"), path=Path(taught))
+                           if taught and Path(taught).is_dir() else doc.get("scan_id")],
+                          how=f"teach {name!r} again on a good part")
     cal = _calibration(session, preset)
     k = cal.lateral_px_per_mm if cal is not None and cal.has_xy else None
     res = AlignmentResult(name=name, verdict=INDETERMINATE, position_units="mm" if k else "px",

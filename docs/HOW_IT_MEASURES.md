@@ -44,6 +44,8 @@ This is triangulation, as in a laser line sensor. The stripes come as a short se
 
 **Event log:** one line per inspection that ran, with its values and limits, and links to a picture and, where the inspection has them, to height profiles and 3D data. It is kept as table files, one pair per month (the inspections, and their values), in the library's `events` folder.
 
+**Bad parts:** a part judged FAIL or PULL is kept for tracking - copied to the bad-part output when one is set - and is never used as a reference: the scanner only ever compares a part with good parts.
+
 ## Two ways the projector shows stripes
 
 - **Video.** The projector is a second screen of this PC. The software shows each pattern as a picture, and the camera takes its frames while the picture stands. Every normal scan works this way.

@@ -9,16 +9,23 @@
 // the header and that one row.
 //
 // Words: Inspection no. = the run id. Part ID = the code read from the part. Program = what
-// was checked. Judgment = PASS / FAIL / PULL ("-" for a measurement, which decides nothing).
+// was checked, and under it how the scanner was used (operating_mode). Judgment = PASS / FAIL
+// (disposition REJECT) / PULL ("-" for a measurement, which decides nothing); "REJECT and
+// PULL only" shows the parts that did not continue. hardware MOCK = a simulated inspection.
 // An inspection can have more than one row (written again when something happened to the
 // run after its result, e.g. ABORT after the verdict): the last one counts.
+// Times: the scanner's local time with its offset to UTC, as the file holds it; shown as
+// written (the shop's clock), sorted by the moment. The files are kept by that month.
 'use strict';
 
 const $ = (sel) => document.querySelector(sel);
 const FILES = '/files/';
 const EVENTS = 'events/';
 const PAGE = 500;                       // rows shown at once (a month can hold many thousands)
-const state = { month: null, rows: [], shown: PAGE, waiting: 0 };
+const state = { month: null, rows: [], shown: PAGE, waiting: 0, bad: false };
+const MODES = { measure: 'Measure', quick_check: 'Quick check', station: 'Station',
+  recipe_run: 'Recipe run' };
+const NOT_CONTINUED = ['FAIL', 'PULL'];  // the judgments of the parts that did not continue
 
 function parseCsv(text) {
   // RFC 4180: fields in double quotes may hold commas and doubled quotes -> rows of cells.
@@ -82,7 +89,9 @@ function lastRows(rows) {
 }
 
 function monthNow() {
-  return new Date().toISOString().slice(0, 7);              // the files are kept by UTC month
+  // the files are kept by the month of the scanner's local time: this computer's month
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
 
 function validMonth(m) {
@@ -102,11 +111,21 @@ function fileUrl(path) {
 }
 
 function localTime(iso) {
-  const d = new Date(iso);
-  if (!iso || Number.isNaN(d.getTime())) return iso || '';
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
-    + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  // the time as the file holds it: the scanner's own clock (its offset is in the tooltip)
+  const m = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d:\d\d)/.exec(iso || '');
+  return m ? `${m[1]} ${m[2]}` : (iso || '');
+}
+
+function moment(iso) {
+  // the instant of a time: rows written in summer time and in winter time sort as they happened
+  const t = Date.parse(iso || '');
+  return Number.isNaN(t) ? null : t;
+}
+
+function newestFirst(a, b) {
+  const ta = moment(a.time), tb = moment(b.time);
+  if (ta !== null && tb !== null && ta !== tb) return tb - ta;
+  return a.time < b.time ? 1 : a.time > b.time ? -1 : 0;
 }
 
 function el(tag, text, cls) {
@@ -146,7 +165,7 @@ function rowEl(r) {
   }
   tr.appendChild(time);
   const id = el('td', r.inspection_id, 'evid mono');
-  if (r.mode === 'MOCK') {
+  if ((r.hardware || r.mode) === 'MOCK') {             // `mode`: a row written before v1 settled
     const mock = el('span', 'MOCK', 'tag warn');
     mock.title = 'A simulated inspection: no real part was measured';
     id.appendChild(document.createTextNode(' '));
@@ -155,7 +174,13 @@ function rowEl(r) {
   tr.appendChild(id);
   tr.appendChild(el('td', r.part_id));
   tr.appendChild(el('td', r.part));
-  tr.appendChild(el('td', r.program));
+  const program = el('td', r.program);
+  if (r.operating_mode) {
+    const mode = el('span', MODES[r.operating_mode] || r.operating_mode, 'muted small evmode');
+    mode.title = 'How the scanner was used (operating mode)';
+    program.appendChild(mode);
+  }
+  tr.appendChild(program);
   const j = el('td');
   j.appendChild(el('span', r.judgment, JUDGMENT_CLASS[r.judgment] || 'muted'));
   tr.appendChild(j);
@@ -176,9 +201,10 @@ function rowEl(r) {
 }
 
 function matches(r, needle) {
+  if (state.bad && !NOT_CONTINUED.includes(r.judgment)) return false;
   if (!needle) return true;
-  return ['inspection_id', 'part_id', 'part', 'program', 'judgment', 'reason', 'values', 'time']
-    .some((k) => String(r[k] || '').toLowerCase().includes(needle));
+  return ['inspection_id', 'part_id', 'part', 'program', 'operating_mode', 'judgment', 'reason',
+    'values', 'time'].some((k) => String(r[k] || '').toLowerCase().includes(needle));
 }
 
 function render() {
@@ -188,10 +214,13 @@ function render() {
   body.textContent = '';
   rows.slice(0, state.shown).forEach((r) => body.appendChild(rowEl(r)));
   const n = state.rows.length;
-  $('#evCount').textContent = needle ? `${rows.length} of ${n} inspection(s)` : `${n} inspection(s)`;
+  $('#evCount').textContent = (needle || state.bad) ? `${rows.length} of ${n} inspection(s)`
+    : `${n} inspection(s)`;
   const empty = $('#evEmpty');
   empty.hidden = rows.length > 0;
-  empty.textContent = n ? 'No row contains that text.' : `No inspections recorded in ${state.month}.`;
+  empty.textContent = !n ? `No inspections recorded in ${state.month}.`
+    : needle ? 'No row contains that text.'
+      : `No inspection of ${state.month} was REJECT or PULL.`;
   const more = $('#evMore');
   more.hidden = rows.length <= state.shown;
   more.textContent = `Show ${Math.min(PAGE, rows.length - state.shown)} more`;
@@ -227,8 +256,7 @@ async function load(month) {
     if (state.month !== month) return;                      // another month was picked meanwhile
     // one row per inspection (its last), newest first; the file is in the order the rows
     // were written, and a waiting row was written after the rows in the file
-    state.rows = lastRows(rows.concat(waiting))
-      .sort((a, b) => (a.time < b.time ? 1 : a.time > b.time ? -1 : 0));
+    state.rows = lastRows(rows.concat(waiting)).sort(newestFirst);
     state.waiting = waiting.length;
     err.hidden = true;
   } catch (e) {
@@ -253,7 +281,11 @@ function init() {
   $('#evReload').addEventListener('click', () => load(state.month));
   $('#evFilter').addEventListener('input', () => { state.shown = PAGE; render(); });
   $('#evMore').addEventListener('click', () => { state.shown += PAGE; render(); });
-  const asked = new URLSearchParams(window.location.search).get('month');
+  const params = new URLSearchParams(window.location.search);
+  const bad = $('#evBad');                             // ?bad=1: open with the filter on
+  bad.checked = state.bad = params.get('bad') === '1';
+  bad.addEventListener('change', () => { state.bad = bad.checked; state.shown = PAGE; render(); });
+  const asked = params.get('month');
   load(validMonth(asked) ? asked : monthNow());
 }
 

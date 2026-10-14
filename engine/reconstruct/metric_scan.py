@@ -558,9 +558,13 @@ def compare_metric(s, scan: MetricScan, golden: MetricScan, max_dist_mm: float =
     material and a second part or component are not reported. A verdict comes from a station
     metric job with measure: "golden" (every component, both directions)."""
     from scipy import ndimage
+    from .. import badparts
     check_cal(s, scan, "compare_metric")
     check_cal(s, golden, "compare_metric (golden)")
     rules.require_same_geometry(scan.geometry_id, golden.geometry_id, "compare_metric")
+    # never compared with a part judged REJECT / PULL (engine/badparts.py)
+    badparts.require_good(s.store, "compare_metric: the golden", [golden],
+                          how=badparts.HOW_GOLDEN)
     a, g = scan.cloud, golden.cloud
     if foreground_only:
         # the part, not the wall: a re-placed part moves against the background,

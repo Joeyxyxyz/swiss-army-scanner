@@ -38,6 +38,12 @@ job (a station config with one job, a recipe run) is ONE implicit work state "ru
 outcome is the job's own disposition (CONTINUE -> CONFIRMED, REJECT -> DEFECT, anything
 else DOUBT). A cycle of a flow (engine/flow/) is CONTINUE only when every required work
 state was CONFIRMED; its `pull_reasons` may carry `step` (the work state they belong to).
+
+`outputs.bad_part_output` (added in 0.4, every other key kept): the bad-part output folder
+in force for the run, null when off (engine/badparts.py). After result.json is written,
+write_result hands a REJECT / PULL to engine/badparts.record: its scans are marked as a bad
+part's (never a reference) and it is copied to that folder; a copy that failed is said in
+the run's warnings (the result the caller prints and returns), never in a changed judgment.
 """
 
 from __future__ import annotations
@@ -50,8 +56,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from . import badparts, eventlog
 from . import disposition as D
-from . import eventlog
 
 RESULT_SCHEMA_VERSION = "0.4"
 RESULTS = ("PASS", "FAIL", "INVALID", "ABORTED")
@@ -112,14 +118,19 @@ def append_event(log_path: Path, run_id: str, event: str, level: str = "info",
         f.write(json.dumps(rec, default=str) + "\n")
     if event == eventlog.ABORTED_EVENT:
         eventlog.amend(Path(log_path).parent)   # its row again, now PULL (never raises)
+        badparts.record(Path(log_path).parent)  # a PULL now: marked, copied (never raises)
 
 
 def software_info() -> dict:
+    """{package_version, git_commit}: the installed package's version, else the version the
+    source tree states (engine.__version__, as pyproject.toml); the commit when it runs from
+    a git checkout (a copied tree has none)."""
     try:
         from importlib.metadata import version
         pkg = version("swiss-army-scanner")
     except Exception:                       # noqa: BLE001 - running from a source tree
-        pkg = None
+        from . import __version__
+        pkg = __version__
     commit = None
     if (_ROOT / ".git").exists():
         try:
@@ -164,7 +175,11 @@ def empty_result(*, run_id: str, run_folder: str, mock: bool, operator_confirmed
         "disposition": None,                # CONTINUE | REJECT | PULL (engine/disposition.py)
         "pull_reasons": [],
         "warnings": [],
-        "outputs": {"mesh": [], "deviation_map": None, "report": None, "log": "run.log.jsonl"},
+        # bad_part_output: the folder a part judged REJECT / PULL is copied to (null: off).
+        # Whoever builds the run puts its configuration's there; write_result settles it
+        # (engine/badparts.py: the command line, the configuration, else the environment)
+        "outputs": {"mesh": [], "deviation_map": None, "report": None, "log": "run.log.jsonl",
+                    "bad_part_output": None},
         "recipe": None,
         "zones": [],
         "feedback": None,
@@ -209,10 +224,16 @@ def write_result(run_dir: Path, result: dict) -> Path:
         result.setdefault(key, empty)
     if not result.get("steps"):             # a single job: one implicit work state
         result["steps"] = [implicit_step(result)]
+    badparts.settle(result)                 # outputs.bad_part_output: where a bad part goes
     result["finished"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     out = Path(run_dir) / "result.json"
     with open(out, "x", encoding="utf-8") as f:
         json.dump(result, f, indent=2, default=str)
         f.write("\n")
     eventlog.record(run_dir)                # its row in the inspection event log (never raises)
+    # a REJECT / PULL: marked on its scans and copied to the bad-part output (never raises);
+    # what failed is said in the run's output (its warnings), result.json stays as written
+    got = badparts.record(run_dir)
+    if got and got.get("warnings") and isinstance(result.get("warnings"), list):
+        result["warnings"].extend(got["warnings"])
     return out

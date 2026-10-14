@@ -22,7 +22,8 @@ engine/flow/), portable to any DMD projector + camera line:
       -> pull      the disposition on top of the verdict (engine/disposition.py): the guard
                    band (guard_band_pct of a tolerance next to its limit: PULL) and the doubt
                    reasons the line rejects instead of pulling
-      -> outputs   run folder, result codes for the I/O registers, overlay image
+      -> outputs   run folder, result codes for the I/O registers, overlay image, the
+                   bad-part output (engine/badparts.py)
 
 validate(doc) -> Recipe, or RecipeError listing EVERY problem with its path
 ("zones[1].checks[0] (flatness): tol_mm must be > 0 (mm), got -1"). Hand-written: no
@@ -64,8 +65,11 @@ FEEDBACK_DEFAULTS = {"enabled": True, "pass_colour": "green", "fail_colour": "re
                      "fill_fail": True,
                      "fill_level": 0.6, "cross_px": 24, "text": True, "text_px": 28,
                      "hold_s": 5.0, "max_fit_px": 2.0, "photo": True}
+# bad_part_output: where a part judged REJECT or PULL is copied (engine/badparts.py; a
+# folder relative to the recipe file, "off", or null: the station's / the computer's)
 OUTPUT_DEFAULTS = {"runs_dir": None, "overlay": True,
-                   "result_codes": {"PASS": 1, "FAIL": 2, "INVALID": 3, "ABORTED": 4, "PULL": 5}}
+                   "result_codes": {"PASS": 1, "FAIL": 2, "INVALID": 3, "ABORTED": 4, "PULL": 5},
+                   "bad_part_output": None}
 # the disposition on top of the verdict (engine/disposition.py): guard band in % of a
 # tolerance (0 = off) and the doubt reasons this line rejects instead of pulling ([] = none)
 PULL_DEFAULTS = {"guard_band_pct": 0.0, "invalid_reasons_to_reject": []}
@@ -414,6 +418,9 @@ def _feedback_rules(fb: dict, E: _Errors) -> None:
 def _output_rules(outs: dict, E: _Errors) -> None:
     if outs["runs_dir"] is not None and not isinstance(outs["runs_dir"], str):
         E.add("outputs.runs_dir", "must be a folder path or null")
+    if outs["bad_part_output"] is not None and not isinstance(outs["bad_part_output"], str):
+        E.add("outputs.bad_part_output", "must be a folder path, \"off\" or null (engine/"
+              "badparts.py: where a part judged REJECT or PULL is copied)")
     if not isinstance(outs["overlay"], bool):
         E.add("outputs.overlay", "must be true or false")
     rc = outs["result_codes"]

@@ -66,6 +66,7 @@ rig is not gated in Station mode.
 |---|---|
 | `preset` | the rig preset every profile scans with (a profile's own `preset` wins; `null`: each recipe's pinned preset) |
 | `library`, `mock_library`, `runs_dir`, `operator_confirmed` | as in a single-job config (below); paths are relative to this file |
+| `bad_part_output` | as in a single-job config (below): where a cycle judged REJECT or PULL is copied (one folder per part, `bad_parts_v1.csv`); for its cycles and for a work state checked on its own it wins over the recipes' `outputs.bad_part_output`. `null` (default): a cycle uses its recipes' (the ones of the work states it checked; when they name different folders, the one of the work state that speaks for the cycle - where it was kicked out - and the cycle's output warns: set it here), else `$SAS_BAD_PART_OUTPUT`. Never at the top level of a configuration with a flow (refused: it belongs here) |
 | `default_profile` | the profile selected when the configuration is (default: the first) |
 | `io.inputs` | the sensor signals of the line the work states may `expect`: `{"<signal>": {"description", "source"}}` (or a list of names). A work state naming another signal is refused, and so is a claim for a name no configuration declares. The claims arrive at run time: `POST /api/io/inputs {"<signal>": true}`, `scan run --input <signal>=true`, an input backend's `signals` map. **A claim belongs to one cycle**: every claim is forgotten when a cycle ends (and on ABORT, HOME, FAULT, a configuration / profile change), so the line reports its sensors for every part |
 | `io.max_age_s` | optional: the oldest a claim may be (seconds) when a work state's scan starts; an older one is unknown (DOUBT). `null` (default): no limit beyond "reported for this cycle" |
@@ -356,6 +357,7 @@ this file.
 | `preset` | rig preset (`--preset` on the command line wins); `null` = the recipe's preset (recipe jobs), else the preset selected (`preset-select`) in the library the run uses (`library` / `mock_library`): a selection that no longer exists is refused, never replaced by a default. A preset file path naming a device (`CON`, `CONIN$`, a `\\.\` prefix, a trailing dot or space, a `:`) is refused |
 | `library`, `mock_library` | library root for real / `--mock` runs; `null` = `--library`, `$SWISS_SCANNER_LIBRARY` or `<repo>/library` |
 | `runs_dir` | where run folders go; `$SCANNER_RUNS_DIR` overrides |
+| `bad_part_output` | the **bad-part output**: a folder (relative to this file) where every run judged REJECT or PULL gets a folder of its own named by its part ID (`result.json`, picture, height profiles, `scan.ply`) and a row in `bad_parts_v1.csv` (REJECT and PULL told apart); `"off"` for none; `null` (default): a recipe job's `outputs.bad_part_output`, else `$SAS_BAD_PART_OUTPUT`. `scan run --bad-part-output DIR` wins over it. A folder of its own: one that is, holds or lies inside the library or a runs folder is refused (nothing copied, said in the run's warnings). A good part writes nothing there; a failed copy never changes the judgment (README, *Bad parts*). A job's `golden` is never a part judged REJECT or PULL: the run is refused (PULL) and says why |
 | `operator_confirmed` | a human confirmed the physical setup; the real rig refuses without it (or `--operator-confirmed`). `true` / `false` only: a quoted `"false"` is refused |
 | `require_mm` | `true`: a px-only result (no calibration at this geometry) is INVALID (`true` / `false` only) |
 | `threshold_mm` | FAIL threshold in mm (a positive, finite number); `null` = the preset's `tolerance.ch_fail_mm` (metric jobs: required, INVALID without it) |
@@ -398,7 +400,8 @@ this file.
   "disposition": "CONTINUE",
   "pull_reasons": [],
   "warnings": [],
-  "outputs": {"mesh": [], "deviation_map": "...png", "report": "...json", "log": "run.log.jsonl"},
+  "outputs": {"mesh": [], "deviation_map": "...png", "report": "...json", "log": "run.log.jsonl",
+              "bad_part_output": null},
   "recipe": null,
   "zones": [],
   "feedback": null,
@@ -428,7 +431,8 @@ work state `run` whose outcome is the job's own disposition (CONTINUE -> `CONFIR
 -> `DEFECT`, anything else `DOUBT`), with no sensor claim and no permission; a cycle of a
 flow lists every work state (*Profiles and work states* above), `cycle` says how it ended
 (`ended_by`, `kickout`, `sensor_mismatch`, `sensor_mismatches`, `unconfirmed`) and its
-`pull_reasons` may carry `step`.
+`pull_reasons` may carry `step`. `outputs.bad_part_output` (0.4, every other key unchanged)
+names the bad-part output in force for the run (null: off).
 
 `INVALID` means the numbers cannot be trusted (no mm calibration at this geometry,
 an INDETERMINATE engine verdict, a refused or crashed run). Never report an

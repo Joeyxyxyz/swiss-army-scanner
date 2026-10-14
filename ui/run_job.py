@@ -5,7 +5,8 @@ Flow-ready job runner: one station config file in, one run folder out.
 
 A station config (JSON, or YAML when PyYAML is installed) holds every
 station parameter: station id, preset, job type, thresholds, zone, where
-run folders go. Nothing station-specific lives in code. This module reads the
+run folders go, where a part judged REJECT or PULL is copied (bad_part_output,
+engine/badparts.py). Nothing station-specific lives in code. This module reads the
 SINGLE-JOB form (station_id, preset, job, part): one job, which the engine
 treats as a station configuration with one implicit profile ("default") and a
 one-step flow (its one work state is that job; engine/flow/schema.py
@@ -52,6 +53,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from engine import badparts as _badparts
 from engine import disposition as _disp
 from engine import runs as _runs
 from engine.flow import schema as _flow
@@ -113,6 +115,9 @@ class StationConfig:
     recipe: Optional[str] = None
     feedback: Optional[bool] = None         # None: the recipe's feedback.enabled
     mock_part: Optional[str] = None         # MOCK only: what the simulated human places
+    # where a part judged REJECT / PULL is copied (engine/badparts.py): a full folder path,
+    # "off", or None (it says nothing: the recipe's, else the computer's)
+    bad_part_output: Optional[str] = None
     source: Optional[Path] = None
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -221,6 +226,10 @@ def config_from_doc(doc: dict, base_dir: Path, source: Optional[Path] = None) ->
     min_area = job.get("min_area_px", 50)
     if not _count(min_area) or min_area < 1:
         raise StationConfigError("job.min_area_px must be a positive integer")
+    try:
+        bad_out = _badparts.configured(doc.get(_badparts.KEY), base_dir)
+    except ValueError as e:
+        raise StationConfigError(str(e)) from None
     runs_env = os.environ.get("SCANNER_RUNS_DIR")
     return StationConfig(
         station_id=sid,
@@ -237,7 +246,7 @@ def config_from_doc(doc: dict, base_dir: Path, source: Optional[Path] = None) ->
         n_sigma=float(n_sigma),
         min_area_px=int(min_area),
         operator_confirmed=_flag(doc, "operator_confirmed", False),
-        mock_part=_mock_part(doc.get("mock_part")),
+        mock_part=_mock_part(doc.get("mock_part")), bad_part_output=bad_out,
         source=Path(source).resolve() if source else None, raw=doc, **metric, **rec)
 
 
@@ -371,10 +380,13 @@ def empty_result(cfg: StationConfig, run_id: str, run_folder: str, mock: bool,
            "config": str(cfg.source.name) if cfg.source else None}
     if cfg.job_type == "recipe":
         job["recipe"] = cfg.recipe
-    return _runs.empty_result(run_id=run_id, run_folder=run_folder, mock=mock,
-                              operator_confirmed=operator_confirmed, station=cfg.station_id,
-                              job=job, part={"role": cfg.part_role, "label": cfg.part_label},
-                              threshold_mm=cfg.threshold_mm, zone=cfg.zone,
-                              # a single job: the configuration's one implicit profile
-                              station_config=str(cfg.source.name) if cfg.source else None,
-                              profile=_flow.LEGACY_PROFILE)
+    res = _runs.empty_result(run_id=run_id, run_folder=run_folder, mock=mock,
+                             operator_confirmed=operator_confirmed, station=cfg.station_id,
+                             job=job, part={"role": cfg.part_role, "label": cfg.part_label},
+                             threshold_mm=cfg.threshold_mm, zone=cfg.zone,
+                             # a single job: the configuration's one implicit profile
+                             station_config=str(cfg.source.name) if cfg.source else None,
+                             profile=_flow.LEGACY_PROFILE)
+    # the station's bad-part output (a recipe job: it wins over the recipe's own)
+    res["outputs"][_badparts.KEY] = cfg.bad_part_output
+    return res

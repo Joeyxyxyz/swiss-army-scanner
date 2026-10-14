@@ -7,10 +7,17 @@ Inspection event log: one row per inspection, in the library, for a spreadsheet.
     <library>/events/pending/<the same two file names>     rows that could not be appended
     <library>/events/last_v1.csv                           the newest inspection row, alone
 
-One file pair per month (the month of the inspection's time, UTC). `v1` in the name is the
-format: the two headers below. A later format gets a new name; a v1 file is never rewritten
-with other columns. A month's file grows to tens of MB: whoever wants only the row of the
-inspection that just ended (its part id) reads last_v1.csv, the header and that one row.
+One file pair per month (the month of the inspection's time as its `time` cell reads it:
+this computer's local time). `v1` in the name is the format: the two headers below. A later
+format gets a new name; a row is never added under other columns. A v1 file whose header
+is not the v1 header is brought to it the first time a row is added to it, the file as it
+was moved to events/replaced_<time>/ (never deleted): one written before the v1 header was
+settled (its `mode` column is `hardware` now; it has no `operating_mode`) keeps its rows
+cell for cell; one changed in another program (a column added in a spreadsheet program and
+saved) keeps its rows by their column names (an added column stays in the file moved
+aside). Work on a copy of a log file, never on the file itself.
+A month's file grows to tens of MB: whoever wants only the row of the inspection that just
+ended (its part id) reads last_v1.csv, the header and that one row.
 
 An inspection is a run that opened a run folder and wrote its result.json: a recipe run, a
 quick check, a station job, a cycle of a station configuration, a measurement. A cycle is
@@ -26,7 +33,9 @@ right after; a rebuild reads the event itself. THE LAST ROW OF AN INSPECTION ID 
 every reader. Its value rows are written once.
 
 The inspection row (INSPECTION_FIELDS, in this order):
-    time            when the result was written (the document's `finished`, UTC)
+    time            when the result was written (the document's `finished`), in this
+                    computer's local time with its offset to UTC, ISO 8601
+                    (2026-10-13T13:28:05+02:00): the shop's own clock, never ambiguous
     inspection_id   the run id (the name of the run folder)
     part_id         the code read from the part: the run log's `codes` event (codes read
                     before the scan), else the codes the run's `code` checks read from the
@@ -37,7 +46,11 @@ The inspection row (INSPECTION_FIELDS, in this order):
                     configuration / profile; one work state's check: ... / work state; any
                     other single job: its station configuration (or station id); a
                     measurement: measure:<what>
-    mode            MOCK or REAL, as the document says: a MOCK row is a simulated inspection
+    operating_mode  how the scanner was used: measure (Measure), quick_check (Quick check),
+                    station (Station: a cycle, a work state's check, a single-job station
+                    config) or recipe_run (a recipe run on its own: `scan recipe-run`)
+    hardware        REAL or MOCK, as the document says: a MOCK row is a simulated inspection
+                    (no real part was measured)
     judgment        PASS (disposition CONTINUE), FAIL (REJECT), PULL (PULL, and any
                     disposition that is none of the three: never a pass by default; a run
                     the line counted ABORTED after its verdict; a cycle that never ended); a
@@ -60,7 +73,9 @@ The inspection row (INSPECTION_FIELDS, in this order):
                     cycle that never ended: it wrote none)
     preset, calibration_id   as the document says (a cycle: of its work states' checks)
     rig             the rig geometry the scan was made at (geometry_id)
-    software        package version and commit, as the document says
+    software        the software that judged it, as the document says: its version (the
+                    package's, else engine.__version__) and, from a git checkout, the commit
+                    ("0.1.0 d4fc9c1"); empty for a document that names neither
 
 File cells are relative to the library with forward slashes (what the web server's /files/
 route serves) when the file is inside the library, else the full path.
@@ -105,7 +120,8 @@ Rules of the log:
     the log itself writes stays. Line breaks and tabs in a cell become one space.
   * The log is on unless the environment says SAS_EVENTLOG=off (read at every call): then
     nothing is written, anywhere - no row, no waiting row, no picture, no profile file.
-    The tests run with it off.
+    The tests run with it off. The bad-part output (engine/badparts.py) reads the same
+    facts of a run folder (inspection()) but does not need the log: it works with it off.
 
     python -m engine.eventlog --rebuild [--library DIR] [--runs DIR] [--stations DIR]
                                         [--recipes DIR]     (each may be given again)
@@ -170,10 +186,13 @@ UNENDED_TEXT = ("the cycle never ended: no result.json was written (the program 
                 "was closed or stopped before the cycle was over)")
 UNENDED_QUIET_S = 3600.0                # where an open log cannot be told: a cycle whose files
                                         # were written since may still be running
-INSPECTION_FIELDS = ("time", "inspection_id", "part_id", "part", "program", "mode", "judgment",
-                     "reason", "n_values", "n_out_of_limit", "values", "time_s", "image_file",
-                     "profile_file", "data_3d_file", "result_file", "preset", "calibration_id",
-                     "rig", "software")
+INSPECTION_FIELDS = ("time", "inspection_id", "part_id", "part", "program", "operating_mode",
+                     "hardware", "judgment", "reason", "n_values", "n_out_of_limit", "values",
+                     "time_s", "image_file", "profile_file", "data_3d_file", "result_file",
+                     "preset", "calibration_id", "rig", "software")
+# columns of a v1 file written before its header was settled: old name -> name now
+OLD_NAMES = {"mode": "hardware"}
+OPERATING_MODES = ("measure", "quick_check", "station", "recipe_run")
 VALUE_FIELDS = ("inspection_id", "step", "zone", "check", "name", "value", "unit",
                 "lower_limit", "upper_limit", "result")
 JUDGMENTS = {"CONTINUE": "PASS", "REJECT": "FAIL", "PULL": "PULL"}
@@ -334,6 +353,20 @@ def _when(text) -> Optional[datetime]:
     except ValueError:
         return None
     return t if t.tzinfo is not None else t.replace(tzinfo=timezone.utc)
+
+
+def local_time(text) -> Optional[str]:
+    """A time as result.json writes it (ISO 8601, UTC) -> this computer's local time with its
+    offset to UTC, to the second ("2026-10-13T13:28:05+02:00"): a shop reads its own clock,
+    and the offset keeps every row unambiguous, also across a change to or from summer
+    time. Text that is no time is kept as it is."""
+    t = _when(text)
+    if t is None:
+        return None if text in (None, "") else str(text)
+    try:
+        return t.astimezone().isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):    # out of the platform's range: as written
+        return t.isoformat(timespec="seconds")
 
 
 def _time_s(run_dir: Path, doc: dict, first_ts) -> Optional[float]:
@@ -689,12 +722,18 @@ def _image(library: Path, iid: str, picture: Optional[Path], copy: bool) -> str:
     return _link(dest, library) if dest.is_file() else ""
 
 
-def rows_of(run_dir, library=None, copy_picture: bool = True) -> Optional[tuple]:
-    """(the inspection row, its value rows) of one run folder, read from its result.json
-    and what lies beside it (a cycle that never ended has none: unended_cycle). None when
-    the folder is no inspection of its own: no readable result.json with a run id, or the
-    check of a work state inside a cycle (in_cycle).
-    copy_picture: also copy the run's picture to events/img/ (not with the log off)."""
+def inspection(run_dir, library=None) -> Optional[dict]:
+    """What one run folder says as an inspection, read from its result.json and what lies
+    beside it (a cycle that never ended has none: unended_cycle) - the facts of its row, and
+    the files the bad-part output (engine/badparts.py) copies. None when the folder is no
+    inspection of its own: no readable result.json with a run id, or the check of a work
+    state inside a cycle (in_cycle). Reads only; works with the log off.
+    -> {doc, run_dir, library, inspection_id, codes, part, program, operating_mode,
+    hardware, judgment, disposition (CONTINUE / REJECT / PULL as the row reads it - an ABORT
+    after the verdict is a PULL -, None for a measurement), reason, values (the value rows),
+    time (local, local_time), time_s, picture, profiles ([profile_x, profile_y] that exist,
+    of the folder that speaks for it), ply, result (result.json, None for a cycle that never
+    ended), preset, calibration_id, rig, software}"""
     run_dir = Path(run_dir)
     doc = _read_json(run_dir / RESULT_FILE)
     if doc is None:
@@ -745,24 +784,63 @@ def rows_of(run_dir, library=None, copy_picture: bool = True) -> Optional[tuple]
         preset, rig = said("capture", "preset"), said("capture", "geometry_id")
     for v in vals:
         v["inspection_id"] = iid
-    end = doc.get("finished") or doc.get("started")
     sw = doc.get("software") if isinstance(doc.get("software"), dict) else {}
-    picture = _first(_picture_of(d, x) for d, x in folders)
-    profile = _first((d / PROFILE_X) if (d / PROFILE_X).is_file() else None for d, _ in folders)
-    row = {
-        "time": end, "inspection_id": iid, "part_id": " | ".join(codes), "part": part,
-        "program": program, "mode": doc.get("mode"), "judgment": judgment, "reason": reason,
-        "n_values": len(vals), "n_out_of_limit": sum(v["result"] == "OUT" for v in vals),
-        "values": _summary(vals), "time_s": _time_s(run_dir, doc, first_ts),
-        "image_file": _image(library, iid, picture, copy_picture and enabled()),
-        "profile_file": _link(profile, library),
-        "data_3d_file": _link(_first(_ply_of(d, x, library) for d, x in folders), library),
-        "result_file": _link(run_dir / RESULT_FILE, library)
-        if (run_dir / RESULT_FILE).is_file() else "",
+    speaker = _first((d for d, _ in folders if (d / PROFILE_X).is_file()))
+    return {
+        "doc": doc, "run_dir": run_dir, "library": library, "inspection_id": iid,
+        "codes": codes, "part": part, "program": program,
+        "operating_mode": operating_mode_of(doc), "hardware": doc.get("mode"),
+        "judgment": judgment,
+        "disposition": {v: k for k, v in JUDGMENTS.items()}.get(judgment),
+        "reason": reason, "values": vals,
+        "time": local_time(doc.get("finished") or doc.get("started")),
+        "time_s": _time_s(run_dir, doc, first_ts),
+        "picture": _first(_picture_of(d, x) for d, x in folders),
+        "profiles": [speaker / n for n in (PROFILE_X, PROFILE_Y)
+                     if (speaker / n).is_file()] if speaker is not None else [],
+        "ply": _first(_ply_of(d, x, library) for d, x in folders),
+        "result": run_dir / RESULT_FILE if (run_dir / RESULT_FILE).is_file() else None,
         "preset": preset, "calibration_id": said("calibration", "calibration_id"), "rig": rig,
         "software": " ".join(str(x) for x in (sw.get("package_version"), sw.get("git_commit"))
                              if x)}
+
+
+def rows_of(run_dir, library=None, copy_picture: bool = True) -> Optional[tuple]:
+    """(the inspection row, its value rows) of one run folder (inspection(): None when the
+    folder is no inspection of its own).
+    copy_picture: also copy the run's picture to events/img/ (not with the log off)."""
+    it = inspection(run_dir, library)
+    if it is None:
+        return None
+    library, iid, vals = it["library"], it["inspection_id"], it["values"]
+    row = {
+        "time": it["time"], "inspection_id": iid, "part_id": " | ".join(it["codes"]),
+        "part": it["part"], "program": it["program"], "operating_mode": it["operating_mode"],
+        "hardware": it["hardware"], "judgment": it["judgment"], "reason": it["reason"],
+        "n_values": len(vals), "n_out_of_limit": sum(v["result"] == "OUT" for v in vals),
+        "values": _summary(vals), "time_s": it["time_s"],
+        "image_file": _image(library, iid, it["picture"], copy_picture and enabled()),
+        "profile_file": _link(it["profiles"][0] if it["profiles"] else None, library),
+        "data_3d_file": _link(it["ply"], library),
+        "result_file": _link(it["result"], library) if it["result"] is not None else "",
+        "preset": it["preset"], "calibration_id": it["calibration_id"], "rig": it["rig"],
+        "software": it["software"]}
     return row, vals
+
+
+def operating_mode_of(doc: dict) -> str:
+    """How the scanner was used for a run (the module docstring's `operating_mode`): the
+    document's own operating_mode (measure, quick_check); else a recipe run on its own
+    (recipe_run: a recipe job with no station configuration and no work state); else
+    station (a cycle, a work state's check, a single-job station config)."""
+    om = doc.get("operating_mode")
+    if om in OPERATING_MODES:
+        return om
+    job = doc.get("job") if isinstance(doc.get("job"), dict) else {}
+    if job.get("type") == "recipe" and not doc.get("station_config") \
+            and not job.get("work_state") and not job.get("config"):
+        return "recipe_run"
+    return "station"
 
 
 def _program(doc: dict, job: dict) -> str:
@@ -783,9 +861,10 @@ def _program(doc: dict, job: dict) -> str:
 # ------------------------------------------------------------------ the files
 
 def month_of(time_text) -> str:
-    """YYYY-MM of an inspection's time (UTC); this month when it has none."""
+    """YYYY-MM of an inspection's time as its cell reads it (local time); this month (local)
+    when it has none."""
     m = _MONTH.match(str(time_text or ""))
-    return m.group(0) if m else datetime.now(timezone.utc).strftime("%Y-%m")
+    return m.group(0) if m else datetime.now().astimezone().strftime("%Y-%m")
 
 
 def files_for(library, month: str) -> tuple:
@@ -809,10 +888,12 @@ def _open(path: Path, mode: str):
     return open(path, mode)
 
 
-def _move(src: Path, dst: Path, tries: int = 1) -> None:
+def _move(src: Path, dst: Path, tries: int = 1, guard: bool = True) -> None:
     """One move (the old name or the new one, never half a file). tries: a file that another
-    program reads this very instant cannot be moved on Windows; it can a moment later."""
-    if not enabled():
+    program reads this very instant cannot be moved on Windows; it can a moment later.
+    guard: refused with the log off (the bad-part output's index passes False: it works with
+    the log off)."""
+    if guard and not enabled():
         raise PermissionError(f"the inspection event log is off ({ENV}=off)")
     dst.parent.mkdir(parents=True, exist_ok=True)
     for left in range(tries - 1, -1, -1):
@@ -846,15 +927,18 @@ def _unlock(fh) -> None:
 
 
 @contextmanager
-def _locked(events: Path, wait_s: Optional[float] = None, name: str = LOCK_FILE):
+def _locked(events: Path, wait_s: Optional[float] = None, name: str = LOCK_FILE,
+            opener=None):
     """An OS file lock (one writer at a time, across processes; the OS drops it when the
     holder dies): events/eventlog.lock for the month files, events/pending.lock for the
     waiting rows in events/pending/ (taken alone, or inside the first: never the other way
-    round). Yields False when it could not be had in wait_s: do not write what it guards."""
+    round). Yields False when it could not be had in wait_s: do not write what it guards.
+    opener: how the lock file is opened (default _open: refused with the log off; the
+    bad-part output passes its own, it works with the log off)."""
     wait_s = LOCK_WAIT_S if wait_s is None else wait_s
     fh = None
     try:
-        fh = _open(events / name, "a+b")
+        fh = (opener or _open)(events / name, "a+b")
         end = time.monotonic() + wait_s
         while True:
             try:
@@ -882,18 +966,22 @@ def _locked(events: Path, wait_s: Optional[float] = None, name: str = LOCK_FILE)
             time.sleep(2 * LOCK_POLL_S)
 
 
-def _append(path: Path, fields: tuple, body: bytes) -> None:
+def _append(path: Path, fields: tuple, body: bytes, opener=None, asides=None) -> None:
     """Whole lines onto the end of a file in ONE write (OSError when it cannot be opened for
     writing). A new file gets its header first; a file whose last line was cut short gets a
-    line end first, so the new rows stay whole."""
+    line end first, so the new rows stay whole. A file this process did not leave as it is
+    now has its header looked at first (_settle_header: rows are only ever added under
+    their own columns). opener: as _locked's. asides: as _settle_header's."""
     head = b""
     try:
         size = path.stat().st_size
     except OSError:
         size = 0
+    if size and _ENDED.get(str(path)) != size:  # not as this process left it: look at it
+        size = _settle_header(path, fields, opener, asides)
     if size == 0:
         head = _BOM + _encode(fields, [], header=True)
-    elif _ENDED.get(str(path)) != size:     # not as this process left it: look at its end
+    elif _ENDED.get(str(path)) != size:     # ... and at its end
         try:
             with open(path, "rb") as f:
                 f.seek(-1, os.SEEK_END)
@@ -901,12 +989,120 @@ def _append(path: Path, fields: tuple, body: bytes) -> None:
                     head = b"\r\n"
         except OSError:
             pass
-    with _open(path, "ab") as f:
+    with (opener or _open)(path, "ab") as f:
         f.write(head + body)
     _ENDED[str(path)] = size + len(head) + len(body)
 
 
 _ENDED: dict = {}                       # file -> its size when this process last ended it whole
+
+
+class HeaderMismatch(OSError):
+    """A csv file whose header is not the one its rows are written under, and it could not
+    be replaced now (open in another program): nothing is appended to it - the rows wait."""
+
+
+def _header(path: Path) -> list:
+    """The column names in a csv file's first line ([] when it has none)."""
+    with open(path, "rb") as f:
+        first = f.readline()
+    if first.startswith(_BOM):
+        first = first[len(_BOM):]
+    return next(csv.reader([first.decode("utf-8", errors="replace").rstrip("\r\n")]), [])
+
+
+def _settle_header(path: Path, fields: tuple, opener=None, asides=None) -> int:
+    """Rows are only ever added under their own columns: a file whose header is `fields` is
+    left as it is. Any other header is replaced first (_upgrade), the file as it was kept in
+    <its folder>/replaced_<time>/ (never deleted):
+      * a month file or a waiting file of the log written before the v1 header was settled
+        (OLD_NAMES; columns added since): its rows under the v1 header, cell for cell;
+      * a file changed in another program (a column added or taken out in a spreadsheet
+        program and saved; a header cut short): its rows read by their column names under
+        the header of now (a column it does not know stays in the file kept aside; one it
+        lacks is empty) - none when its header does not even start with `fields[0]`.
+    So the file keeps growing, under its own columns. HeaderMismatch (the rows wait) when
+    it cannot be replaced now (open in another program). opener: as _locked's. asides: a
+    list that gets (the file, the file as it was, what was different) for the caller to
+    report. -> the file's size now."""
+    names = _header(path)
+    if names == list(fields):
+        return path.stat().st_size
+    ours = fields in (INSPECTION_FIELDS, VALUE_FIELDS)
+    mapped = [OLD_NAMES.get(n, n) for n in names] if ours else list(names)
+    base = path.parent.parent if path.parent.name == PENDING_DIR else path.parent
+    unique = bool(mapped) and len(set(mapped)) == len(mapped)
+    early = ours and base.name == EVENTS_DIR and unique and set(mapped) <= set(fields)
+    by_name = unique and mapped[0] == fields[0]
+    if early:
+        what = f"had the header of a build before the {FORMAT} header was settled"
+    elif by_name:
+        added = [n for n, m in zip(names, mapped) if m not in fields]
+        missing = [f for f in fields if f not in mapped]
+        bits = ([f"column(s) added: {', '.join(added[:6])}"] if added else []) + (
+            [f"missing: {', '.join(missing[:6])}"] if missing else [])
+        what = f"was changed in another program ({'; '.join(bits) or 'its columns moved'})"
+    else:
+        what = f"had a header that is not the {FORMAT} header ({', '.join(names[:4]) or 'none'})"
+    try:
+        aside, n = _upgrade(path, fields, base, opener=opener, keep_rows=by_name)
+    except OSError as e:
+        raise HeaderMismatch(f"{path.name} {what} and could not be replaced now ({e}): "
+                             "nothing was added to it") from e
+    log.warning("%s%s %s: its %d row(s) are under the %s header now (the file as it was: %s)",
+                "inspection event log: " if ours else "", path.name, what, n, FORMAT,
+                _link(aside, base.parent))
+    if asides is not None:
+        asides.append((path, aside, what))
+    return path.stat().st_size
+
+
+def _upgrade(path: Path, fields: tuple, events: Path, opener=None,
+             keep_rows: bool = True) -> tuple:
+    """A file whose header is not `fields` (_settle_header) -> the same rows under the
+    header of now (read by its own: OLD_NAMES; a column it did not have is empty; keep_rows
+    False: none), in one move; the file as it was goes to <events>/replaced_<time>/, never
+    deleted. The caller holds the lock of the file. opener: as _locked's (the bad-part
+    output's index: it works with the log off). OSError (nothing changed) when it cannot be
+    moved: the rows wait. -> (where the file as it was went, the rows kept)."""
+    rows = _rows_by_header(path.read_bytes(), fields) if keep_rows else []
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    aside = events / f"replaced_{stamp}" / path.relative_to(events)
+    n = 0
+    while aside.exists():                   # never onto a file moved aside before
+        n += 1
+        aside = events / f"replaced_{stamp}-{n}" / path.relative_to(events)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}_{threading.get_ident()}.tmp")
+    guard = opener is None
+    try:
+        with (opener or _open)(tmp, "xb") as f:
+            f.write(_BOM + _encode(fields, rows, header=True))
+        _move(path, aside, tries=3, guard=guard)
+        try:
+            _move(tmp, path, tries=3, guard=guard)
+        except OSError:
+            os.replace(aside, path)         # put back: nothing changed
+            raise
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    _ENDED.pop(str(path), None)
+    return aside, len(rows)
+
+
+def _rows_by_header(raw: bytes, fields: tuple) -> list:
+    """A whole csv file of the log (its header line first) -> its rows keyed by the column
+    names of now: read by its own header line, so a file written under an older v1 header
+    reads right (OLD_NAMES); a column it does not have is missing (an empty cell)."""
+    if raw.startswith(_BOM):
+        raw = raw[len(_BOM):]
+    reader = csv.reader(io.StringIO(raw.decode("utf-8", errors="replace"), newline=""))
+    names = [OLD_NAMES.get(n, n) for n in next(reader, [])]
+    if not names or names[0] != fields[0]:     # no header line: the rows as `fields`
+        return _data_rows(raw, fields)
+    return [dict(zip(names, cells)) for cells in reader if any(cells)]
 
 
 def _data_lines(raw: bytes) -> bytes:
@@ -974,9 +1170,11 @@ def merge_pending(library) -> int:
         except OSError:
             continue
         try:
-            body = _data_lines(taken.read_bytes())
-            if body:
-                _append(main, fields, body if body.endswith(b"\n") else body + b"\r\n")
+            # read by its own header (one written by an earlier build may differ), added
+            # under the file's
+            rows = _rows_by_header(taken.read_bytes(), fields)
+            if rows:
+                _append(main, fields, _encode(fields, rows))
         except OSError:
             try:
                 _move(taken, p)             # back: they still wait
@@ -1273,7 +1471,7 @@ def _present(cut: dict) -> tuple:
             except OSError:
                 continue
         read[p] = (which, len(raw), head)
-        for r in _data_rows(_data_lines(raw), fields):
+        for r in _rows_by_header(raw, fields):          # by its own header line
             iid = r.get("inspection_id")
             if not iid:
                 continue
@@ -1303,13 +1501,24 @@ def _since(events: Path, read: dict) -> tuple:
                 if same and head is not None:
                     same = f.read(n) == head
                 f.seek(n if same else 0)
-                body = f.read() if same else _data_lines(f.read())
+                body = f.read()
         except OSError:
             continue
-        for r in _data_rows(body, fields):
+        # what follows the bytes read is under the file's header; a whole file is read by its own
+        for r in _data_rows(body, fields) if same else _rows_by_header(body, fields):
             if r.get("inspection_id"):
                 (rows if fields is INSPECTION_FIELDS else values).append((p.name, r))
     return rows, values, files
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _by_time(item) -> tuple:
+    """Sort key of (row, value rows): the moment of its time (a row written in summer time
+    and one in winter time, or an older row in UTC, sort as they happened), then its id."""
+    row = item[0]
+    return _when(row.get("time")) or _EPOCH, str(row.get("time") or ""), row["inspection_id"]
 
 
 def rebuild(library, runs_dirs=None, stations=None, recipes=None) -> dict:
@@ -1317,8 +1526,10 @@ def rebuild(library, runs_dirs=None, stations=None, recipes=None) -> dict:
     truth). runs_dirs: the runs folders to read (default: runs_dirs_of). An inspection whose
     run folder is found is written from it (a cycle that never ended: as PULL,
     unended_cycle); a row of the present files that no run folder gave (the folder is gone,
-    or its run ended while the folders were read) is kept as it is (`kept`).
-    The files it replaces (and the waiting rows) are moved to events/replaced_<time>/.
+    or its run ended while the folders were read) is kept as it is (`kept`; a file written
+    under an older v1 header is read by its own header, and every row is written under the
+    v1 header). The files it replaces (and the waiting rows) are moved to
+    events/replaced_<time>/.
     Nothing is changed when one of them cannot be moved (open in a spreadsheet program):
     close it and run again.
     It may run while inspections are made: the locks are held twice, each time for a
@@ -1377,7 +1588,7 @@ def rebuild(library, runs_dirs=None, stations=None, recipes=None) -> dict:
     staged = set()                          # the names of the new files, written beside
     try:
         for month, items in sorted(months.items()):
-            items.sort(key=lambda it: (str(it[0].get("time") or ""), it[0]["inspection_id"]))
+            items.sort(key=_by_time)            # by the moment, whatever the offset says
             insp, vals = files_for(library, month)
             for path, fields, rows in (
                     (vals, VALUE_FIELDS, [v for _, vs in items for v in vs]),

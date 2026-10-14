@@ -984,9 +984,13 @@ def measure(scan: ObjectScan) -> Dimensions:
 @_verb
 def compare(scan: ObjectScan, golden: Union[ObjectScan, CADRef],
             tol: Optional[ToleranceBand] = None) -> Verdict:
-    """Deviation map + PASS/FAIL against a golden scan (CAD: build step 7)."""
+    """Deviation map + PASS/FAIL against a golden scan (CAD: build step 7). A golden that is
+    a part judged REJECT or PULL is refused (engine/badparts.py)."""
+    from . import badparts
     if isinstance(golden, CADRef):
         raise NotImplementedError("scan-to-CAD lands in build step 7 (golden.py port)")
+    badparts.require_good(_engine().store, "compare: the golden", [golden],
+                          how=badparts.HOW_GOLDEN)
     tol_warn = []
     if tol is None:
         t, tol_warn = _tolerance_for(scan)

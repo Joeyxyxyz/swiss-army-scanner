@@ -14,7 +14,7 @@ import sys
 import numpy as np
 import pytest
 
-from engine import api
+from engine import api, badparts
 from engine.recipes import checks as registry
 from engine.recipes import feedback as FB
 from engine.recipes import runner, schema
@@ -724,13 +724,24 @@ def test_golden_latest_is_the_recorded_golden_not_the_newest_scan(eng_lib, tmp_p
     assert pos["values"]["offset_mm"] > 2.0
 
 
-def test_golden_is_never_the_scan_being_checked(eng_lib, tmp_path):
-    s, sc = eng_lib
-    for recipe in ("ribbed_tube_alignment", _latest_doc(), _latest_doc("by_id", sc["golden"])):
-        res, out = _run(recipe, sc["golden"], tmp_path)
-        assert res["result"] == "INVALID" and out["exit_code"] == 5, res["result"]
-        assert "being checked" in res["invalid_reason"], res["invalid_reason"]
-        assert all(c["verdict"] == "INVALID" for z in res["zones"] for c in z["checks"])
+def test_golden_is_never_the_scan_being_checked(tmp_path):
+    """The golden checked as the part: INVALID, a PULL. That PULL is the golden part's own
+    judgment, so it is never a golden again (engine/badparts.py): this test has a library of
+    its own, the module's golden stays good for the tests that follow."""
+    s = api.configure(tmp_path / "library", mock=True)
+    try:
+        p = api.load_preset(BENCH)
+        g = RS.oracle_scan(s, p, "scene:tube", "ribbed_tube_alignment_golden", seed=9)
+        runner.record_golden(s, api.recipe_load("ribbed_tube_alignment"), p, g)
+        runner.record_golden(s, schema.validate(_latest_doc()), p, g)
+        for recipe in ("ribbed_tube_alignment", _latest_doc(), _latest_doc("by_id", g.id)):
+            res, out = _run(recipe, g.id, tmp_path)
+            assert res["result"] == "INVALID" and out["exit_code"] == 5, res["result"]
+            assert "being checked" in res["invalid_reason"], res["invalid_reason"]
+            assert all(c["verdict"] == "INVALID" for z in res["zones"] for c in z["checks"])
+        assert {f["disposition"] for f in badparts.findings(s.store, [g])} == {"PULL"}
+    finally:
+        api._session = None
 
 
 def test_golden_label_never_matches_a_plain_test_scan(eng_lib, tmp_path):

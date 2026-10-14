@@ -38,6 +38,7 @@ file) and `disposition` / `pull_reasons`.
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -45,7 +46,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from .. import config, eventlog, rigstate, rules
+from .. import badparts, config, eventlog, rigstate, rules
 from .. import disposition as D
 from .. import runs as R
 from . import feedback as FB
@@ -106,9 +107,11 @@ def record_golden(s, recipe, preset, ms) -> Path:
     """Record the metric scan `ms` (a GOOD part) as a golden of `recipe`: an append-only
     entry recipe_golden/<geometry_id>/<ts>_<recipe>/meta.json naming the scan, its label,
     rig fingerprint and stereo calibration. Only recorded goldens (or an exact scan id) can
-    be a recipe's golden. -> the entry folder."""
+    be a recipe's golden. A scan of a part judged REJECT or PULL is refused (engine/
+    badparts.py: references are made from good parts only). -> the entry folder."""
     from ..library.store import json_safe
     rules.require_same_geometry(ms.geometry_id, preset.geometry_id, "recipe golden")
+    badparts.require_good(s.store, f"recipe golden of {recipe.name}", [ms], sweep=True)
     d = s.store.new_dir(GOLDEN_KIND, ms.geometry_id, label=recipe.name)
     meta = {"kind": GOLDEN_KIND, "recipe": recipe.name, "scan_id": ms.id, "label": ms.label,
             "geometry_id": ms.geometry_id,
@@ -147,7 +150,8 @@ def find_golden(s, recipe, geometry_id: str, key=None, exclude=()):
     recipe at this geometry; else the newest golden entry whose label (or scan id) is key;
     else the metric scan whose id is exactly key. A golden entry whose scan was trashed is
     skipped. Refused when the scan is one of `exclude` (the scan being checked: a part is
-    never compared with itself)."""
+    never compared with itself), and when it is a part judged REJECT or PULL (BadPartReference:
+    nothing is ever compared with a bad part, engine/badparts.py)."""
     from ..reconstruct import metric_scan
     key = (recipe.golden or {}).get("scan") if key is None else key
     k = str(key or "").strip()
@@ -177,6 +181,8 @@ def find_golden(s, recipe, geometry_id: str, key=None, exclude=()):
     if ms.id in set(exclude):
         raise LookupError(f"the golden {ms.id} is the scan being checked: a part is never "
                           "compared with itself")
+    badparts.require_good(s.store, f"the golden of recipe {recipe.name}", [ms],
+                          how=badparts.HOW_USE)
     return ms
 
 
@@ -231,6 +237,7 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
     from ..reconstruct import metric_scan
     state = {"img": None, "fb_info": None}
     fp = config.geometry_fingerprint(preset)
+    bad_part_output(res, recipe)
     res["recipe"] = {**recipe.summary(), "tier": None, "result_code": None, "frame": None}
     res["capture"].update(preset=preset.name, geometry_id=preset.geometry_id,
                           exposure_us=preset.camera.exposure_us,
@@ -380,6 +387,30 @@ def execute(s, recipe, preset, *, res: dict, log, run_dir: Path, scan=None,
     log.event("verdict", result=verdict, disposition=disp, pull_reasons=pulls,
               zones={z["id"]: z["verdict"] for z in zres}, feedback_rendered=info["rendered"])
     return state
+
+
+def bad_part_output(res: dict, recipe) -> None:
+    """The recipe's outputs.bad_part_output (relative to the recipe file) into the run
+    document - unless the station configuration put its own there first: the station's wins
+    (engine/badparts.py; the command line and the environment are settled when result.json
+    is written). Never raises: it is set before the run's own error handling."""
+    outs = res.setdefault("outputs", {})
+    mine = recipe_bad_part_output(recipe)
+    if outs.get(badparts.KEY) is None and mine is not None:
+        outs[badparts.KEY] = mine
+
+
+def recipe_bad_part_output(recipe) -> Optional[str]:
+    """A recipe's own outputs.bad_part_output: a full folder path (relative to the recipe
+    file), "off", or None (it says nothing; a value that is no folder path, which loading the
+    recipe refuses). Text only: the folder is not touched."""
+    mine = (getattr(recipe, "outputs", None) or {}).get(badparts.KEY)
+    src = getattr(recipe, "source", None)
+    try:
+        return badparts.configured(mine, os.path.dirname(os.path.abspath(str(src)))
+                                   if src else None)
+    except ValueError:
+        return None
 
 
 def _rig_refused(s, preset, res: dict, log, scan=None) -> bool:
@@ -608,7 +639,8 @@ def run_recipe(s, recipe, preset, *, runs_dir, operator_confirmed: bool = False,
     the disposition's (CONTINUE 0, REJECT 1, PULL 5); refused 2, crashed 4, ABORTED 1 keep
     theirs (disposition PULL). station / context: a work state's check (engine/flow/
     verify.py) names its station and adds {station_config, profile, job: {config,
-    work_state}} to the result."""
+    work_state}} to the result; context bad_part_output: the station configuration's bad-part
+    output (engine/badparts.py), which wins over the recipe's outputs.bad_part_output."""
     ctx = dict(context or {})
     run_id, run_dir = R.new_run(runs_dir, run_name or recipe.name)
     res = R.empty_result(run_id=run_id, run_folder=str(run_dir), mock=s.mock,
@@ -621,6 +653,8 @@ def run_recipe(s, recipe, preset, *, runs_dir, operator_confirmed: bool = False,
                                or recipe.name}, zone=recipe.scan["zone"],
                          station_config=ctx.pop("station_config", None),
                          profile=ctx.pop("profile", None))
+    res["outputs"][badparts.KEY] = ctx.pop(badparts.KEY, None)     # the station's, if it says
+    bad_part_output(res, recipe)
     log = R.RunLog(Path(run_dir) / "run.log.jsonl", run_id)
     state = {}
     code = 5

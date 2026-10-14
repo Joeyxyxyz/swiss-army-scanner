@@ -447,11 +447,17 @@ def canned(stereo_lib):
 
 
 def _canned_run(tmp_path, stereo_lib, monkeypatch, scan, argv=(), **over):
-    seen = {}
+    from dataclasses import replace
+    seen = {"runs": 0}
 
     def fake_scan_fast(zone, p, label, steps, periods, average, **kw):
         seen["average"] = average
-        return scan
+        seen["runs"] += 1
+        # every run scans a NEW part, as on the line: a scan of its own (its own id, the
+        # canned data), so what the run judges it - a REJECT / PULL marks the scan a bad
+        # part, never a reference (engine/badparts.py) - never reaches the canned scan that
+        # is another run's golden
+        return replace(scan, id=f"{scan.id}_r{seen['runs']}")
     monkeypatch.setattr(api, "scan_fast", fake_scan_fast)
     monkeypatch.setattr(cli, "_mock_place_metric", lambda ctx: None)
     tmp_path.mkdir(parents=True, exist_ok=True)

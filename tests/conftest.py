@@ -26,15 +26,21 @@ sys.path.insert(0, str(ROOT))
 # SAS_EVENTLOG=off
 #     The inspection event log writes nothing, anywhere: no row, no waiting row,
 #     no picture copy. The `eventlog_on` fixture sets "on" for one test.
+# SAS_BAD_PART_OUTPUT=off
+#     This computer's default bad-part output (engine/badparts.py) is never used:
+#     a part judged REJECT / PULL is copied only where a test's own configuration
+#     or command line says. The `bad_part_output` fixture gives one test a folder.
 NO_HARDWARE_ENV = "SAS_NO_HARDWARE"
 RIG_FILE_ENV = "SAS_PROJECTOR_CONTROL_FILE"
 EVENTLOG_ENV = "SAS_EVENTLOG"
+BAD_PART_ENV = "SAS_BAD_PART_OUTPUT"
 RIG_FILE_NAME = "projector_control.json"
 
 os.environ.setdefault(NO_HARDWARE_ENV, "1")
 os.environ[RIG_FILE_ENV] = str(Path(tempfile.gettempdir()) / f"sas_tests_{os.getpid()}"
                                / RIG_FILE_NAME)
 os.environ[EVENTLOG_ENV] = "off"
+os.environ[BAD_PART_ENV] = "off"
 
 from engine import api  # noqa: E402
 from engine.capture import riglock  # noqa: E402
@@ -46,12 +52,16 @@ PRESET = "cell_wall_2p7ft_vstripe"   # fringes vertical in camera = correct for 
 
 
 # ------------------------------------------------- isolation guard
-# Two things no test may do, whatever the code under test makes of the variables:
+# Three things no test may do, whatever the code under test makes of the variables:
 #   - open the machine's projector rig file (beside the rig lock);
 #   - write an event-log file (events/inspections_v1_*, events/inspection_values_v1_*,
 #     events/last_v1*, the two lock files, events/pending/, events/img/, a rebuild's
 #     events/rebuild_*/ and events/replaced_*/) without the `eventlog_on` fixture, or
-#     outside a temporary folder.
+#     outside a temporary folder;
+#   - write a file of the bad-part output (engine/badparts.py: its marker, its index and
+#     lock files, anything in a folder below its marker, the copies that wait in
+#     bad_part_pending/, a run folder's bad_part_output.json, a scan's bad_part.jsonl and
+#     bad_part_swept.json) outside a temporary folder.
 # An audit hook sees every open() and rename in this process. It refuses the call
 # (IsolationError) and notes it; the note fails the running test at its end, also
 # when the code under test swallowed the refusal. Child processes are not watched:
@@ -93,6 +103,27 @@ def _is_eventlog(full: str) -> bool:
     return False
 
 
+_BAD_PART_MARKER = "bad_part_output.txt"           # engine/badparts.MARKER, lower case
+_BAD_PART_FILES = (_BAD_PART_MARKER, "bad_parts_v1", "bad_parts.lock", "bad_parts_pending.lock",
+                   "bad_part_output.json", "bad_part.jsonl", "bad_part_swept.json")
+_BAD_PART_DIRS = ("bad_part_pending",)               # <library>/bad_part_pending/: the queue
+_BAD_PART_DEPTH = 3                                  # a part's file: <output>/<part>/<file>
+
+
+def _is_bad_part(full: str) -> bool:
+    """A file of the bad-part output: by its name, or by the marker in a folder above it."""
+    parts = [p.lower() for p in Path(full).parts]
+    if parts and (parts[-1].startswith(_BAD_PART_FILES)
+                  or any(p in _BAD_PART_DIRS for p in parts[:-1])):
+        return True
+    d = os.path.dirname(full)
+    for _ in range(_BAD_PART_DEPTH):
+        if os.path.isfile(os.path.join(d, "BAD_PART_OUTPUT.txt")):
+            return True
+        d = os.path.dirname(d)
+    return False
+
+
 def _writes(mode, flags) -> bool:
     if isinstance(mode, str):
         return any(c in mode for c in "wax+")
@@ -111,6 +142,14 @@ def _refused(event, args):
     except TypeError:                                    # a file descriptor
         return None
     low = text.lower()
+    plain = os.path.normcase(os.path.abspath(text))
+    if _writes(mode, flags) and not any(plain.startswith(root) for root in _Guard.temp):
+        forms = _forms(text)                             # the bad-part output: in a temp folder
+        if not any(f.startswith(root) for f in forms for root in _Guard.temp) \
+                and any(_is_bad_part(f) for f in forms):
+            return (f"a bad-part output file was written outside a temporary folder ({text}): "
+                    f"keep the test's bad-part output and library under tmp_path "
+                    f"({BAD_PART_ENV} is off for tests; the bad_part_output fixture gives one)")
     if RIG_FILE_NAME not in low and "events" not in low:
         return None
     forms = _forms(text)
@@ -182,6 +221,16 @@ def eventlog_on(monkeypatch):
     _Guard.eventlog_on = True
     yield
     _Guard.eventlog_on = False
+
+
+@pytest.fixture
+def bad_part_output(tmp_path, monkeypatch):
+    """This computer's default bad-part output for one test: a folder under tmp_path, put
+    into SAS_BAD_PART_OUTPUT (nothing is created until a part judged REJECT / PULL is
+    copied). -> the folder."""
+    path = tmp_path / "bad_parts"
+    monkeypatch.setenv(BAD_PART_ENV, str(path))
+    return path
 
 
 @pytest.fixture

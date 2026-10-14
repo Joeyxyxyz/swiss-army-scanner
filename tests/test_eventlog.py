@@ -33,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,10 +56,16 @@ STATIC = ROOT / "ui" / "web" / "static"
 EXAMPLE = ROOT / "stations" / "example_tube_line.json"
 PRESET = "bench_9in_metric_bright"
 # the format `v1`: the columns of the two files, in this order (a change needs a new name)
-INSPECTION_COLUMNS = ["time", "inspection_id", "part_id", "part", "program", "mode", "judgment",
-                      "reason", "n_values", "n_out_of_limit", "values", "time_s", "image_file",
-                      "profile_file", "data_3d_file", "result_file", "preset", "calibration_id",
-                      "rig", "software"]
+INSPECTION_COLUMNS = ["time", "inspection_id", "part_id", "part", "program", "operating_mode",
+                      "hardware", "judgment", "reason", "n_values", "n_out_of_limit", "values",
+                      "time_s", "image_file", "profile_file", "data_3d_file", "result_file",
+                      "preset", "calibration_id", "rig", "software"]
+# the header written before v1 was settled (2026-10-13): still read, brought to v1 on append
+EARLY_V1_COLUMNS = ["time", "inspection_id", "part_id", "part", "program", "mode", "judgment",
+                    "reason", "n_values", "n_out_of_limit", "values", "time_s", "image_file",
+                    "profile_file", "data_3d_file", "result_file", "preset", "calibration_id",
+                    "rig", "software"]
+LOCAL_TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d")
 VALUE_COLUMNS = ["inspection_id", "step", "zone", "check", "name", "value", "unit",
                  "lower_limit", "upper_limit", "result"]
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 8        # stands in for a run's picture
@@ -114,6 +121,11 @@ def _job(runs, name="plate_check", *, result="PASS", max_dev=None, threshold=Non
     log.event("run_end", result=res["result"], disposition=res["disposition"])
     log.close()
     return run_id, run_dir, json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+
+
+def _month(doc) -> str:
+    """The month file a run's rows are in: the month of its local time."""
+    return eventlog.month_of(eventlog.local_time(doc["finished"]))
 
 
 def _log(library, month=None) -> tuple:
@@ -196,7 +208,7 @@ def test_a_station_job_is_one_row_with_its_value_and_limit(tmp_path, eventlog_on
     runs = tmp_path / "runs"
     run_id, run_dir, doc = _job(runs, max_dev=0.1234567, threshold=0.2, picture="deviation.png",
                                 codes=["SN-0042"])
-    month = doc["finished"][:7]
+    month = _month(doc)
     events = runs / "events"                # no engine session: the log is beside the run folders
     assert sorted(p.name for p in events.iterdir()) == [
         "eventlog.lock", "img", f"inspection_values_v1_{month}.csv", f"inspections_v1_{month}.csv",
@@ -208,14 +220,22 @@ def test_a_station_job_is_one_row_with_its_value_and_limit(tmp_path, eventlog_on
     assert list(eventlog.VALUE_FIELDS) == VALUE_COLUMNS
     (row,), (val,) = _log(runs)
     assert list(row) == INSPECTION_COLUMNS and list(val) == VALUE_COLUMNS
-    assert row["time"] == doc["finished"] and row["inspection_id"] == run_id == run_dir.name
+    # the shop's own clock, with its offset to UTC: the same moment as the document's UTC time
+    assert LOCAL_TIME.fullmatch(row["time"]) and row["time"] == eventlog.local_time(doc["finished"])
+    assert datetime.fromisoformat(row["time"]) == datetime.fromisoformat(doc["finished"])
+    assert row["inspection_id"] == run_id == run_dir.name
     assert (row["part_id"], row["part"], row["program"]) == ("SN-0042", "plate", "plate_check.json")
-    assert (row["mode"], row["judgment"], row["reason"]) == ("MOCK", "PASS", "")
+    # REAL / MOCK is the hardware; how the scanner was used is the operating mode
+    assert (row["operating_mode"], row["hardware"]) == ("station", "MOCK")
+    assert (row["judgment"], row["reason"]) == ("PASS", "")
     assert (row["n_values"], row["n_out_of_limit"]) == ("1", "0")
     assert row["values"] == "deviation_mm.max=0.123457 mm [..0.2] OK"
     assert float(row["time_s"]) >= 0.0
     assert (row["preset"], row["calibration_id"], row["rig"]) == ("p1", "rig_a/cal_1", "rig_a")
+    # the software that judged it: the version (installed, or the source tree's) and the commit
     assert row["software"] == " ".join(str(v) for v in doc["software"].values() if v)
+    assert row["software"].split()[0] == doc["software"]["package_version"]
+    assert doc["software"]["package_version"] not in (None, "")
     assert row["result_file"] == f"{run_id}/result.json" and row["profile_file"] == ""
     assert row["data_3d_file"] == ""
     # the picture is copied: the link survives a cleaned run folder
@@ -690,7 +710,8 @@ def test_a_cycle_that_never_ended_is_a_pull_row_after_a_rebuild(tmp_path, eventl
     row = _row(runs, cid)
     assert row["judgment"] == "PULL" and row["reason"].startswith(
         "error: the cycle never ended: no result.json was written")
-    assert (row["program"], row["part"], row["mode"]) == ("line1.json / long", "long", "MOCK")
+    assert (row["program"], row["part"], row["hardware"]) == ("line1.json / long", "long", "MOCK")
+    assert row["operating_mode"] == "station"
     assert row["part_id"] == "LOT-7/0042"                   # read by the work state `aligned`
     assert [(v["step"], v["name"], v["value"], v["result"]) for v in vals
             if v["inspection_id"] == cid] == [("loaded", "v_mm", "62", "OK"),
@@ -698,7 +719,9 @@ def test_a_cycle_that_never_ended_is_a_pull_row_after_a_rebuild(tmp_path, eventl
     assert (row["n_values"], row["n_out_of_limit"]) == ("2", "0")
     last = cdir / "steps" / steps[-1][1]
     last_doc = json.loads((last / "result.json").read_text(encoding="utf-8"))
-    assert row["time"] >= last_doc["finished"] and row["time"][:7] == last_doc["finished"][:7]
+    assert LOCAL_TIME.fullmatch(row["time"])
+    assert datetime.fromisoformat(row["time"]) >= datetime.fromisoformat(last_doc["finished"])
+    assert eventlog.month_of(row["time"]) == _month(last_doc)
     assert float(row["time_s"]) >= 0.0
     assert row["result_file"] == "" and row["image_file"] == f"events/img/{cid}.png"
     assert (row["preset"], row["calibration_id"], row["rig"]) == ("p1", "rig_a/cal_1", "rig_a")
@@ -770,6 +793,72 @@ def test_one_file_pair_per_month_with_v1_in_the_name(tmp_path, eventlog_on):
     assert [r["inspection_id"] for r in _log(lib, "2026-02")[0]] == ["run1", "run2", "cut", "run3"]
 
 
+def test_a_file_written_before_the_v1_header_settled_is_brought_to_it(tmp_path, eventlog_on,
+                                                                      caplog):
+    """The files of the first real-rig day have `mode` (REAL / MOCK) and no `operating_mode`.
+    A rebuild reads them by their own header; the first row appended to one brings it to the
+    v1 header - its rows kept cell for cell, the file as it was moved aside, never a row under
+    the wrong column - and so does a waiting file when it is merged. Any other header (a
+    file changed in a spreadsheet program) is never appended to either: the file is moved
+    aside as it is and its rows go on, by their column names, in a new file."""
+    lib = tmp_path / "library"
+    events = lib / "events"
+    (events / "pending").mkdir(parents=True)
+    old = {"time": "2026-10-13T11:28:00+00:00", "inspection_id": "old1", "program": "p",
+           "mode": "REAL", "judgment": "PULL", "reason": "rig_check: MOVED"}
+    raw = eventlog._BOM + eventlog._encode(tuple(EARLY_V1_COLUMNS), [old], header=True)
+    month_file = events / "inspections_v1_2026-10.csv"
+    month_file.write_bytes(raw)
+    # a rebuild with no run folder keeps the row, read by its own header, under v1
+    out = eventlog.rebuild(lib, [tmp_path / "no_runs"])
+    assert out["ok"] and out["kept"] == 1
+    (row,) = eventlog.read_rows(month_file)
+    assert list(row) == INSPECTION_COLUMNS
+    assert (row["hardware"], row["judgment"]) == ("REAL", "PULL")
+    # the first append to an early file brings it to v1 first; a waiting early file too
+    month_file.write_bytes(raw)
+    eventlog._ENDED.clear()
+    waiting = events / "pending" / month_file.name
+    waiting.write_bytes(eventlog._BOM + eventlog._encode(tuple(EARLY_V1_COLUMNS), [
+        {**old, "inspection_id": "old2", "mode": "MOCK", "judgment": "FAIL"}], header=True))
+    new = {"time": "2026-10-13T16:00:00+02:00", "inspection_id": "new1",
+           "operating_mode": "station", "hardware": "MOCK", "judgment": "PASS"}
+    assert eventlog.append(lib, new, []) == {"written": 1, "pending": 0, "lost": 0}
+    rows = eventlog.read_rows(month_file)
+    assert list(rows[0]) == INSPECTION_COLUMNS
+    assert [(r["inspection_id"], r["hardware"], r["operating_mode"], r["judgment"])
+            for r in rows] == [("old1", "REAL", "", "PULL"), ("old2", "MOCK", "", "FAIL"),
+                               ("new1", "MOCK", "station", "PASS")]
+    assert not waiting.exists() and eventlog.waiting(lib) == 0
+    # the file as it was, twice: moved aside by the rebuild, then by the append (never deleted)
+    assert [p.read_bytes() for p in events.glob("replaced_*/inspections_v1_2026-10.csv")] \
+        == [raw, raw]
+    assert "before the v1 header was settled" in caplog.text
+    # a file with a header of its own is never added to: it is moved aside as it is, and the
+    # month's rows go on in a new file
+    foreign = events / "inspections_v1_2026-09.csv"
+    foreign.write_bytes(b"a,b\r\n1,2\r\n")
+    out = eventlog.append(lib, {"time": "2026-09-01T00:00:00+00:00", "inspection_id": "x"}, [])
+    assert out == {"written": 1, "pending": 0, "lost": 0}
+    assert [r["inspection_id"] for r in eventlog.read_rows(foreign)] == ["x"]
+    assert [p.read_bytes() for p in events.glob("replaced_*/inspections_v1_2026-09.csv")] \
+        == [b"a,b\r\n1,2\r\n"]
+    assert "had a header that is not the v1 header (a, b)" in caplog.text
+    # a file changed in a spreadsheet program (a column added, saved): its rows go on under
+    # the v1 header, the file as it was is kept - the log never stops growing
+    rows = eventlog.read_rows(month_file)
+    edited = eventlog._BOM + eventlog._encode((*INSPECTION_COLUMNS, "qa_note"),
+                                              [{**r, "qa_note": "ok"} for r in rows], header=True)
+    month_file.write_bytes(edited)
+    new2 = {**new, "inspection_id": "new2"}
+    assert eventlog.append(lib, new2, []) == {"written": 1, "pending": 0, "lost": 0}
+    assert [r["inspection_id"] for r in eventlog.read_rows(month_file)] == [
+        "old1", "old2", "new1", "new2"]
+    assert list(eventlog.read_rows(month_file)[0]) == INSPECTION_COLUMNS
+    assert edited in [p.read_bytes() for p in events.glob("replaced_*/inspections_v1_2026-10.csv")]
+    assert "was changed in another program (column(s) added: qa_note)" in caplog.text
+
+
 def test_the_newest_row_is_also_a_small_file_of_its_own(tmp_path, eventlog_on, monkeypatch,
                                                         caplog):
     """events/last_v1.csv: the header and the row of the inspection that just ended, for a
@@ -779,7 +868,7 @@ def test_the_newest_row_is_also_a_small_file_of_its_own(tmp_path, eventlog_on, m
     events, last = runs / "events", runs / "events" / "last_v1.csv"
     assert eventlog.LAST == last.name
     first, _, doc = _job(runs, max_dev=0.1, threshold=0.2, codes=["SN-1"])
-    month = doc["finished"][:7]
+    month = _month(doc)
     raw = last.read_bytes()
     assert raw.startswith(b"\xef\xbb\xbf" + ",".join(INSPECTION_COLUMNS).encode() + b"\r\n")
     assert raw.endswith(b"\r\n") and raw.count(b"\r\n") == 2 and len(raw) < 2000
@@ -834,7 +923,7 @@ def test_a_failed_append_changes_nothing_waits_and_is_merged_next_time(tmp_path,
                                                                        monkeypatch):
     runs = tmp_path / "runs"
     first, _, doc1 = _job(runs, max_dev=0.1, threshold=0.2)
-    month = doc1["finished"][:7]
+    month = _month(doc1)
     name = f"inspections_v1_{month}.csv"
     main, pending = runs / "events" / name, runs / "events" / "pending" / name
     before = main.read_bytes()
@@ -887,7 +976,7 @@ def test_a_file_held_as_a_spreadsheet_program_holds_it(tmp_path, eventlog_on):
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
     runs = tmp_path / "runs"
     first, _, doc = _job(runs, max_dev=0.1, threshold=0.2)
-    name = f"inspections_v1_{doc['finished'][:7]}.csv"
+    name = f"inspections_v1_{_month(doc)}.csv"
     main = runs / "events" / name
     GENERIC_READ, SHARE_READ, OPEN_EXISTING = 0x80000000, 0x1, 3
     h = k32.CreateFileW(str(main), GENERIC_READ, SHARE_READ, None, OPEN_EXISTING, 0x80, None)
@@ -942,7 +1031,7 @@ def test_a_row_is_not_dropped_while_the_log_is_busy(tmp_path, eventlog_on, monke
     slow disk): the inspection is held up for LOCK_WAIT_S and no longer, its rows wait in
     events/pending/ - whole, counted by the page - and are added at the next append."""
     first, _, doc = _job(tmp_path, max_dev=0.1, threshold=0.2)
-    month = doc["finished"][:7]
+    month = _month(doc)
     pending = tmp_path / "events" / "pending"
     monkeypatch.setattr(eventlog, "LOCK_WAIT_S", 0.2)
     with eventlog._locked(tmp_path / "events") as held:
@@ -1125,7 +1214,7 @@ def test_rebuild_may_run_while_inspections_are_made(tmp_path, eventlog_on, monke
     that waits, a row written again - and nothing twice."""
     runs = tmp_path / "runs"
     first, first_dir, doc = _job(runs, max_dev=0.1, threshold=0.2)
-    month = doc["finished"][:7]
+    month = _month(doc)
     events = runs / "events"
     real_present, late, free = eventlog._present, [], []
 
@@ -1415,7 +1504,9 @@ def test_a_recipe_run_is_one_row_with_values_picture_profile_and_3d_data(real, m
     (row,), vals = _log(root)
     rid = res["run_id"]
     assert (row["inspection_id"], row["judgment"], row["reason"]) == (rid, "PASS", "")
-    assert (row["program"], row["part"], row["mode"]) == ("tube_long_end_face", "tube_long", "MOCK")
+    assert (row["program"], row["part"], row["hardware"]) == (
+        "tube_long_end_face", "tube_long", "MOCK")
+    assert row["operating_mode"] == "recipe_run"            # a recipe run on its own
     assert row["preset"] == PRESET and row["calibration_id"] == res["calibration"]["calibration_id"]
     assert row["rig"] == res["capture"]["geometry_id"] and row["part_id"] == ""
     # one value row per tolerance of every check, with the limits the check held it to
@@ -1505,6 +1596,7 @@ def test_a_real_cycle_and_a_work_state_on_its_own(real, tmp_path):
     assert [r["inspection_id"] for r in rows] == [res["run_id"], one["run_id"]]
     assert rows[1]["program"] == "example_tube_line.json / long_tube / loaded"
     assert rows[1]["judgment"] == "PASS"
+    assert [r["operating_mode"] for r in rows] == ["station", "station"]
     mine = [v for v in vals2 if v["inspection_id"] == one["run_id"]]
     assert mine and all(v["step"] == "" for v in mine)
     _same_after_rebuild(root, [runs])
@@ -1532,8 +1624,8 @@ def test_a_real_cycle_that_never_ended(real, tmp_path, monkeypatch):
     (row,), vals = _log(root)
     assert (row["inspection_id"], row["judgment"]) == (cid, "PULL")
     assert row["reason"].startswith("error: the cycle never ended")
-    assert (row["program"], row["part"], row["mode"]) == (
-        "example_tube_line.json / long_tube", "long_tube", "MOCK")
+    assert (row["program"], row["part"], row["hardware"], row["operating_mode"]) == (
+        "example_tube_line.json / long_tube", "long_tube", "MOCK", "station")
     want = [(z["id"], ch["id"], t["name"]) for z in one["result"]["zones"] for ch in z["checks"]
             for t in ch["tolerances"] or []]
     assert [(v["zone"], v["check"], v["name"]) for v in vals] == want and want
@@ -1544,7 +1636,7 @@ def test_a_real_cycle_that_never_ended(real, tmp_path, monkeypatch):
     assert (root / row["image_file"]).read_bytes() == (
         Path(one["run_dir"]) / "overlay.png").read_bytes()
     assert row["data_3d_file"].endswith("_t_long_ok.ply")
-    assert row["time"] == one["result"]["finished"]
+    assert row["time"] == eventlog.local_time(one["result"]["finished"])
     _same_after_rebuild(root, [runs])
 
 
@@ -1559,8 +1651,8 @@ def test_a_measurement_is_a_row_without_a_judgment(real, tmp_path):
     assert out["exit_code"] == 0 and doc["status"] == "MEASURED"
     (row,), vals = _log(root)
     assert (row["inspection_id"], row["judgment"], row["reason"]) == (doc["run_id"], "-", "")
-    assert (row["program"], row["part"], row["mode"]) == ("measure:flatness", "measure_flatness",
-                                                          "MOCK")
+    assert (row["program"], row["part"], row["hardware"], row["operating_mode"]) == (
+        "measure:flatness", "measure_flatness", "MOCK", "measure")
     assert [(v["name"], v["unit"]) for v in vals] == [(v["name"], v["units"])
                                                       for v in doc["values"]]
     assert all((v["lower_limit"], v["upper_limit"], v["result"], v["check"]) == (
@@ -1612,6 +1704,7 @@ def test_a_quick_check_is_one_row_and_a_pass_in_the_guard_band_reads_pull(real, 
     assert code == 0
     (row,), (val,) = _log(root)
     assert (row["judgment"], row["program"], row["part"]) == ("PASS", "quick_check", "quick_check")
+    assert (row["operating_mode"], row["hardware"]) == ("quick_check", "MOCK")
     assert (val["name"], val["check"], val["upper_limit"], val["result"]) == (
         "deviation_mm.max", "metric", "0.5", "OK")
     limit = f"{float(val['value']) * 1.5:.4f}"
@@ -1749,6 +1842,9 @@ const out = {};
   run('render()');
   out.filtered = shown();
   el('evFilter').value = '';
+  run('state.bad = true; render()');                    // "REJECT and PULL only"
+  out.bad = shown();
+  run('state.bad = false; render()');
   await run("load(shiftMonth('2026-10', -1))");
   out.september = shown();
   out.asked = asked.slice();
@@ -1761,6 +1857,9 @@ const out = {};
                count: el('evCount').textContent };
   await run("load('nonsense')");
   out.stays = el('evMonth').value;
+  files = { '/files/events/inspections_v1_2026-11.csv': data.early };
+  await run("load('2026-11')");
+  out.early = table().map((x) => [x.cells[0], x.cells[1], x.time, x.cells[4]]);
   out.parsed = run(`parseCsv('a,"b ""x"", y",c\\r\\n1,,"two\\nlines"\\n')`);
   out.odd = ['', 'a,b\\n\\n\\nc', '"never closed,\\nrow', 'ab"cd,ef"gh,i\\r',
              '\\x22\\x22\\x22\\x22,\\x22\\x22\\r\\n,', 'a\\rb\\rc']
@@ -1786,17 +1885,18 @@ def test_the_page_shows_the_newest_rows_first_with_links_and_waiting_rows(tmp_pa
 
     def row(i, when, **kw):
         return {"time": when, "inspection_id": f"run{i}", "part_id": f"SN-{i}", "part": "tube",
-                "program": "line1.json / long", "mode": "REAL", "judgment": "PASS", "reason": "",
+                "program": "line1.json / long", "operating_mode": "station", "hardware": "REAL",
+                "judgment": "PASS", "reason": "",
                 "n_values": 2, "n_out_of_limit": 0, "values": "v_mm=1 mm [0..2] OK",
                 "image_file": f"events/img/run{i}.png", "result_file": f"runs/run{i}/result.json",
                 **kw}
     main = [row(1, "2026-10-13T07:00:00+00:00"),
-            row(3, "2026-10-13T09:00:00+00:00", judgment="FAIL", n_out_of_limit=1, mode="MOCK",
-                reason='lid/flatness: 0.31 mm > 0.2 mm, "too high"',
+            row(3, "2026-10-13T09:00:00+00:00", judgment="FAIL", n_out_of_limit=1,
+                hardware="MOCK", reason='lid/flatness: 0.31 mm > 0.2 mm, "too high"',
                 part_id='=cmd|\' /C calc\'!A0', profile_file="runs/run3/profile_x.csv",
                 data_3d_file="output/pointclouds/a b.ply"),
             row(2, "2026-10-13T08:00:00+00:00", judgment="-", program="measure:flatness",
-                result_file=outside, image_file=""),
+                operating_mode="measure", result_file=outside, image_file=""),
             # run1 again: ABORT came after its verdict, so its row was written a second time
             row(1, "2026-10-13T07:00:00+00:00", judgment="PULL",
                 reason="aborted: ABORT was pressed after this run wrote its verdict")]
@@ -1804,10 +1904,16 @@ def test_the_page_shows_the_newest_rows_first_with_links_and_waiting_rows(tmp_pa
                    reason="guard_band: v_mm 1.99 is within 10 % of its upper limit"),
                row(6, "2026-10-13T06:00:00+00:00")]
     many = [row(i, f"2027-01-01T00:{i // 60:02d}:{i % 60:02d}+00:00") for i in range(620)]
+    # a file written before the v1 header was settled (`mode`, no operating_mode), with times
+    # at three offsets: by the moment the newest is 01:10 UTC, by the text it is the oldest
+    early = [row(21, "2026-11-01T01:30:00+01:00", mode="MOCK"),
+             row(22, "2026-11-01T01:10:00+00:00", mode="REAL"),
+             row(23, "2026-11-01T02:20:00+02:00", mode="REAL")]
     data = {"files": {
         "/files/events/inspections_v1_2026-10.csv": _csv_text(INSPECTION_COLUMNS, main),
         "/files/events/pending/inspections_v1_2026-10.csv": _csv_text(INSPECTION_COLUMNS, waiting)},
-        "many": _csv_text(INSPECTION_COLUMNS, many), "outside": outside}
+        "many": _csv_text(INSPECTION_COLUMNS, many), "outside": outside,
+        "early": _csv_text(EARLY_V1_COLUMNS, early)}
     (tmp_path / "data.json").write_text(json.dumps(data), encoding="utf-8")
     (tmp_path / "harness.js").write_text(_PAGE_HARNESS, encoding="utf-8")
     r = subprocess.run([node, str(tmp_path / "harness.js"), str(STATIC / "events.js"),
@@ -1844,6 +1950,18 @@ def test_the_page_shows_the_newest_rows_first_with_links_and_waiting_rows(tmp_pa
     assert two["cells"][5] == "-" and two["judgment"] == "muted"
     f = out["filtered"]
     assert [x["cells"][1] for x in f["rows"]] == ["run7"] and f["count"] == "1 of 5 inspection(s)"
+    # how the scanner was used, under the program
+    assert two["cells"][4] == "measure:flatnessMeasure" and three["cells"][4].endswith("Station")
+    # "REJECT and PULL only": the parts that did not continue (FAIL is REJECT), newest first
+    b = out["bad"]
+    assert [x["cells"][1] for x in b["rows"]] == ["run7", "run3 MOCK", "run1"]
+    assert b["count"] == "3 of 5 inspection(s)" and b["empty"] is None
+    # an early v1 file: read by its own header (MOCK still marked), sorted by the moment, each
+    # time shown as the file holds it (the scanner's clock; the offset in the tooltip)
+    assert out["early"] == [
+        ["2026-11-01 01:10:00", "run22", "2026-11-01T01:10:00+00:00", "line1.json / long"],
+        ["2026-11-01 01:30:00", "run21 MOCK", "2026-11-01T01:30:00+01:00", "line1.json / long"],
+        ["2026-11-01 02:20:00", "run23", "2026-11-01T02:20:00+02:00", "line1.json / long"]]
     # another month: its own two files are asked for; none there is not an error
     sep = out["september"]
     assert out["asked"][-2:] == ["/files/events/inspections_v1_2026-09.csv",
@@ -1869,7 +1987,7 @@ def test_the_server_serves_the_page_and_the_log_with_the_routes_it_has(eng, even
     from ui.web import server as ui_server
     lib = eng.store.root
     run_id, _, doc = _job(lib / "runs", max_dev=0.1, threshold=0.2, picture="overlay.png")
-    month = doc["finished"][:7]
+    month = _month(doc)
     api._session = None
     (tmp_path / "stations").mkdir()
     httpd, app = ui_server.make_server(mock=True, library=lib, port=0,

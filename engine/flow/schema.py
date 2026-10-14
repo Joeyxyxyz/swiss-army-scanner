@@ -97,10 +97,13 @@ _PERMIT = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
 
 TOP_KEYS = {"schema_version", "station_id", "description", "parameters", "profiles", "flow",
             "mock", "_comment"}
-LEGACY_TOP_KEYS = {"preset", "library", "mock_library", "runs_dir", "operator_confirmed"}
+LEGACY_TOP_KEYS = {"preset", "library", "mock_library", "runs_dir", "operator_confirmed",
+                   "bad_part_output"}
+# bad_part_output: where a part judged REJECT or PULL is copied (engine/badparts.py): a
+# folder relative to the configuration file, "off", or null (the recipe's / the computer's)
 PARAMETER_DEFAULTS = {"preset": None, "library": None, "mock_library": None, "runs_dir": None,
                       "operator_confirmed": False, "default_profile": None, "io": None,
-                      "defaults": None}
+                      "defaults": None, "bad_part_output": None}
 STEP_DEFAULTS = {"retries": 1, "timeout_s": None, "trigger": "step"}
 PROFILE_KEYS = {"title", "description", "preset", "recipes", "zones", "golden", "scan", "part",
                 "feedback", "pull", "mock_scene", "_comment"}
@@ -356,7 +359,8 @@ def lift_legacy(doc: dict, source: Optional[Path] = None) -> StationConfiguratio
                 on_defect=[{"action": "kickout", "disposition": "REJECT", "reason": ""}],
                 on_doubt=[{"action": "kickout", "disposition": "PULL", "reason": ""}])
     params = copy.deepcopy(PARAMETER_DEFAULTS)
-    params.update({k: doc.get(k) for k in ("preset", "library", "mock_library", "runs_dir")})
+    params.update({k: doc.get(k) for k in ("preset", "library", "mock_library", "runs_dir",
+                                           "bad_part_output")})
     params["operator_confirmed"] = doc.get("operator_confirmed") is True
     params["default_profile"] = LEGACY_PROFILE
     return StationConfiguration(station_id=sid, description=str(doc.get("_comment") or ""),
@@ -517,6 +521,10 @@ def _parameters(v, E: _Errors) -> tuple:
         if out[k] is not None and not isinstance(out[k], str):
             E.add(f"parameters.{k}", "must be a folder path or null")
             out[k] = None
+    if out["bad_part_output"] is not None and not isinstance(out["bad_part_output"], str):
+        E.add("parameters.bad_part_output", "must be a folder path, \"off\" or null (where a "
+              "part judged REJECT or PULL is copied)")
+        out["bad_part_output"] = None
     if not isinstance(out["operator_confirmed"], bool):
         E.add("parameters.operator_confirmed", "must be true or false (unquoted), got "
               f"{out['operator_confirmed']!r}")

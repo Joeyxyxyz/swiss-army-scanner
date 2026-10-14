@@ -83,7 +83,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from .. import config, eventlog, rigstate, rules
+from .. import badparts, config, eventlog, rigstate, rules
 from .. import disposition as D
 from .. import runs as R
 from ..measure import values as V
@@ -850,6 +850,7 @@ def _write_doc(run_dir: Path, doc: dict) -> Path:
         json.dump(doc, f, indent=2, default=str)
         f.write("\n")
     eventlog.record(run_dir)                # its row in the inspection event log (never raises)
+    badparts.record(run_dir)                # a measurement judges nothing: nothing written there
     return out
 
 
@@ -931,6 +932,9 @@ def run(s, preset, spec: Spec, *, runs_dir, scans: Optional[list] = None,
         if spec.what == "deviation":
             try:
                 golden = runner._find_metric(s, spec.golden, preset.geometry_id)
+                # never a part judged REJECT / PULL (engine/badparts.py)
+                badparts.require_good(s.store, "the golden scan", [golden],
+                                      how=badparts.HOW_GOLDEN)
                 metric_scan.check_cal(s, golden, "the golden scan")
                 runner._same_setup(golden, preset, fp, cal, "the golden scan")
             except (LookupError, rules.RuleViolation) as e:

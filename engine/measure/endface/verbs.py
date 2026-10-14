@@ -52,7 +52,7 @@ from typing import Optional
 
 import numpy as np
 
-from ... import config, rules
+from ... import badparts, config, rules
 from ...library.store import json_safe, read_meta, safe_label
 from ...results import FaceCheck, FaceGolden, FaceProfile, FaceScan, FaceTarget, MetricScan, RingShot
 from . import detectors as det_mod
@@ -1755,6 +1755,15 @@ def _placement(p: FaceProfile) -> det_mod.Placement:
                              pixels=p._pixels)
 
 
+def _sources(s, geometry_id: str, facescan_id, metric_scan_ids, files=()) -> list:
+    """What a placement rests on, for engine/badparts.require_good: its face scan's entry
+    (check_face records its result there), its repeat metric scans, its own files."""
+    fs = s.store.root / "facescans" / str(geometry_id) / str(facescan_id or "")
+    out = [fs] if facescan_id and fs.is_dir() else []
+    out += [m for m in (metric_scan_ids or []) if isinstance(m, str)]
+    return out + [Path(f) for f in files if f]
+
+
 def _stored_settings(gh: FaceGolden, g: np.ndarray, over: Optional[dict] = None) -> tuple:
     """(Settings, default detector) from a golden's params (+ per-check trigger overrides).
     The radii are the golden's: its stored resolved set (params['radii']); a golden made
@@ -1802,7 +1811,10 @@ def face_golden(s, placements: list, label: str = "golden", params: Optional[dic
     rim: the rim outline (roundness) settings {tol_mm 0.4, min_arc_mm 1.5, guard_band_pct 20,
     k_sigma 4}; the golden learns the outline's per-angle median and spread from the
     placements whose flood pair shows it. size_tol_pct (4): a placement whose outline is
-    further off the face diameter is refused (a golden is never built on mis-scaled data)."""
+    further off the face diameter is refused (a golden is never built on mis-scaled data).
+    A placement of a part judged REJECT or PULL - by an inspection, by check_face, or one that
+    lives in a bad-part output - is refused (engine/badparts.py: references are made from
+    good parts only)."""
     safe_label(label)
     if callable(detector):
         raise ValueError("face_golden: detector must be a name "
@@ -1820,7 +1832,14 @@ def face_golden(s, placements: list, label: str = "golden", params: Optional[dic
         raise ValueError(f"face_golden: unknown radii {bad} (known: {list(radii_mod.KEYS)})")
     rimp = _rim_params(rim)
     tol = _size_tol(size_tol_pct)
+    # good parts only: what is given (a face scan, a profile file), then what each rests on
+    badparts.require_good(s.store, "face_golden placement",
+                          [p for p in placements if not isinstance(p, FaceProfile)])
     profs = [load_profile(s, p) for p in placements]
+    badparts.require_good(s.store, "face_golden placement",
+                          [x for p in profs for x in _sources(s, p.geometry_id, p.facescan_id,
+                                                              p.metric_scan_ids,
+                                                              [p.files.get("npz")])], sweep=True)
     b = _check_same(profs, "face_golden")
     cal = _require_current_cal(s, b["geometry_id"], b["geometry_fp"], b["calibration_id"],
                                "face_golden")
@@ -2102,6 +2121,13 @@ def check_face(s, placement, golden=None, label: Optional[str] = None,
     prof = load_profile(s, placement)
     gh = as_golden(s, golden, prof)
     what = f"check_face vs golden {gh.id}"
+    # never against a golden whose placements were judged REJECT / PULL since (engine/badparts)
+    badparts.require_good(s.store, f"{what}: its placement",
+                          [gh.path] + [x for p in (gh.meta or {}).get("placements") or []
+                                       if isinstance(p, dict)
+                                       for x in _sources(s, gh.geometry_id, p.get("facescan_id"),
+                                                         p.get("metric_scans"))],
+                          how=badparts.HOW_USE)
     rules.require_same_geometry(prof.geometry_id, gh.geometry_id, what)
     rules.require_same_fingerprint(prof.geometry_fp, gh.meta.get("geometry_fp"), what)
     if abs(prof.face_diameter_mm - gh.face_diameter_mm) > DIAMETER_TOL_MM:

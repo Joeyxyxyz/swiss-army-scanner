@@ -23,7 +23,9 @@ An inspection is a run that opened a run folder and wrote its result.json: a rec
 quick check, a station job, a cycle of a station configuration, a measurement. A cycle is
 ONE inspection: the checks of its work states (their run folders under <cycle>/steps/) give
 its value rows, each naming its step. The check of one work state run outside a cycle is an
-inspection of its own. A START that is refused before a run folder exists writes no row.
+inspection of its own. A START that is refused before a run folder exists writes no row, also
+when the command bus PULLs the part for it (a configuration that is not usable, a zone
+selection it cannot use, a start check that failed): that PULL is on the line's outputs only.
 
 An inspection id can have more than one row: the row is written again (amend) when
 something happened to the run after its result.json was written - the line counting it

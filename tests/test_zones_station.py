@@ -307,14 +307,16 @@ def test_the_bus_gate_refuses_a_cycle_without_or_with_a_pull():
 
 @pytest.fixture(scope="module")
 def web(lab):
-    """A MOCK server on the module's library with two station configurations: own.json
-    (the whole field, as written) and sel.json ("zone": "selection"). Its scans are the
-    synthetic wall scan."""
+    """A MOCK server on the module's library with three station configurations: own.json
+    (the whole field, as written), sel.json ("zone": "selection") and selbad.json (the same,
+    with a bad-part output: stations/bad). Its scans are the synthetic wall scan."""
     stations = lab["tmp"] / "stations"
     stations.mkdir()
     (stations / "own.json").write_text(json.dumps(_station_doc(lab["tmp"], None)), encoding="utf-8")
     (stations / "sel.json").write_text(json.dumps(_station_doc(lab["tmp"], "selection")),
                                        encoding="utf-8")
+    (stations / "selbad.json").write_text(json.dumps(
+        {**_station_doc(lab["tmp"], "selection"), "bad_part_output": "bad"}), encoding="utf-8")
     httpd, app = ui_server.make_server(mock=True, library=lab["lib"], port=0,
                                        stations_dir=stations, preset=PRESET)
     t = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
@@ -480,6 +482,50 @@ def test_the_selection_is_fixed_while_the_station_is_armed(web):
     assert "cells (2), tube (1)" in r["message"] and "disarmed" in r["message"]
     b = r["bus"]
     assert b["state"] == "READY" and b["last_disposition"] == "PULL" and asked[n:] == ["zoneset:cells"]
+
+
+def test_a_start_the_bus_pulls_for_its_zones_is_a_pull_on_the_line_only(web, eventlog_on):
+    """What the docs say (README, *Scan zones* and *Bad parts*; stations/README.md): a START /
+    TRIGGER the bus refuses with a PULL because the zone selection cannot be used never opened
+    a run folder. The part is PULLed on the line's outputs and the refusal says why, but there
+    is no event-log row and no copy in the configuration's bad-part output. `scan run` with
+    the same file opens a run folder, and its PULL is copied
+    (test_zone_selection_and_a_bad_part_output_in_one_configuration)."""
+    c, app, asked = web
+    _clear(c, app)
+    runs, bad = app.stations_dir.parent / "runs", app.stations_dir / "bad"
+    events = app.session.store.root / eventlog.EVENTS_DIR
+
+    def records():
+        return (sorted(p.name for p in runs.iterdir()) if runs.is_dir() else [],
+                sorted(str(p) for p in events.rglob("*")) if events.is_dir() else [],
+                bad.exists())
+    assert c.post("/api/cmd/config", {"config": "selbad.json"})[0] == 200
+    _wait_state(c, ("READY",))
+    before, n = records(), len(asked)
+    assert before[2] is False
+    # nothing switched on: START is refused, the part PULLed on the line, the reason given
+    status, r = c.post("/api/cmd/start", {"source": "test"})
+    assert status == 409 and "selbad.json inspects the selected zones and none is switched on" \
+        in r["message"], r
+    b = r["bus"]
+    assert b["last_result"] == "INVALID" and b["last_disposition"] == "PULL" and b["signals"]["PULL"]
+    assert r["jobs"] == {} and asked[n:] == []
+    assert any(h[2] == "START" and h[3] is False and "none is switched on" in h[4]
+               for h in b["history"]), b["history"]
+    assert records() == before                  # no run folder, no event row, no copy
+    # armed with a selection that then changes behind the server's back: the TRIGGER PULLs,
+    # and the same holds
+    status, r = _select(c, [{"set": "cells", "on": True, "ids": None}])
+    assert status == 200, r
+    status, r = c.post("/api/cmd/arm", {"source": "plc", "zones": r["selection"]["stamp"]})
+    assert status == 200 and r["bus"]["state"] == "ARMED", r
+    api.zone_select(on="tube", preset=app.session.preset, by="a terminal")
+    status, r = c.post("/api/cmd/trigger", {"source": "plc"})
+    assert status == 409 and "the zones changed since ARM" in r["message"], r
+    assert r["bus"]["last_disposition"] == "PULL" and r["bus"]["signals"]["PULL"]
+    assert r["bus"]["state"] == "READY" and asked[n:] == []
+    assert records() == before
 
 
 def test_start_is_refused_while_the_painter_holds_the_rig(web):

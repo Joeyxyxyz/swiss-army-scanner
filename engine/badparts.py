@@ -3,7 +3,9 @@ The bad-part output, and references made from good parts only.
 
 BAD-PART OUTPUT (off unless a folder is set). Every inspection whose disposition is REJECT or
 PULL gets a folder there, so a factory can track its bad parts; the good parts are what the
-scanner checks against.
+scanner checks against. An inspection is a run that wrote its result.json: a START / TRIGGER
+the command bus PULLs before a run folder exists (a configuration that is not usable, a zone
+selection it cannot use) has nothing to copy - that PULL is on the line's outputs only.
 
     <folder>/BAD_PART_OUTPUT.txt          what the folder is: written first, it marks the
                                           folder (nothing in it is ever a reference)

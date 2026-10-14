@@ -5,6 +5,11 @@ order fails here the way it would on the bench:
 - every node needs an initialised camera (Init, not yet DeInit);
 - TriggerSelector / Source / Activation / Overlap only while TriggerMode is Off;
 - the stream buffer nodes only while not acquiring;
+- StreamBufferCountManual above the driver's maximum is refused ("Value = 172
+  must be equal or smaller than Max = 164"); the maximum is `buffer_max`,
+  settable at any time (on a PC it moves with the free memory);
+- triggered frames wait in that many stream buffers, oldest first: a frame that
+  arrives while all are full is lost and its frame id is skipped;
 - EndAcquisition raises when the camera is not acquiring ("Camera is not
   started"); DeInit raises while acquiring;
 - System.ReleaseInstance raises SPINNAKER_ERR_RESOURCE_IN_USE while any Python
@@ -19,9 +24,13 @@ lead_s + k * period_s later (wall clock); `n_pulses` stops the train,
 `incomplete` makes those pulses' images incomplete, `error_at` raises a
 non-timeout SpinnakerException at that pulse. Line modes: Line0 is a read-only
 input (opto), the others writable; `line_modes` sets their starting mode and
-`stuck_lines` accept a LineMode write but keep their mode.
+`stuck_lines` accept a LineMode write but keep their mode. Stream buffers:
+`buffer_max` is the driver's maximum, `fail_buffers` makes the driver refuse
+every count (no memory for them); device.lost counts the frames lost to full
+buffers since BeginAcquisition.
 """
 
+import collections
 import itertools
 import time
 import types
@@ -33,7 +42,10 @@ SPINNAKER_ERR_TIMEOUT = -1011
 SPINNAKER_ERR_RESOURCE_IN_USE = -1004
 SPINNAKER_ERR_ACCESS_DENIED = -1005
 SPINNAKER_ERR_NOT_AVAILABLE = -1008
+SPINNAKER_ERR_OUT_OF_MEMORY = -1021
+GENICAM_ERR_OUT_OF_RANGE = -2002
 RW, RO = 4, 3
+DEFAULT_BUFFERS = 10                # StreamBufferCountManual before anyone sets it
 
 TRIGGER_CONFIG = ("TriggerSelector", "TriggerSource", "TriggerActivation", "TriggerOverlap")
 STREAM_NODES = ("StreamBufferHandlingMode", "StreamBufferCountMode", "StreamBufferCountManual")
@@ -54,15 +66,33 @@ class _Device:
         self.acquiring = False
         self.values = {"TriggerMode": fake.enum("TriggerMode_Off"), "LineSelector": None}
         self.line_mode = {ln: fake.enum(f"LineMode_{m}") for ln, m in fake.line_modes.items()}
-        self.k = 0
+        self.k = 0                  # the next pulse that has not arrived yet
         self.fid = 0
         self.t_begin = None
+        self.buffers = DEFAULT_BUFFERS      # stream buffers of this acquisition
+        self.queue = collections.deque()    # (pulse, frame id) waiting to be read
+        self.lost = 0
         self.log = fake.log
 
     def need_init(self, what):
         if not self.init:
             raise SpinnakerException(f"{what}: camera is not initialized",
                                      SPINNAKER_ERR_NOT_AVAILABLE)
+
+    def due(self, k):
+        return self.t_begin + self.fake.lead_s + k * self.fake.period_s
+
+    def arrive(self, now):
+        """Every pulse due by `now` takes a frame id and a free stream buffer; with
+        all buffers full the frame is lost (oldest first: nothing is overwritten)."""
+        f = self.fake
+        while (f.n_pulses is None or self.k < f.n_pulses) and self.due(self.k) <= now:
+            if len(self.queue) < self.buffers:
+                self.queue.append((self.k, self.fid))
+            else:
+                self.lost += 1
+            self.k += 1
+            self.fid += 1
 
 
 class _Node:
@@ -84,10 +114,16 @@ class _Node:
             return d.line_mode[line]
         if self._name == "PixelFormat":
             return d.values.get("PixelFormat", d.fake.enum("PixelFormat_Mono8"))
+        if self._name == "StreamBufferCountMax":
+            return int(d.fake.buffer_max)
+        if self._name == "StreamBufferCountManual":
+            return d.values.get(self._name, DEFAULT_BUFFERS)
         return d.values.get(self._name, 0)
 
     def GetMax(self):
         self._dev.need_init(f"{self._name}.GetMax")
+        if self._name == "StreamBufferCountManual":
+            return int(self._dev.fake.buffer_max)
         return 1440 if self._name == "Width" else 1080
 
     def SetValue(self, v):
@@ -101,6 +137,16 @@ class _Node:
                                      SPINNAKER_ERR_ACCESS_DENIED)
         if self._name == "TriggerSource" and f.fail_source:
             raise SpinnakerException("TriggerSource write failed", SPINNAKER_ERR_ACCESS_DENIED)
+        if self._name == "StreamBufferCountManual":
+            if f.fail_buffers:
+                raise SpinnakerException("Could not allocate the stream buffers",
+                                         SPINNAKER_ERR_OUT_OF_MEMORY)
+            if int(v) > int(f.buffer_max):
+                raise SpinnakerException(f"Value = {int(v)} must be equal or smaller than "
+                                         f"Max = {int(f.buffer_max)}", GENICAM_ERR_OUT_OF_RANGE)
+            if int(v) < 1:
+                raise SpinnakerException(f"Value = {int(v)} must be equal or greater than "
+                                         "Min = 1", GENICAM_ERR_OUT_OF_RANGE)
         if self._name == "LineMode":
             if self.GetAccessMode() != RW:
                 raise SpinnakerException("LineMode is read-only for this line",
@@ -181,6 +227,9 @@ class _Camera:
         if d.acquiring:
             raise SpinnakerException("Camera is already streaming", SPINNAKER_ERR_RESOURCE_IN_USE)
         d.acquiring, d.t_begin, d.k = True, time.perf_counter(), 0
+        d.buffers = int(d.values.get("StreamBufferCountManual", DEFAULT_BUFFERS))
+        d.queue.clear()
+        d.lost = 0
         d.log.append(("BeginAcquisition",))
 
     def EndAcquisition(self):
@@ -198,20 +247,20 @@ class _Camera:
         triggered = d.values["TriggerMode"] == f.enum("TriggerMode_On")
         if not triggered:
             return _Image(d.fid, 0, False)
-        k = d.k
+        now = time.perf_counter()
+        d.arrive(now)                        # what came in since the last read
+        k = d.queue[0][0] if d.queue else d.k
         if f.error_at is not None and k >= f.error_at:
             raise SpinnakerException("Stream has been aborted", -1012)
-        due = d.t_begin + f.lead_s + k * f.period_s
-        now = time.perf_counter()
-        if (f.n_pulses is not None and k >= f.n_pulses) or due > now + timeout_ms / 1000.0:
-            time.sleep(timeout_ms / 1000.0)
-            raise SpinnakerException("Failed waiting for EventData on NEW_BUFFER_DATA event",
-                                     SPINNAKER_ERR_TIMEOUT)
-        if due > now:
-            time.sleep(due - now)
-        d.k += 1
-        fid = d.fid
-        d.fid += 1
+        if not d.queue:                      # nothing waiting: the next pulse, or the timeout
+            due = d.due(k)
+            if (f.n_pulses is not None and k >= f.n_pulses) or due > now + timeout_ms / 1000.0:
+                time.sleep(timeout_ms / 1000.0)
+                raise SpinnakerException("Failed waiting for EventData on NEW_BUFFER_DATA "
+                                         "event", SPINNAKER_ERR_TIMEOUT)
+            time.sleep(max(0.0, due - time.perf_counter()))
+            d.arrive(due)
+        k, fid = d.queue.popleft()
         return _Image(fid, int(round((f.lead_s + k * f.period_s) * 1e9)), k in f.incomplete)
 
 
@@ -259,13 +308,15 @@ class FakePySpin(types.ModuleType):
     are distinct ints created on first use; name_of() maps one back."""
 
     def __init__(self, *, period_s=0.005, lead_s=0.005, n_pulses=None, incomplete=(),
-                 error_at=None, line_modes=None, fail_source=False, stuck_lines=()):
+                 error_at=None, line_modes=None, fail_source=False, stuck_lines=(),
+                 buffer_max=1024, fail_buffers=False):
         super().__init__("PySpin")
         self._enums, self._names = {}, {}
         self._ids = itertools.count(100)
         self.period_s, self.lead_s, self.n_pulses = float(period_s), float(lead_s), n_pulses
         self.incomplete, self.error_at, self.fail_source = set(incomplete), error_at, fail_source
         self.stuck_lines = set(stuck_lines)
+        self.buffer_max, self.fail_buffers = int(buffer_max), bool(fail_buffers)
         self.line_modes = {"Line0": "Input", "Line1": "Output", "Line2": "Input",
                            "Line3": "Input", **(line_modes or {})}
         self.log = []

@@ -90,6 +90,22 @@ def test_cli_trigger_test_exit_codes(tmp_path, capsys, monkeypatch):
     api._session = None
 
 
+def test_cli_trigger_test_error_is_not_no_pulses(tmp_path, capsys, monkeypatch):
+    """Exit 1 is the verdict NO PULSES / RATE MISMATCH. An error in the test (the camera
+    could not be set up, a driver error) exits 4 with its own words, never 1."""
+    def refused(*a, **k):
+        raise pm.CameraSetupError("stream buffers: the camera driver allows only 4 now "
+                                  "(64 asked, at least 8 needed)")
+    monkeypatch.setattr(api, "trigger_test", refused)
+    assert cli.build_parser().parse_args(["trigger-test"]).unexpected_exit == cli.EXIT_ERROR
+    assert cli.main(["--mock", "--library", str(tmp_path / "lib"), "trigger-test",
+                     "--seconds", "1"]) == cli.EXIT_ERROR == 4
+    cap = capsys.readouterr()
+    assert "CameraSetupError" in cap.err and "stream buffers" in cap.err
+    assert "NO PULSES" not in cap.out + cap.err
+    api._session = None
+
+
 # ------------------------------------------------------------------ timing validation
 
 @pytest.mark.parametrize("P", [10000, 5000, 4500])

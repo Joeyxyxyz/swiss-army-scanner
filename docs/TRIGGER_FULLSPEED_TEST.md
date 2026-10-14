@@ -182,7 +182,7 @@ The command:
 3. Prints the count, the rate (Hz), the period mean / std / min / max from the **camera timestamps**, the estimated missed pulses, frame-id gaps, timeouts and incomplete frames, and a verdict.
 4. **Always** sets TriggerMode back to Off, then de-initialises the camera and releases it.
 
-Exit codes: 0 = OK, 1 = NO PULSES or RATE MISMATCH.
+Exit codes: 0 = OK, 1 = NO PULSES or RATE MISMATCH, 4 = an error: the test did not reach a verdict (for example the camera could not be set up; the message says what).
 
 | Verdict | Meaning / what to do |
 |---|---|
@@ -259,6 +259,7 @@ The camera needs nothing: every command sets TriggerMode back to Off when it exi
 | Double pulses (period ≪ expected) | Ringing, long wires, no common ground | Short twisted pair, common ground |
 | Refused: trigger line Line2 / Line1 | Not a camera input (pin 3 is the 3.3 V aux output, pin 4 the opto output) | Wire Line0 (pin 2) or Line3 (pin 1), `--line Line0` / `Line3` |
 | Refused: line "does not read back as an input" | The camera keeps the line as an output | Reset the line in SpinView (LineMode Input) or use Line0 |
+| trigger-test (exit 4) or scan-trigger: "stream buffers: the camera driver ..." | The camera driver did not give the stream buffers the capture asks for (64 at most; the driver's own maximum follows the PC's free memory). The camera was not armed and no trigger was looked at: this is a camera set-up error, not NO PULSES | Free memory on the PC (close other programs) and run again |
 | scan-trigger: "frame ids jump" | Camera dropped frames (USB, buffers) or the period is at the camera's limit | Longer period; dedicated USB3 port |
 | scan-trigger: "spacing" | The GUI timing differs from the pack's manifest | Use the pack built for the period the GUI runs |
 | scan-trigger: "no sync_code frame stands out" | Not the fast-scan loop, or the trigger is not one frame per pattern | Check the sequence rows (procedure.txt), Trigger Out 1 polarity, plane check |

@@ -26,6 +26,13 @@ running camera is refused.
 The PySpin trigger setup (`configure_pyspin_trigger`, `restore_free_run`,
 `PySpinTriggeredCamera`) is bench code; tests run it only against a fake
 PySpin module (tests/test_trigger_pyspin_mock.py), never a camera.
+
+Stream buffers: the camera driver is asked for STREAM_BUFFERS at most, never
+more than its own maximum (which moves with the PC's free memory), whatever
+the length of the capture. Every frame is read as it arrives and converted
+only after the last one, so the count covers a short stall of the reader,
+not the capture. A count the driver does not give is a CameraSetupError
+with the numbers - never a 'no pulses' result.
 """
 
 from __future__ import annotations
@@ -43,10 +50,20 @@ ACK_PHRASE = "projector is in pattern mode, set by a human in the TI GUI"
 # Line1 is the opto-isolated OUTPUT and Line2 the bidirectional line / 3.3 V
 # auxiliary output (pin 3): never a trigger input here.
 TRIGGER_INPUT_LINES = ("Line0", "Line3")
+# Stream buffers asked of the camera driver for a triggered capture. A scan that asked
+# for frames + 8 was refused on the bench (172 asked, 164 allowed with memory busy).
+STREAM_BUFFERS = 64
+STREAM_BUFFERS_MIN = 8        # the driver gives fewer: the camera is not armed
 
 
 class PatternModeRefused(rules.SafetyViolation):
     """The guard was not satisfied; nothing was armed or grabbed."""
+
+
+class CameraSetupError(RuntimeError):
+    """The camera could not be set up for a triggered capture: the driver did not
+    give the stream buffers. Raised before the camera is armed, so no trigger was
+    looked at - not a TimeoutError, never counted as 'no pulses'."""
 
 
 class MissingFrames(RuntimeError):
@@ -164,7 +181,9 @@ class TriggeredSequenceCapture:
                         f"frame {k + 1} of {n} (pattern {self.sequence[k]['name']}) arrived "
                         f"incomplete ({e}): image data lost on USB3 - use a USB3 port on its "
                         "own controller, a shorter cable, or a longer pattern period") from e
-                frames.append(np.asarray(img, dtype=np.float32))
+                # kept as grabbed: nothing slow between two grabs, so the reader keeps
+                # up with the camera and STREAM_BUFFERS are enough for any length
+                frames.append(_keep(img))
                 ids.append(int(fid))
                 ts.append(int(t))
             if not self.allow_extra:
@@ -178,6 +197,8 @@ class TriggeredSequenceCapture:
             raise MissingFrames(
                 f"{extra} extra frame(s) after the {n} expected: the sequence is set to "
                 "repeat, or the camera was triggered by something else — uncheck Repeat")
+        for k in range(n):                   # float32 one by one, the camera is disarmed
+            frames[k] = np.asarray(frames[k], dtype=np.float32)
         return TriggeredCapture(frames, ids, ts, self.sequence, report)
 
     def _extra_frames(self) -> int:
@@ -226,6 +247,14 @@ class TriggeredSequenceCapture:
                 "sequence_ms": round((ts[-1] - ts[0]) / 1e6, 3) if n > 1 else 0.0}
 
 
+def _keep(img):
+    """A grabbed frame, safe to hold until the capture ends: a view of a buffer the
+    camera may fill again is copied, anything else is kept as it came."""
+    if isinstance(img, np.ndarray) and not img.flags.owndata:
+        return img.copy()
+    return img
+
+
 # ============================================================ bench
 # PySpin is passed in (or imported lazily) so importing this module never needs
 # the camera SDK. Tests run this code only against a fake PySpin module.
@@ -250,12 +279,61 @@ def require_input_line(cam, PySpin, line: str) -> None:
                                  f"{cam.LineMode.GetValue()!r}): not used as the trigger")
 
 
+def _stream_buffer_max(stream) -> Optional[int]:
+    """The most stream buffers the driver allows now (it follows the PC's free
+    memory), or None when the driver does not say."""
+    for read in (lambda: stream.StreamBufferCountManual.GetMax(),
+                 lambda: stream.StreamBufferCountMax.GetValue()):
+        try:
+            return int(read())
+        except Exception:  # noqa: BLE001 - not reported this way by this driver
+            continue
+    return None
+
+
+def set_stream_buffers(cam, PySpin, want: int = STREAM_BUFFERS) -> dict:
+    """Manual stream buffer count: `want`, at most STREAM_BUFFERS and never more than
+    the driver's maximum -> {"asked", "max", "set"} (max None: not reported).
+    CameraSetupError, with the numbers, when the maximum is under STREAM_BUFFERS_MIN,
+    when the driver refuses the count, or when fewer than that read back."""
+    s = cam.TLStream
+    s.StreamBufferCountMode.SetValue(PySpin.StreamBufferCountMode_Manual)
+    asked = max(STREAM_BUFFERS_MIN, min(int(want), STREAM_BUFFERS))
+    nmax = _stream_buffer_max(s)
+    said = "not reported" if nmax is None else str(nmax)
+    hint = ("free memory on the PC (close other programs) and run again. The camera was "
+            "not armed: this is a camera set-up error, the trigger was not looked at")
+    if nmax is not None and nmax < STREAM_BUFFERS_MIN:
+        raise CameraSetupError(
+            f"stream buffers: the camera driver allows only {nmax} now ({asked} asked, at "
+            f"least {STREAM_BUFFERS_MIN} needed); {hint}")
+    n = asked if nmax is None else min(asked, nmax)
+    try:
+        s.StreamBufferCountManual.SetValue(int(n))
+    except Exception as e:  # noqa: BLE001 - whatever the driver raises, it is this request
+        raise CameraSetupError(
+            f"stream buffers: the camera driver refused {n} ({asked} asked, driver maximum "
+            f"{said}): {e}; {hint}") from e
+    try:
+        got = int(s.StreamBufferCountManual.GetValue())
+    except Exception:  # noqa: BLE001 - no read-back: what was written counts
+        got = n
+    if got < STREAM_BUFFERS_MIN:
+        raise CameraSetupError(
+            f"stream buffers: {n} were set but the camera driver holds {got} ({asked} "
+            f"asked, driver maximum {said}, at least {STREAM_BUFFERS_MIN} needed); {hint}")
+    return {"asked": asked, "max": nmax, "set": got}
+
+
 def configure_pyspin_trigger(cam, PySpin=None, *, exposure_us: float,
                              source: str = "Line0", activation: str = "RisingEdge",
-                             buffers: int = 64) -> None:
-    """Hardware-trigger a Blackfly S (acquisition must be stopped).
+                             buffers: int = STREAM_BUFFERS) -> dict:
+    """Hardware-trigger a Blackfly S (acquisition must be stopped) -> what was
+    applied: {"buffers": {"asked", "max", "set"}} (set_stream_buffers).
     Order matters: TriggerMode Off before changing selector/source; the
-    source line is checked to be an input first (require_input_line)."""
+    source line is checked to be an input first (require_input_line). The
+    stream buffers come before TriggerMode On: a count the driver does not give
+    (CameraSetupError) leaves the trigger off."""
     if PySpin is None:
         import PySpin  # noqa: N813
     cam.TriggerMode.SetValue(PySpin.TriggerMode_Off)
@@ -272,11 +350,10 @@ def configure_pyspin_trigger(cam, PySpin=None, *, exposure_us: float,
     cam.ExposureTime.SetValue(float(exposure_us))
     cam.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
     # every frame matters: keep them all, oldest first
-    s = cam.TLStream
-    s.StreamBufferHandlingMode.SetValue(PySpin.StreamBufferHandlingMode_OldestFirst)
-    s.StreamBufferCountMode.SetValue(PySpin.StreamBufferCountMode_Manual)
-    s.StreamBufferCountManual.SetValue(int(buffers))
+    cam.TLStream.StreamBufferHandlingMode.SetValue(PySpin.StreamBufferHandlingMode_OldestFirst)
+    applied = {"buffers": set_stream_buffers(cam, PySpin, buffers)}
     cam.TriggerMode.SetValue(PySpin.TriggerMode_On)
+    return applied
 
 
 def restore_free_run(cam, PySpin=None) -> None:
@@ -307,15 +384,22 @@ class PySpinTriggeredCamera:
             import PySpin  # noqa: N813
         self.cam, self.PySpin = cam, PySpin
         self.exposure_us, self.source = exposure_us, source
+        self.applied = {}                    # what the last arm() set (stream buffers)
 
-    def arm(self, n: int) -> None:
+    def arm(self, n: int) -> dict:
+        """Trigger on, acquisition started -> what was applied (kept in .applied).
+        The stream buffers do not follow n (the frames expected): STREAM_BUFFERS at
+        most, never more than the driver allows - the caller reads every frame as it
+        arrives. CameraSetupError when the driver does not give them."""
         try:
             self.cam.EndAcquisition()
         except Exception:  # noqa: BLE001 - was not streaming
             pass
-        configure_pyspin_trigger(self.cam, self.PySpin, exposure_us=self.exposure_us,
-                                 source=self.source, buffers=max(16, n + 8))
+        self.applied = configure_pyspin_trigger(self.cam, self.PySpin,
+                                                exposure_us=self.exposure_us,
+                                                source=self.source, buffers=STREAM_BUFFERS)
         self.cam.BeginAcquisition()
+        return self.applied
 
     def grab_triggered(self, timeout_ms: int):
         """-> (image, frame id, timestamp ns). TimeoutError only for the grab

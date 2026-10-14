@@ -5297,7 +5297,8 @@ Surfer atlas (regions become zones atlas:<name>/<region>, e.g. scan part --zone 
                                          low-passes the fine fringes (sharp projector)
   scan trigger-test [--line Line0] [--seconds 5] [--expect-period-ms P]
                                          EXPERIMENTAL: count TRIG_OUT_1 pulses at the camera
-                                         (camera only; exit 0 OK, 1 NO PULSES / RATE MISMATCH)
+                                         (camera only; exit 0 OK, 1 NO PULSES / RATE MISMATCH,
+                                         4 an error, e.g. the camera could not be set up)
   scan scan-trigger <label> --pack DIR [--variant full] [--line Line0] [--repeats N]
           --pattern-mode-set-by-human    EXPERIMENTAL hardware-triggered scan, one frame per
                                          pattern (docs/TRIGGER_FULLSPEED_TEST.md)
@@ -6196,6 +6197,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--expect-period-ms", type=float, help="the GUI's Pattern Period, ms")
     p.add_argument("--exposure", type=float, default=1000.0, metavar="US",
                    help="camera exposure (short; default 1000 us)")
+    p.set_defaults(unexpected_exit=EXIT_ERROR)          # an error (4) is not NO PULSES (1)
     p = cmd("scan-trigger", cmd_scan_trigger, "EXPERIMENTAL hardware-triggered metric scan of a "
                                               "flash pack (TRIG_OUT_1 -> camera)",
             "the hardware-triggered scan")

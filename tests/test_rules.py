@@ -1,6 +1,7 @@
 """§9 safety rules — enforced, not advisory."""
 
 import ast
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,10 +10,12 @@ import numpy as np
 import pytest
 
 from engine import api, rules
+from engine.capture import riglock
 from engine.capture.projector import MockWindow, Projector
 from engine.config import ProjectionCfg
 from engine.library.store import LibraryStore
 
+import conftest
 from conftest import ROOT, VALIDATION_OBJECT
 
 ENGINE = ROOT / "engine"
@@ -30,41 +33,151 @@ def _imports(path: Path):
 
 # ------------------------------------------------------------ rule 1: HDMI
 
-USB_TOOL = ENGINE / "capture" / "dmd_control.py"   # the one sanctioned USB module
+# The only two engine files that may load a USB module, and nothing else:
+USB_TOOL = Path("engine/capture/dmd_control.py")    # the standalone diagnostics tool
+SEQ_HELPER = Path("engine/seqctl/helper.py")        # the sequence-control helper process
+HELPER_MODULE = "engine.seqctl.helper"
+IMPORT_CALLS = ("import_module", "__import__", "run_module")
+
+
+def _usb_import_offenders(root: Path) -> list:
+    """Engine files under `root` that import the seed package or hidapi and may
+    not. dmd_control.py may import both. The sequence-control helper may import
+    hid only: it carries its own framing, never the seed driver (which parks the
+    mirrors when it closes)."""
+    offenders = []
+    for py in (root / "engine").rglob("*.py"):
+        rel = py.relative_to(root)
+        if rel == USB_TOOL:
+            continue
+        for mod in _imports(py):
+            if mod.startswith("swiss_army_sensor") or (mod == "hid" and rel != SEQ_HELPER):
+                offenders.append(f"{rel.as_posix()}: {mod}")
+    return offenders
+
+
+def _named(py: Path, rel: Path):
+    """("import", module) for every module a file imports, relative imports made
+    absolute ('from . import x' names the package and package.x); ("call", text)
+    for a string handed to an import call; ("text", text) for every string."""
+    for node in ast.walk(ast.parse(py.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                yield "import", a.name
+        elif isinstance(node, ast.ImportFrom):
+            pkg = list(rel.with_suffix("").parts[:-1]) if node.level else []
+            pkg = pkg[:max(0, len(pkg) - node.level + 1)]
+            mod = ".".join(pkg + ([node.module] if node.module else []))
+            yield "import", mod
+            for a in node.names:
+                yield "import", f"{mod}.{a.name}"
+        elif isinstance(node, ast.Call) and getattr(
+                node.func, "attr", getattr(node.func, "id", None)) in IMPORT_CALLS:
+            for a in node.args:
+                if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                    yield "call", a.value
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            yield "text", node.value
+
+
+def _names_the_tool(kind: str, name: str) -> bool:
+    if kind == "text":                  # importlib.import_module("...dmd_control")
+        return name.endswith("dmd_control") and "." in name
+    return name.split(".")[-1] == "dmd_control"
+
+
+def _imports_the_helper(kind: str, name: str) -> bool:
+    if kind == "import":
+        return name == HELPER_MODULE or name.startswith(HELPER_MODULE + ".")
+    return kind == "call" and name.split(".")[-1] == "helper" and (
+        "seqctl" in name or name.startswith("."))
+
+
+def _usb_module_importers(root: Path) -> list:
+    """Files under `root` that import one of the two USB modules. Both run as
+    their own process only. dmd_control: never imported by the engine, nor named
+    in a string there. The helper: never imported by the engine or the UI; its
+    name for `python -m` is how it is started and is allowed, an import call
+    with that name is not. Neither may import the other."""
+    offenders = set()
+    for top in ("engine", "ui"):
+        for py in (root / top).rglob("*.py"):
+            rel = py.relative_to(root)
+            for kind, name in _named(py, rel):
+                if (top == "engine" and rel != USB_TOOL and _names_the_tool(kind, name)) \
+                        or (rel != SEQ_HELPER and _imports_the_helper(kind, name)):
+                    offenders.add(rel.as_posix())
+    return sorted(offenders)
 
 
 def test_engine_never_imports_dlp_usb_driver():
     """No engine module imports swiss_army_sensor (whose __init__ pulls in
     the DLPC350 driver) or hidapi. Seed modules come via engine/_seed.py.
-    Only the standalone diagnostics tool dmd_control.py may."""
-    offenders = []
-    for py in ENGINE.rglob("*.py"):
-        if py == USB_TOOL:
-            continue
-        for mod in _imports(py):
-            if mod == "hid" or mod.startswith("swiss_army_sensor"):
-                offenders.append(f"{py.relative_to(ROOT)}: {mod}")
+    Only the standalone diagnostics tool dmd_control.py may, and the
+    sequence-control helper engine/seqctl/helper.py may import hid."""
+    offenders = _usb_import_offenders(ROOT)
     assert not offenders, offenders
 
 
 def test_nothing_imports_the_usb_tool():
-    """dmd_control is run as its own process, never imported by the engine."""
-    offenders = []
-    for py in ENGINE.rglob("*.py"):
-        if py == USB_TOOL:
-            continue
-        for node in ast.walk(ast.parse(py.read_text(encoding="utf-8"))):
-            names = []
-            if isinstance(node, ast.ImportFrom):
-                names = [node.module or ""] + [a.name for a in node.names]
-            elif isinstance(node, ast.Import):
-                names = [a.name for a in node.names]
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str) \
-                    and node.value.endswith("dmd_control") and "." in node.value:
-                names = [node.value]            # importlib.import_module("...dmd_control")
-            if any(n.split(".")[-1] == "dmd_control" for n in names):
-                offenders.append(str(py.relative_to(ROOT)))
+    """dmd_control and the sequence-control helper are run as their own
+    process, never imported by the engine (the helper: nor by the UI)."""
+    offenders = _usb_module_importers(ROOT)
     assert not offenders, offenders
+
+
+def _tree(root: Path, files: dict) -> Path:
+    for rel, text in files.items():
+        f = root / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+    return root
+
+
+# a made-up source tree holding what is allowed: the two USB modules, and the
+# helper started by name as a child process
+ALLOWED_TREE = {
+    "engine/capture/dmd_control.py": "import hid\nfrom swiss_army_sensor.drivers import x\n",
+    "engine/seqctl/helper.py": "def open_device():\n    import hid\n    return hid\n",
+    "engine/seqctl/client.py":
+        "import sys\nARGS = [sys.executable, '-m', 'engine.seqctl.helper']\n",
+    "ui/web/projector.py": "from engine.seqctl import client\n",
+}
+
+
+def test_usb_checks_accept_the_two_usb_modules(tmp_path):
+    root = _tree(tmp_path, ALLOWED_TREE)
+    assert _usb_import_offenders(root) == [] and _usb_module_importers(root) == []
+
+
+@pytest.mark.parametrize("rel,text,offender", [
+    ("engine/seqctl/link.py", "import hid\n", "engine/seqctl/link.py: hid"),
+    ("engine/capture/other.py", "def f():\n    import hid\n", "engine/capture/other.py: hid"),
+    ("engine/seqctl/helper.py", "import hid\nfrom swiss_army_sensor.drivers import dlp_driver\n",
+     "engine/seqctl/helper.py: swiss_army_sensor.drivers"),
+])
+def test_usb_checks_refuse_any_other_usb_import(tmp_path, rel, text, offender):
+    root = _tree(tmp_path, {**ALLOWED_TREE, rel: text})
+    assert _usb_import_offenders(root) == [offender]
+
+
+@pytest.mark.parametrize("rel,text", [
+    ("engine/seqctl/client.py", "from . import helper\n"),
+    ("engine/seqctl/client.py", "from .helper import main\n"),
+    ("engine/seqctl/__init__.py", "from .helper import main\n"),
+    ("engine/capture/other.py", "from ..seqctl import helper\n"),
+    ("engine/api.py", "def f():\n    import engine.seqctl.helper as h\n"),
+    ("engine/api.py", "import importlib\nh = importlib.import_module('engine.seqctl.helper')\n"),
+    ("engine/api.py", "import runpy\nrunpy.run_module('engine.seqctl.helper')\n"),
+    ("ui/web/server.py", "from engine.seqctl import helper\n"),
+    ("engine/capture/other.py", "from . import dmd_control\n"),
+    ("engine/api.py", "TOOL = 'engine.capture.dmd_control'\n"),
+    ("engine/seqctl/helper.py", "from ..capture import dmd_control\n"),
+    ("engine/capture/dmd_control.py", "from engine.seqctl.helper import main\n"),
+])
+def test_usb_checks_refuse_an_import_of_a_usb_module(tmp_path, rel, text):
+    root = _tree(tmp_path, {**ALLOWED_TREE, rel: text})
+    assert _usb_module_importers(root) == [rel]
 
 
 def test_projector_stops_if_usb_driver_loaded_mid_scan(monkeypatch):
@@ -231,3 +344,79 @@ def test_fingerprint_diffs():
     assert rules.fingerprint_diffs(a, {**a, "rotate90": True}) == ["rotate90 False -> True"]
     with pytest.raises(rules.GeometryMismatch, match="basis_axis"):
         rules.require_same_fingerprint(a, {**a, "basis_axis": "y"}, "capture_object")
+
+
+# ------------------------------------- the test harness (tests/conftest.py)
+
+def test_tests_start_without_hardware_and_without_machine_files():
+    """Every test process: no real device, a projector rig file path that is not
+    the machine's and does not exist (control off), the event log off."""
+    assert os.environ.get(conftest.NO_HARDWARE_ENV) == "1", \
+        "the tests run with SAS_NO_HARDWARE=1 only"
+    path = Path(os.environ[conftest.RIG_FILE_ENV])
+    assert path.name == conftest.RIG_FILE_NAME and not path.exists()
+    beside_lock = riglock.lock_candidates()[0].with_name(conftest.RIG_FILE_NAME)
+    assert conftest._forms(beside_lock) <= conftest._Guard.machine
+    assert not conftest._forms(path) & conftest._Guard.machine
+    assert os.environ[conftest.EVENTLOG_ENV] == "off"
+
+
+def test_machine_rig_file_is_refused_and_noted(tmp_path, monkeypatch, rig_file):
+    """The guard, shown on a stand-in for the machine's file (the real one is
+    never addressed): every way of opening it is refused and noted, so the test
+    fails even when the code under test swallows the refusal."""
+    machine = tmp_path / "machine" / conftest.RIG_FILE_NAME
+    monkeypatch.setattr(conftest._Guard, "machine", conftest._forms(machine))
+    for attempt in (lambda: open(machine, encoding="utf-8"),
+                    lambda: machine.read_text(encoding="utf-8"),
+                    lambda: os.open(str(machine), os.O_RDONLY)):
+        with pytest.raises(conftest.IsolationError, match="rig file"):
+            attempt()
+    assert len(conftest.take_isolation_notes()) == 3
+    # the test's own rig file is the one the variable names, and the test's to write
+    assert Path(os.environ[conftest.RIG_FILE_ENV]) == rig_file and not rig_file.exists()
+    rig_file.write_text('{"control": "off"}', encoding="utf-8")
+    assert rig_file.read_text(encoding="utf-8")
+    assert conftest.take_isolation_notes() == []
+
+
+def test_event_log_files_are_refused_without_the_fixture(tmp_path):
+    events = tmp_path / "library" / "events"
+    (events / "pending").mkdir(parents=True)
+    rows = events / "inspections_v1_2026-01.csv"
+    for attempt in (lambda: open(rows, "a", encoding="utf-8"),
+                    lambda: rows.write_text("time\n", encoding="utf-8"),
+                    lambda: os.replace(tmp_path / "rows.tmp", rows),
+                    lambda: open(events / "inspection_values_v1_2026-01.csv", "w"),
+                    lambda: open(events / "pending" / "row.json", "w"),
+                    lambda: open(events / "img" / "a.png", "wb"),
+                    lambda: open(events / "last_v1.csv", "w"),
+                    lambda: open(events / "eventlog.lock", "a+b"),
+                    lambda: open(events / "pending.lock", "a+b"),
+                    lambda: open(events / "rebuild_20260101T000000Z" / "rows.csv", "w"),
+                    lambda: os.replace(rows, events / "replaced_20260101T000000Z" / rows.name)):
+        with pytest.raises(conftest.IsolationError, match="eventlog_on"):
+            attempt()
+    assert len(conftest.take_isolation_notes()) == 11
+    assert [p for p in events.rglob("*") if p.is_file()] == []
+    with pytest.raises(FileNotFoundError):                   # reading is never refused
+        open(rows, encoding="utf-8")
+    (tmp_path / "library" / "events.txt").write_text("not an event-log file")
+    assert conftest.take_isolation_notes() == []
+
+
+def test_event_log_fixture_allows_rows_in_a_temporary_folder_only(tmp_path, monkeypatch,
+                                                                  eventlog_on):
+    assert os.environ[conftest.EVENTLOG_ENV] == "on"
+    rows = tmp_path / "library" / "events" / "inspection_values_v1_2026-01.csv"
+    rows.parent.mkdir(parents=True)
+    with open(rows, "a", encoding="utf-8") as fh:
+        fh.write("time\n")
+    os.replace(rows, rows.with_name("inspections_v1_2026-01.csv"))
+    assert conftest.take_isolation_notes() == []
+    # the same write where no temporary folder is (shown by narrowing what counts as one)
+    monkeypatch.setattr(conftest._Guard, "temp",
+                        {f + os.sep for f in conftest._forms(tmp_path / "temp")})
+    with pytest.raises(conftest.IsolationError, match="temporary folder"):
+        open(rows, "a", encoding="utf-8")
+    assert len(conftest.take_isolation_notes()) == 1

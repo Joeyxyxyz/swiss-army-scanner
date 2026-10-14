@@ -113,9 +113,12 @@ uses the FLIR Spinnaker SDK (`RealCamera`); any **GenICam** camera (**GigE Visio
 4. `scan rig-check --set-reference` with the station empty: HOME then detects a nudged
    camera or projector (shift, roll and zoom; OK only when the projected pattern is matched;
    a pattern that is not seen, or roll / zoom that cannot be determined, is UNKNOWN, never
-   OK; roll / zoom detection is tested on the mock bench only so far). After a small camera
-   nudge `scan rig-check --rehome` writes a re-homed copy of the calibration (the camera's
-   rotation taken out, the original kept; rotation only, so recalibrate when you can).
+   OK; roll / zoom detection is tested on the mock bench only so far). MOVED names the
+   device: the camera (the pattern moved with the scene), the projector or its picture (the
+   pattern moved against the scene), or both. After a small camera nudge `scan rig-check
+   --rehome` writes a re-homed copy of the calibration (the camera's rotation taken out, the
+   original kept; rotation only, so recalibrate when you can); a projector move is put back
+   or recalibrated.
 
 Every mm the engine reports comes from the stereo calibration of the SAME geometry and
 fingerprint (rule 6); without one a recipe run is INVALID and says how to calibrate.

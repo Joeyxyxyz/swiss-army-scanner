@@ -29,7 +29,7 @@ This is triangulation, as in a laser line sensor. The stripes come as a short se
 - **Shadows.** Where only the projector or only the camera sees the surface, there is no reading.
 - **Mirror-like and very dark surfaces** send the light past the camera, straight into it, or hardly back at all: the reading there is missing or poor.
 - **Movement during the scan.** A part that moves between the patterns is read wrongly.
-- **A rig bumped since calibration** gives wrong mm. The rig check (the HOME button) finds that: it projects a test pattern, compares the camera picture with the one stored after calibration, and answers OK, MOVED or UNKNOWN.
+- **A rig bumped since calibration** gives wrong mm. The rig check (the HOME button) finds that: it projects a test pattern, compares the camera picture with the one stored after calibration, and answers OK, MOVED or UNKNOWN. MOVED also says what moved: the camera (the scene and the pattern on it moved together in its picture), the projector or its picture (the pattern moved over a still scene), or both. A small turn of the camera can be corrected in software; a projector move needs the projector put back, or a new calibration. Between checks, every scan that reads the stripes in both directions checks itself: when the two directions disagree far more than they did when the calibration was made, it warns that the calibration may not fit the rig any more.
 - **Fine detail.** See *Limits & sizing* in the README.
 
 ## The words on the operator page

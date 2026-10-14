@@ -464,6 +464,55 @@ def test_cli_and_web_take_the_fine_prefilter(scene, tmp_path, capsys):
         api._session = scene["s"]
 
 
+def _rig_check(sc, status: str, message: str) -> None:
+    """A rig check's line on the scene's record (as engine/calibrate/rigref.py writes it), at
+    the default tolerance against a trusted reference of the calibration in use: a MOVED
+    objects on this FIXED rig, an OK answers it."""
+    from engine import rigstate
+    cid = sc["cal"].id
+    rigstate.record_check(sc["s"].store, sc["p"], {
+        "status": status, "tol_px": 0.5, "calibration_id": cid, "reference_id": "ref0",
+        "reference_calibration_id": cid, "reference_trust": {"mobile": True, "fixed": True},
+        "message": message})
+
+
+def test_a_fixed_rig_after_a_moved_check_flash_scan_says_so(scene, tmp_path, capsys,
+                                                           monkeypatch):
+    """A rig check said MOVED on this FIXED rig. scan-flash still gives its mm (the design:
+    only Measure and Quick check refuse a fixed rig), but not silently: the rig check's words
+    and the way out first in its warnings (printed), the rig stamp trusted false, both at the
+    top of --json and in the stored entry. Before, they reached the entry's meta only."""
+    from engine import rigstate
+    from ui import cli
+    p = _use(scene)
+    words = "projector (or its picture) moved ~18.6 px against the scene"
+    _rig_check(scene, "MOVED", words)
+    try:
+        r = api.fast_scan_flash(str(scene["pack"]), "zone", "e2e_moved", p, roi=scene["roi"],
+                                keep_recording=False)
+        w = r["warnings"][0]
+        assert w.startswith(rigstate.IN_DOUBT) and "rig check MOVED at" in w and words in w
+        assert "| fix: put the rig right, then `scan rig-check`" in w
+        assert r["rig"]["mount"] == "fixed" and r["rig"]["trusted"] is False
+        assert r["scan"].meta["rig"] == r["rig"] and r["scan"].meta["warnings"][0] == w
+        assert r["n_points"] > 5000                         # the mm are given
+        monkeypatch.setattr(api, "fast_scan_flash", lambda *a, **k: r)
+        argv = ["--mock", "--library", str(tmp_path / "library"), "scan-flash", "--pack",
+                str(scene["pack"])]
+        assert cli.main(argv) == 0
+        out = capsys.readouterr().out
+        assert "points in mm" in out and f"! {rigstate.IN_DOUBT}" in out, out
+        assert cli.main([*argv[:3], "--json", *argv[3:]]) == 0
+        doc = json.loads(capsys.readouterr().out)
+        assert doc["warnings"][0] == w and doc["rig"]["trusted"] is False
+    finally:
+        api._session = scene["s"]
+        _rig_check(scene, "OK", "rig in place")             # answered: later scans trusted
+    from engine.reconstruct import metric_scan
+    assert metric_scan._require_rig(scene["s"], p, "fast_scan_flash") == {"mount": "fixed",
+                                                                          "trusted": True}
+
+
 def test_nothing_here_can_reach_the_projector():
     """Rule 1 for the whole flash path, pack side and capture side: no DLPC350 USB / HID,
     no dmd_control, no projector window in the modules this test drove."""

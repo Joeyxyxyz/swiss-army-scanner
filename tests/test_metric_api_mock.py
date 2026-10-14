@@ -137,6 +137,91 @@ def test_compare_metric_to_golden_and_mesh(ctx):
     assert 30 < meta["bbox_max"][0] - meta["bbox_min"][0] < 49      # the seen arc, not 360
 
 
+def test_consistency_check_against_what_the_calibration_gave():
+    """The rule (engine/reconstruct/metric_scan.py): a two-axis scan warns when its camera and
+    projector rays miss each other by more than CONSISTENCY_FACTOR x the calibration's own fit
+    residual at the scan's distance, never below CONSISTENCY_FLOOR_MM. The real rig's numbers:
+    its calibration's 0.26 px is 0.09 mm at 766 mm; 0.044 mm (end faces) and 0.25 mm (a whole
+    board scene) while it fitted - no warning; 1.2 mm after the projector was nudged - the
+    warning."""
+    from types import SimpleNamespace
+    from engine.reconstruct import metric_scan as M
+    K = [[2144.5, 0.0, 720.0], [0.0, 2128.7, 540.0], [0.0, 0.0, 1.0]]
+    cal = SimpleNamespace(id="rig/20261013_stereo", rms={"stereo_px": 0.2614}, K_cam=K)
+    good = M.consistency_check({"median_mm": 0.044}, cal, 766.0)
+    assert good["fits"] and good["warning"] is None
+    assert good["at_calibration_mm"] == pytest.approx(0.2614 * 766.0 / 2136.6, abs=1e-3)
+    assert good["limit_mm"] == pytest.approx(M.CONSISTENCY_FACTOR * good["at_calibration_mm"],
+                                             abs=1e-3)
+    assert 0.4 < good["limit_mm"] < 0.55
+    assert M.consistency_check({"median_mm": 0.25}, cal, 766.0)["fits"]
+    bad = M.consistency_check({"median_mm": 1.2}, cal, 766.0)
+    assert not bad["fits"] and bad["warning"].endswith(M.CALIBRATION_MAY_NOT_FIT)
+    assert "1.20 mm (median)" in bad["warning"] and cal.id in bad["warning"]
+    assert M.CALIBRATION_MAY_NOT_FIT == ("the calibration may not fit this rig any more: run "
+                                         "the rig check")
+    # no fit residual on the record: the floor is the limit
+    bare = SimpleNamespace(id="c", rms={}, K_cam=K)
+    assert M.consistency_check({"median_mm": 0.29}, bare, 766.0)["fits"]
+    floor = M.consistency_check({"median_mm": 0.31}, bare, 766.0)
+    assert not floor["fits"] and floor["limit_mm"] == M.CONSISTENCY_FLOOR_MM
+    assert "records no fit residual" in floor["warning"]
+    # a calibration with a very small residual: the floor keeps a scene's noise from warning
+    tiny = SimpleNamespace(id="c", rms={"stereo_px": 0.02}, K_cam=K)
+    assert M.consistency_check({"median_mm": 0.25}, tiny, 766.0)["fits"]
+    # one decoded axis: nothing to check; a median that is not a number does not fit
+    assert M.consistency_check(None, cal, 766.0) is None
+    assert not M.consistency_check({"median_mm": float("nan")}, cal, 766.0)["fits"]
+
+
+def test_a_calibration_that_no_longer_fits_is_said_by_the_two_axis_scan(ctx):
+    """On the real rig a calibration that no longer fitted went unnoticed without a rig check:
+    every two-axis scan's rays missed each other by ~1.2 mm (0.044 mm while it fitted) and
+    nothing was said. Here the scan made with the fitting calibration passes its check; the
+    same frames triangulated with a calibration whose projector is tilted 0.3 deg (what a
+    nudged projector makes of the old one) warn - in meta, in the result, printed - and the
+    mm are still given (a warning, not a refusal)."""
+    import contextlib
+    import io
+    import numpy as np
+    from engine.calibrate import stereo
+    from engine.capture import rigcheck
+    from engine.reconstruct import metric_scan as M
+    from ui import cli
+    p = _use(ctx)
+    if "ms" not in ctx:
+        pytest.skip("needs the scan test")
+    ms = ctx["ms"]
+    chk = ms.meta["consistency_check"]
+    assert chk["fits"] and chk["warning"] is None and chk["at_calibration_mm"] > 0
+    assert not any(M.CALIBRATION_MAY_NOT_FIT in w for w in ms.meta["warnings"])
+    store = ctx["s"].store
+    cal = stereo.latest(store, p.geometry_id, config.geometry_fingerprint(p))
+    Rt = rigcheck.rotation_from_rotvec(np.radians([0.3, 0.0, 0.0]))
+    d = store.new_dir("calibrations", p.geometry_id, label="stereo")
+    bad = stereo.StereoCalibration.from_json(
+        {**cal.to_json(), "id": f"{p.geometry_id}/{d.name}", "R": (Rt @ cal.R).tolist(),
+         "t": (Rt @ np.ravel(cal.t)).tolist()}, d)
+    store.write_json(d / "stereo_calibration.json", bad.to_json())
+    try:
+        r = api.triangulate(ms)
+        new = r["scan"]
+        assert new.calibration_id == bad.id and new.units == "mm" and r["n_points"] > 100000
+        c = new.meta["consistency_check"]
+        assert not c["fits"] and c["median_mm"] > c["limit_mm"] > 0
+        assert r["warnings"] == new.meta["warnings"]
+        assert any(w.endswith(M.CALIBRATION_MAY_NOT_FIT) for w in r["warnings"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["--mock", "--library", str(store.root), "triangulate", ms.id])
+        assert code == cli.EXIT_OK and M.CALIBRATION_MAY_NOT_FIT in out.getvalue()
+        assert "  ! the camera and projector rays miss each other by" in out.getvalue()
+    finally:
+        _use(ctx)
+        api.delete(d, reason="test: the calibration that does not fit")
+    assert stereo.latest(store, p.geometry_id, config.geometry_fingerprint(p)).id == cal.id
+
+
 def test_rule6_changed_geometry_and_trashed_calibration(ctx):
     p = _use(ctx)
     if "ms" not in ctx:

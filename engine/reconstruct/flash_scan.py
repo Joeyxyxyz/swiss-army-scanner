@@ -297,13 +297,15 @@ def fast_scan_flash(s, preset, pack=None, variant: Optional[str] = None, label: 
         display_mode="pattern")
     times["triangulate_save_s"] = round(time.perf_counter() - t0, 3)
     times["total_s"] = round(time.perf_counter() - t_all, 3)
-    warnings += r.get("warnings", [])
+    # the entry's own first: a fixed rig in doubt (the rig check's words), then the capture's
+    warnings = list(dict.fromkeys([*(ms.meta.get("warnings") or []), *warnings,
+                                   *r.get("warnings", [])]))
     return {"scan": ms, "id": ms.id, "mode": MODE, "n_points": int(cloud.mask.sum()),
             "valid_pct": ms.meta.get("valid_pct"), "calibration_id": cal.id,
             "confidence": res.confidence, "frame_stats": frame_stats,
             "loop_ms": r["loop_period_ms"], "variant_detected": r.get("variant_detected"),
             "plan": plan, "times_s": times, "recording": rec_path, "zone": zone_label,
-            "warnings": warnings}
+            "warnings": warnings, "rig": rig}
 
 
 # ------------------------------------------------------------- offline sort

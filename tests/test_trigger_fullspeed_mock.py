@@ -20,7 +20,7 @@ from ui import cli
 from conftest import PRESET
 from engine.capture.mock_bench import MockBench
 
-from test_flash_e2e_mock import scene, _use  # noqa: F401  (module fixture + helper)
+from test_flash_e2e_mock import scene, _use, _rig_check  # noqa: F401  (module fixture + helpers)
 
 ROOT = Path(__file__).resolve().parents[1]
 _SCENE_CAMERA = hw.mock_scene_camera
@@ -206,6 +206,26 @@ def test_scan_trigger_8bit_hybrid_pack(scene):  # noqa: F811
     r = api.scan_trigger(str(d), None, "trig8", p, acknowledge=pm.ACK_PHRASE)
     assert r["timing"]["frames"] == 16 and r["timing"]["set_ms"] == 160.0
     assert r["decode"]["basis"].startswith("hybrid") and r["n_points"] > 5000
+
+
+def test_scan_trigger_on_a_fixed_rig_after_a_moved_check_says_so(scene):  # noqa: F811
+    """A rig check said MOVED on this FIXED rig: the triggered scan gives its mm, with the rig
+    check's words first in its warnings (what the command line prints) and the rig stamp
+    trusted false at the top of its result (--json). Before, only the entry's meta had them."""
+    from engine import rigstate
+    p = _use(scene)
+    words = "camera and projector moved: recalibrate before measuring"
+    _rig_check(scene, "MOVED", words)
+    try:
+        r = api.scan_trigger(str(scene["pack"]), "zone", "trig_moved", p, repeats=2,
+                             acknowledge=pm.ACK_PHRASE)
+    finally:
+        _rig_check(scene, "OK", "rig in place")
+    w = r["warnings"][0]
+    assert w.startswith(rigstate.IN_DOUBT) and "rig check MOVED at" in w and words in w
+    assert r["rig"]["mount"] == "fixed" and r["rig"]["trusted"] is False
+    assert r["scan"].meta["rig"] == r["rig"] and r["scan"].meta["warnings"][0] == w
+    assert r["n_points"] > 5000
 
 
 

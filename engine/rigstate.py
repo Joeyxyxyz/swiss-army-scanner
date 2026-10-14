@@ -40,9 +40,10 @@ The record (append-only, one JSON object per line, never rewritten):
         {"time", "event": "calib_pose", "pose_id", "set", "preset"}
         {"time", "event": "calibration", "calibration_id", "poses": [pose ids], "set"}
         {"time", "event": "rig_check", "status": OK | MOVED | UNKNOWN | REFERENCE_SET |
-         REHOMED, "tol_px", "moved", "shift_px", "calibration_id", "reference_id",
-         "reference_calibration_id", "reference_trust": {"mobile", "fixed"}, "requested",
-         "rehome_from", "previous_reference_id", "message", "preset", "mount"}
+         REHOMED, "tol_px", "moved", "shift_px", "camera_motion_px", "projector_motion_px",
+         "calibration_id", "reference_id", "reference_calibration_id", "reference_trust":
+         {"mobile", "fixed"}, "requested", "rehome_from", "previous_reference_id", "message",
+         "preset", "mount"}
 
 The ORDER of the lines is the order of events: what answers what is decided by the record's
 order, never by comparing clock times (a clock set back by daylight saving or a time sync
@@ -60,7 +61,11 @@ Quick check / Station -> PULL when it says no. Station mode on a FIXED rig is no
 (its behaviour is unchanged: the command bus goes to FAULT on a MOVED / UNKNOWN rig check);
 Measure and Quick check (strict=True) also refuse a fixed rig with an unanswered objection.
 require() is the same gate for the engine's own capture verbs (scan_metric, scan_fast, ...):
-a mobile rig that is not verified gives no mm cloud at all.
+a mobile rig that is not verified gives no mm cloud at all. A FIXED rig is not refused there
+(the design: trusted until a check objects, the mm still given), but never silently: while
+an objection stands - what Measure and Quick check would refuse, doubt() - the mm go out
+with a warning in the rig check's own words and the way out (IN_DOUBT; printed, in the
+entry's meta "warnings" and its "rig" stamp, stamp(): trusted false).
 
 Pure library I/O: no hardware, no engine session.
 """
@@ -84,6 +89,8 @@ GOOD = ("OK", "REFERENCE_SET", "REHOMED")   # every other status of a rig check 
 BAD = ("MOVED", "UNKNOWN")                  # ... as these two do (the ones a check reports)
 CLOCK_SLACK_S = 2.0                         # a stored scan stamped later than now + this: refused
 MAX_TAIL = 5000                             # at most this many of the newest lines are read
+MESSAGE_CHARS = 500                         # a rig check's message is kept to this many chars
+                                            # (its headline: which device moved, what to do)
 UNVERIFIED = "mobile rig not verified: run rig-check / re-home / calibrate"
 HOW_MOBILE = ("verify the rig for this session: `scan rig-check` (OK against the reference of "
               "the calibration in use, one stored while the rig was verified), `scan rig-check "
@@ -94,6 +101,7 @@ HOW_MOVED = ("put the rig right, then `scan rig-check` (OK against the reference
              "it moved), `scan rig-check --rehome` after a small camera move, or calibrate "
              "again from poses captured now (`scan calib-pose`, `scan calibrate-stereo`); with "
              "the rig known good `scan rig-check --set-reference` stores a new reference")
+IN_DOUBT = "fixed rig not confirmed: these mm may be off (Measure and Quick check give none)"
 _TS = re.compile(r"^(\d{8}T\d{6})_(\d{6})")  # library/store.timestamp(): an entry's own time
 _BLOCK = 1 << 16                            # the record is read backwards in blocks this big
 
@@ -245,7 +253,8 @@ def record_check(store, preset, result: dict, now: Optional[datetime] = None) ->
     """A rig check's result on the record (engine/calibrate/rigref.rig_check calls it)."""
     return append(store, preset.geometry_id, {
         "event": "rig_check", "status": result.get("status"), "moved": result.get("moved"),
-        "shift_px": result.get("shift_px"), "tol_px": result.get("tol_px"),
+        "shift_px": result.get("shift_px"), "camera_motion_px": result.get("camera_motion_px"),
+        "projector_motion_px": result.get("projector_motion_px"), "tol_px": result.get("tol_px"),
         "calibration_id": result.get("calibration_id"),
         "reference_id": result.get("reference_id"),
         "reference_calibration_id": result.get("reference_calibration_id"),
@@ -254,7 +263,7 @@ def record_check(store, preset, result: dict, now: Optional[datetime] = None) ->
         "requested": bool(result.get("requested")),
         "rehome_from": result.get("rehome_from"),
         "previous_reference_id": result.get("previous_reference_id"),
-        "message": " ".join(str(result.get("message") or "").split())[:300],
+        "message": " ".join(str(result.get("message") or "").split())[:MESSAGE_CHARS],
         "preset": preset.name, "mount": preset.rig.mount, "mock": bool(result.get("mock"))}, now)
 
 
@@ -722,19 +731,53 @@ def gate(store, preset, strict: bool = False, scan=None, now: Optional[datetime]
 def require(s, preset, what: str, scan=None) -> dict:
     """The gate for the engine's own capture verbs (a metric scan, a fast scan, ...): a
     MOBILE rig that is not verified in this session gives no mm at all - rules.RuleViolation
-    before the rig is touched. A fixed rig is never refused here (unchanged). -> the gate."""
-    g = gate(s.store, preset, strict=False, scan=scan, presets_dir=getattr(s, "presets_dir", None))
+    before the rig is touched. A fixed rig is never refused here (unchanged); the gate then
+    also carries "doubt" (doubt(): what Measure and Quick check would say against its mm now,
+    None when nothing objects), which stamp() records. -> the gate."""
+    pdir = getattr(s, "presets_dir", None)
+    g = gate(s.store, preset, strict=False, scan=scan, presets_dir=pdir)
     if not g["ok"]:
         raise rules.RuleViolation(f"{what}: {g['message']} | fix: {g['how_to_fix']}")
+    if g["mount"] != "mobile":
+        g = {**g, "doubt": doubt(s.store, preset, scan=scan, presets_dir=pdir)}
     return g
+
+
+def doubt(store, preset, scan=None, now: Optional[datetime] = None,
+          presets_dir=None) -> Optional[dict]:
+    """A FIXED rig's mm that are given (require() never refuses a fixed rig) but that Measure
+    and Quick check would refuse now - a rig check's MOVED / UNKNOWN stands unanswered, or a
+    stored `scan` was made while it stood or just before it (gate(strict=True)) ->
+    {"code", "message" (the gate's: the rig check's own words), "how_to_fix" (rig check OK
+    again, a new reference, a recalibration), "warning" (one line: IN_DOUBT, the message and
+    the way out)}; None when nothing objects, and for a mobile rig (refused instead). Never
+    raises: a record that can't be read is a doubt too (fail closed) - this only adds a
+    warning to mm that are given anyway, it never stops them."""
+    try:
+        if mount_of(store, preset, presets_dir)[0] == "mobile":
+            return None
+        g = gate(store, preset, strict=True, scan=scan, now=now, presets_dir=presets_dir)
+    except Exception as e:                  # noqa: BLE001 - a warning never stops the mm
+        g = {"ok": False, "code": "rig_check", "how_to_fix": HOW_MOVED,
+             "message": (f"the rig-state record could not be read ({type(e).__name__}: {e}): "
+                         "the rig position is not confirmed")}
+    if g["ok"]:
+        return None
+    return {"code": g["code"], "message": g["message"], "how_to_fix": g["how_to_fix"],
+            "warning": f"{IN_DOUBT} - {g['message']} | fix: {g['how_to_fix']}"}
 
 
 def stamp(g: dict) -> Optional[dict]:
     """What a metric scan records of the gate it was captured under (meta "rig"): a mobile
-    rig's verification; None for a fixed rig."""
+    rig's verification; a fixed rig's state from require() - {"mount": "fixed", "trusted"}
+    and, when not trusted, doubt()'s code / message / how_to_fix / warning. None for a fixed
+    rig's gate that require() did not make."""
     st = g.get("state") or {}
     if g.get("mount") != "mobile":
-        return None
+        if "doubt" not in g:
+            return None
+        d = g["doubt"]
+        return {"mount": "fixed", "trusted": d is None, **(d or {})}
     return {"mount": "mobile", "verified_by": st.get("verified_by"),
             "verified_at": st.get("verified_at")}
 
@@ -748,7 +791,8 @@ def public(st: dict) -> dict:
         if r is None:
             return None
         return {"time": t(r["time"]), "status": r.get("status"), "moved": r.get("moved"),
-                "shift_px": r.get("shift_px"), "tol_px": r.get("tol_px"),
+                "shift_px": r.get("shift_px"), "camera_motion_px": r.get("camera_motion_px"),
+                "projector_motion_px": r.get("projector_motion_px"), "tol_px": r.get("tol_px"),
                 "calibration_id": r.get("calibration_id"),
                 "reference_id": r.get("reference_id"),
                 "unreadable": bool(r.get("unreadable")),

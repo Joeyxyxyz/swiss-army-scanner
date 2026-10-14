@@ -2453,7 +2453,15 @@ def cmd_scan_metric(ctx):
     ctx.kv([["valid", f"{ms.meta['valid_pct']:.1f} %"],
             ["consistency median / p95", f"{_f(c.get('median_mm'), 4)} / "
                                          f"{_f(c.get('p95_mm'), 4)} mm"]])
-    return EXIT_OK, {"metric_scan": ms}
+    ctx.warn(ms.meta.get("warnings"))       # a fixed rig in doubt, a calibration that may not fit
+    return EXIT_OK, {"metric_scan": ms, **_scan_says(ms.meta)}
+
+
+def _scan_says(meta: dict) -> dict:
+    """--json of a scan verb: what its entry says it rests on, at the top level too: its
+    warnings (a fixed rig in doubt first, in the rig check's words; a calibration that may
+    not fit) and its rig stamp (meta "rig")."""
+    return {"warnings": list((meta or {}).get("warnings") or []), "rig": (meta or {}).get("rig")}
 
 
 def cmd_triangulate(ctx):
@@ -2503,6 +2511,7 @@ def cmd_accuracy(ctx):
             ["max |error|", _u(r["max_abs_error_mm"], "mm", 4)],
             ["repeatability sigma", _u(r["repeatability_sigma_mm"], "mm", 4)],
             ["mean measured", _u(r["mean_measured_mm"], "mm", 4)]])
+    ctx.warn(r.get("warnings"))             # a fixed rig in doubt, rays that miss
     return (EXIT_OK if r["verdict"] == "GO" else EXIT_NOT_OK), r
 
 
@@ -2539,6 +2548,7 @@ def cmd_accuracy_block(ctx):
                 x.get("reference_source", "-"), _f(x.get("error_mm"), 4),
                 _f(x.get("tol_mm", x.get("limit_mm")), 3), x["verdict"]] for x in r["rows"]])
     ctx.warn([f"{q['reason']}: {q['message']}" for q in r.get("pull_reasons") or []])
+    ctx.warn(r.get("warnings"))             # a fixed rig in doubt, rays that miss
     return D.exit_code(r), r
 
 
@@ -2614,8 +2624,8 @@ def cmd_dent_scan(ctx):
             ["crop x0,y0,x1,y1", ",".join(str(v) for v in ds.meta.get("crop_x0y0x1y1", []))],
             ["metric scan", ", ".join(ds.metric_scan_ids) or no_metric],
             ["stored", str(ds.path)]])
-    ctx.warn(ds.warnings)
-    return EXIT_OK, {"dentset": ds}
+    ctx.warn(ds.warnings)                   # the metric scan's first: a fixed rig in doubt
+    return EXIT_OK, {"dentset": ds, **_scan_says(ds.meta)}
 
 
 def cmd_dent_null(ctx):
@@ -2890,7 +2900,7 @@ def cmd_face_scan(ctx):
                     _f(bool(x["ok"]))] for x in ae["shots"]])
     ctx.kv([["stored", str(fs.path)]])
     ctx.warn(fs.warnings)
-    return EXIT_OK, {"facescan": fs}
+    return EXIT_OK, {"facescan": fs, **_scan_says(fs.meta)}
 
 
 def cmd_face_profile(ctx):
@@ -2927,7 +2937,7 @@ def cmd_face_profile(ctx):
               [[_f(r["r_mm"], 2), _f(r["h_median_mm"], 4), _f(r["h_std_mm"], 4), r["n"]]
                for r in pr.radial])
     ctx.warn(pr.warnings)
-    return EXIT_OK, {"profile": pr}
+    return EXIT_OK, {"profile": pr, "warnings": list(pr.warnings or []), "rig": st.get("rig")}
 
 
 def cmd_face_golden(ctx):
@@ -3135,7 +3145,7 @@ def cmd_scan_fast(ctx):
                         f"average {m['average']}, hold {m['min_hold_s']:g} s)"],
             ["valid", f"{m['valid_pct']:.1f} %"], ["flood pair", "kept (flood.npz)"]])
     ctx.warn(m.get("warnings"))
-    return EXIT_OK, {"metric_scan": ms, **({"zones": zr} if zr else {})}
+    return EXIT_OK, {"metric_scan": ms, **({"zones": zr} if zr else {}), **_scan_says(m)}
 
 
 def _flood_arg(key: Optional[str]):
@@ -3198,7 +3208,8 @@ def cmd_station(ctx):
         ctx.say(f"  set aside at camera px ({x['camera_px'][0]:.0f}, {x['camera_px'][1]:.0f}): "
                 f"{x['why']}")
     ctx.warn(m.warnings)
-    return EXIT_OK, {"station": m}
+    return EXIT_OK, {"station": m, "warnings": list(m.warnings or []),
+                     "rig": (m.meta or {}).get("rig")}
 
 
 def _station_item(key: str):
@@ -3627,6 +3638,14 @@ def cmd_rig_check(ctx):
                                             "tiles)"])
     if r.get("shift_mm") is not None:
         rows.append(["~mm", f"{r['shift_mm']:.3f} mm at {r.get('working_distance_mm')} mm"])
+    if r.get("camera_motion_px") is not None:       # each device's own (rigcheck.who_moved)
+        pm = r.get("projector_motion_px")
+        n = r.get("tiles_set_aside") or 0
+        rows.append(["camera / projector",
+                     f"camera's view {r['camera_motion_px']:.2f} px, projector's picture "
+                     + (f"{pm:.2f} px against the scene" if pm is not None else "not compared")
+                     + (f" ({n} part(s) of the frame moved with neither and were set aside: "
+                        "the scene changed there since the reference?)" if n else "")])
     rh = r.get("rehome") or {}
     if rh.get("rotation_deg") is not None:          # the camera rotation fitted to the flood
         rows.append(["camera rotation",

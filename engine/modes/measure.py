@@ -673,8 +673,10 @@ def measure_scan(s, preset, spec: Spec, ms, golden=None, warnings: Optional[list
             # a face of known size that reads the wrong size: its own reason (the
             # calibration or the lens, not the part's placement)
             code = "size_mismatch" if "size mismatch" in str(e) else "incomplete"
-            raise V.MeasureError(f"end face: {e}", code) from None
-        warnings += [str(w) for w in m.warnings if "tube" not in str(w).lower()]
+            raise V.MeasureError(f"end face: {e}{_calibration_hint(s, ms, str(e))}",
+                                 code) from None
+        warnings += [w for w in (str(x) for x in m.warnings if "tube" not in str(x).lower())
+                     if w not in warnings]
         out = V.endfaces(m.cells)
         yy, xx = np.ogrid[:cloud.mask.shape[0], :cloud.mask.shape[1]]
         for i, (c, r) in enumerate(out["circles"]):     # each face: the noise inside its rim
@@ -692,6 +694,23 @@ def measure_scan(s, preset, spec: Spec, ms, golden=None, warnings: Optional[list
     z = cloud.xyz[..., 2][out["mask"]]
     out["z_mm"] = float(np.median(z)) if z.size else None
     return out
+
+
+def _calibration_hint(s, ms, why: str) -> str:
+    """End faces set aside because too little of the disc was measured, on a scan whose
+    camera and projector rays miss each other far more than its calibration did
+    (metric_scan.consistency_of): the likelier cause is the calibration, not the part -> the
+    hint for the NOT_MEASURABLE reason; "" otherwise."""
+    from ..reconstruct import metric_scan
+    if "of the disc measured" not in why and "too few measured points" not in why:
+        return ""
+    chk = metric_scan.consistency_of(s, ms)
+    if chk is None or chk.get("fits"):
+        return ""
+    seen = (f"{chk['median_mm']:.2f} mm (median)" if chk.get("median_mm") is not None else
+            "an amount that could not be computed")
+    return (f" - the scan's camera and projector rays miss each other by {seen}, limit "
+            f"{chk['limit_mm']:.2f} mm: {metric_scan.CALIBRATION_MAY_NOT_FIT}")
 
 
 def _live_scan(s, preset, spec: Spec, label: str):

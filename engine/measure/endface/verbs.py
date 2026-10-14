@@ -399,8 +399,12 @@ def locate_face(s, scan, face_diameter_mm: float = locate_mod.FACE_DIAMETER_MM,
 def _store_face(s, L: dict, face_diameter_mm: float, label: str,
                 extra: Optional[dict] = None) -> FaceTarget:
     """A located face (_locate) -> its face target in faces/<geometry>/ (+ the overlay)."""
+    from ...reconstruct import metric_scan
     ms, cal, geo, fp, r = (L[k] for k in ("ms", "cal", "geo", "fp", "r"))
-    warnings = list(L["warnings"])
+    # what the locate scan rests on, first (meta "rig"): a fixed rig in doubt when it was
+    # made, a calibration that may not fit
+    rig, doubts = metric_scan.stored_doubts(s, [ms])
+    warnings = doubts + [w for w in L["warnings"] if w not in doubts]
     cloud = ms.cloud
     flood_src, sc = L["flood_src"], L["size_check"]
     cons = (ms.meta or {}).get("consistency") or {}
@@ -447,7 +451,7 @@ def _store_face(s, L: dict, face_diameter_mm: float, label: str,
                 "face_cam_px": int(r["cam_mask"].sum()), "mm_per_camera_px": r["mm_per_camera_px"],
                 "affine": r["affine"], "dmd_centre": r["dmd_centre"], "dmd_ellipse": r["dmd_ellipse"],
                 "params": r["params"], "units": UNITS_FACE, "mock": s.mock, "warnings": warnings,
-                "size_check": sc, "centre_check": L.get("centre_check"),
+                "rig": rig, "size_check": sc, "centre_check": L.get("centre_check"),
                 "rim_outline": outline_mod.public(L["outline"]),
                 "locate_scan": dict(extra or {})}
         if sc["status"] == "mismatch":               # never a silent pass: a PULL, said here
@@ -906,7 +910,8 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
     from ...reconstruct import metric_scan as _ms
     rig_stamp = _ms._require_rig(s, p, "targeted_face_scan")                   # mobile: verified
     t = as_face(s, face, p, "targeted_face_scan")                               # rule 5
-    warnings = []
+    # a fixed rig in doubt still scans (rigstate.doubt), and says so first
+    warnings = [rig_stamp["warning"]] if (rig_stamp or {}).get("warning") else []
     if t.calibration_id != cal.id:
         warnings.append(f"face target {t.id} was located under stereo calibration {t.calibration_id}; "
                         f"the current one is {cal.id} (the camera mask and DMD ring are px, still "
@@ -993,6 +998,13 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
                 warnings.append(f"repeat {k + 1}: only {reps[-1]['face_decoded_pct']:.0f}% of the face "
                                 "decoded (dark or glinting face? auto exposure / auto_intensity; "
                                 "moved part? check_ring)")
+            reps[-1]["consistency_check"] = ms.meta.get("consistency_check")
+        miss = [(k + 1, r["consistency_check"]) for k, r in enumerate(reps)
+                if (r.get("consistency_check") or {}).get("warning")]
+        if miss:                            # the calibration may not fit: once, the worst repeat
+            worst = max(miss, key=lambda kc: kc[1].get("median_mm") or float("inf"))[1]
+            warnings.append(f"repeat{'s' if len(miss) > 1 else ''} "
+                            f"{', '.join(str(k) for k, _ in miss)}: {worst['warning']}")
         if flood is not None:
             s.store.write_preview(d / "preview.png", flood[y0:y1, x0:x1])
         meta = {"kind": "facescan", "id": d.name, "label": label, "geometry_id": p.geometry_id,
@@ -1007,7 +1019,7 @@ def targeted_face_scan(s, preset, face=None, label: str = "face", repeats: int =
                 "dmd_ellipse": t.dmd_ellipse, "method": "plane",
                 "depth_set": set_meta, "depth_frames": nb,
                 "polar": bool(polar), "polar_patterns": specs, "crop_x0y0x1y1": list(box),
-                "metric_scans": ids, "repeats": reps, "mock": s.mock,
+                "metric_scans": ids, "repeats": reps, "mock": s.mock, "rig": rig_stamp,
                 "note": "polar coords: R = 1 at the face rim (the DMD face ellipse normalised); "
                         "polar frames are float32 camera DN of the crop, in polar_patterns order; "
                         "pattern 255 lands bright when invert is false",
@@ -1461,8 +1473,13 @@ def face_profile(s, scans=None, face=None, label: Optional[str] = None,
     The CENTRE of the face frame is the flood outline's when the whole outline shows (the
     bright flat itself: stats 'centre' says how far that is from the located circle's
     centre, the profile is computed about it), else the located circle's."""
+    from ...reconstruct import metric_scan
     tol = _size_tol(size_tol_pct)
     ms, cal, geo, fp, t, fs_id, warnings = _profile_inputs(s, scans, face)
+    # what the scans rest on, first: a fixed rig in doubt when they were made, a calibration
+    # that may not fit (stats "rig"); the profile is made as before
+    rig, doubts = metric_scan.stored_doubts(s, ms)
+    warnings[:0] = [w for w in doubts if w not in warnings]
     label = label or (ms[0].label.rsplit("_r", 1)[0] if ms[0].label else "face")
     safe_label(label)
     if not (0.05 <= float(grid_mm) <= 2.0):
@@ -1536,6 +1553,7 @@ def face_profile(s, scans=None, face=None, label: Optional[str] = None,
                         "(check_face PULLs it) - locate the face again")
     st = res["stats"]
     st["centre"] = centre
+    st["rig"] = rig
     st["flood_pair"] = bool(fl)
     st["flood_saturated_pct"] = mfcfar.saturated_pct(pixels)
     # the rim outline: its size (the one dimension known beforehand) and its roundness (an

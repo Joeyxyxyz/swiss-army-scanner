@@ -836,7 +836,9 @@ def test_no_mm_cloud_from_an_unverified_mobile_rig(rig, monkeypatch):
                         lambda *a, **k: touched.append(a) or pytest.fail("the rig was touched"))
     before = RS.oracle_scan(s, p, [], "before")
     assert metric_scan._require_rig_of(s, before, "triangulate")["mount"] == "mobile"
-    assert metric_scan._require_rig(s, rig.fixed, "scan_metric") is None       # fixed: no gate
+    # fixed: no gate; the scan records that nothing objects
+    assert metric_scan._require_rig(s, rig.fixed, "scan_metric") == {"mount": "fixed",
+                                                                     "trusted": True}
     rigstate.new_session(s.store, p, "carried")
     for call in (lambda: api.scan_fast(None, p, "direct"),
                  lambda: api.scan_metric(p, "direct"),
@@ -862,6 +864,128 @@ def test_no_mm_cloud_from_an_unverified_mobile_rig(rig, monkeypatch):
         code, out = _cli(["--mock", "--library", lib, "--preset", "mob", *argv])
         assert code == 2 and "points in mm" not in out and "GO" not in out, argv
     assert touched == []
+
+
+def test_a_fixed_rig_after_moved_gives_mm_and_every_scan_says_so(rig, monkeypatch):
+    """The first real-rig run: after a rig check said MOVED on a FIXED rig, Measure and Quick
+    check refused (kept), but the plain scans (scan-fast, scan-metric, the station
+    measurement) said "points in mm" with no word, and their entries recorded rig None. The
+    design (README *Operating modes*): a fixed rig is trusted until a check objects, and then
+    only Measure and Quick check refuse its mm - the plain verbs are never refused. So they
+    keep the mm and say so: a printed warning in the rig check's own words with the way out,
+    first in meta "warnings", the "rig" stamp (trusted false), both at the top of --json too;
+    a verb that measures a stored scan says it of a scan made while the objection stood. An
+    answer (a rig check OK) clears it for what is scanned after it."""
+    from engine.reconstruct import metric_scan
+    api._session = rig.s
+    s, p = rig.s, rig.fixed
+    words = ("camera and projector moved: the camera's view ~0.7 px, the projector's picture "
+             "~18.6 px against the scene: recalibrate before measuring")
+    _check(rig, "MOVED", preset=p, moved="camera and projector", message=words)
+    st = metric_scan._require_rig(s, p, "scan_fast")
+    assert st["mount"] == "fixed" and st["trusted"] is False and st["code"] == "rig_check"
+    w = st["warning"]
+    assert w.startswith(rigstate.IN_DOUBT) and "rig check MOVED at" in w and words in w
+    assert "| fix: put the rig right, then `scan rig-check`" in w
+    assert "--set-reference" in w and "calibrate-stereo" in w   # every way out is named
+    # a real (mock) capture: the mm are given, and say so
+    ms = api.scan_fast(None, p, "after_moved", axis="xy")
+    assert ms.units == "mm" and ms.meta["n_points"] > 1000
+    assert ms.meta["rig"] == st and ms.meta["warnings"][0] == w
+    stored = json.loads((ms.path / "meta.json").read_text(encoding="utf-8"))
+    assert stored["rig"]["trusted"] is False and stored["warnings"][0] == w
+    # the command line: printed, and at the top of --json (the scan is the one above)
+    monkeypatch.setattr(api, "scan_fast", lambda *a, **k: ms)
+    monkeypatch.setattr(api, "scan_metric", lambda *a, **k: ms)
+    base = ["--mock", "--library", str(s.store.root), "--preset", PRESET]
+    api._session = None
+    for argv in (["scan-fast", "x", "--axis", "xy"], ["scan-metric", "x"]):
+        code, out = _cli([*base, *argv])
+        assert code == 0 and "points in mm" in out, argv
+        assert f"! {rigstate.IN_DOUBT}" in out and "rig check MOVED at" in out, out
+        code, out = _cli([*base, "--json", *argv])
+        doc = json.loads(out)
+        assert doc["warnings"][0] == w and doc["rig"]["trusted"] is False, argv
+        assert doc["metric_scan"]["meta"]["rig"]["trusted"] is False
+    monkeypatch.undo()
+    api._session = s
+    # a verb that measures a STORED scan made while the objection stood: the same words
+    faces = RS.oracle_scan(s, p, "scene:endfaces", "faces_after_moved")
+    m = api.station_measure(faces)
+    assert m.warnings[0].startswith(rigstate.IN_DOUBT) and "rig check MOVED" in m.warnings[0]
+    assert m.meta["rig"]["trusted"] is False and len(m.cells) == 2      # measured as before
+    # answered: what is scanned now is trusted again; the scan made while the objection
+    # stood stays in doubt (scan again)
+    _check(rig, "OK", preset=p)
+    assert metric_scan._require_rig(s, p, "scan_fast") == {"mount": "fixed", "trusted": True}
+    m = api.station_measure(faces)
+    assert m.meta["rig"]["trusted"] is False and "in doubt" in m.warnings[0]
+    assert "scan again" in m.warnings[0]
+    m = api.station_measure(RS.oracle_scan(s, p, "scene:endfaces", "faces_after_ok"))
+    assert m.meta["rig"] == {"mount": "fixed", "trusted": True}
+    assert not any(rigstate.IN_DOUBT in x for x in m.warnings)
+
+
+def test_accuracy_and_the_check_block_say_a_fixed_rig_in_doubt(rig, monkeypatch):
+    """`accuracy` and `accuracy-block` measure metric scans. On a FIXED rig after a MOVED rig
+    check their verdict is made as before, and they say what it rests on: the rig check's
+    words first in their warnings (printed), the rig stamp trusted false at the top of the
+    result (--json) and in the stored report. Before, neither said anything."""
+    from engine.capture.mock_stereo import check_block_placement, check_block_shapes
+    from engine.measure import checkblock as cb
+    api._session = rig.s
+    s, p = rig.s, rig.fixed
+    spec = cb.design()
+    refs = {"values": cb.references(spec)}
+    wall = RS.oracle_scan(s, p, [], "wall")
+    block = RS.oracle_scan(s, p, check_block_shapes(spec, *check_block_placement()), "block")
+    acc0 = api.accuracy_check("plane", {}, scans=[wall])
+    blk0 = api.accuracy_block(spec, refs, scans=[block])
+    for r in (acc0, blk0):
+        assert r["rig"] == {"mount": "fixed", "trusted": True}
+        assert not any(rigstate.IN_DOUBT in w for w in r["warnings"])
+    words = "projector (or its picture) moved ~18.6 px against the scene"
+    _check(rig, "MOVED", preset=p, moved="projector", message=words)
+    acc = api.accuracy_check("plane", {}, scans=[wall])
+    blk = api.accuracy_block(spec, refs, scans=[block])
+    w = acc["warnings"][0]
+    assert w.startswith(rigstate.IN_DOUBT) and "rig check MOVED at" in w and words in w
+    for r, r0 in ((acc, acc0), (blk, blk0)):
+        assert r["warnings"][0] == w and r["rig"]["trusted"] is False
+        stored = json.loads(Path(r["file"]).read_text(encoding="utf-8"))
+        assert stored["rig"]["trusted"] is False and stored["warnings"][0] == w
+    # never a different judgment
+    assert acc["verdict"] == acc0["verdict"] and acc["mean_error_mm"] == acc0["mean_error_mm"]
+    assert (blk["result"], blk["disposition"]) == (blk0["result"], blk0["disposition"])
+    # the command line prints it (exit codes as before) and puts it at the top of --json
+    (rig.tmp / "block.json").write_text(json.dumps(spec), encoding="utf-8")
+    monkeypatch.setattr(api, "accuracy_check", lambda *a, **k: acc)
+    monkeypatch.setattr(api, "accuracy_block", lambda *a, **k: blk)
+    base = ["--mock", "--library", str(s.store.root), "--preset", PRESET]
+    for argv, code0 in ((["accuracy", "plane"], 0 if acc["verdict"] == "GO" else 1),
+                        (["accuracy-block", "--block", str(rig.tmp / "block.json")],
+                         D.exit_code(blk))):
+        code, out = _cli([*base, *argv])
+        assert code == code0 and f"! {rigstate.IN_DOUBT}" in out, (argv, out)
+        code, out = _cli([*base, "--json", *argv])
+        doc = json.loads(out)
+        assert code == code0 and doc["warnings"][0] == w and doc["rig"]["trusted"] is False
+
+
+def test_a_rig_state_record_that_cant_be_read_is_a_doubt_never_an_error(rig):
+    """The fixed rig's record is only read to say whether its mm are in doubt: a record that
+    can't be read is a doubt (fail closed), and never stops the scan or the measurement."""
+    from engine.reconstruct import metric_scan
+    api._session = rig.s
+    s, p = rig.s, rig.fixed
+    f = rigstate.log_path(s.store, p.geometry_id)
+    assert not f.exists()
+    f.mkdir(parents=True)                           # the record is a folder: not readable
+    st = metric_scan._require_rig(s, p, "scan_fast")
+    assert st["mount"] == "fixed" and st["trusted"] is False
+    assert st["warning"].startswith(rigstate.IN_DOUBT) and "could not be read" in st["warning"]
+    rig_, warnings = metric_scan.stored_doubts(s, [RS.oracle_scan(s, p, [], "unread")])
+    assert rig_["trusted"] is False and "could not be read" in warnings[0]
 
 
 def test_a_work_state_of_a_mobile_rig_is_never_confirmed_unverified(rig):

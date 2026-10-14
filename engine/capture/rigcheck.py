@@ -15,6 +15,17 @@ Two frames are compared:
             scene's albedo does not dominate)
 A pattern shift with no flood shift points at the projector.
 
+Which device moved (who_moved): a camera move shifts the scene in its view and the
+projected pattern with it (the pattern lies on the scene); a projector move - or a move of
+its picture: focus / zoom, the picture the computer sends - shifts the pattern AGAINST the
+scene and leaves the flood. So the camera's motion is the flood's, the projector's is the
+pattern's motion relative to the flood, tile by tile. A tile that moves with neither (a part
+placed since the reference changes the scene there) is set aside before either is judged.
+MOVED then names the camera, the projector (or its picture), both, or "camera or projector"
+when it can't tell (the flood is not matched, or neither moved beyond the tolerance on its own
+and the frames do not show two small moves on the reference's scene: _mover), and says what to
+do: a small camera turn can be re-homed, a projector move cannot.
+
 One global shift misses a roll or a zoom / focus nudge about the image centre
 (the centre-weighted correlation averages it out). motion() therefore also
 matches a grid of tiles and fits a similarity (shift + roll + scale) to their
@@ -64,6 +75,21 @@ REHOME_MIN_AGREE = 0.6        # re-home: share of the matched tiles (and of thei
                               # the frame) that must agree on the one rotation
 REHOME_AGREE_PX = 0.4         # re-home: pattern tiles vs the flood's rotation, rms (or
 REHOME_AGREE_FRACTION = 0.15  #          this fraction of the motion, whichever is larger)
+WHO_INLIER_PX = 0.3           # who moved: a tile further than this (and 3 x the median) from the
+                              # motion the other tiles agree on is set aside (a changed scene);
+                              # the pattern moved WITH the scene (the camera alone moved) while
+                              # the two stay within the tolerance, or within
+                              # REHOME_AGREE_FRACTION of the camera's motion (the re-home's own
+                              # rule: tile errors grow with a large move)
+# what a MOVED says to do, per device it names
+MOVED_FIX = {
+    "camera": "a small camera turn can be re-homed, else recalibrate before measuring",
+    "projector": ("a projector move can't be re-homed: put the projector and its picture back "
+                  "(mount, focus / zoom, the computer's display settings) and check again, else "
+                  "recalibrate before measuring"),
+    "camera and projector": "recalibrate before measuring (a projector move can't be re-homed)",
+    "camera or projector": ("put the rig right and check again, else recalibrate before "
+                            "measuring")}
 
 
 def random_block_pattern(shape=(1140, 912), block: int = PATTERN_BLOCK_PX,
@@ -235,7 +261,8 @@ def motion(ref: np.ndarray, img: np.ndarray, grid: int = TILE_GRID, upsample: in
                     shift, the global shift (None when nothing was matched)
       texture       both frames show texture (a pattern that is visible but does not
                     match moved; one that is not visible was not checked)
-      tiles_used / tiles, tile_shifts"""
+      tiles_used / tiles, tile_shifts (each: centre_px, box_px [x0, y0, x1, y1] input px,
+                    dx, dy, peak, used)"""
     r = np.asarray(ref, np.float64)
     m = np.asarray(img, np.float64)
     if r.ndim == 3:
@@ -297,6 +324,7 @@ def motion(ref: np.ndarray, img: np.ndarray, grid: int = TILE_GRID, upsample: in
                 "motion_px": round(max(cand), 3) if (matched and cand) else None,
                 "texture": texture, "tiles_used": len(used), "tiles": len(tiles),
                 "tile_shifts": [{"centre_px": [round(t["centre"][0], 1), round(t["centre"][1], 1)],
+                                 "box_px": [int(v) for v in t["box"]],
                                  "dx": t["dx"], "dy": t["dy"], "peak": t["peak"],
                                  "used": t["used"]} for t in tiles]})
     return out
@@ -533,6 +561,149 @@ def _motion_px(s: dict) -> float:
     return float(s["shift_px"] if v is None else v)
 
 
+# ------------------------------------------------------------ who moved
+
+def _field_motion(pts, shifts, weights, boxes=None, diag: Optional[float] = None) -> Optional[dict]:
+    """The largest image displacement of ONE motion field over the area its tiles cover, with
+    the tiles that do not move with the others set aside -> {"px", "tiles", "set_aside"}, None
+    without a tile. Three or more tiles spread over the frame (MIN_TILE_SPREAD x diag): a
+    similarity (shift + roll + scale) is fitted, and the worst tile is dropped while it lies
+    further than WHO_INLIER_PX and 3 x the median from the fit of the rest (at least three
+    stay); px = the fit at the corners of the kept tiles' area or a kept tile's own shift,
+    the larger. Fewer tiles, or too close together: the median tile."""
+    P = np.asarray(pts, np.float64).reshape(-1, 2)
+    D = np.asarray(shifts, np.float64).reshape(-1, 2)
+    W = np.asarray(weights, np.float64).reshape(-1)
+    n = len(P)
+    if n == 0:
+        return None
+    keep = np.ones(n, bool)
+    sim, c = None, P.mean(axis=0)
+    while keep.sum() >= 3:
+        Q = P[keep]
+        span = max(float(np.hypot(*(p - q))) for p in Q for q in Q)
+        if diag is not None and span < MIN_TILE_SPREAD * float(diag):
+            sim = None
+            break
+        sim = fit_similarity(Q, D[keep], c, W[keep])
+        r = np.hypot(*(similarity_at(sim, P, c) - D).T)
+        worst = int(np.argmax(np.where(keep, r, -1.0)))
+        if keep.sum() > 3 and r[worst] > max(WHO_INLIER_PX, 3.0 * float(np.median(r[keep]))):
+            keep[worst] = False
+            continue
+        break
+    mag = np.hypot(*D[keep].T)
+    if sim is None:
+        px = float(np.median(np.hypot(*D.T)))
+    else:
+        if boxes is not None:
+            B = np.asarray(boxes, np.float64).reshape(-1, 4)[keep]
+            x0, y0, x1, y1 = B[:, 0].min(), B[:, 1].min(), B[:, 2].max() - 1, B[:, 3].max() - 1
+        else:
+            (x0, y0), (x1, y1) = P[keep].min(axis=0), P[keep].max(axis=0)
+        cnr = similarity_at(sim, [[x0, y0], [x1, y0], [x0, y1], [x1, y1]], c)
+        px = max(float(np.max(np.hypot(cnr[:, 0], cnr[:, 1]))), float(mag.max()))
+    return {"px": round(px, 3), "tiles": int(keep.sum()), "set_aside": int(n - keep.sum())}
+
+
+def _diag(m: Optional[dict]) -> Optional[float]:
+    sh = (m or {}).get("shape")
+    return float(np.hypot(*sh)) if sh else None
+
+
+def _tiles(m: Optional[dict]) -> list:
+    return [t for t in ((m or {}).get("tile_shifts") or []) if t.get("used")]
+
+
+def _boxes(tiles: list) -> Optional[list]:
+    return [t["box_px"] for t in tiles] if tiles and all(t.get("box_px") for t in tiles) else None
+
+
+def who_moved(flood: Optional[dict], pattern: Optional[dict]) -> dict:
+    """The camera's and the projector's own motion, from the two channels (module docstring)
+    -> {"camera_motion_px": the scene's motion in the camera's view (the flood's tiles),
+    "projector_motion_px": the projected picture's motion AGAINST the scene (pattern minus
+    flood, tile by tile: the same tile of the same grid), "tiles_set_aside": tiles that moved
+    with neither (a part placed since the reference, a glint)}; a number is None when its
+    channel is not matched. A channel matched without tiles (a bare phase_shift) counts with
+    its global shift."""
+    out = {"camera_motion_px": None, "projector_motion_px": None, "tiles_set_aside": 0}
+    if not _matched(flood):
+        return out
+    ft = _tiles(flood)
+    cam = _field_motion([t["centre_px"] for t in ft], [[t["dx"], t["dy"]] for t in ft],
+                        [t["peak"] for t in ft], _boxes(ft), _diag(flood))
+    if cam is None:
+        out["camera_motion_px"] = round(_motion_px(flood), 3)
+    else:
+        out["camera_motion_px"], out["tiles_set_aside"] = cam["px"], cam["set_aside"]
+    if not _matched(pattern):
+        return out
+    fa, pa = (list((m or {}).get("tile_shifts") or []) for m in (flood, pattern))
+    if all(t.get("box_px") for t in fa + pa):
+        by_box = {tuple(t["box_px"]): t for t in pa}
+        pairs = [(f, by_box.get(tuple(f["box_px"]))) for f in fa]
+    else:                                   # no boxes given: the same place in the same grid
+        pairs = list(zip(fa, pa)) if len(fa) == len(pa) else []
+    pairs = [(f, p) for f, p in pairs if p is not None and f.get("used") and p.get("used")]
+    rel = _field_motion([f["centre_px"] for f, _ in pairs],
+                        [[p["dx"] - f["dx"], p["dy"] - f["dy"]] for f, p in pairs],
+                        [min(f["peak"], p["peak"]) for f, p in pairs],
+                        _boxes([f for f, _ in pairs]), _diag(flood))
+    if rel is not None:
+        out["projector_motion_px"] = rel["px"]
+        out["tiles_set_aside"] = max(out["tiles_set_aside"], rel["set_aside"])
+    elif flood["peak"] >= MIN_PEAK and pattern["peak"] >= MIN_PEAK:
+        out["projector_motion_px"] = round(float(np.hypot(pattern["dx"] - flood["dx"],
+                                                          pattern["dy"] - flood["dy"])), 3)
+    return out
+
+
+def _unchanged(flood: Optional[dict], pattern: Optional[dict], who: dict) -> bool:
+    """The frames show the reference's scene: every tile of both channels matched, none set
+    aside. A part placed since the reference shows as tiles that no longer match, or that moved
+    with neither device; the tiles around it match in part and leak up to ~0.35 px into each
+    device's motion (synthetic parts after an empty reference, nothing moved)."""
+    if who.get("tiles_set_aside"):
+        return False
+    for m in (flood, pattern):
+        n = (m or {}).get("tiles")
+        if not n or (m or {}).get("tiles_used") != n:
+            return False
+    return True
+
+
+def _mover(cam: Optional[float], who: dict, tol_px: float, worst: Optional[float] = None,
+           unchanged: bool = False) -> str:
+    """Which device a MOVED names: "camera" (the pattern moved with the scene), "projector"
+    (the pattern moved against it, the camera's view within the tolerance), "camera and
+    projector", or "camera or projector" (the camera's view can't be measured, the pattern
+    can't be compared with it, or neither moved beyond the tolerance on its own). A device
+    moved when its own motion is beyond tol_px. When neither is, two small moves are named
+    against half of it only on the reference's scene (`unchanged`, _unchanged) and when they
+    explain the frame's largest motion `worst` (it exceeds the sum of their motions by no more
+    than half the tolerance): a part placed since the reference leaks a few tenths of a px into
+    each device's motion, which alone named the camera (a re-home!) or both. The pattern moved
+    with the scene while it stays within the limit, or within REHOME_AGREE_FRACTION of the
+    camera's motion. NaN reads as moved, and never as explained."""
+    cpx, ppx = who.get("camera_motion_px"), who.get("projector_motion_px")
+    if cam is None or ppx is None:
+        return "camera or projector"
+    cpx = cam if cpx is None else cpx
+    together = REHOME_AGREE_FRACTION * cpx if math.isfinite(cpx) else 0.0
+
+    def named(lim: float) -> Optional[str]:
+        proj, camera = not ppx <= max(lim, together), not cpx <= lim
+        return ("camera and projector" if proj and camera else "projector" if proj else
+                "camera" if camera else None)
+
+    what = named(tol_px)
+    half = 0.5 * tol_px
+    if what is None and unchanged and worst is not None and worst - (cpx + ppx) <= half:
+        what = named(half)
+    return what or "camera or projector"
+
+
 def check_tol(tol_px) -> float:
     """The MOVED tolerance as a finite px number >= 0 (ValueError otherwise: a NaN or an
     infinite tolerance would read every motion as 'in place')."""
@@ -549,12 +720,15 @@ def assess(flood: Optional[dict], pattern: Optional[dict], tol_px: float = DEFAU
            mm_per_px: Optional[float] = None, distance_mm: Optional[float] = None) -> dict:
     """OK / MOVED / UNKNOWN from the flood and pattern motions (motion() dicts; a bare
     phase_shift dict is a shift only: roll / zoom not determined; None = not measured).
-    MOVED names what moved; mm only when mm_per_px is known (never a px number reported as
-    mm). Fail closed: OK needs the pattern matched with its roll / zoom determined (the
-    pattern is the only channel that sees the projector) and every matched channel within
-    tol_px; a flood with no texture is fine (the pattern sees the camera too), a flood that
-    shows texture but no longer matches is not. tol_px must be finite and >= 0
-    (ValueError)."""
+    MOVED names what moved ("moved": camera | projector | camera and projector | camera or
+    projector, who_moved / _mover) and what to do about it (MOVED_FIX: a small camera turn can
+    be re-homed, a projector move can't); every verdict carries who_moved()'s numbers
+    (camera_motion_px, projector_motion_px, tiles_set_aside). mm only when mm_per_px is known
+    (never a px number reported as mm). Fail closed: OK needs the pattern matched with its
+    roll / zoom determined (the pattern is the only channel that sees the projector) and
+    every matched channel within tol_px; a flood with no texture is fine (the pattern sees
+    the camera too), a flood that shows texture but no longer matches is not. tol_px must be
+    finite and >= 0 (ValueError)."""
     tol_px = check_tol(tol_px)
     cam = _motion_px(flood) if _matched(flood) else None
     rig = _motion_px(pattern) if _matched(pattern) else None
@@ -570,28 +744,49 @@ def assess(flood: Optional[dict], pattern: Optional[dict], tol_px: float = DEFAU
             return ""
         return f", roll {s['rotation_deg']:+.3f} deg, scale {s['scale_pct']:+.3f} %"
 
+    who = who_moved(flood, pattern)
+
     def verdict(status, moved, message, px=worst, smm=mm):
         return {"status": status, "moved": moved,
                 "shift_px": round(px, 3) if px is not None else None,
-                "shift_mm": smm, "message": message}
+                "shift_mm": smm, "message": message, **who}
+
+    def pm(v):
+        return f"~{v:.1f} px" + (f" (~{v * mm_per_px:.2f} mm)" if mm_per_px else "")
 
     if worst is not None and not worst <= tol_px:          # NaN motion: MOVED, never OK
-        if cam is not None and not cam <= tol_px:
-            what, s = "camera", flood
-        elif cam is not None and rig is not None:
-            what, s = "projector", pattern
+        what = _mover(cam, who, tol_px, worst, _unchanged(flood, pattern, who))
+        cpx, ppx = who["camera_motion_px"], who["projector_motion_px"]
+        frame = f"largest image motion over the frame {size}"
+        if what == "camera":
+            s = flood if not cam <= tol_px else pattern
+            text = (f"camera moved {size} (largest image motion over the frame{rollzoom(s)}; "
+                    "the projected pattern moved with the scene)")
+        elif what == "projector":
+            text = (f"projector (or its picture) moved {pm(ppx)} against the scene, the "
+                    f"camera's view {cpx:.1f} px ({frame}{rollzoom(pattern)})")
+        elif what == "camera and projector":
+            text = (f"camera and projector moved: the camera's view {pm(cpx)}, the projector's "
+                    f"picture {pm(ppx)} against the scene ({frame}{rollzoom(pattern)})")
         else:
-            what, s = "camera or projector", (pattern if rig is not None else flood)
-        return verdict("MOVED", what, f"{what} moved {size} (largest image motion over the "
-                                      f"frame{rollzoom(s)}): re-home / recalibrate before measuring")
+            why = ("the scene's own texture is not matched" if cam is None else
+                   "the pattern can't be compared with the scene" if ppx is None else
+                   f"neither the camera's view ({cpx:.1f} px) nor the projector's picture "
+                   f"({ppx:.1f} px) moved that far on its own - two small moves together, or "
+                   "has the scene changed since the reference?")
+            text = (f"camera or projector moved {size} (largest image motion over the frame"
+                    f"{rollzoom(pattern if rig is not None else flood)}; which one can't be "
+                    f"told: {why})")
+        return verdict("MOVED", what, f"{text}: {MOVED_FIX[what]}")
     if rig is None:
         if pattern is not None and pattern.get("texture"):
             what = "projector" if cam is not None else "camera or projector"
+            name = "projector (or its picture)" if cam is not None else what
             return verdict("MOVED", what,
-                           f"{what} moved: the pattern is visible but no longer matches the "
+                           f"{name} moved: the pattern is visible but no longer matches the "
                            f"reference (match {pattern['peak']:.2f} < {MIN_PEAK:g}): moved, "
                            "rolled or zoomed / refocused beyond what the check measures - "
-                           "re-home / recalibrate before measuring", px=None, smm=None)
+                           f"{MOVED_FIX[what]}", px=None, smm=None)
         if cam is None:
             return verdict("UNKNOWN", None, "no usable texture in the frames (lens cap? projector "
                                             "off? an empty, featureless scene?): rig position "

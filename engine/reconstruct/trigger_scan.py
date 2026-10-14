@@ -370,6 +370,8 @@ def scan_trigger(s, preset, pack, variant: Optional[str] = None, label: str = "t
     times = {"capture_s": capture_s, "decode_s": decode_s,
              "triangulate_save_s": round(time.perf_counter() - t0, 3),
              "total_s": round(time.perf_counter() - t_all, 3)}
+    # the entry's own first: a fixed rig in doubt (the rig check's words), then the capture's
+    warnings = list(dict.fromkeys([*(ms.meta.get("warnings") or []), *warnings]))
     return {"scan": ms, "id": ms.id, "mode": MODE, "n_points": int(cloud.mask.sum()),
             "valid_pct": ms.meta.get("valid_pct"), "calibration_id": cal.id,
-            "timing": timing, "decode": dec, "times_s": times, "warnings": warnings}
+            "timing": timing, "decode": dec, "times_s": times, "warnings": warnings, "rig": rig}

@@ -514,3 +514,51 @@ def test_failed_metric_scan_keeps_the_captured_frames(mock_cell, monkeypatch):
     m = json.loads((ds.path / "meta.json").read_text())
     assert m["metric_scans"] == [] and "no decodable" in m["metric_error"]
     assert [d.id for d in api.list_library("dentsets")] == [ds.id]
+
+
+def test_a_dent_set_on_a_fixed_rig_after_a_moved_check_says_so(mock_cell, tmp_path, capsys,
+                                                                monkeypatch):
+    """A rig check said MOVED on this FIXED rig: dent-scan still captures and its metric scan
+    gives mm, but the dent set says so - the metric scan's rig warning (the rig check's words,
+    the way out) first in its warnings (printed), its rig stamp (trusted false) in the stored
+    meta, both at the top of --json. Before, the stamp was dropped and nothing was printed.
+    Without a metric scan (it failed) the rig gate's own stamp from before the capture."""
+    from engine import rigstate
+    from engine.reconstruct import metric_scan
+    from ui import cli
+    s, p, _ = mock_cell
+    cal = _truth_calibration(s, p)
+    words = "camera and projector moved: recalibrate before measuring"
+    rigstate.record_check(s.store, p, {
+        "status": "MOVED", "tol_px": 0.5, "calibration_id": cal.id, "reference_id": "ref0",
+        "reference_calibration_id": cal.id, "reference_trust": {"mobile": True, "fixed": True},
+        "message": words})
+    ds = api.capture_dent_set("E5:E7", "moved", p, steps=4)
+    w = ds.warnings[0]
+    assert w.startswith(rigstate.IN_DOUBT) and "rig check MOVED at" in w and words in w
+    assert any("projector map" in x for x in ds.warnings)          # its own warnings follow
+    assert ds.meta["rig"]["mount"] == "fixed" and ds.meta["rig"]["trusted"] is False
+    assert len(ds.metric_scan_ids) == 1
+    ms = next(x for x in api.list_library("metric") if x.id == ds.metric_scan_ids[0])
+    assert ms.meta["warnings"][0] == w and ms.meta["rig"] == ds.meta["rig"]
+    m = json.loads((ds.path / "meta.json").read_text())
+    assert m["rig"]["trusted"] is False and m["warnings"][0] == w
+    monkeypatch.setattr(api, "capture_dent_set", lambda *a, **k: ds)
+    argv = ["--mock", "--library", str(tmp_path / "cli_library"), "dent-scan", "x"]
+    try:
+        assert cli.main(argv) == 0
+        assert f"! {rigstate.IN_DOUBT}" in capsys.readouterr().out
+        assert cli.main([*argv[:3], "--json", *argv[3:]]) == 0
+        doc = json.loads(capsys.readouterr().out)
+        assert doc["warnings"][0] == w and doc["rig"]["trusted"] is False
+    finally:
+        api._session = s
+    monkeypatch.undo()
+
+    def fail(*a, **k):
+        raise ValueError("no decodable pixels in the zone")
+    monkeypatch.setattr(metric_scan, "scan_metric", fail)
+    ds = api.capture_dent_set("E5:E7", "moved_nometric", p, steps=4)
+    assert ds.metric_scan_ids == [] and ds.warnings[0].startswith(rigstate.IN_DOUBT)
+    assert ds.meta["rig"]["trusted"] is False
+    assert any("metric scan failed" in x for x in ds.warnings)

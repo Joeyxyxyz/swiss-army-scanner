@@ -620,6 +620,57 @@ def test_cylinder_and_end_face_diameters(lab):
         assert "flat within the noise" in flat["result"]["message"]
 
 
+def test_end_faces_set_aside_on_rays_that_miss_say_the_calibration_may_not_fit(lab, monkeypatch):
+    """The first real-rig run: Measure end face answered "found 1 face disc(s), expected 2" -
+    a face set aside because too little of its disc was measured - on scans whose camera and
+    projector rays missed each other by ~1.2 mm (0.044 mm while the calibration fitted). The
+    likelier cause is then the calibration, and the NOT_MEASURABLE reason says so; the same
+    refusal on a scan whose rays agree says nothing of the kind (the part's placement)."""
+    from engine.measure.station import verbs as station
+    from engine.measure.station.geometry import StationError
+    from engine.reconstruct import metric_scan
+    p = _use(lab)
+    s, src = lab["s"], lab["faces"]
+    cal = RS.truth_calibration(s, p)
+
+    def stored(label, miss_mm):
+        """The end-face scan again, with both axes' ray miss `miss_mm` everywhere."""
+        c = src.cloud
+        cloud = MetricCloud(xyz=c.xyz, mask=c.mask, consistency=np.where(c.mask, miss_mm, np.nan),
+                            method="plane", geometry_id=c.geometry_id,
+                            calibration_id=c.calibration_id)
+        return metric_scan._save(s, src.field, cloud, label, cal, config.geometry_fingerprint(p),
+                                 p.name, {"synthetic": True})
+    bad, good = stored("faces_rays_miss", 1.2), stored("faces_rays_meet", 0.04)
+    assert bad.meta["consistency_check"]["fits"] is False and good.meta["consistency_check"]["fits"]
+    assert bad.meta["warnings"][0].endswith(metric_scan.CALIBRATION_MAY_NOT_FIT)
+    why = ("found 1 face disc(s), expected 2 (radius 22..34 px); set aside: (421, 730): only 41 % "
+           "of the disc measured (< 70 %) and no rim circle: not shown to be an end face - pass "
+           "cell_px_hint or r_px_range, or check the flood")
+
+    def set_aside(*a, **k):
+        raise StationError(why)
+    monkeypatch.setattr(station, "station_measure", set_aside)
+    out = api.measure_run("endface", p, scans=[bad], runs_dir=lab["runs"],
+                          face_diameter_mm=21.0, n_faces=2)
+    doc = out["result"]
+    assert out["exit_code"] == 5 and doc["status"] == "NOT_MEASURABLE"
+    assert doc["reason"] == "incomplete" and doc["values"] == []
+    assert why in doc["message"] and "rays miss each other by 1.20 mm (median)" in doc["message"]
+    assert doc["message"].endswith(metric_scan.CALIBRATION_MAY_NOT_FIT)
+    doc = api.measure_run("endface", p, scans=[good], runs_dir=lab["runs"],
+                          face_diameter_mm=21.0, n_faces=2)["result"]
+    assert doc["reason"] == "incomplete" and why in doc["message"]
+    assert metric_scan.CALIBRATION_MAY_NOT_FIT not in doc["message"]
+    # another refusal (no disc at all) on the same scan is not about too little of a disc
+    monkeypatch.setattr(station, "station_measure", lambda *a, **k: (_ for _ in ()).throw(
+        StationError("no face disc (radius 22..34 px) found on the flood")))
+    doc = api.measure_run("endface", p, scans=[bad], runs_dir=lab["runs"],
+                          face_diameter_mm=21.0, n_faces=2)["result"]
+    assert doc["reason"] == "incomplete"
+    assert metric_scan.CALIBRATION_MAY_NOT_FIT not in doc["message"]
+
+
 def test_deviation_vs_a_golden_scan_gives_values_only(lab):
     same = _measure(lab, "deviation", "box_b", golden=lab["box"].id)
     v = _values(same)

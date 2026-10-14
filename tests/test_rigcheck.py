@@ -1,16 +1,19 @@
 """Rig check (HOME): the sub-pixel shift estimator (engine/capture/rigcheck.py, pure)
-on known synthetic shifts, the OK / MOVED / UNKNOWN assessment, and `scan rig-check`
-end to end in mock (reference -> OK -> a simulated nudge -> MOVED)."""
+on known synthetic shifts, the OK / MOVED / UNKNOWN assessment, which device a MOVED names
+(camera / projector or its picture / both / can't tell, at the tolerance edge, with a part
+placed since the reference), and `scan rig-check` end to end in mock (reference -> OK -> a
+simulated nudge -> MOVED)."""
 
 import contextlib
 import io
 import json
+import re
 
 import numpy as np
 import pytest
 from scipy import ndimage
 
-from engine import api
+from engine import api, rigstate
 from engine.capture import rigcheck as R
 from ui import cli
 
@@ -212,6 +215,186 @@ def test_assess_a_nan_motion_is_moved_never_ok():
         assert R.assess(flood, pattern)["status"] == "MOVED"
 
 
+# ------------------------------------------------------------ which device moved
+
+def _moved(cam=(0.0, 0.0), proj=(0.0, 0.0), seed=0, part=None, part_shift=(0.0, 0.0)):
+    """flood / pattern motions of a camera move `cam` and a projector move `proj` (camera px):
+    the scene shifts by cam in the camera's view, the projected pattern by cam + proj.
+    part: a mask where a part stands now that was not there for the reference - its own
+    texture in the flood, the pattern on it displaced by part_shift more (another depth)."""
+    scene, pat = _texture(), _pattern_cam()
+    if part is None:
+        sc = _warp(scene, dx=cam[0], dy=cam[1])
+        pt = _warp(pat, dx=cam[0] + proj[0], dy=cam[1] + proj[1])
+    else:
+        on = _warp(pat, dx=proj[0] + part_shift[0], dy=proj[1] + part_shift[1])
+        sc = _warp(np.where(part, _texture(seed=99), scene), dx=cam[0], dy=cam[1])
+        pt = _warp(np.where(part, on, _warp(pat, dx=proj[0], dy=proj[1])), dx=cam[0], dy=cam[1])
+    flood = R.motion(_noisy(scene, 1.0, seed), _noisy(sc, 1.0, seed + 1))
+    pattern = R.motion(_noisy(pat, 0.01, seed + 2), _noisy(pt, 0.01, seed + 3))
+    return flood, pattern
+
+
+def _box(y0, y1, x0, x1, shape=(480, 640)):
+    m = np.zeros(shape, bool)
+    m[y0:y1, x0:x1] = True
+    return m
+
+
+@pytest.mark.parametrize("cam, proj, tol, status, moved", [
+    ((1.0, 0.0), (0.0, 0.0), 1.3, "OK", None),
+    ((1.0, 0.0), (0.0, 0.0), 0.7, "MOVED", "camera"),
+    ((0.0, 0.0), (1.0, 0.0), 1.3, "OK", None),
+    ((0.0, 0.0), (1.0, 0.0), 0.7, "MOVED", "projector"),
+    ((1.0, 0.0), (0.0, 1.0), 0.7, "MOVED", "camera and projector"),
+    ((0.8, 0.0), (0.8, 0.0), 1.2, "MOVED", "camera and projector"),   # each within, together not
+    ((0.0, 0.4), (3.0, 0.0), 0.7, "MOVED", "projector"),     # the camera within the tolerance
+    ((3.0, 0.0), (0.0, 0.4), 0.7, "MOVED", "camera"),        # the projector within it
+])
+def test_moved_names_the_device_at_the_tolerance_edge(cam, proj, tol, status, moved):
+    """A camera move shifts the scene and the pattern on it alike; a projector move shifts the
+    pattern against the scene. Each device is judged by its own motion: within the tolerance
+    it is in place, beyond it it moved; two moves each within it but together beyond it are
+    both named."""
+    flood, pattern = _moved(cam, proj)
+    v = R.assess(flood, pattern, tol_px=tol)
+    assert v["status"] == status and v["moved"] == moved, v
+    assert v["camera_motion_px"] == pytest.approx(np.hypot(*cam), abs=0.15)
+    assert v["projector_motion_px"] == pytest.approx(np.hypot(*proj), abs=0.15)
+    if moved == "projector":
+        assert v["message"].startswith("projector (or its picture) moved ~")
+        assert "can't be re-homed" in v["message"] and "camera moved" not in v["message"]
+    elif moved == "camera":
+        assert v["message"].startswith("camera moved ~") and "can be re-homed" in v["message"]
+    elif moved:
+        assert v["message"].startswith("camera and projector moved: the camera's view ~")
+        assert "recalibrate" in v["message"] and "can't be re-homed" in v["message"]
+    # the re-home is never suggested by the check itself (rigref adds it when it fits)
+    assert "rig-check --rehome" not in v["message"]
+
+
+def test_the_real_rig_case_names_the_projector_not_a_24_px_camera_move():
+    """The first real-rig run: the camera's view moved 0.68 px (its mount creeps), the
+    projected picture 18.5 px (the projector was nudged); the headline said 'camera moved
+    ~24.0 px'. Now both are named with their own numbers, the projector's the larger, and the
+    advice is a recalibration (a projector move can't be re-homed). With the camera's creep
+    inside the tolerance only the projector is named."""
+    flood, pattern = _moved((-0.24, 0.64), (18.52, 2.0))
+    v = R.assess(flood, pattern, tol_px=0.5, mm_per_px=0.357, distance_mm=766.0)
+    assert v["status"] == "MOVED" and v["moved"] == "camera and projector", v
+    assert v["camera_motion_px"] == pytest.approx(0.68, abs=0.15)
+    assert v["projector_motion_px"] == pytest.approx(18.63, abs=0.3)
+    assert re.match(r"camera and projector moved: the camera's view ~0\.\d px \(~0\.\d\d mm\), "
+                    r"the projector's picture ~18\.\d px \(~6\.\d\d mm\) against the scene "
+                    r"\(largest image motion over the frame ~1\d\.\d px \(~\d\.\d\d mm at 766 mm\)",
+                    v["message"]), v["message"]
+    assert v["message"].endswith(": recalibrate before measuring (a projector move can't be "
+                                 "re-homed)")
+    flood, pattern = _moved((-0.1, 0.25), (18.52, 2.0))
+    v = R.assess(flood, pattern, tol_px=0.5)
+    assert v["moved"] == "projector", v
+    assert re.match(r"projector \(or its picture\) moved ~18\.\d px against the scene, the "
+                    r"camera's view 0\.\d px", v["message"]), v["message"]
+
+
+def _grid(shifts, H=480, W=640, peak=0.9):
+    """A motion() result from 3 x 3 tile shifts (row by row, camera px), the global shift their
+    median, the similarity determined."""
+    boxes = R._tile_boxes((H, W), 3)
+    ts = [{"centre_px": [(x0 + x1 - 1) / 2.0, (y0 + y1 - 1) / 2.0], "box_px": [x0, y0, x1, y1],
+           "dx": float(d[0]), "dy": float(d[1]), "peak": peak, "used": True}
+          for (y0, y1, x0, x1), d in zip(boxes, shifts)]
+    med = np.median(np.asarray(shifts, float), axis=0)
+    mx = float(np.max(np.hypot(*np.asarray(shifts, float).T)))
+    return {"dx": float(med[0]), "dy": float(med[1]), "shift_px": float(np.hypot(*med)),
+            "peak": peak, "matched": True, "similarity": True, "rotation_deg": 0.0,
+            "scale_pct": 0.0, "motion_px": mx, "texture": True, "tiles_used": 9, "tiles": 9,
+            "shape": [H, W], "tile_shifts": ts}
+
+
+def test_a_part_placed_since_the_reference_is_set_aside_not_called_a_move():
+    """The reference was taken with the scene empty; a part now sits in one tile: there the
+    flood and the pattern show a changed scene (a shift of neither device). That tile is set
+    aside before either device is judged: the projector's 18 px move is the projector's, and
+    a changed scene alone is never called a camera or projector move."""
+    flood = _grid([(0.0, 0.0)] * 4 + [(0.9, 0.6)] + [(0.0, 0.0)] * 4)
+    pattern = _grid([(18.0, 3.0)] * 4 + [(5.0, -1.0)] + [(18.0, 3.0)] * 4)
+    who = R.who_moved(flood, pattern)
+    assert who["camera_motion_px"] == pytest.approx(0.0, abs=1e-3)
+    assert who["projector_motion_px"] == pytest.approx(np.hypot(18, 3), abs=1e-3)
+    assert who["tiles_set_aside"] == 1
+    v = R.assess(flood, pattern)
+    assert v["status"] == "MOVED" and v["moved"] == "projector", v
+    # nothing moved, the part's tile alone beyond the tolerance: MOVED, but which device can't
+    # be told - and the message asks whether the scene changed
+    v = R.assess(flood, _grid([(0.0, 0.0)] * 4 + [(-0.3, 0.2)] + [(0.0, 0.0)] * 4))
+    assert v["status"] == "MOVED" and v["moved"] == "camera or projector", v
+    assert "has the scene changed since the reference?" in v["message"]
+    assert v["camera_motion_px"] < 0.05 and v["projector_motion_px"] < 0.05
+
+
+BAR = _box(170, 320, 100, 520)                  # across the middle row of tiles
+L_SHAPE = BAR | _box(170, 470, 100, 220)
+
+
+@pytest.mark.parametrize("part, shift", [
+    (BAR, (0.55, 0.0)), (BAR, (1.0, 0.0)), (BAR, (3.0, 0.0)), (BAR, (6.0, 0.5)),
+    (L_SHAPE, (0.55, 0.0)), (L_SHAPE, (0.7, 0.0)),
+    (_box(120, 400, 150, 500), (1.0, 0.0)),     # a large block
+    (_box(60, 420, 330, 640), (0.55, 0.0)),     # a block over the right side
+    (_box(60, 420, 330, 640), (0.7, 0.0)),
+])
+def test_a_wide_part_with_nothing_moved_names_no_device(part, shift):
+    """Nothing moved; a part was placed since an empty-scene reference (the real case), at
+    another depth (the pattern on it displaced). The tiles around it match in part and leak
+    0.2 - 0.35 px into each device's motion: within the tolerance, beyond half of it - which
+    named the camera ('can be re-homed') or both. Two small moves are named only on the
+    reference's scene and when they explain the frame's motion: here no device is named."""
+    flood, pattern = _moved(part=part, part_shift=shift)
+    v = R.assess(flood, pattern, tol_px=0.5)
+    assert v["moved"] in (None, "camera or projector"), v
+    assert v["camera_motion_px"] <= 0.5 and v["projector_motion_px"] <= 0.5
+    if v["status"] == "MOVED":
+        assert "has the scene changed since the reference?" in v["message"]
+        assert "can be re-homed" not in v["message"]
+
+
+@pytest.mark.parametrize("cam, proj, moved", [
+    ((2.0, 0.0), (0.0, 0.0), "camera"),
+    ((0.0, 0.0), (6.0, 0.0), "projector"),
+    ((-0.24, 0.64), (18.5, 2.9), "camera and projector"),     # the real rig's numbers
+])
+def test_a_device_move_is_still_named_with_a_part_placed(cam, proj, moved):
+    """The same part (one tile, the pattern on it 3 px off): a device whose own motion is beyond
+    the tolerance is named as before."""
+    flood, pattern = _moved(cam, proj, part=_box(170, 320, 220, 420), part_shift=(3.0, 0.0))
+    v = R.assess(flood, pattern, tol_px=0.5)
+    assert v["status"] == "MOVED" and v["moved"] == moved, v
+
+
+def test_two_small_moves_are_named_only_on_the_references_scene():
+    """Camera 0.35 px + projector 0.35 px, tolerance 0.5: each within it, the picture 0.7 px.
+    On the reference's scene both are named; with a part placed since the reference (one tile,
+    set aside) the same moves can't be told from a changed scene."""
+    flood, pattern = _moved((0.35, 0.0), (0.35, 0.0))
+    v = R.assess(flood, pattern, tol_px=0.5)
+    assert v["status"] == "MOVED" and v["moved"] == "camera and projector", v
+    assert R._unchanged(flood, pattern, v)
+    flood, pattern = _moved((0.35, 0.0), (0.35, 0.0), part=_box(170, 320, 220, 420),
+                            part_shift=(3.0, 0.0))
+    v = R.assess(flood, pattern, tol_px=0.5)
+    assert v["status"] == "MOVED" and v["moved"] == "camera or projector", v
+    assert not R._unchanged(flood, pattern, v)      # the part's tile no longer matches
+    assert "two small moves together, or has the scene changed since the reference?" in v["message"]
+    # pure: the same numbers, explained or not
+    who = {"camera_motion_px": 0.3, "projector_motion_px": 0.3, "tiles_set_aside": 0}
+    assert R._mover(0.3, who, 0.5, worst=0.6, unchanged=True) == "camera and projector"
+    assert R._mover(0.3, who, 0.5, worst=0.6, unchanged=False) == "camera or projector"
+    assert R._mover(0.3, who, 0.5, worst=1.0, unchanged=True) == "camera or projector"
+    assert R._mover(0.3, who, 0.5, worst=float("nan"), unchanged=True) == "camera or projector"
+    assert R._mover(0.3, who, 0.5, unchanged=True) == "camera or projector"     # worst unknown
+
+
 def test_one_straight_edge_is_not_a_tile_match():
     """A tile that holds one straight edge only gives no shift along the edge (aperture):
     it is not used, so it cannot report a false 'no motion' along it."""
@@ -262,6 +445,13 @@ def test_cli_rig_check_reference_ok_then_moved(tmp_path):
     assert r["shift_px"] == pytest.approx(np.hypot(2.3, 0.4), abs=0.4)
     assert r["flood"]["dx"] == pytest.approx(2.3, abs=0.4)
     assert r["shift_mm"] is None and any("px only" in w for w in r["warnings"])   # no stereo cal
+    # which device: the whole picture moved with the scene - the camera
+    assert r["moved"] == "camera" and r["projector_motion_px"] < 0.3, r
+    assert r["camera_motion_px"] == pytest.approx(np.hypot(2.3, 0.4), abs=0.4)
+    code, out = _cli([*lib[:-1], "rig-check", "--mock-shift", "2.3,-0.4"])
+    assert code == cli.EXIT_NOT_OK and "Rig check: MOVED  camera moved ~" in out
+    assert re.search(r"camera / projector +camera's view 2\.\d\d px, projector's picture "
+                     r"0\.\d\d px against the scene", out), out
 
 
 def test_cli_mock_shift_needs_mock(tmp_path):
@@ -311,3 +501,74 @@ def test_api_rig_check_mock_roll_and_projector_move(preset, monkeypatch):
     monkeypatch.setattr(flow, "capture_patterns", projector_rolled)
     r = api.rig_check(preset)
     assert r["status"] == "MOVED" and r["moved"] == "projector", r
+
+
+def test_api_rig_check_names_the_device_with_parts_placed_after_an_empty_reference(
+        tmp_path, capsys):
+    """The real case on the simulated rig: the reference was taken with the scene empty (a
+    textured wall), the checks run with two cylinders standing in front of it. The rig itself
+    is moved as on the bench - the camera turned about its centre, the projector turned about
+    its own - and the check names what moved: never 'camera moved ~26 px' for a projector."""
+    import test_rehome_mock as T
+    from engine.capture.mock_bench import MockBench
+    from engine.capture.mock_stereo import EndFace, MetricCylinder, StereoRig
+    from conftest import FIXTURE_PRESETS
+    pd = tmp_path / "presets"
+    pd.mkdir()
+    d = json.loads((FIXTURE_PRESETS / "cell_wall_2p7ft_vstripe_fullrange.json").read_text())
+    d["name"], d["camera"]["average"] = "metric_fast", 1
+    (pd / "metric_fast.json").write_text(json.dumps(d))
+    bench = MockBench(seed=7)
+    api.configure(tmp_path / "library", mock=True, bench=bench, presets_dir=pd)
+    try:
+        p = api.load_preset("metric_fast")
+        rig0 = StereoRig.bench()
+
+        def scene(Rn=np.eye(3), Rp=np.eye(3), parts=True):
+            """The camera turned by Rn, the projector by Rp; the world (the wall, the parts)
+            stays where it is."""
+            bench.clear()
+            bench.stereo_wall = False
+            bench.stereo_rig = StereoRig(rig0.camera, rig0.projector, Rp @ rig0.R @ Rn.T,
+                                         Rp @ rig0.t)
+            bench.use_stereo()
+            bench.place(T._world(Rn)[0])                        # the textured wall only
+            n = np.array([0.0, 0.0, -1.0])
+            for x in ((-25.0, 25.0) if parts else ()):
+                c = np.array([x, 20.0, 783.0])
+                bench.place(EndFace(center=tuple(Rn @ c), normal=tuple(Rn @ n), radius=10.5,
+                                    albedo=0.85))
+                bench.place(MetricCylinder(center=tuple(Rn @ (c - 19.0 * n)), radius=10.5,
+                                           height=38.0, axis=tuple(Rn @ n), albedo=0.5))
+
+        scene(parts=False)
+        assert api.rig_check(p)["status"] == "REFERENCE_SET"
+        scene()                                                 # the parts, nothing moved
+        r = api.rig_check(p)
+        assert r["status"] == "OK" and r["tiles_set_aside"] >= 1, r
+        Rp = R.rotation_from_rotvec(np.radians([0.0, 0.47, 0.05]))     # the picture ~26 px
+        scene(Rp=Rp)
+        r = api.rig_check(p)
+        assert r["status"] == "MOVED" and r["moved"] == "projector", r
+        assert r["projector_motion_px"] > 20 and r["camera_motion_px"] < 0.2
+        assert r["message"].startswith("projector (or its picture) moved ~")
+        assert "camera moved" not in r["message"] and "can't be re-homed" in r["message"]
+        assert r["rehome"] is None                              # never offered for a projector
+        scene(Rn=T._rot(0.05, 0.02, 0.0))                       # the camera turned, ~2.4 px
+        r = api.rig_check(p)
+        assert r["status"] == "MOVED" and r["moved"] == "camera", r
+        assert 1.8 < r["camera_motion_px"] < 3.0 and r["projector_motion_px"] < 0.3
+        assert "the projected pattern moved with the scene" in r["message"]
+        # the projector nudged and the camera crept 0.6 px: both, the projector the larger
+        scene(Rn=T._rot(0.015, 0.0, 0.0), Rp=Rp)
+        r = api.rig_check(p)
+        assert r["status"] == "MOVED" and r["moved"] == "camera and projector", r
+        assert 0.5 < r["camera_motion_px"] < 1.0 and r["projector_motion_px"] > 20
+        assert r["message"].startswith("camera and projector moved: the camera's view ~")
+        assert "recalibrate" in r["message"]
+        rec = rigstate.read(api._session.store, p.geometry_id)[-1]
+        assert rec["moved"] == "camera and projector"
+        assert rec["projector_motion_px"] == r["projector_motion_px"]
+        assert rec["message"] == r["message"]                   # the whole headline is kept
+    finally:
+        api._session = None

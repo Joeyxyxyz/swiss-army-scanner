@@ -713,6 +713,41 @@ def test_targeted_face_scan_then_profile(mock_face):
     assert api.face_profile(fs1).stats["flood_pair"]
 
 
+def test_face_scan_and_profile_after_a_moved_check_say_so(mock_face):
+    """The first real-rig run: face-scan and face-profile gave their mm with no word after a
+    rig check said MOVED on the fixed rig. They still scan and profile (only Measure and Quick
+    check refuse a fixed rig's mm), and say so first, in the rig check's own words: the face
+    scan's warnings and its meta "rig" (trusted false), each repeat's metric scan, the
+    profile's warnings and stats "rig". After an answer (a rig check OK) a new face scan is
+    trusted again."""
+    from engine import rigstate
+    p = _m(mock_face)
+    s, cal = mock_face["s"], mock_face["cal"]
+    base = {"tol_px": 0.5, "calibration_id": cal.id, "reference_id": "ref0",
+            "reference_calibration_id": cal.id,
+            "reference_trust": {"mobile": True, "fixed": True}}
+    words = "projector (or its picture) moved ~18.6 px against the scene"
+    rigstate.record_check(s.store, p, {**base, "status": "MOVED", "moved": "projector",
+                                       "message": words})
+    try:
+        fs = api.targeted_face_scan(None, p, "after_moved", repeats=1, duty=0.7, steps=4,
+                                    polar=False)
+        assert fs.warnings[0].startswith(rigstate.IN_DOUBT) and words in fs.warnings[0]
+        assert fs.meta["rig"]["trusted"] is False and fs.meta["rig"]["code"] == "rig_check"
+        ms = [m for m in api.list_library("metric") if m.id in fs.metric_scan_ids]
+        assert ms[0].meta["rig"]["trusted"] is False
+        assert ms[0].meta["warnings"][0] == fs.warnings[0]
+        pr = api.face_profile(fs)
+        assert pr.warnings[0].startswith(rigstate.IN_DOUBT) and words in pr.warnings[0]
+        assert pr.stats["rig"]["trusted"] is False
+        assert pr.stats["flatness_rms_mm"] < 0.06                       # measured as before
+    finally:
+        rigstate.record_check(s.store, p, {**base, "status": "OK", "message": "rig in place"})
+    fs = api.targeted_face_scan(None, p, "after_ok", repeats=1, duty=0.7, steps=4, polar=False)
+    assert fs.meta["rig"] == {"mount": "fixed", "trusted": True}
+    assert not any(rigstate.IN_DOUBT in w for w in fs.warnings)
+
+
 def test_tilephase_face_scan_matches_multifreq_with_half_the_frames(mock_face):
     """mode tilephase (experimental): 36 depth frames vs 74, the same projector coordinates
     on the face (no fringe-order error) and the same heights within noise."""

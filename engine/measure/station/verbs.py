@@ -226,11 +226,17 @@ def _zone_image(X, mask, fr, model) -> Optional[np.ndarray]:
 def station_measure(s, scan, flood=None, label: Optional[str] = None,
                     params: Optional[dict] = None, zone_model: Optional[dict] = None,
                     zone_labels: Optional[dict] = None, write: bool = True) -> tuple:
-    """-> (StationMeasurement, internals {X, d, r}). zone_model / zone_labels: a golden's."""
+    """-> (StationMeasurement, internals {X, d, r}). zone_model / zone_labels: a golden's.
+    What the scan rests on comes first in the warnings and in the report's "rig"
+    (metric_scan.stored_doubts: a fixed rig in doubt when it was made, in the rig check's
+    words; a calibration that may not fit); the measurement is made as before."""
+    from ...reconstruct import metric_scan
     prm = geo_mod.StationParams.from_dict(params)
     ms, cal, geo, fp = _scan_and_cal(s, scan)
     label = safe_label(label or f"{ms.label}_station")
-    d, fsrc, warnings = resolve_flood(s, ms, flood, geo, fp)
+    rig, warnings = metric_scan.stored_doubts(s, [ms])
+    d, fsrc, more = resolve_flood(s, ms, flood, geo, fp)
+    warnings += more
     cloud = ms.cloud
     X = np.where(cloud.mask[..., None], cloud.xyz, np.nan).astype(np.float64)
     r = geo_mod.measure(X, d, cal.K_cam, cal.dist_cam, prm, zone_model,
@@ -238,6 +244,7 @@ def station_measure(s, scan, flood=None, label: Optional[str] = None,
     warnings += r["warnings"]
     rep = _report(r, ms, cal, geo, fp, prm, fsrc, label, warnings)
     rep["mock"] = bool(s.mock)
+    rep["rig"] = rig
     files = {}
     if write:
         files = _write_measure(s, rep, r, X, d, ms)

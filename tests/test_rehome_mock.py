@@ -393,8 +393,10 @@ def test_rehome_refused_when_the_projector_moved_or_the_move_is_too_large(rig):
         assert len(_stereo_cals(p)) == n, name
         if name == "projector":
             assert r["moved"] == "projector" and "CAMERA move" in r["rehome"]["why"]
-        elif name == "both":
-            assert "not camera-like" in r["rehome"]["why"]
+        elif name == "both":                        # the check itself names both
+            assert r["moved"] == "camera and projector" and "can't be re-homed" in r["message"]
+            assert "(camera and projector moved)" in r["rehome"]["why"]
+            assert "CAMERA move" in r["rehome"]["why"]
         else:
             assert "too large" in r["rehome"]["why"] and "recalibrate" in r["rehome"]["why"]
     _set_camera(bench, rig0, Rn)                                   # back in place

@@ -116,7 +116,9 @@ def capture_dent_set(s, long_preset, short_preset, label: str = "dentset",
                      zone: Optional[str] = None, lines_v: bool = True, metric: bool = True,
                      metric_preset=None, steps=None, periods=None,
                      pattern_set: str = "production") -> DentSet:
-    """One pose: long pass, short pass (two rig sessions) + one metric scan (same zone)."""
+    """One pose: long pass, short pass (two rig sessions) + one metric scan (same zone).
+    meta "rig" / "warnings": the metric scan's rig stamp and its warnings first (a fixed rig
+    in doubt says so in the rig check's words), then the dent set's own."""
     from ...calibrate import flow, stereo
     safe_label(label)
     if pattern_set not in ds_mod.PATTERN_SETS:
@@ -137,11 +139,11 @@ def capture_dent_set(s, long_preset, short_preset, label: str = "dentset",
                          f"{long_preset.name} in more than the exposure ({'; '.join(diffs)}): the "
                          "HDR composite scales the short pass by the exposure ratio only - use "
                          "two presets that differ only in camera.exposure_us")
-    cal = None
+    cal = rig = None
     if metric:                           # rule 6, before the rig is touched
         cal = stereo.require(s.store, long_preset.geometry_id, fp, "capture_dent_set (metric scan)")
         from ...reconstruct import metric_scan as _ms
-        _ms._require_rig(s, metric_preset, "capture_dent_set (metric scan)")   # mobile: verified
+        rig = _ms._require_rig(s, metric_preset, "capture_dent_set (metric scan)")  # mobile: verified
     proj_mask = cam_mask = None
     cells = []
     if zone:
@@ -185,6 +187,13 @@ def capture_dent_set(s, long_preset, short_preset, label: str = "dentset",
                             "are saved WITHOUT one: scan_metric the same zone without moving the "
                             "cell and pass it to detect_dents / calibrate_dent_null as "
                             "metric_scans")
+    # what the mm rest on, first: the metric scan's own (a fixed rig in doubt in the rig
+    # check's words, a calibration that may not fit), else the rig gate's from before the capture
+    if ms is not None:
+        rig = (ms.meta or {}).get("rig", rig)
+    said = [(rig or {}).get("warning"), *(((ms.meta or {}).get("warnings") or [])
+                                         if ms is not None else [])]
+    warnings = list(dict.fromkeys([str(w) for w in said if w] + warnings))
     d = s.store.new_dir("dentsets", long_preset.geometry_id, label=label)
     with s.store.filling(d):
         _save_npy(d / "frames_long.npy", stacks["long"])
@@ -216,7 +225,7 @@ def capture_dent_set(s, long_preset, short_preset, label: str = "dentset",
                 "metric_error": metric_error,
                 "calibration_id": cal.id if cal is not None else None,
                 "units": "camera DN (averaged frames), crop offset x0, y0 in camera px",
-                "warnings": warnings}
+                "rig": rig, "warnings": warnings}
         s.store.write_json(d / "meta.json", json_safe(meta))
     if interrupted is not None:
         raise interrupted
